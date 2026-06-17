@@ -1,0 +1,41 @@
+# DNS Proxy Configuration Example
+#
+# This file demonstrates the configuration options for the DNS proxy.
+# The proxy routes DNS queries based on their opcode to processing modules,
+# and forwards all other opcodes to upstream resolvers.
+
+server:
+  # Address to listen on (port 8053 by default - non-privileged)
+  # For standard DNS, use :53 but requires root privileges
+  address: ":8053"
+
+  # Networks to enable
+  networks:
+    - udp
+    - tcp
+
+upstreams:
+  # Primary upstream resolver
+  - address: "8.8.8.8:53"
+    protocol: "udp"
+    timeout: "5s"
+
+  # Secondary upstream resolver (used as fallback)
+  - address: "1.1.1.1:53"
+    protocol: "udp"
+    timeout: "5s"
+
+# Processing rules map opcodes to module names
+processing_rules:
+  # Route opcode 2 (STATUS) to a status processor module
+  # Modules must be registered in cmd/sig0lease_proxy/main.go to handle this opcode
+  - opcode: 2
+    module: "status_handler"
+
+  # Route opcode 5 (UPDATE) to an update handler module
+  # UPDATE queries are used for dynamic DNS updates (RFC 2136)
+  - opcode: 5
+    module: "update_handler"
+
+# Default forward is used for opcodes not listed in processing_rules
+default_forward: "8.8.8.8:53"
