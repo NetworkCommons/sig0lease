@@ -1,6 +1,6 @@
 # sig0lease — Package Architecture
 
-Agent module for automated DNS-SD service registration using the Service Registration Protocol (SRP) with SIG(0) and TSIG authentication, targeting a `golang.org/x/dns` / `miekg/dns`-based Go implementation against a BIND 9 test server.
+Agent module for automated DNS-SD service registration using the Service Registration Protocol (SRP) with SIG(0) and TSIG authentication, targeting a `golang.org/x/dns` / `codeberg.org/miekg/dns v2`-based Go implementation against a BIND 9 test server.
 
 ## Directory Layout
 
@@ -21,8 +21,8 @@ agent/
 │   ├── sig0/                     # RFC 2931 — SIG(0) request/response signing
 │   │   ├── signer.go             # KeyStore interface, Signer type (sign DNS message with private key)
 │   │   ├── verifier.go           # Verify(msg, publicKey) error — validates SIG(0) RRs
-│   │   └── algorithm.go          # ECDSAP256SHA256 (algorithm 13) and TSIG algorithm map
-│   │                               # per RFC 9665 §6.6: ECDSAP256SHA256 required, others optional
+│   │   └── algorithm.go          # ED25519 (algorithm 15) and TSIG algorithm map
+│   │                               # per RFC 9665 §6.6: ED25519 required for sig0namectl compatibility, others optional
 │   │   ├── signer_test.go
 │   │   ├── verifier_test.go
 │   │   └── algorithm_test.go
@@ -117,10 +117,10 @@ Each package is designed to have a single responsible RFC or standard. Cross-cut
 | Responsibility | Detail |
 |---|---|
 | API surface | `type KeyStore interface { PrivateKey() crypto.PrivateKey; PublicKey() dns.PublicKey }`<br>`type Signer struct { Store KeyStore }` — `Sign(msg *dns.Msg) (*dns.SIG, error)`<br>`func Verify(msg *dns.Msg, pub dns.PublicKey) error` |
-| Algorithms | **Required**: ECDSAP256SHA256 (algorithm 13). Per RFC 9665 §6.6: registrars MUST implement this. Other algorithms per RFC 8624 are optional ("SHOULD").<br>**TSIG**: Also support HMAC-SHA256 for TSIG-based authentication as an alternative path. |
+| Algorithms | **Required**: ED25519 (algorithm 15) per RFC 8032. Per RFC 9665 §6.6: registrars MUST implement this for sig0namectl compatibility. Other algorithms per RFC 8624 are optional ("SHOULD").<br>**TSIG**: Also support HMAC-SHA256 for TSIG-based authentication as an alternative path. |
 | Interaction with miekg/dns | Use `dns.StartSIG(msg, sig)` / `dns.InsertRR(msg, sig)` or manually build the SIG RR in the Additional section. |
 
-**Tests**: Sign a valid message → verify succeeds. Verify with wrong key → error. Multiple algorithms: test ECDSAP256SHA256 is always accepted; others are rejected if not configured. TSIG path: sign/verify with HMAC-SHA256. Time-window validation (SIG validity period).
+**Tests**: Sign a valid message → verify succeeds. Verify with wrong key → error. Multiple algorithms: test ED25519 is always accepted; others are rejected if not configured. TSIG path: sign/verify with HMAC-SHA256. Time-window validation (SIG validity period).
 
 ### 4. `pkg/srp/instruction.go` — DNS-SD Instruction Construction (RFC 9665 §3.3.1)
 
@@ -213,6 +213,6 @@ Each package is designed to have a single responsible RFC or standard. Cross-cut
 
 | Dependency | Purpose |
 |---|---|
-| `github.com/miekg/dns` | DNS wire format, message building, RR types (recommended by project) |
-| Standard library `crypto/ecdsa`, `crypto/tls`, `encoding/binary` | SIG(0) signing, TLS transport, lease encoding |
+| `codeberg.org/miekg/dns v2` | DNS wire format, message building, RR types (recommended by project; v2 is successor to miekg/dns v1 on GitHub) |
+| Standard library `crypto/ed25519`, `crypto/tls`, `encoding/binary` | SIG(0) signing with ED25519 keys, TLS transport, lease encoding |
 | (optional) `gopkg.in/yaml.v3` or `github.com/pelletier/go-toml/v2` | Server config parsing for `cmd/sig0lease-server` |

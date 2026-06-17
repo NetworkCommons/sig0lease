@@ -29,7 +29,7 @@ flowchart TD
     end
 
     %% SIG0 Algorithm Requirements RFC 9665 6.6
-    Sig0KeyStore --> ECDSAP256[ECDSAP256SHA256 REQUIRED MUST implement RFC 8624 3.1]
+    Sig0KeyStore --> ED2551[ED25519 REQUIRED MUST implement RFC 8032 RFC 9665 for sig0namectl compatibility]
     Sig0KeyStore --> OtherAlgos[Other algorithms Optional SHOULD support]
 
     %% BIND 9 Support
@@ -44,7 +44,7 @@ flowchart TD
     TsigVerify -->|Failure| RejectTsig[RCODE NOTAUTH]
 
     style ChooseAuth fill:#fff4e6
-    style ECDSAP256 fill:#d4edda
+    style ED25519 fill:#d4edda
     style BindSupportSIG0 fill:#cce5ff
     style BindSupportTsig fill:#cce5ff
 ```
@@ -118,14 +118,14 @@ sequenceDiagram
     C->>S: Config specifies auth_method SIG0 or TSIG
 
     alt SIG0 mode recommended per RFC 9665
-        Note over C: Use miekg dns CryptoSIG0 interface with ECDSAP256SHA256
+        Note over C: Use codeberg.org/miekg/dns v2 CryptoSIG0 interface with ED25519 per RFC 8032
 
         C->>C: Load private key from PEM file
         C->>C: Build DNS Update message
         C->>Bind: Send update may pass through S as proxy
         Bind-->>C: RCODE response
     else TSIG mode fallback
-        Note over C: Use miekg dns TSIG with HMAC SHA256
+        Note over C: Use codeberg.org/miekg/dns v2 TSIG with HMAC SHA256
 
         C->>C: Compute HMAC SHA256 over message
         C->>Bind: Send update with TSIG RR
@@ -142,16 +142,18 @@ sequenceDiagram
 | Replay protection | Validity window plus signature | Timestamps plus MAC |
 | Non-repudiation | Yes signature cant be forged | No shared secret |
 | BIND 9 config | update-policy local or named rules | key name secret |
-| RFC requirement | RFC 9665 6.6 MUST implement ECDSAP256SHA256 | RFC 8945 Optional |
+| RFC requirement | RFC 9665 6.6 MUST implement ED25519 per RFC 8032 for sig0namectl compatibility | RFC 8945 Optional |
 
 ## Recommended Approach for sig0lease
 
 Per the project docs and RFC requirements:
 
-1. **Primary**: SIG0 with ECDSAP256SHA256
-   - Required by RFC 9665 6.6
+1. **Primary**: SIG0 with ED25519 per RFC 8032
+   - Required by RFC 9665 §6.6 for sig0namectl compatibility
    - Better security properties asymmetric non-repudiation
    - Public keys can be distributed via DNS
+
+   Note: ED25519 (algorithm 15) is used instead of ECDSAP256SHA256 (algorithm 13)
 
 2. **Fallback Alternative**: TSIG with HMAC SHA256
    - Supported for compatibility

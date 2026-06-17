@@ -215,7 +215,7 @@ flowchart TD
 
     subgraph "Signature Validation"
         direction TB
-        VerifySig[Verify SIG0 TSIG Using miekg dns SIG0Verify]
+         VerifySig[Verify SIG0 TSIG Using codeberg.org/miekg/dns v2 SIG0Verify]
         VerifySig -->|Success| ValOpt[Validate lease options]
         VerifySig -->|Fail| ErrAuth[RCODE REFUSED]
     end

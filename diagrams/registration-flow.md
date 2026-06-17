@@ -22,7 +22,7 @@ sequenceDiagram
     %% Step 2: Sign Message
     alt SIG0 Authentication RFC 2931
         Client->>Client: Compute SIG0 over message
-        Note right of Client: Hash SHA256 RFC 8624<br/>Algorithm ECDSAP256SHA256
+        Note right of Client: Hash SHA256 RFC 8624<br/>Algorithm ED25519 per RFC 8032 for sig0namectl compatibility
         Client->>Server: DNS Update Message plus SIG0 RR
     else TSIG Authentication RFC 8945
         Client->>Client: Compute TSIG HMAC SHA256 over message
@@ -60,7 +60,7 @@ sequenceDiagram
                     else No Conflict
                         %% Step 5: Forward to DNS Server
                         Server->>DNS: Send DNS Update signed
-                        Note right of Server DNS: Uses miekg dns Client.SendUpdate
+                         Note right of Server DNS: Uses codeberg.org/miekg/dns v2 Client.SendUpdate
 
                         DNS-->>Server: Response RCODE
 

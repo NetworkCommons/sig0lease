@@ -82,7 +82,7 @@ graph TB
     style SRPClient fill:#e1ffe1
     style UpdateClient fill:#fff5e1
 
-    note1[RFC 9664 Update Lease RFC 9665 SRP Protocol RFC 2931 SIG0 RFC 8945 TSIG]
+     note1[RFC 9664 Update Lease RFC 9665 SRP Protocol RFC 2931 SIG0 ED25519 RFC 8032 RFC 8945 TSIG]
     note1 -.->|documented in| ServerCLI
 ```
 

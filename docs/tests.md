@@ -30,7 +30,7 @@ Unit tests exercise individual packages in isolation, using in-memory objects an
 | K-01 | `TestRoundTrip` | Create KeyRecord, encode to `*dns.KEY`, decode back → identical fields. | 2539, 4034 §4 |
 | K-02 | `TestZeroFlagsSRP` | Flags=0 encodes correctly; flags≠0 is valid wire format but flagged for SRP use. | 9665 §3.2.5.1 |
 | K-03 | `TestNilPublicKey` | Decode with empty PublicKey → expect error or nil check on access. | 2539 §3 |
-| K-04 | `TestAlgorithmMapping` | Algorithm=13 (ECDSAP256SHA256) maps to correct digest type. | 8624 §3.1 |
+| K-04 | `TestAlgorithmMapping` | Algorithm=15 (ED25519 per RFC 8032) maps to correct digest type. | 8624 §3.1 |
 
 ### 1.3 `pkg/sig0` — SIG(0) Signing & Verification
 
@@ -41,7 +41,7 @@ Unit tests exercise individual packages in isolation, using in-memory objects an
 | S-03 | `TestVerifyTamperedMsg` | Sign message, modify one RRSIG-bearing RR after signing → verify fails. | 2931 §5 |
 | S-04 | `TestVerifyExpiredSIG` | Set SIG validity window in the past → verify rejects. | 2931 §5 (time window) |
 | S-05 | `TestVerifyPreValidSIG` | Set SIG validFrom > time of verification → reject as not-yet-valid. | 2931 §5 |
-| S-06 | `TestAlgorithm_ECDSAP256SHA256` | Algorithm=13 always accepted (MUST per RFC 9665 §6.6). | 9665 §6.6 |
+| S-06 | `TestAlgorithm_ED25519` | Algorithm=15 (ED25519 per RFC 8032) always accepted (MUST for sig0namectl compatibility). | 9665 §6.6 |
 | S-07 | `TestTSIG_HMAC_SHA256` | Sign/verify using TSIG with HMAC-SHA256 as alternative auth path. | 8945 |
 | S-08 | `TestVerify_MACMismatch` | Verify with truncated/wrong MAC → expect failure. | 2931 §5 |
 
@@ -125,7 +125,7 @@ Each integration test group:
 | E-02 | `TestLeaseRefresh_Succeeds` | Wait to 80% lease mark → client sends Refresh → BIND still serves the service. | 9664 §5 |
 | E-03 | `TestLeaseExpiry_GarbageCollection` | Wait past lease duration → records are removed or not served. Verify via dig returning NXDOMAIN/nodata. | 9664 §7, 9665 §5.1 |
 | E-04 | ` testNameConflict_FCFS` | Host A registers "myhost" → Host B tries same name with different key → BIND returns YXDomain (or update rejected by server validation). | 9665 §3.2.4.1, §3.3.3 |
-| E-05 | `TestSIG0AuthPath` | Full register + refresh using SIG(0) / ECDSAP256SHA256 → all operations succeed. | 2931, 9665 §6.6 |
+| E-05 | `TestSIG0AuthPath` | Full register + refresh using SIG(0) / ED25519 per RFC 8032 → all operations succeed. | 2931, 9665 §6.6 |
 | E-06 | `TestTSIGAuthPath` | Full register + refresh using TSIG / HMAC-SHA256 → all operations succeed on BIND side. | 8945 |
 | E-07 | `TestRemoveAllServices` | Client sends LEASE=0 update → all service RRs for hostname disappear from BIND zone. | 9665 §3.2.5.5.1 |
 | E-08 | `TestSubtypeManagement_Atomic` | Register service with subtypes A, B, C → send update without subtype B → subtype B removed atomically. | 9665 §3.3.4 |

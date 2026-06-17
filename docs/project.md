@@ -20,9 +20,9 @@ profits from financial payment for priority ranking in search results but also p
 gaining and on-selling of valuable data assets from those doing the searching.
 
 DNS Service Discovery is a mechanism by which secure autonomous service publication can be
-achieved without such intermediaries. The sig0namectl project developed the world’s first read-only
+achieved without such intermediaries. The sig0namectl project developed the world's first read-only
 DNS-SD web browser application. The sig0lease module brings to the project a capability that
-enables easy-to-use collaborative live updates for secure DNS Service Discovery.
+enables easy-to-use collaborative live updates for secure DNS Service Discovery using ED25519 keypairs for SIG(0) authentication per RFC 8032 for compatibility with sig0namectl.
 
 ### How will the project solve this problem? How do you intend to implement the project technically? What similar approaches already exist, and what will make your project different or better?
 The project builds on recently published IETF standards that define secure DNS-SD updates
@@ -47,7 +47,7 @@ Projects with similar approaches include:
 sig0lease builds an innovative cross-platform SRP solution targeted for Internet-based applications aimed for human use, not just IoT devices.
 
 ### Existing libraries that can be reused
-https://codeberg.org/miekg/dns is a well-respected library that should be used as a basis for development, possibly contributing back functionality to the repository.
+https://codeberg.org/miekg/dns v2 (successor to miekg/dns v1 on GitHub) is the recommended library for DNS operations and should be used as a basis for development, possibly contributing back functionality to the repository.
 
 ### Briefly describe the risks involved in implementing your project and explain what measures you have planned to mitigate these risks or what alternative solutions you have in mind.
 Risk: The two IETF RFCs that define the SRP protocol could be unclear, incomplete or

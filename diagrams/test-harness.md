@@ -33,7 +33,7 @@ flowchart TD
 
     H1 -->|spawns| BIND9[BIND 9 process]
     H2 -->|creates zone files in temp dir| BIND9
-    H4 -->|generates| TestKey[ECDSA P256 key pair]
+    H4 -->|generates| TestKey[ED25519 key pair per RFC 8032]
 
     TestKey --> D1
     BIND9 -->|listens on| BindPort[Port from port_mgr]
@@ -41,7 +41,7 @@ flowchart TD
 
     T3 --> DnsQuery[DNS query to test service]
     DnsQuery --> H3
-    H3 -->|uses miekg dns or exec dig| BIND9
+     H3 -->|uses codeberg.org/miekg/dns v2 or exec dig| BIND9
     H3 -->|returns records| T4
 
     T4 --> Assert{Assertions}
@@ -73,7 +73,7 @@ sequenceDiagram
     Test->>Test: Load test keys from testdata/
     Test->>Test: Build SRP update message
 
-    Test->>Bind: DNS Update via miekg dns
+     Test->>Bind: DNS Update via codeberg.org/miekg/dns v2
     Bind->>Bind: Validate SIG0 signature
     Bind->>Bind: Check zone file rules
     Bind-->>Test: Response with RCODE
@@ -127,9 +127,9 @@ flowchart TD
 
 ```
 testdata/
-├── keys/                     ECDSA P256 key pairs PKCS#8
-│   ├── host1.pem            Private key plus public key for FCFS tests
-│   └── host2.pem            Second host key for conflict tests
+ ├── keys/                     ED25519 key pairs per RFC 8032
+ │   ├── host1.pem            Private key plus public key for FCFS tests
+ │   └── host2.pem            Second host key for conflict tests
 ├── zones/                    BIND 9 zone files
 │   ├── default.service.arpa.zone
 │   └── reverse.zone         Reverse mapping optional

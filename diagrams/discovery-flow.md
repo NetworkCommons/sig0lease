@@ -173,12 +173,12 @@ flowchart TD
     style Ready fill:#d4edda
 ```
 
-## Integration with miekg dns
+## Integration with codeberg.org/miekg/dns v2
 
 ```mermaid
 sequenceDiagram
     participant Client as sig0lease discovery module
-    participant Miekg as miekg/dns library
+    participant Miekg as codeberg.org/miekg/dns v2 library
 
     Client->>Miekg: &dns.Msg{ Question: []dns.Question{ {Name: "." Qtype: dns.TypeSOA} } } ExchangeContext ctx addr
 
