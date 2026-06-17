@@ -19,14 +19,14 @@ type Result struct {
 
 // Resolver forwards DNS queries to upstream servers.
 type Resolver struct {
-	servers   []string
-	protocol  string
-	timeout   time.Duration
-	dialer    *net.Dialer
-	wg        sync.WaitGroup
-	ctx       context.Context
-	cancel    context.CancelFunc
-	mu        sync.Mutex
+	servers  []string
+	protocol string
+	timeout  time.Duration
+	dialer   *net.Dialer
+	wg       sync.WaitGroup
+	ctx      context.Context
+	cancel   context.CancelFunc
+	mu       sync.Mutex
 }
 
 // NewResolver creates a new DNS resolver that forwards to upstream servers.
@@ -44,12 +44,12 @@ func NewResolver(servers []string, protocol string, timeout time.Duration) (*Res
 	ctx, cancel := context.WithCancel(context.Background())
 
 	return &Resolver{
-		servers:   servers,
-		protocol:  protocol,
-		timeout:   timeout,
-		dialer:    &net.Dialer{Timeout: timeout},
-		ctx:       ctx,
-		cancel:    cancel,
+		servers:  servers,
+		protocol: protocol,
+		timeout:  timeout,
+		dialer:   &net.Dialer{Timeout: timeout},
+		ctx:      ctx,
+		cancel:   cancel,
 	}, nil
 }
 

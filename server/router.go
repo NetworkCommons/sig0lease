@@ -6,9 +6,9 @@ import (
 	"fmt"
 
 	"codeberg.org/miekg/dns"
-	"github.com/NetworkCommons/sig0lease_proxy/forward"
-	"github.com/NetworkCommons/sig0lease_proxy/handlers"
-	"github.com/NetworkCommons/sig0lease_proxy/logging"
+	"github.com/NetworkCommons/sig0lease/forward"
+	"github.com/NetworkCommons/sig0lease/handlers"
+	"github.com/NetworkCommons/sig0lease/logging"
 )
 
 // Router routes DNS requests based on opcode to appropriate handlers or forwarder.
@@ -80,7 +80,9 @@ func (r *Router) forwardToUpstream(w dns.ResponseWriter, rMsg *dns.Msg) *dns.Msg
 	resp, err := r.forwardMessage(rMsg)
 	if err != nil {
 		r.logger.Errorf("Forward error: %v", err)
+		// Create response preserving the original message ID
 		resp = new(dns.Msg)
+		resp.ID = rMsg.ID
 		resp.Rcode = dns.RcodeServerFailure
 		resp.Response = true
 	}

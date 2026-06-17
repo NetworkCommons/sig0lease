@@ -30,11 +30,21 @@ func (h *StubHandler) Handle(ctx context.Context, w dns.ResponseWriter, r *dns.M
 		h.logger.Debugf("Stub handler %s received opcode %d", h.name, r.Opcode)
 	}
 
-	// Return empty response - placeholder for actual implementation
-	resp := new(dns.Msg)
+	// Copy the request to preserve all header fields including ID
+	resp := r.Copy()
+
+	// Clear the Data buffer so Pack() will be called by WriteTo to update flags
+	resp.Data = nil
+
+	// Now modify for response - clear sections and set appropriate flags
 	resp.Rcode = dns.RcodeSuccess
 	resp.Response = true
 	resp.RecursionAvailable = true
+
+	// Clear answer, authority, and additional sections (we'll add them if needed)
+	resp.Answer = nil
+	resp.Ns = nil
+	resp.Extra = nil
 
 	return resp, nil
 }

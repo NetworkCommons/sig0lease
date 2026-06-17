@@ -1,4 +1,4 @@
-# sig0lease Proxy
+# sig0lease
 
 A modular DNS proxy server implementing the Service Registration Protocol (SRP) for secure dynamic DNS-SD updates, using SIG(0) authentication.
 
@@ -29,7 +29,7 @@ A modular DNS proxy server implementing the Service Registration Protocol (SRP) 
 
 ## Directory Structure
 
-- `cmd/sig0lease_proxy/` - Main binary entry point
+- `cmd/sig0lease/` - Main binary entry point
 - `pkg/` - Library modules
   - `sig0/` - SIG(0) signing and verification (RFC 2931)
   - `lease/` - Update Lease EDNS option (RFC 9664)
@@ -45,13 +45,13 @@ A modular DNS proxy server implementing the Service Registration Protocol (SRP) 
 ### Build
 
 ```bash
-go build ./cmd/sig0lease_proxy
+make build
 ```
 
 ### Run with Config File
 
 ```bash
-./sig0lease-proxy config.yaml
+./bin/<your OS>/sig0lease examples/config.yaml
 ```
 
 If no config file is provided, default settings are used:
@@ -80,13 +80,16 @@ type Handler interface {
 
 ```bash
 # Start the proxy (non-privileged port 8053 by default)
-./sig0lease-proxy config.yaml
+./bin/<your OS>/sig0lease examples/config.yaml &
 
 # Test normal DNS query (opcode 0 - QUERY) on port 8053
-dig @localhost -p 8053 example.com
+dig @localhost -p 8053 example.com A +short
 
-# For standard port 53, run with sudo or change config to :53
+# Run the full test suite
+./examples/test.sh
 ```
+
+For standard port 53, run with sudo or change config to `:53`.
 
 ## Standards Compliance
 

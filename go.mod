@@ -1,4 +1,4 @@
-module github.com/NetworkCommons/sig0lease_proxy
+module github.com/NetworkCommons/sig0lease
 
 go 1.25.0
 

@@ -6,10 +6,10 @@ import (
 	"os"
 
 	"codeberg.org/miekg/dns"
-	"github.com/NetworkCommons/sig0lease_proxy/config"
-	"github.com/NetworkCommons/sig0lease_proxy/handlers"
-	"github.com/NetworkCommons/sig0lease_proxy/logging"
-	"github.com/NetworkCommons/sig0lease_proxy/server"
+	"github.com/NetworkCommons/sig0lease/config"
+	"github.com/NetworkCommons/sig0lease/handlers"
+	"github.com/NetworkCommons/sig0lease/logging"
+	"github.com/NetworkCommons/sig0lease/server"
 )
 
 func main() {

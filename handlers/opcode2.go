@@ -29,16 +29,21 @@ func NewStatusHandler() *StatusHandler {
 func (h *StatusHandler) Handle(ctx context.Context, w dns.ResponseWriter, r *dns.Msg) (*dns.Msg, error) {
 	h.logger.Debugf("Processing STATUS query from %s", w.RemoteAddr().String())
 
-	resp := new(dns.Msg)
+	// Copy the request to preserve all header fields including ID
+	resp := r.Copy()
+
+	// Clear the Data buffer so Pack() will be called by WriteTo to update flags
+	resp.Data = nil
+
+	// Now modify for response - clear sections and set appropriate flags
 	resp.Rcode = dns.RcodeSuccess
 	resp.Response = true
 	resp.Authoritative = true
 
-	// Copy the question section
-	if len(r.Question) > 0 {
-		resp.Question = make([]dns.RR, len(r.Question))
-		copy(resp.Question, r.Question)
-	}
+	// Clear answer, authority, and additional sections (we'll add them if needed)
+	resp.Answer = nil
+	resp.Ns = nil
+	resp.Extra = nil
 
 	h.logger.Debugf("STATUS query handled for %s", resp.Question[0].Header().Name)
 
