@@ -18,6 +18,7 @@ type Result struct {
 }
 
 // Resolver forwards DNS queries to upstream servers.
+// FIXME: servers is a list, but protocol and timeout are single values, differently in config. Should we support per-server protocol/timeout?
 type Resolver struct {
 	servers  []string
 	protocol string
@@ -60,6 +61,10 @@ func (r *Resolver) Query(ctx context.Context, msg *dns.Msg) (*dns.Msg, error) {
 	copy(servers, r.servers)
 	r.mu.Unlock()
 
+	// 1. Create a child context that we can cancel locally
+    queryCtx, cancel := context.WithCancel(ctx)
+    defer cancel() // Ensure resources are freed when this function returns
+
 	resultCh := make(chan Result, len(servers))
 
 	// Send queries concurrently to all upstreams
@@ -67,13 +72,13 @@ func (r *Resolver) Query(ctx context.Context, msg *dns.Msg) (*dns.Msg, error) {
 		r.wg.Add(1)
 		go func(addr string) {
 			defer r.wg.Done()
-			resp, err := r.exchangeWithContext(ctx, msg, addr)
+			resp, err := r.exchangeWithContext(queryCtx, msg, addr)
 			resultCh <- Result{Response: resp, Error: err}
 		}(server)
 	}
 
 	// Collect responses until we get one or all fail
-	ctxDone := ctx.Done()
+	ctxDone := queryCtx.Done()
 	timeout := time.After(r.timeout)
 
 	for i := 0; i < len(servers); i++ {
@@ -114,7 +119,7 @@ func (r *Resolver) exchangeWithContext(ctx context.Context, msg *dns.Msg, server
 // exchange performs a single DNS exchange with an upstream server.
 func (r *Resolver) exchange(ctx context.Context, server string, msg *dns.Msg) (*dns.Msg, error) {
 	network := r.protocol
-	if network == "" || network == "udp" {
+	if network == "" {
 		network = "udp"
 	}
 	resp, err := dns.Exchange(ctx, msg, network, server)

@@ -18,8 +18,8 @@ A modular DNS proxy server implementing the Service Registration Protocol (SRP) 
 │   DNS       │     │  Router (based   │     │               │
 │  Client     │────►│  on opcode)      │────►│  Processing   │
 └─────────────┘     └──────────────────┘     │    Modules    │
-                                              │  (SIG(0), etc)│
-                                              └───────────────┘
+                                             │  (SIG(0), etc)│
+                                             └───────────────┘
                                                      │
                                               ┌──────┴──────┐
                                               │ Forwarding  │
@@ -51,7 +51,7 @@ make build
 ### Run with Config File
 
 ```bash
-./bin/<your OS>/sig0lease examples/config.yaml
+./bin/<your OS>/sig0lease ./config.yaml
 ```
 
 If no config file is provided, default settings are used:
@@ -80,13 +80,13 @@ type Handler interface {
 
 ```bash
 # Start the proxy (non-privileged port 8053 by default)
-./bin/<your OS>/sig0lease examples/config.yaml &
+./bin/<your OS>/sig0lease ./config.yaml &
 
 # Test normal DNS query (opcode 0 - QUERY) on port 8053
 dig @localhost -p 8053 example.com A +short
 
 # Run the full test suite
-./examples/test.sh
+./test.sh
 ```
 
 For standard port 53, run with sudo or change config to `:53`.

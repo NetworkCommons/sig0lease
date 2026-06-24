@@ -53,7 +53,7 @@ lint:
 
 # Build and run the proxy with example config
 run: build
-	./$(BUILD_DIR)/$(BINARY_NAME) examples/config.yaml
+	./$(BUILD_DIR)/$(BINARY_NAME) ./config.yaml
 
 # Install dependencies
 deps:

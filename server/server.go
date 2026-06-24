@@ -33,7 +33,7 @@ func New(cfg *config.Config, logger *logging.Logger) (*Server, error) {
 			fwdServers = append(fwdServers, u.Address)
 		}
 	}
-
+	// FIXME: servers is a list, but protocol and timeout are single values, differently in config. Should we support per-server protocol/timeout?
 	resolver, err := forward.NewResolver(
 		fwdServers,
 		cfg.Upstreams[0].Protocol,
@@ -176,9 +176,22 @@ func (s *Server) handleRequest(w dns.ResponseWriter, r *dns.Msg) {
 		s.logger.Infof("handleRequest: Response has Data len=%d, Rcode=%d", len(resp.Data), resp.Rcode)
 		s.logger.Infof("handleRequest: About to call w.Write()...")
 
+		// Debug: check if Data needs packing
+		if len(resp.Data) == 0 {
+			s.logger.Infof("handleRequest: Data is empty, calling Pack()...")
+			if err := resp.Pack(); err != nil {
+				s.logger.Errorf("handleRequest: Pack() failed: %v", err)
+			} else {
+				s.logger.Infof("handleRequest: Pack() succeeded, new Data len=%d", len(resp.Data))
+			}
+		}
+
 		// Use WriteTo which handles TCP length prefixing
 		n, err := resp.WriteTo(w)
 		s.logger.Infof("handleRequest: resp.WriteTo returned n=%d, err=%v", n, err)
+		if err != nil {
+			s.logger.Errorf("handleRequest: Write error: %v", err)
+		}
 	} else {
 		s.logger.Errorf("No response generated for query from %s", w.RemoteAddr().String())
 	}

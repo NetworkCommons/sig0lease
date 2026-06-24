@@ -3,6 +3,7 @@ package handlers
 
 import (
 	"context"
+	"fmt"
 
 	"codeberg.org/miekg/dns"
 )
@@ -23,30 +24,77 @@ func NewStubHandler(name string, opcodes []uint8) *StubHandler {
 	}
 }
 
-// Handle processes a DNS message - currently just logs and returns empty response.
-// TODO: Implement actual processing logic for this module.
+// Handle processes a DNS message and returns the response.
+//
+// This is a generic handler that:
+//   - Logs incoming request details
+//   - Validates message structure
+//   - Returns a properly formatted response with appropriate flags
+//
+// To implement specific processing, extend this handler or create new handlers.
 func (h *StubHandler) Handle(ctx context.Context, w dns.ResponseWriter, r *dns.Msg) (*dns.Msg, error) {
 	if h.logger != nil {
-		h.logger.Debugf("Stub handler %s received opcode %d", h.name, r.Opcode)
+		h.logger.Debugf("Stub handler %s received opcode %d from %s",
+			h.name, r.Opcode, w.RemoteAddr().String())
 	}
 
-	// Copy the request to preserve all header fields including ID
-	resp := r.Copy()
+	// Validate message
+	if r == nil {
+		return nil, fmt.Errorf("nil message received")
+	}
 
-	// Clear the Data buffer so Pack() will be called by WriteTo to update flags
+	// Validate Question section
+	if len(r.Question) == 0 {
+		h.logger.Warn("No question section in message")
+		return h.makeErrorResponse(r, dns.RcodeFormatError, "no question section"), nil
+	}
+
+	if len(r.Question) > 1 {
+		h.logger.Debugf("Multiple questions in message: %d", len(r.Question))
+	}
+
+	// Log question details - parse Question section properly
+	if len(r.Question) > 0 {
+		qHeader := r.Question[0].Header()
+		h.logger.Debugf("Question: %s (%d, %d)", qHeader.Name, qHeader.TTL, qHeader.Class)
+	}
+
+	// Create response message
+	resp := &dns.Msg{
+		MsgHeader: r.MsgHeader,
+		Question:  r.Question,
+	}
+
+	// Clear the data buffer to ensure Pack() will be called on WriteTo
 	resp.Data = nil
 
-	// Now modify for response - clear sections and set appropriate flags
-	resp.Rcode = dns.RcodeSuccess
+	// Set response flags
 	resp.Response = true
-	resp.RecursionAvailable = true
+	if r.RecursionDesired {
+		resp.RecursionAvailable = true
+	}
 
-	// Clear answer, authority, and additional sections (we'll add them if needed)
-	resp.Answer = nil
-	resp.Ns = nil
-	resp.Extra = nil
+	// Set response code (success by default for stub handler)
+	resp.Rcode = dns.RcodeSuccess
 
 	return resp, nil
+}
+
+// makeErrorResponse creates a properly formatted error response.
+func (h *StubHandler) makeErrorResponse(req *dns.Msg, rcode int, msg string) *dns.Msg {
+	resp := &dns.Msg{
+		MsgHeader: req.MsgHeader,
+		Question:  req.Question,
+	}
+
+	resp.Response = true
+	resp.Rcode = uint16(rcode)
+
+	if msg != "" && h.logger != nil {
+		h.logger.Debugf("Returning error response: %s", msg)
+	}
+
+	return resp
 }
 
 // Setup initializes the handler configuration.

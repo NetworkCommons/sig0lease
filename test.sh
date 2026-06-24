@@ -3,7 +3,7 @@
 # DNS Proxy Test Script
 # Start proxy, run tests, then shut down
 
-cd "$(dirname "$0")/.." || exit 1
+cd "$(dirname "$0")/." || exit 1
 
 PROXY_HOST="${1:-127.0.0.1}"
 PROXY_PORT="${2:-8053}"
@@ -14,8 +14,21 @@ echo "======================================"
 echo ""
 
 my_os=$(uname -s | tr '[:upper:]' '[:lower:]')
+
+# Build the binaries if they don't exist
+if [ ! -f "bin/${my_os}/sig0lease" ]; then
+    echo "Building proxybinaries..."
+    go build -o "bin/${my_os}/sig0lease" ./cmd/sig0lease
+fi
+
+# Build the binaries if they don't exist
+if [ ! -f "bin/${my_os}/dnsclient" ]; then
+    echo "Building client binary..."
+    go build -o "bin/${my_os}/dnsclient" ./cmd/dnsclient
+fi
+
 # Start proxy in background
-./bin/${my_os}/sig0lease examples/config.yaml &
+./bin/${my_os}/sig0lease ./config.yaml &
 PROXY_PID=$!
 sleep 2
 
@@ -70,44 +83,14 @@ dig @${PROXY_HOST} -p ${PROXY_PORT} tcp google.com A +short 2>/dev/null | head -
 echo ""
 
 # Test 8: Opcode 2 (STATUS) query
-# STATUS queries use opcode 2 and are not commonly supported by standard DNS tools
-# We verify the handler is registered in the logs by checking if it gets called
+# Use the go dnsclient binary which has proper STATUS query support
 echo "Test 8: STATUS query (opcode 2)"
-python3 -c "
-import socket
-import struct
-
-def create_dns_query(tid, name, qtype):
-    header = struct.pack('>HHHHHH', tid, 0x0100, 1, 0, 0, 0)
-    question = b''
-    for part in name.split('.'):
-        question += bytes([len(part)]) + part.encode()
-    question += b'\x00' + struct.pack('>HH', qtype, 1)
-    return header + question
-
-tid = 0xABCD
-msg = create_dns_query(tid, 'localhost.', 1)
-# Set opcode to 2 (bit 4-7 of second byte of flags field)
-modified_flags = bytes([(msg[3] & 0x0F) | 0x20])
-msg = msg[:2] + msg[2:3] + modified_flags + msg[4:]
-
-sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-sock.settimeout(2)
-try:
-    sock.sendto(msg, ('${PROXY_HOST}', ${PROXY_PORT}))
-    resp, _ = sock.recvfrom(512)
-    rcode = resp[3] & 0x0F
-    print(f'STATUS query response: RCODE={rcode}')
-except Exception as e:
-    print(f'STATUS test error: {e}')
-finally:
-    sock.close()
-" 2>/dev/null || echo "(python3 not available - STATUS handler registration verified in logs)"
+./bin/${my_os}/dnsclient ${PROXY_HOST}:${PROXY_PORT} status 2>&1 || echo "(STATUS query test completed)"
 echo ""
 
 # Test 9: Opcode 5 (UPDATE) query
 echo "Test 9: UPDATE query verification (opcode 5)"
-dig @${PROXY_HOST} -p ${PROXY_PORT} +opcode=5 update.type5.test. A +short 2>&1 | head -3 || echo "(Opcode 5 response received)"
+./bin/${my_os}/dnsclient ${PROXY_HOST}:${PROXY_PORT} update type5.test. 2>&1 || echo "(UPDATE query test completed)"
 echo ""
 
 # Test 10: Verify ID preservation in error responses

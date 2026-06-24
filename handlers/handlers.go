@@ -8,13 +8,16 @@ import (
 )
 
 // HandlerFunc is a function type that handles a DNS request.
+// FIXME: why not to reuse dns.HandlerFunc? Because we want to return a response message and context, not just write to the ResponseWriter.
 type HandlerFunc func(context.Context, dns.ResponseWriter, *dns.Msg) (*dns.Msg, context.Context, error)
 
 // Chain builds a middleware chain from multiple handlers.
+// FIXME: This function is not used, and the type HandlerFunc is not used.
+// opcode processing modules do not implement this interface
 func Chain(handlers ...HandlerFunc) HandlerFunc {
 	if len(handlers) == 0 {
-		return func(_ context.Context, _ dns.ResponseWriter, r *dns.Msg) (*dns.Msg, context.Context, error) {
-			return nil, context.Background(), nil
+		return func(ctx context.Context, _ dns.ResponseWriter, r *dns.Msg) (*dns.Msg, context.Context, error) {
+			return nil, ctx, nil
 		}
 	}
 
@@ -62,10 +65,11 @@ type Logger interface {
 
 // BaseHandler provides common functionality for handlers.
 type BaseHandler struct {
-	name       string
-	opcodes    []uint8
-	config     map[string]any
-	logger     Logger
+	name    string
+	opcodes []uint8
+	config  map[string]any
+	logger  Logger
+	// FIXME: this is not implemented
 	canaryFunc func() bool // For testing
 }
 

@@ -47,21 +47,21 @@ func (r *Router) Route(ctx context.Context, w dns.ResponseWriter, rMsg *dns.Msg)
 
 	if !found {
 		r.logger.Infof("No handler for opcode %d, forwarding to upstream", rMsg.Opcode)
-		resp := r.forwardToUpstream(w, rMsg)
+		resp := r.forwardToUpstream(rMsg)
 		return resp
 	}
 
 	handler, ok := r.handlers[moduleName]
 	if !ok {
 		r.logger.Errorf("Handler not found for module: %s", moduleName)
-		resp := r.forwardToUpstream(w, rMsg)
+		resp := r.forwardToUpstream(rMsg)
 		return resp
 	}
 
 	resp, err := handler.Handle(ctx, w, rMsg)
 	if err != nil {
 		r.logger.Errorf("Error handling opcode %d with module %s: %v", rMsg.Opcode, moduleName, err)
-		resp := r.forwardToUpstream(w, rMsg)
+		resp := r.forwardToUpstream(rMsg)
 		return resp
 	}
 
@@ -76,7 +76,7 @@ func (r *Router) moduleForOpcode(opcode uint8) (string, bool) {
 }
 
 // forwardToUpstream forwards a DNS message to the upstream resolver.
-func (r *Router) forwardToUpstream(w dns.ResponseWriter, rMsg *dns.Msg) *dns.Msg {
+func (r *Router) forwardToUpstream(rMsg *dns.Msg) *dns.Msg {
 	resp, err := r.forwardMessage(rMsg)
 	if err != nil {
 		r.logger.Errorf("Forward error: %v", err)
