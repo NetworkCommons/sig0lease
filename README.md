@@ -80,7 +80,6 @@ autonumber
     P->>R: Show unsuccessful registration
   end
   P->>+D: Lease Registration DNS KEY RR Update
-  D->>P: indicate successful DNS KEY RR Update
   break when DNS RR UPDATE fails
     D->>P: Indicate unsuccessful DNS KEY RR Update
     P->>R: Indicate unsuccessful named key registration request
