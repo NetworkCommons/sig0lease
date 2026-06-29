@@ -64,7 +64,7 @@ make sig0client
 
 ## 🎮 Quick start
 
-### Lease Registration of a named key
+### Lease Registration of a named KEY Resource Record
 
 ```mermaid
 sequenceDiagram
@@ -79,8 +79,8 @@ autonumber
   break when named public key fails policy
     P->>R: Show unsuccessful registration
   end
-  P->>+D: Publish & sign named public KEY record
-  P->>R: Show successful named key registration
+  P->>+D: Lease Regsitration time out
+  P->>R: Show successful named key registration request
 ```
 
 By default, DNS key labels beneath a compatible domain zone can be claimed on a "First Come, First Served" (FCFS) basis.
@@ -94,7 +94,7 @@ returning the listed public key for the specific FQDN.
 
 Note: It may take a minute or so for your local DNS resolver to update its cache with the new key.
 
-### Refreshing KEY Resource Record with a named key
+### Lease Refresh of a named KEY Resource Record
 
 ```mermaid
 sequenceDiagram
@@ -102,23 +102,15 @@ autonumber
   participant R as Requester<br><br> (sig0lease client)
   participant P as Provider<br><br>(sig0lease proxy server)
   participant D as DNS<br><br>(Authoritative DNS server)
-  R->>R: Create resource record updates & sign with named private key
+  R->>R: Create KEY resource record lease refresh request & sign with named private key
   R->>P: Request refresh of DNS KEY RR lease
-  P->>P: Verify update request signature against lease registered named key
+  P->>P: Verify refresh request signature against registered leased named key
   break when update request signature does not match registered named public key
-    P-->>R: Show unsuccessful update
+    P-->>R: Show unsuccessful lease refresh
   end
-  P->>P: Publish & sign updated resource records
-  P->>R: Show successful update
+  P->>P: update lease timeout counters for refreshed KEY RR lease
+  P->>R: Show successful lease refresh
 ```
-
-#### `dnssd-domain fqdn`
-
-Manages DNS records necessary to activate wide area DNS Service Discovery browsing.
-
-#### `dnssd-service fqdn`
-
-Gives an *example* of how to register browsable wide area DNS-SD services.
 
 ***
 **[🔝 back to top](#toc)**
