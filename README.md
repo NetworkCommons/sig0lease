@@ -84,6 +84,7 @@ autonumber
   break when DNS RR UPDATE fails
     D->>P: Indicate unsuccessful DNS KEY RR Update
     P->>R: Indicate unsuccessful named key registration request
+  end
   D->>P: Indicate successful DNS KEY RR Update
   P->>R: Show successful named key registration request
 ```
