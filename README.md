@@ -70,7 +70,7 @@ make sig0client
 sequenceDiagram
 autonumber
   participant R as Requester<br><br>(sig0lease client)
-  participant P as Provider<br><br>(sig0lease server)
+  participant P as Provider<br><br>(sig0lease proxy server)
   participant D as DNS<br><br>(Authoritative DNS server)
 
   R->>R: Generate named keypair
