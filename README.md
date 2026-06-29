@@ -71,13 +71,13 @@ sequenceDiagram
 autonumber
   participant R as Requester<br><br>(sig0lease client)
   participant P as Provider<br><br>(sig0lease server)
-  participant D as Resolver<br><br>(Authoritative DNS server)
+  participant D as DNS<br><br>(Authoritative DNS server)
 
   R->>R: Generate named keypair
   R->>P: Request lease registration of named public key
   P->>P: Apply registration policy
   break when named public key fails policy
-    P->>D: Show unsuccessful registration
+    P->>R: Show unsuccessful registration
   end
   P->>+D: Publish & sign named public KEY record
   P->>R: Show successful named key registration
