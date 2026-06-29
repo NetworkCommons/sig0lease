@@ -86,9 +86,12 @@ autonumber
   end
   D->>P: Indicate successful DNS KEY RR Update
   P->>R: Show successful named key registration request
+  break when no successful KEY RR lease refresh occurs within the Lease Duration 
+    P-->>D: Lease Registration DNS KEY RR deletion 
+  end
 ```
 
-By default, DNS key labels beneath a compatible domain zone can be claimed on a "First Come, First Served" (FCFS) basis.
+By default, DNS KEY labels beneath a compatible domain zone can be claimed on a "First Come, First Served" (FCFS) basis.
 
 The successful registration can be verified by
 
@@ -114,6 +117,7 @@ autonumber
   end
   P->>P: update lease timeout counters for refreshed KEY RR lease
   P->>R: Show successful lease refresh
+
 ```
 
 ***
