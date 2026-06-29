@@ -46,6 +46,9 @@ type Config struct {
 	// Opcode processing rules - opcodes listed here are processed by modules
 	ProcessingRules []ProcessingConfig `yaml:"processing_rules"`
 
+	// Handler-specific configuration (e.g., for update handler)
+	Handlers map[string]map[string]interface{} `yaml:"handlers"`
+
 	// DefaultForward is the upstream to use for opcodes not in ProcessingRules
 	DefaultForward string `yaml:"default_forward"`
 }
@@ -70,6 +73,7 @@ func NewDefaultConfig() *Config {
 				Timeout:  5 * time.Second,
 			},
 		},
+		Handlers:       make(map[string]map[string]interface{}),
 		DefaultForward: "8.8.8.8:53",
 	}
 }
@@ -144,4 +148,17 @@ func (c *Config) GetOpcodeMap() map[uint8]string {
 		opcodeMap[rule.Opcode] = rule.Module
 	}
 	return opcodeMap
+}
+
+// GetKeystoreDir returns the keystore directory from handler configuration.
+// Returns empty string if not configured.
+func (c *Config) GetKeystoreDir() string {
+	if c.Handlers != nil {
+		if updateHandlerCfg, ok := c.Handlers["update"]; ok {
+			if dir, ok := updateHandlerCfg["keystore_dir"].(string); ok && dir != "" {
+				return dir
+			}
+		}
+	}
+	return ""
 }

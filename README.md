@@ -66,15 +66,25 @@ Modules implement the `handlers.Handler` interface:
 type Handler interface {
     Name() string
     CanHandle(opcode uint8) bool
-    Handle(ctx context.Context, w dns.ResponseWriter, r *dns.Msg) (*dns.Msg, error)
+    Handle(ctx context.Context, w dns.ResponseWriter, r *dns.Msg) *HandlerResult
     Setup(cfg map[string]any) error
 }
 ```
 
+### Handler Response Types
+
+Handlers return a `HandlerResult` with a status code indicating how the router should process the packet:
+
+- **StatusProcessed (0)** - Handler successfully processed the packet; return response to client
+- **StatusNotRelevant (1)** - Packet is valid but not relevant to this protocol (e.g., UPDATE without UPDATE-LEASE EDNS option); router forwards to default upstream resolver
+- **StatusError (2)** - Handler encountered an error during processing; return error response to client
+
+This pattern allows handlers to signal whether a packet is relevant to their protocol without throwing exceptions, enabling clean fallback forwarding for packets that don't match the expected protocol structure.
+
 ### Available Modules
 
-- `status_handler` - Handles opcode 2 (STATUS queries)
-- `update_handler` - Handles opcode 5 (UPDATE queries for RFC 2136 dynamic DNS)
+- `status_handler` - Handles opcode 2 (STATUS queries)  
+- `update_handler` - Handles opcode 5 (UPDATE queries with sig0lease authentication per RFC 9664)
 
 ## Testing with dig
 

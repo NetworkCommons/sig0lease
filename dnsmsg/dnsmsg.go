@@ -24,11 +24,9 @@ func MakeResponse(r *dns.Msg) *dns.Msg {
 	resp.Authoritative = false
 
 	// Copy question section if needed
-	if r.Question != nil && len(r.Question) > 0 {
+	if len(r.Question) > 0 {
 		resp.Question = make([]dns.RR, len(r.Question))
-		for i, q := range r.Question {
-			resp.Question[i] = q
-		}
+		copy(resp.Question, r.Question)
 	}
 
 	return resp
@@ -69,7 +67,7 @@ func MakeStatusResponse(r *dns.Msg) *dns.Msg {
 	// - Server version
 	// - Uptime
 	// - Statistics
-	if r.Question != nil && len(r.Question) > 0 {
+	if len(r.Question) > 0 {
 		resp.Question = make([]dns.RR, len(r.Question))
 		copy(resp.Question, r.Question)
 	}

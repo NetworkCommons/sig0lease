@@ -40,10 +40,17 @@ func (r *Router) RegisterHandler(h handlers.Handler) {
 }
 
 // Route determines how to handle a DNS message based on its opcode.
+// Flow:
+//  1. Check if opcode has a registered handler
+//  2. If yes, call handler and check result status:
+//     - StatusProcessed: Return response to client
+//     - StatusNotRelevant: Apply default forward (fallback action)
+//     - StatusError: Return error response to client
+//  3. If no handler, apply default forward
 func (r *Router) Route(ctx context.Context, w dns.ResponseWriter, rMsg *dns.Msg) *dns.Msg {
 	moduleName, found := r.moduleForOpcode(rMsg.Opcode)
 
-	r.logger.Infof("Route: Opcode=%d, FoundModule=%v", rMsg.Opcode, moduleName)
+	r.logger.Infof("Route: Opcode=%d, FoundModule=%v, Module=%s", rMsg.Opcode, found, moduleName)
 
 	if !found {
 		r.logger.Infof("No handler for opcode %d, forwarding to upstream", rMsg.Opcode)
@@ -58,15 +65,47 @@ func (r *Router) Route(ctx context.Context, w dns.ResponseWriter, rMsg *dns.Msg)
 		return resp
 	}
 
-	resp, err := handler.Handle(ctx, w, rMsg)
-	if err != nil {
-		r.logger.Errorf("Error handling opcode %d with module %s: %v", rMsg.Opcode, moduleName, err)
-		resp := r.forwardToUpstream(rMsg)
-		return resp
+	// Call handler and get result
+	result := handler.Handle(ctx, w, rMsg)
+	if result == nil {
+		r.logger.Errorf("Handler returned nil result for opcode %d", rMsg.Opcode)
+		return r.forwardToUpstream(rMsg)
 	}
 
-	r.logger.Infof("Handler returned response: Rcode=%d", resp.Rcode)
-	return resp
+	r.logger.Infof("Handler %s returned status=%s, reason=%s", moduleName, result.Status, result.Reason)
+
+	// Handle based on result status
+	switch result.Status {
+	case handlers.StatusProcessed:
+		// Handler processed the packet, return the response
+		r.logger.Debugf("Handler processed opcode %d, returning response with Rcode=%d", rMsg.Opcode, result.Message.Rcode)
+		return result.Message
+
+	case handlers.StatusNotRelevant:
+		// Packet not relevant to this handler (e.g., UPDATE without UPDATE-LEASE EDNS option)
+		// Apply fallback action: forward to upstream
+		r.logger.Infof("Handler declined packet (not relevant), forwarding to upstream")
+		resp := r.forwardToUpstream(rMsg)
+		return resp
+
+	case handlers.StatusError:
+		// Handler encountered an error
+		if result.Message != nil {
+			r.logger.Errorf("Handler error: %v, returning error response with Rcode=%d", result.Error, result.Message.Rcode)
+			return result.Message
+		}
+		// Create error response if handler didn't provide one
+		resp := new(dns.Msg)
+		resp.ID = rMsg.ID
+		resp.Rcode = dns.RcodeServerFailure
+		resp.Response = true
+		r.logger.Errorf("Handler error with no response: %v", result.Error)
+		return resp
+
+	default:
+		r.logger.Errorf("Unknown handler status: %v", result.Status)
+		return r.forwardToUpstream(rMsg)
+	}
 }
 
 // moduleForOpcode returns the module name for an opcode if one is configured.

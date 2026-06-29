@@ -2,6 +2,7 @@
 package keyrec
 
 import (
+	"encoding/base64"
 	"fmt"
 
 	"codeberg.org/miekg/dns"
@@ -42,12 +43,15 @@ func FromKEY(r *dns.KEY) (*KeyRecord, error) {
 		return nil, fmt.Errorf("KEY record is nil")
 	}
 
-	// Parse the public key from base64-encoded string
-	publicKeyStr := r.PublicKey
+	// Parse the public key from base64-encoded string to raw bytes
 	var publicKey []byte
+	publicKeyStr := r.PublicKey
 	if len(publicKeyStr) > 0 {
-		publicKey = make([]byte, len(publicKeyStr))
-		copy(publicKey, publicKeyStr)
+		var err error
+		publicKey, err = base64.StdEncoding.DecodeString(publicKeyStr)
+		if err != nil {
+			return nil, fmt.Errorf("failed to decode public key from base64: %w", err)
+		}
 	}
 
 	kr := &KeyRecord{
@@ -69,10 +73,10 @@ func (k *KeyRecord) ToKEY() (*dns.KEY, error) {
 		return nil, fmt.Errorf("KeyRecord is nil")
 	}
 
-	// Convert public key bytes to string (base64)
+	// Convert public key bytes to base64-encoded string
 	publicKeyStr := ""
 	if len(k.PublicKey) > 0 {
-		publicKeyStr = string(k.PublicKey)
+		publicKeyStr = base64.StdEncoding.EncodeToString(k.PublicKey)
 	}
 
 	key := new(dns.KEY)

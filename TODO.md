@@ -94,8 +94,23 @@ cmd/
 ## Implementation Notes
 
 - sig0namectl uses `github.com/shynome/doh-client` for DoH
-- We should use standard `github.com/miekg/dns` throughout
+- We should use standard `codeberg.org/miekg/dns` throughout
 - The handler architecture in sig0lease_proxy should wrap these packages:
   - Handlers are distinct modules that can be registered
   - Each handler implements the Handler interface
   - Handlers receive DNS messages, process them, and return responses
+
+## Handler Status Code Pattern (Implemented)
+
+The router dispatches DNS messages to handlers based on opcode. Handlers use status codes to communicate:
+
+- **StatusProcessed (0)** - Handler processed the packet; response sent to client
+- **StatusNotRelevant (1)** - Packet valid but not relevant to protocol; router forwards to default upstream
+- **StatusError (2)** - Handler error; error response sent to client
+
+This pattern allows clean detection of protocol variants without exceptions:
+
+Example: UPDATE handler checks for UPDATE-LEASE EDNS option (RFC 9664 Section 4)
+- UPDATE + UPDATE-LEASE EDNS → StatusProcessed (sig0lease lease registration)
+- UPDATE without UPDATE-LEASE → StatusNotRelevant (forwarded as standard RFC 2136 UPDATE)
+- Any parsing error → StatusError (error response)

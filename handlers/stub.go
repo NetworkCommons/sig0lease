@@ -24,7 +24,7 @@ func NewStubHandler(name string, opcodes []uint8) *StubHandler {
 	}
 }
 
-// Handle processes a DNS message and returns the response.
+// Handle processes a DNS message and returns a HandlerResult.
 //
 // This is a generic handler that:
 //   - Logs incoming request details
@@ -32,7 +32,7 @@ func NewStubHandler(name string, opcodes []uint8) *StubHandler {
 //   - Returns a properly formatted response with appropriate flags
 //
 // To implement specific processing, extend this handler or create new handlers.
-func (h *StubHandler) Handle(ctx context.Context, w dns.ResponseWriter, r *dns.Msg) (*dns.Msg, error) {
+func (h *StubHandler) Handle(ctx context.Context, w dns.ResponseWriter, r *dns.Msg) *HandlerResult {
 	if h.logger != nil {
 		h.logger.Debugf("Stub handler %s received opcode %d from %s",
 			h.name, r.Opcode, w.RemoteAddr().String())
@@ -40,13 +40,14 @@ func (h *StubHandler) Handle(ctx context.Context, w dns.ResponseWriter, r *dns.M
 
 	// Validate message
 	if r == nil {
-		return nil, fmt.Errorf("nil message received")
+		return NewErrorResult(nil, "nil message received", fmt.Errorf("nil message"))
 	}
 
 	// Validate Question section
 	if len(r.Question) == 0 {
 		h.logger.Warn("No question section in message")
-		return h.makeErrorResponse(r, dns.RcodeFormatError, "no question section"), nil
+		msg := h.makeErrorResponse(r, dns.RcodeFormatError, "no question section")
+		return NewErrorResult(msg, "no question section", nil)
 	}
 
 	if len(r.Question) > 1 {
@@ -77,7 +78,7 @@ func (h *StubHandler) Handle(ctx context.Context, w dns.ResponseWriter, r *dns.M
 	// Set response code (success by default for stub handler)
 	resp.Rcode = dns.RcodeSuccess
 
-	return resp, nil
+	return NewProcessedResult(resp)
 }
 
 // makeErrorResponse creates a properly formatted error response.

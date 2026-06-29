@@ -130,8 +130,7 @@ func (c *Client) QueryMultiple(msg *dns.Msg, servers []string) (*dns.Msg, error)
 
 	for _, server := range servers {
 		go func(s string) {
-			msgCopy := new(dns.Msg)
-			*msgCopy = *msg
+			msgCopy := msg.Copy()
 			resp, err := c.Query(msgCopy)
 			if err != nil {
 				errCh <- fmt.Errorf("%s: %w", s, err)
@@ -145,14 +144,20 @@ func (c *Client) QueryMultiple(msg *dns.Msg, servers []string) (*dns.Msg, error)
 		}(server)
 	}
 
-	select {
-	case resp := <-respCh:
-		return resp, nil
-	case err := <-errCh:
-		return nil, fmt.Errorf("all servers failed: %w", err)
-	case <-ctx.Done():
-		return nil, fmt.Errorf("timeout waiting for response: %w", ctx.Err())
+	var lastErr error
+
+	for range servers {
+		select {
+		case resp := <-respCh:
+			return resp, nil //Success! Return immediately.
+		case err := <-errCh:
+			lastErr = err // Track the error, but keep waiting for others
+		case <-ctx.Done():
+			return nil, fmt.Errorf("timeout waiting for response: %w", ctx.Err())
+		}
 	}
+	// If we exit the loop, it means every single server sent an error to errCh
+	return nil, fmt.Errorf("all %d servers failed. Last error: %w", len(servers), lastErr)
 }
 
 // MakeQuery creates a standard DNS query message.
@@ -162,12 +167,12 @@ func MakeQuery(name string, qtype uint16, opcode uint8) *dns.Msg {
 	if m == nil {
 		return nil
 	}
-	
+
 	m.Opcode = opcode
-	
+
 	// Set the Rcode to 0 (NOERROR) - for queries this is standard
 	m.Rcode = 0
-	
+
 	return m
 }
 
@@ -193,12 +198,12 @@ func MakeUpdateQuery(zone string, rr dns.RR) *dns.Msg {
 		return nil
 	}
 	m.Opcode = dns.OpcodeUpdate
-	
+
 	// Add zone section to Ns (authority)
 	if rr != nil {
 		m.Ns = append(m.Ns, rr)
 	}
-	
+
 	return m
 }
 

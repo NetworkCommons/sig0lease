@@ -26,7 +26,7 @@ func NewStatusHandler() *StatusHandler {
 	}
 }
 
-// Handle processes a STATUS query and returns a status response.
+// Handle processes a STATUS query and returns a HandlerResult.
 //
 // For STATUS queries:
 // - The Question section contains the server name (usually ".")
@@ -35,7 +35,7 @@ func NewStatusHandler() *StatusHandler {
 // - The Additional section contains uptime-related information
 //
 // This implementation returns a basic status response with server identity.
-func (h *StatusHandler) Handle(ctx context.Context, w dns.ResponseWriter, r *dns.Msg) (*dns.Msg, error) {
+func (h *StatusHandler) Handle(ctx context.Context, w dns.ResponseWriter, r *dns.Msg) *HandlerResult {
 	h.logger.Debugf("Processing STATUS query from %s", w.RemoteAddr().String())
 
 	// Create response message with copied header fields
@@ -104,7 +104,7 @@ func (h *StatusHandler) Handle(ctx context.Context, w dns.ResponseWriter, r *dns
 	h.logger.Debugf("Answer section: %d records, Extra section: %d records",
 		len(resp.Answer), len(resp.Extra))
 
-	return resp, nil
+	return NewProcessedResult(resp)
 }
 
 // Setup initializes the handler configuration.

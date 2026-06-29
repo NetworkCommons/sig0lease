@@ -47,8 +47,12 @@ type Handler interface {
 	// CanHandle returns true if this handler can process the given opcode
 	CanHandle(opcode uint8) bool
 
-	// Handle processes a DNS message and returns the response
-	Handle(ctx context.Context, w dns.ResponseWriter, r *dns.Msg) (*dns.Msg, error)
+	// Handle processes a DNS message and returns a HandlerResult.
+	// The result status determines how the router handles the response:
+	//   - StatusProcessed: Send the response message to the client
+	//   - StatusNotRelevant: Packet not relevant to this handler, apply fallback action (e.g., forward)
+	//   - StatusError: Error occurred, send error response to client
+	Handle(ctx context.Context, w dns.ResponseWriter, r *dns.Msg) *HandlerResult
 
 	// Setup initializes the handler with configuration
 	Setup(cfg map[string]any) error

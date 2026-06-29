@@ -1,9 +1,13 @@
 // Package sig0 implements SIG(0) request/response signing as per RFC 2931.
-// This is a simplified implementation for the SRP proxy use case.
+// Uses codeberg.org/miekg/dns SIG(0) facilities for proper cryptographic signing.
+// Provenance: RFC 2931 (Transaction Signatures with SIG(0))
 package sig0
 
 import (
 	"crypto"
+	"crypto/ed25519"
+	"crypto/rand"
+	"encoding/base64"
 	"fmt"
 	"log"
 	"time"
@@ -11,70 +15,255 @@ import (
 	"codeberg.org/miekg/dns"
 )
 
-const (
-	// ECDSAP256SHA256 is the required algorithm per RFC 9665 §6.6
-	ECDSAP256SHA256 = 13
-)
-
-// KeyStore interface defines how to access keys for signing.
-type KeyStore interface {
-	PrivateKey() crypto.PrivateKey
-	PublicKey() dns.RR // Returns a KEY or DNSKEY RR
-	Name() string      // Name of the key (for logging)
-}
-
 // Signer holds state for signing DNS messages with SIG(0).
+// Implements RFC 2931 SIG(0) signing using the loaded KeyStore.
 type Signer struct {
-	store   KeyStore
-	private crypto.PrivateKey
-	update  *dns.Msg
+	keyRR   *dns.KEY          // The KEY RR for this signer (RFC 2539)
+	private crypto.PrivateKey // Private key material for signing
+	update  *dns.Msg          // Current UPDATE message being built
 }
 
-// NewSigner creates a new signer from a keystore.
-func NewSigner(store KeyStore) (*Signer, error) {
-	private := store.PrivateKey()
-	if private == nil {
-		return nil, fmt.Errorf("no private key available")
+// sig0SignerImpl wraps CryptoSIG0 or provides custom implementation for algorithms
+// that CryptoSIG0 doesn't support (like ED25519 in SIG(0) mode).
+// Implements the full dns.SIG0Signer interface.
+type sig0SignerImpl struct {
+	base      dns.CryptoSIG0
+	algorithm uint8 // Algorithm for special handling (0 means use base CryptoSIG0)
+}
+
+// Sign implements the full dns.SIG0Signer interface with SIG0Option parameter
+// For ED25519, we bypass the hash function requirement that CryptoSIG0 needs
+func (s sig0SignerImpl) Sign(sig *dns.SIG, p []byte, _ dns.SIG0Option) ([]byte, error) {
+	// For ED25519, CryptoSIG0.Sign would fail because AlgorithmToHash doesn't have it
+	// ED25519 does its own hashing, so we can't use CryptoSIG0.Sign directly
+	if s.algorithm == 15 { // ED25519 (algorithm value)
+		// Use the Ed25519 private key directly
+		ed25519Key, ok := s.base.Signer().(ed25519.PrivateKey)
+		if !ok {
+			return nil, fmt.Errorf("ED25519 signer is not an ed25519.PrivateKey")
+		}
+
+		// According to RFC 2931 and the dns library implementation,
+		// we need to sign: SIG_RDATA || MSG_BODY
+		// Where SIG_RDATA is the SIG record without the signature field
+		// We use the same binary wire format the dns library does
+
+		// Build SIG record data: TypeCovered(2) + Algorithm(1) + Labels(1) + OrigTTL(4) +
+		//                         Expiration(4) + Inception(4) + KeyTag(2) + SignerName + Signature(0)
+		sigData := make([]byte, 0, 100)
+
+		// TypeCovered (for SIG(0), this is typically 0)
+		sigData = append(sigData, 0, 0)
+
+		// Algorithm
+		sigData = append(sigData, sig.Algorithm)
+
+		// Labels
+		sigData = append(sigData, sig.Labels)
+
+		// OrigTTL (use Hdr.TTL)
+		sigData = append(sigData, byte(sig.OrigTTL>>24), byte(sig.OrigTTL>>16), byte(sig.OrigTTL>>8), byte(sig.OrigTTL))
+
+		// Expiration
+		sigData = append(sigData, byte(sig.Expiration>>24), byte(sig.Expiration>>16), byte(sig.Expiration>>8), byte(sig.Expiration))
+
+		// Inception
+		sigData = append(sigData, byte(sig.Inception>>24), byte(sig.Inception>>16), byte(sig.Inception>>8), byte(sig.Inception))
+
+		// KeyTag
+		sigData = append(sigData, byte(sig.KeyTag>>8), byte(sig.KeyTag))
+
+		// SignerName (wire format)
+		sigData = appendDomainName(sigData, sig.SignerName)
+
+		// Combine SIG record data with message data
+		toSign := append(sigData, p...)
+
+		// ED25519 signature
+		return ed25519Key.Sign(rand.Reader, toSign, crypto.Hash(0))
+	}
+
+	// For other algorithms, use the base CryptoSIG0 implementation
+	return s.base.Sign(sig, p)
+}
+
+// Helper to append domain name in DNS wire format
+func appendDomainName(buf []byte, name string) []byte {
+	if name == "." {
+		return append(buf, 0)
+	}
+
+	// Split the domain name into labels
+	// This is a simple implementation for DNS names
+	i := 0
+	for i < len(name) {
+		// Find the next label
+		j := i
+		for j < len(name) && name[j] != '.' {
+			j++
+		}
+
+		label := name[i:j]
+		buf = append(buf, byte(len(label)))
+		buf = append(buf, []byte(label)...)
+
+		if j == len(name) {
+			break
+		}
+		i = j + 1
+	}
+
+	// Add root label if not already present
+	if len(name) == 0 || name[len(name)-1] != '.' {
+		buf = append(buf, 0)
+	}
+
+	return buf
+}
+
+// Verify implements the full dns.SIG0Signer interface with SIG0Option parameter
+func (s sig0SignerImpl) Verify(sig *dns.SIG, p []byte, _ dns.SIG0Option) error {
+	// For ED25519, we need custom verification as well
+	if s.algorithm == 15 { // ED25519
+		// Verify using ED25519 key from the KEY record
+		// The public key is stored as base64-encoded data in the KEY record
+		pubKeyB64 := s.base.PublicKey.PublicKey
+
+		// Decode base64 public key
+		pubKeyBinary, err := base64.StdEncoding.DecodeString(pubKeyB64)
+		if err != nil {
+			return fmt.Errorf("failed to decode base64 public key: %w", err)
+		}
+
+		if len(pubKeyBinary) != 32 {
+			return fmt.Errorf("invalid ED25519 public key length after base64 decode: %d (expected 32)", len(pubKeyBinary))
+		}
+
+		ed25519Pub := ed25519.PublicKey(pubKeyBinary)
+
+		// Build the data that was signed - same format as Sign method
+		sigData := make([]byte, 0, 100)
+
+		// TypeCovered
+		sigData = append(sigData, 0, 0)
+
+		// Algorithm
+		sigData = append(sigData, sig.Algorithm)
+
+		// Labels
+		sigData = append(sigData, sig.Labels)
+
+		// OrigTTL
+		sigData = append(sigData, byte(sig.OrigTTL>>24), byte(sig.OrigTTL>>16), byte(sig.OrigTTL>>8), byte(sig.OrigTTL))
+
+		// Expiration
+		sigData = append(sigData, byte(sig.Expiration>>24), byte(sig.Expiration>>16), byte(sig.Expiration>>8), byte(sig.Expiration))
+
+		// Inception
+		sigData = append(sigData, byte(sig.Inception>>24), byte(sig.Inception>>16), byte(sig.Inception>>8), byte(sig.Inception))
+
+		// KeyTag
+		sigData = append(sigData, byte(sig.KeyTag>>8), byte(sig.KeyTag))
+
+		// SignerName
+		sigData = appendDomainName(sigData, sig.SignerName)
+
+		toVerify := append(sigData, p...)
+
+		// Decode base64 signature
+		sig_bytes, err := base64.StdEncoding.DecodeString(sig.Signature)
+		if err != nil {
+			return fmt.Errorf("failed to decode signature: %w", err)
+		}
+
+		// Verify ED25519 signature
+		if !ed25519.Verify(ed25519Pub, toVerify, sig_bytes) {
+			return fmt.Errorf("ED25519 signature verification failed")
+		}
+
+		return nil
+	}
+
+	// For other algorithms, use the base CryptoSIG0 implementation
+	return s.base.Verify(sig, p)
+}
+
+// Key returns the KEY RR
+func (s sig0SignerImpl) Key() *dns.KEY {
+	return s.base.Key()
+}
+
+// Signer returns the crypto signer
+func (s sig0SignerImpl) Signer() crypto.Signer {
+	return s.base.Signer()
+}
+
+// NewSigner creates a new SIG(0) signer from a KEY record and private key.
+// Provenance: Uses dns.CryptoSIG0 pattern from codeberg/miekg/dns
+func NewSigner(keyRR *dns.KEY, privateKey crypto.PrivateKey) (*Signer, error) {
+	if keyRR == nil {
+		return nil, fmt.Errorf("KEY RR cannot be nil")
+	}
+	if privateKey == nil {
+		return nil, fmt.Errorf("private key cannot be nil")
+	}
+	if _, ok := privateKey.(crypto.Signer); !ok {
+		return nil, fmt.Errorf("private key must implement crypto.Signer")
 	}
 	return &Signer{
-		store:   store,
-		private: private,
+		keyRR:   keyRR,
+		private: privateKey,
 	}, nil
 }
 
-// StartUpdate initializes a new DNS update message for the given zone.
+// StartUpdate initializes a new DNS UPDATE message for the given zone.
+// Provenance: RFC 2136 specifies UPDATE message format
 func (s *Signer) StartUpdate(zone string) error {
 	if s.update != nil {
 		return fmt.Errorf("update already in progress")
 	}
-	log.Println("-- Set dns.Msg Structure --")
+	log.Println("-- Creating DNS UPDATE message for zone:", zone)
 
-	// Create an UPDATE message with SOA in Question section
+	// Create a proper UPDATE message (RFC 2136)
+	// - Opcode = UPDATE
+	// - Question section contains the zone SOA
+	// - Authority section contains RRs to be added/removed
 	m := new(dns.Msg)
 	m.Opcode = dns.OpcodeUpdate
-	m.Question = []dns.RR{&dns.SOA{Hdr: dns.Header{Name: zone, Class: dns.ClassINET}}}
+	m.Question = []dns.RR{&dns.SOA{
+		Hdr: dns.Header{
+			Name:  zone,
+			Class: dns.ClassINET,
+		},
+	}}
 
 	s.update = m
 	return nil
 }
 
-// UpdateRR adds a resource record to the current update.
+// UpdateRR adds a resource record to the UPDATE message's Authority section.
+// In DNS UPDATE (RFC 2136), RRs to be added/modified go in the Authority section.
 func (s *Signer) UpdateRR(rr dns.RR) error {
 	if s.update == nil {
 		return fmt.Errorf("no update in progress")
 	}
-	log.Println("-- Adding RR --")
-	s.update.Extra = append(s.update.Extra, rr)
+	log.Printf("-- Adding RR to update: %s", rr.String())
+	s.update.Ns = append(s.update.Ns, rr)
 	return nil
 }
 
-// RemoveRR removes a resource record from the current update.
+// RemoveRR marks a resource record for removal.
+// RFC 2136 specifies removal with class = NONE, ttl = 0
 func (s *Signer) RemoveRR(rr dns.RR) error {
 	if s.update == nil {
 		return fmt.Errorf("no update in progress")
 	}
-	log.Println("-- Removing RR --")
-	s.update.Extra = append(s.update.Extra, rr)
+	log.Printf("-- Removing RR from update: %s", rr.String())
+	// Clone the RR and set class to NONE to signal deletion
+	h := rr.Header()
+	h.Class = dns.ClassNONE
+	h.TTL = 0
+	s.update.Ns = append(s.update.Ns, rr)
 	return nil
 }
 
@@ -83,12 +272,12 @@ func (s *Signer) UpdateParsedRR(rrStr string) error {
 	if s.update == nil {
 		return fmt.Errorf("no update in progress")
 	}
-	log.Println("-- Parsing and adding RR: ", rrStr)
+	log.Println("-- Parsing and adding RR:", rrStr)
 	rr, err := dns.New(rrStr)
 	if err != nil {
 		return fmt.Errorf("failed to parse RR: %w", err)
 	}
-	s.update.Extra = append(s.update.Extra, rr)
+	s.update.Ns = append(s.update.Ns, rr)
 	return nil
 }
 
@@ -97,99 +286,109 @@ func (s *Signer) RemoveParsedRR(rrStr string) error {
 	if s.update == nil {
 		return fmt.Errorf("no update in progress")
 	}
-	log.Println("-- Parsing and removing RR: ", rrStr)
+	log.Println("-- Parsing and removing RR:", rrStr)
 	rr, err := dns.New(rrStr)
 	if err != nil {
 		return fmt.Errorf("failed to parse RR: %w", err)
 	}
-	s.update.Extra = append(s.update.Extra, rr)
+	// Mark for deletion by setting class to NONE and TTL to 0
+	h := rr.Header()
+	h.Class = dns.ClassNONE
+	h.TTL = 0
+	s.update.Ns = append(s.update.Ns, rr)
 	return nil
 }
 
-// SignUpdate signs the update message with SIG(0).
+// SignUpdate signs the current UPDATE message with SIG(0) and returns it.
+// Provenance: RFC 2931 SIG(0) transaction signing + codeberg/miekg/dns SIG0Sign()
 func (s *Signer) SignUpdate() (*dns.Msg, error) {
 	if s.update == nil {
 		return nil, fmt.Errorf("no update in progress")
 	}
 
-	log.Println("-- Signing DNS message with SIG(0) --")
+	log.Println("-- Signing DNS UPDATE message with SIG(0) --")
 
-	// Get public key for signing parameters
-	pubKey := s.store.PublicKey()
-	rdataKey := getDNSKEYData(pubKey)
-
-	// Create SIG RR with proper parameters
+	// Create SIG record for SIG(0) signing
+	// Provenance: dns.SIG0Sign() requires a properly initialized SIG with:
+	// - SignerName, KeyTag, Algorithm, Inception, Expiration
+	now := uint32(time.Now().Unix())
 	sigRR := new(dns.SIG)
 	sigRR.Hdr.Name = "."
-	sigRR.Algorithm = rdataKey.Algorithm
-	sigRR.Expiration = uint32(time.Now().Unix()) + 300 // 5 minutes validity
-	sigRR.Inception = uint32(time.Now().Unix()) - 300
-	sigRR.KeyTag = keyTag(pubKey)
-	sigRR.SignerName = pubKey.Header().Name
+	sigRR.Hdr.Class = dns.ClassANY
+	sigRR.Algorithm = s.keyRR.Algorithm
+	sigRR.Inception = now - 300  // 5 minutes before now (clock skew tolerance)
+	sigRR.Expiration = now + 300 // 5 minutes after now (signature validity)
+	sigRR.KeyTag = s.keyRR.KeyTag()
+	sigRR.SignerName = s.keyRR.Hdr.Name
 
-	log.Printf("-- Signing with algorithm %d, key tag %d --", sigRR.Algorithm, sigRR.KeyTag)
+	log.Printf("-- SIG(0) with Algorithm=%d, KeyTag=%d, Signer=%s",
+		sigRR.Algorithm, sigRR.KeyTag, sigRR.SignerName)
 
-	// Add SIG to extra section and pack the message
-	s.update.Extra = append(s.update.Extra, sigRR)
-	if err := s.update.Pack(); err != nil {
-		return nil, fmt.Errorf("failed to pack message: %w", err)
+	// Add the SIG record to the Pseudo section (not Extra!)
+	// dns.SIG0Sign expects the SIG record to be in m.Pseudo section
+	// The Pseudo section is for OPT and TSIG/SIG(0) records
+	s.update.Pseudo = append(s.update.Pseudo, sigRR)
+
+	// Create CryptoSIG0 signer for dns.SIG0Sign()
+	// Provenance: codeberg/miekg/dns pattern for SIG(0) implementation
+	cryptoSigner, ok := s.private.(crypto.Signer)
+	if !ok {
+		return nil, fmt.Errorf("private key does not implement crypto.Signer interface")
 	}
+
+	baseSigner := dns.CryptoSIG0{
+		CryptoSigner: cryptoSigner,
+		PublicKey:    s.keyRR,
+	}
+	wrappedSigner := sig0SignerImpl{
+		base:      baseSigner,
+		algorithm: s.keyRR.Algorithm, // Pass algorithm for ED25519 support
+	}
+
+	// Sign the message using SIG0Sign from codeberg/miekg/dns
+	// This fills in the signature on the SIG record we added to Pseudo above
+	options := dns.SIG0Option{} // Empty options struct for SIG0Sign
+	err := dns.SIG0Sign(s.update, wrappedSigner, &options)
+	if err != nil {
+		return nil, fmt.Errorf("failed to sign UPDATE with SIG(0): %w", err)
+	}
+
+	log.Println("-- SIG(0) signing successful --")
 
 	m := s.update
 	s.update = nil
 	return m, nil
 }
 
-// getDNSKEYData extracts DNSKEY rdata from a public key RR.
-func getDNSKEYData(pubKey dns.RR) struct {
-	Flags     uint16
-	Protocol  uint8
-	Algorithm uint8
-	PublicKey string
-} {
-	switch rr := pubKey.(type) {
-	case *dns.KEY:
-		return struct {
-			Flags     uint16
-			Protocol  uint8
-			Algorithm uint8
-			PublicKey string
-		}{
-			Flags:     rr.Flags,
-			Protocol:  rr.Protocol,
-			Algorithm: rr.Algorithm,
-			PublicKey: rr.PublicKey,
-		}
-	case *dns.DNSKEY:
-		return struct {
-			Flags     uint16
-			Protocol  uint8
-			Algorithm uint8
-			PublicKey string
-		}{
-			Flags:     rr.Flags,
-			Protocol:  rr.Protocol,
-			Algorithm: rr.Algorithm,
-			PublicKey: rr.PublicKey,
-		}
-	default:
-		return struct {
-			Flags     uint16
-			Protocol  uint8
-			Algorithm uint8
-			PublicKey string
-		}{}
+// VerifySignature verifies a SIG(0) signature on a message.
+// This is useful for servers to verify client-signed requests.
+// Provenance: RFC 2931 SIG(0) verification + codeberg/miekg/dns SIG0Verify()
+func VerifySignature(msg *dns.Msg, keyRR *dns.KEY) error {
+	if msg == nil {
+		return fmt.Errorf("message cannot be nil")
 	}
-}
+	if keyRR == nil {
+		return fmt.Errorf("KEY RR cannot be nil")
+	}
 
-// keyTag calculates the key tag for SIG(0) use.
-func keyTag(pubKey dns.RR) uint16 {
-	switch rr := pubKey.(type) {
-	case *dns.KEY:
-		return rr.KeyTag()
-	case *dns.DNSKEY:
-		return rr.KeyTag()
-	default:
-		return 0
+	log.Println("-- Verifying SIG(0) signature on message --")
+
+	// Create CryptoSIG0 verifier (without private key for verification)
+	baseVerifier := dns.CryptoSIG0{
+		PublicKey: keyRR,
 	}
+	cryptoVerifier := sig0SignerImpl{
+		base:      baseVerifier,
+		algorithm: keyRR.Algorithm, // Pass algorithm for ED25519 support
+	}
+
+	// Verify the signature using SIG0Verify from codeberg/miekg/dns
+	options := dns.SIG0Option{} // Empty options struct for SIG0Verify
+	err := dns.SIG0Verify(msg, keyRR, cryptoVerifier, &options)
+	if err != nil {
+		return fmt.Errorf("SIG(0) verification failed: %w", err)
+	}
+
+	log.Println("-- SIG(0) signature verified --")
+	return nil
 }

@@ -27,7 +27,7 @@ func main() {
 	}
 
 	// Create logger
-	logger := logging.NewLogger("info", "text")
+	logger := logging.NewLogger("debug", "text")
 	logger.Infof("Starting DNS Proxy")
 
 	// Create server
@@ -38,6 +38,7 @@ func main() {
 	}
 
 	// Register processing module handlers based on configuration
+	// Phase 3 setup: Prepare handler configuration with upstream resolver for SIG(0) signing
 	opcodeMap := cfg.GetOpcodeMap()
 	for opcode, moduleName := range opcodeMap {
 		switch moduleName {
@@ -47,12 +48,36 @@ func main() {
 			srv.RegisterHandler(h)
 			logger.Infof("Registered %s for opcode %d (%s)",
 				moduleName, opcode, dns.OpcodeToString[opcode])
+
 		case "update_handler":
 			h := handlers.NewUpdateHandler()
 			h.SetLogger(logger)
+
+			// Phase 3: Setup handler with configuration for upstream coordination
+			// This includes:
+			//  - Loading downstream key for client SIG(0) verification
+			//  - Loading upstream key for signing UPDATEs to authoritative server
+			//  - Configuring upstream resolver for forwarding
+			handlerCfg := cfg.Handlers["update"]
+			if handlerCfg != nil {
+				// Add resolver to config for upstream coordination
+				resolverCfg := make(map[string]interface{})
+				for k, v := range handlerCfg {
+					resolverCfg[k] = v
+				}
+				resolverCfg["upstream_resolver"] = srv.GetResolver()
+
+				if err := h.Setup(resolverCfg); err != nil {
+					logger.Warnf("Failed to setup %s: %v", moduleName, err)
+				} else {
+					logger.Infof("Phase 3: Upstream coordination configured for %s", moduleName)
+				}
+			}
+
 			srv.RegisterHandler(h)
 			logger.Infof("Registered %s for opcode %d (%s)",
 				moduleName, opcode, dns.OpcodeToString[opcode])
+
 		default:
 			logger.Warnf("Unknown handler module: %s", moduleName)
 		}
