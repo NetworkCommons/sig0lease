@@ -92,20 +92,19 @@ The successful registration can be verified by
 
 returning the listed public key for the specific FQDN.
 
-the keypair is enabled to add, modify or delete any DNS resource record at or under [*.]*mysubdomain.zenr.io*.
-
 Note: It may take a minute or so for your local DNS resolver to update its cache with the new key.
 
-### Updating resource records with a named key
+### Refreshing KEY Resource Record with a named key
 
 ```mermaid
 sequenceDiagram
 autonumber
-  participant R as Requester<br><br> (DNSSEC client)
-  participant P as Provider<br><br>(DNSSEC server)
+  participant R as Requester<br><br> (sig0lease client)
+  participant P as Provider<br><br>(sig0lease proxy server)
+  participant D as DNS<br><br>(Authoritative DNS server)
   R->>R: Create resource record updates & sign with named private key
-  R->>P: Request publication of updated records
-  P->>P: Verify update request signature against registered named key
+  R->>P: Request refresh of DNS KEY RR lease
+  P->>P: Verify update request signature against lease registered named key
   break when update request signature does not match registered named public key
     P-->>R: Show unsuccessful update
   end
