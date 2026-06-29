@@ -79,12 +79,16 @@ autonumber
   break when named public key fails policy
     P->>R: Show unsuccessful registration
   end
-  P->>+D: Lease Regsitration time out
+  P->>+D: Lease Registration DNS KEY RR Update
+  D->>P: indicate successful DNS KEY RR Update
+  break when DNS RR UPDATE fails
+    D->>P: Indicate unsuccessful DNS KEY RR Update
+    P->>R: Indicate unsuccessful named key registration request
+  D->>P: Indicate successful DNS KEY RR Update
   P->>R: Show successful named key registration request
 ```
 
 By default, DNS key labels beneath a compatible domain zone can be claimed on a "First Come, First Served" (FCFS) basis.
-
 
 The successful registration can be verified by
 
