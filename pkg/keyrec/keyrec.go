@@ -15,22 +15,22 @@ const (
 
 // KeyRecord represents a DNSKEY or KEY record.
 type KeyRecord struct {
-	Flags      uint16
-	Protocol   uint8
-	Algorithm  uint8
-	PublicKey  []byte
-	keyTag     uint16 // cached key tag for performance
+	Flags     uint16
+	Protocol  uint8
+	Algorithm uint8
+	PublicKey []byte
+	keyTag    uint16 // cached key tag for performance
 }
 
 // Parse parses a KEY record from an RR.
 func (k *KeyRecord) Parse(rr dns.RR) error {
 	switch r := rr.(type) {
 	case *dns.KEY:
-		k, err := FromKEY(r)
+		kr, err := FromKEY(r)
 		if err != nil {
 			return err
 		}
-		*k = *k
+		*k = *kr
 		return nil
 	default:
 		return fmt.Errorf("unsupported record type: %T", rr)
@@ -147,7 +147,7 @@ func (k *KeyRecord) String() string {
 	if k == nil {
 		return "<nil>"
 	}
-	
+
 	keyHex := ""
 	if len(k.PublicKey) > 0 {
 		if len(k.PublicKey) <= 16 {
@@ -156,16 +156,16 @@ func (k *KeyRecord) String() string {
 			keyHex = fmt.Sprintf(" %x...%x", k.PublicKey[:8], k.PublicKey[len(k.PublicKey)-8:])
 		}
 	}
-	
+
 	return fmt.Sprintf("KeyRecord{Flags:0x%04x, Protocol:%d, Algorithm:%d (%s), KeyTag:%d%s}",
 		k.Flags, k.Protocol, k.Algorithm, k.AlgorithmName(), k.KeyTag(), keyHex)
 }
 
 // KEY record constants from dns package
 const (
-	DSA     = uint8(3)
-	ECDSA256 = uint8(13)
-	ECDSA384 = uint8(14)
-	ED25519  = uint8(15)
+	DSA       = uint8(3)
+	ECDSA256  = uint8(13)
+	ECDSA384  = uint8(14)
+	ED25519   = uint8(15)
 	RSASHA256 = uint8(10)
 )

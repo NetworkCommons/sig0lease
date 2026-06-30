@@ -56,11 +56,11 @@ func TestKeyTag(t *testing.T) {
 
 	tag1 := k.KeyTag()
 	tag2 := k.KeyTag() // Should be cached
-	
+
 	if tag1 != tag2 {
 		t.Errorf("KeyTag not consistent: %d vs %d", tag1, tag2)
 	}
-	
+
 	if tag1 == 0 {
 		t.Error("KeyTag should not be zero")
 	}
@@ -73,7 +73,7 @@ func TestString(t *testing.T) {
 		Algorithm: ED25519,
 		PublicKey: make([]byte, 32),
 	}
-	
+
 	s := k.String()
 	if s == "" || !contains(s, "Flags") {
 		t.Errorf("String() should contain 'Flags', got: %s", s)

@@ -40,7 +40,7 @@ handlers:
 
     # Upstream zone (authoritative zone where actual registrations happen)
     # Phase 1: Proxy forwards validated requests to this zone using Upstream SIG(0) key
-    upstream_zone: "dev.zenr.io."
+    upstream_zone: "ns1.free2air.org."
 
     # Keystore directory containing DNSSEC keys in sig0namectl format
     # Keys must be named: Kzone.+015+keytag.key and Kzone.+015+keytag.private

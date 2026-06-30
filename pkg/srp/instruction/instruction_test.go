@@ -105,9 +105,9 @@ func TestServiceValidate(t *testing.T) {
 
 func TestInstructionValidate(t *testing.T) {
 	tests := []struct {
-		name    string
-		inst    *Instruction
-		valid   bool
+		name  string
+		inst  *Instruction
+		valid bool
 	}{
 		{"empty name", New(""), false},
 		{"valid with service", func() *Instruction {

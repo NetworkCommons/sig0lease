@@ -28,7 +28,7 @@ const (
 
 // LeaseOption represents the Update Lease EDNS(0) option.
 type LeaseOption struct {
-	Lease    uint32 // The LEASE value in seconds
+	Lease    uint32  // The LEASE value in seconds
 	KeyLease *uint32 // Optional KEY-LEASE value (nil for 4-byte variant)
 }
 

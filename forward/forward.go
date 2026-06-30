@@ -62,8 +62,8 @@ func (r *Resolver) Query(ctx context.Context, msg *dns.Msg) (*dns.Msg, error) {
 	r.mu.Unlock()
 
 	// 1. Create a child context that we can cancel locally
-    queryCtx, cancel := context.WithCancel(ctx)
-    defer cancel() // Ensure resources are freed when this function returns
+	queryCtx, cancel := context.WithCancel(ctx)
+	defer cancel() // Ensure resources are freed when this function returns
 
 	resultCh := make(chan Result, len(servers))
 

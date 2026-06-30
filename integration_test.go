@@ -10,13 +10,34 @@ import (
 
 	"codeberg.org/miekg/dns"
 	"github.com/NetworkCommons/sig0lease/client"
+	"github.com/NetworkCommons/sig0lease/config"
 	"github.com/NetworkCommons/sig0lease/pkg/keyrec"
 	"github.com/NetworkCommons/sig0lease/pkg/sig0"
 )
 
+// getKeystoreDir retrieves the keystore directory from environment or config.
+// Returns error if not defined - keystore path must be explicitly configured.
+func getKeystoreDir(t *testing.T) string {
+	// Priority 1: Environment variable
+	if dir := os.Getenv("KEYSTORE_DIR"); dir != "" {
+		return dir
+	}
+
+	// Priority 2: Config file
+	if cfg, err := config.LoadConfig("config.yaml"); err == nil {
+		if dir := cfg.GetKeystoreDir(); dir != "" {
+			return dir
+		}
+	}
+
+	// No fallback - keystore path must be configured
+	t.Fatalf("KEYSTORE_DIR environment variable or config.yaml keystore_dir must be defined")
+	return ""
+}
+
 // TestLeaseCreationAndSigning tests creating a signed lease registration request
 func TestLeaseCreationAndSigning(t *testing.T) {
-	keystoreDir := getKeystoreDir()
+	keystoreDir := getKeystoreDir(t)
 
 	// Find and load the test key
 	keyName, err := keyrec.FindKeyByZone(keystoreDir, "test.dev.zenr.io")
@@ -78,7 +99,7 @@ func TestLeaseCreationAndSigning(t *testing.T) {
 
 // TestLeaseVerification tests that the proxy can verify a signed lease request
 func TestLeaseVerification(t *testing.T) {
-	keystoreDir := getKeystoreDir()
+	keystoreDir := getKeystoreDir(t)
 
 	// Find and load the test key
 	keyName, err := keyrec.FindKeyByZone(keystoreDir, "test.dev.zenr.io")
@@ -124,7 +145,7 @@ func TestLeaseQueryWithDig(t *testing.T) {
 		t.Skip("Skipping DNS integration test (set SKIP_DNS_TESTS=1 to skip)")
 	}
 
-	keystoreDir := getKeystoreDir()
+	keystoreDir := getKeystoreDir(t)
 
 	// Find and load the test key
 	keyName, err := keyrec.FindKeyByZone(keystoreDir, "test.dev.zenr.io")
@@ -207,7 +228,7 @@ func TestLeaseQueryWithDig(t *testing.T) {
 
 // TestLeaseRefreshRequest tests creating a refresh request
 func TestLeaseRefreshRequest(t *testing.T) {
-	keystoreDir := getKeystoreDir()
+	keystoreDir := getKeystoreDir(t)
 
 	// Find and load the test key
 	keyName, err := keyrec.FindKeyByZone(keystoreDir, "test.dev.zenr.io")
@@ -256,7 +277,7 @@ func TestLeaseTimingCycle(t *testing.T) {
 		t.Skip("Skipping timing test in short mode")
 	}
 
-	keystoreDir := getKeystoreDir()
+	keystoreDir := getKeystoreDir(t)
 
 	// Find and load the test key
 	keyName, err := keyrec.FindKeyByZone(keystoreDir, "test.dev.zenr.io")
@@ -330,7 +351,7 @@ func TestLeaseTimingCycle(t *testing.T) {
 
 // TestLeaseSignatureVariations tests different lease request scenarios
 func TestLeaseSignatureVariations(t *testing.T) {
-	keystoreDir := getKeystoreDir()
+	keystoreDir := getKeystoreDir(t)
 
 	// Find and load the test key
 	keyName, err := keyrec.FindKeyByZone(keystoreDir, "test.dev.zenr.io")
