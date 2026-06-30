@@ -10,6 +10,7 @@ import (
 	"encoding/base64"
 	"fmt"
 	"log"
+	"strings"
 	"time"
 
 	"codeberg.org/miekg/dns"
@@ -89,9 +90,11 @@ func (s sig0SignerImpl) Sign(sig *dns.SIG, p []byte, _ dns.SIG0Option) ([]byte, 
 
 // Helper to append domain name in DNS wire format
 func appendDomainName(buf []byte, name string) []byte {
+	name = canonicalDomainName(name)
 	if name == "." {
 		return append(buf, 0)
 	}
+	name = name[:len(name)-1] // strip trailing dot; root terminator is appended below
 
 	// Split the domain name into labels
 	// This is a simple implementation for DNS names
@@ -113,12 +116,21 @@ func appendDomainName(buf []byte, name string) []byte {
 		i = j + 1
 	}
 
-	// Add root label if not already present
-	if len(name) == 0 || name[len(name)-1] != '.' {
-		buf = append(buf, 0)
-	}
+	// Always terminate with root label.
+	buf = append(buf, 0)
 
 	return buf
+}
+
+func canonicalDomainName(name string) string {
+	name = strings.TrimSpace(strings.ToLower(name))
+	if name == "" || name == "." {
+		return "."
+	}
+	if !strings.HasSuffix(name, ".") {
+		name += "."
+	}
+	return name
 }
 
 // Verify implements the full dns.SIG0Signer interface with SIG0Option parameter
@@ -315,6 +327,7 @@ func (s *Signer) SignUpdate() (*dns.Msg, error) {
 	sigRR := new(dns.SIG)
 	sigRR.Hdr.Name = "."
 	sigRR.Hdr.Class = dns.ClassANY
+	sigRR.Hdr.TTL = 0
 	sigRR.Algorithm = s.keyRR.Algorithm
 	sigRR.Inception = now - 300  // 5 minutes before now (clock skew tolerance)
 	sigRR.Expiration = now + 300 // 5 minutes after now (signature validity)
