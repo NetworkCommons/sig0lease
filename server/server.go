@@ -46,7 +46,7 @@ func New(cfg *config.Config, logger *logging.Logger) (*Server, error) {
 	}
 
 	// Create router with opcode mappings and resolver
-	router, err := NewRouter(cfg.GetOpcodeMap(), cfg.DefaultForward, logger, resolver)
+	router, err := NewRouter(cfg.GetOpcodeMap(), logger, resolver)
 	if err != nil {
 		resolver.Shutdown()
 		return nil, fmt.Errorf("create router: %w", err)

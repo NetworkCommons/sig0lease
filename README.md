@@ -86,17 +86,30 @@ This pattern allows handlers to signal whether a packet is relevant to their pro
 - `status_handler` - Handles opcode 2 (STATUS queries)  
 - `update_handler` - Handles opcode 5 (UPDATE queries with sig0lease authentication per RFC 9664)
 
-## Testing with dig
+## Testing
 
 ```bash
-# Start the proxy (non-privileged port 8053 by default)
-./bin/<your OS>/sig0lease ./config.yaml &
+# Fast unit tests (no live integration environment)
+make test
 
-# Test normal DNS query (opcode 0 - QUERY) on port 8053
-dig @localhost -p 8053 example.com A +short
+# Keystore-dependent unit tests
+make test-unit
 
-# Run the full test suite
-./tests/test.sh
+# Full integration test (starts proxy and uses sig0lease-client)
+make test-integration
+
+# Single e2e registration using built client binary
+make test-register ADDR=127.0.0.1:8053 ZONE=dev.zenr.io. KEYNAME=test.dev.zenr.io.
+```
+
+Manual smoke test:
+
+```bash
+# Start the proxy
+make run-server
+
+# Send one registration through the client binary
+make run-client ADDR=127.0.0.1:8053 CMD="register dev.zenr.io. test.dev.zenr.io."
 ```
 
 For standard port 53, run with sudo or change config to `:53`.

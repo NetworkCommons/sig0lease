@@ -16,19 +16,19 @@ echo ""
 my_os=$(uname -s | tr '[:upper:]' '[:lower:]')
 
 # Build the binaries if they don't exist
-if [ ! -f "bin/${my_os}/sig0lease" ]; then
-    echo "Building proxybinaries..."
-    go build -o "bin/${my_os}/sig0lease" ./cmd/sig0lease
+if [ ! -f "../bin/${my_os}/sig0lease" ]; then
+    echo "Building proxy binaries..."
+    go build -o "../bin/${my_os}/sig0lease" ./cmd/sig0lease
 fi
 
 # Build the binaries if they don't exist
-if [ ! -f "bin/${my_os}/dnsclient" ]; then
+if [ ! -f "../bin/${my_os}/dnsclient" ]; then
     echo "Building client binary..."
-    go build -o "bin/${my_os}/dnsclient" ./cmd/dnsclient
+    go build -o "../bin/${my_os}/dnsclient" ./cmd/dnsclient
 fi
 
 # Start proxy in background
-./bin/${my_os}/sig0lease ./config.yaml &
+../bin/${my_os}/sig0lease ../config.yaml &
 PROXY_PID=$!
 sleep 2
 
@@ -85,12 +85,12 @@ echo ""
 # Test 8: Opcode 2 (STATUS) query
 # Use the go dnsclient binary which has proper STATUS query support
 echo "Test 8: STATUS query (opcode 2)"
-./bin/${my_os}/dnsclient ${PROXY_HOST}:${PROXY_PORT} status 2>&1 || echo "(STATUS query test completed)"
+../bin/${my_os}/dnsclient ${PROXY_HOST}:${PROXY_PORT} status 2>&1 || echo "(STATUS query test completed)"
 echo ""
 
 # Test 9: Opcode 5 (UPDATE) query
 echo "Test 9: UPDATE query verification (opcode 5)"
-./bin/${my_os}/dnsclient ${PROXY_HOST}:${PROXY_PORT} update type5.test. 2>&1 || echo "(UPDATE query test completed)"
+../bin/${my_os}/dnsclient ${PROXY_HOST}:${PROXY_PORT} update type5.test. 2>&1 || echo "(UPDATE query test completed)"
 echo ""
 
 # Test 10: Verify ID preservation in error responses

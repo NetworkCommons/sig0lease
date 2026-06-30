@@ -48,9 +48,6 @@ type Config struct {
 
 	// Handler-specific configuration (e.g., for update handler)
 	Handlers map[string]map[string]interface{} `yaml:"handlers"`
-
-	// DefaultForward is the upstream to use for opcodes not in ProcessingRules
-	DefaultForward string `yaml:"default_forward"`
 }
 
 // NewDefaultConfig returns a configuration with sensible defaults.
@@ -73,8 +70,7 @@ func NewDefaultConfig() *Config {
 				Timeout:  5 * time.Second,
 			},
 		},
-		Handlers:       make(map[string]map[string]interface{}),
-		DefaultForward: "8.8.8.8:53",
+		Handlers: make(map[string]map[string]interface{}),
 	}
 }
 
@@ -103,15 +99,6 @@ func (c *Config) Validate() error {
 		}
 		if upstream.Timeout <= 0 {
 			c.Upstreams[i].Timeout = 5 * time.Second
-		}
-	}
-
-	// Parse default forward as address for validation
-	if c.DefaultForward == "" {
-		if len(c.Upstreams) > 0 {
-			c.DefaultForward = c.Upstreams[0].Address
-		} else {
-			c.DefaultForward = "8.8.8.8:53"
 		}
 	}
 

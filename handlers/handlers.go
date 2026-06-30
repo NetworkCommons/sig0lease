@@ -3,6 +3,7 @@ package handlers
 
 import (
 	"context"
+	"log"
 
 	"codeberg.org/miekg/dns"
 )
@@ -88,6 +89,16 @@ func NewBaseHandler(name string, opcodes []uint8) *BaseHandler {
 // SetLogger sets the logger for this handler.
 func (b *BaseHandler) SetLogger(logger Logger) {
 	b.logger = logger
+}
+
+// Debugf logs a formatted debug message through the configured logger.
+// If no logger is configured, it falls back to the standard logger so this is never silent.
+func (b *BaseHandler) Debugf(format string, args ...any) {
+	if b.logger != nil {
+		b.logger.Debugf(format, args...)
+		return
+	}
+	log.Printf("WARN: handler logger is nil; debug message: "+format, args...)
 }
 
 // SetConfig sets configuration for the handler.

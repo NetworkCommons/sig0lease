@@ -240,7 +240,7 @@ func cmdRegister(proxyAddr string, args []string) {
 	}
 	fmt.Printf("    Packed size: %d bytes\n", len(signedMsg.Data))
 
-	c := client.New(proxyAddr, "udp", 5*time.Second)
+	c := client.New(proxyAddr, "udp", 20*time.Second)
 	resp, err := c.Query(signedMsg)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "ERROR: Failed to send query: %v\n", err)
@@ -297,7 +297,7 @@ func cmdVerify(proxyAddr string, args []string) {
 
 	// Send a standard query for the key record
 	msg := dns.NewMsg(keyname, dns.TypeKEY)
-	c := client.New(proxyAddr, "udp", 5*time.Second)
+	c := client.New(proxyAddr, "udp", 20*time.Second)
 	resp, err := c.Query(msg)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "ERROR: Query failed: %v\n", err)

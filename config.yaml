@@ -20,13 +20,14 @@ server:
     - tcp
 
 upstreams:
-  # Primary upstream resolver (authoritative server at dev.zenr.io)
-  - address: "dev.zenr.io:53"
+  # Generic upstream resolvers used for non-processed opcodes and fallback forwarding.
+  # UPDATE handler primarily resolves authoritative server from handlers.update.upstream_zone.
+  - address: "8.8.8.8:53"
     protocol: "udp"
     timeout: "5s"
 
   # Secondary upstream resolver (used as fallback)
-  - address: "8.8.8.8:53"
+  - address: "8.8.4.4:53"
     protocol: "udp"
     timeout: "5s"
 
@@ -34,13 +35,9 @@ upstreams:
 # Proxy acts as intermediary between downstream client and upstream authoritative server
 handlers:
   update:
-    # Downstream zone (zone from which clients send Registration Requests)
-    # Phase 1: Proxy receives requests to this zone from clients using Downstream SIG(0) key
-    downstream_zone: "test.dev.zenr.io."
-
-    # Upstream zone (authoritative zone where actual registrations happen)
-    # Phase 1: Proxy forwards validated requests to this zone using Upstream SIG(0) key
-    upstream_zone: "ns1.free2air.org."
+    # Upstream zone used to discover authoritative nameserver for UPDATE forwarding.
+    # Proxy resolves NS for this zone and sends UPDATE to that authoritative server.
+    upstream_zone: "dev.zenr.io."
 
     # Keystore directory containing DNSSEC keys in sig0namectl format
     # Keys must be named: Kzone.+015+keytag.key and Kzone.+015+keytag.private
@@ -59,6 +56,5 @@ processing_rules:
   - opcode: 5
     module: "update_handler"
 
-# Default forward is used for opcodes not listed in processing_rules
-default_forward: "127.0.0.1:53"
+# Forwarding for opcodes not listed in processing_rules uses the upstreams list above.
 

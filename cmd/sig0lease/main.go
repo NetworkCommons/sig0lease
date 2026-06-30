@@ -53,21 +53,11 @@ func main() {
 			h := handlers.NewUpdateHandler()
 			h.SetLogger(logger)
 
-			// Phase 3: Setup handler with configuration for upstream coordination
-			// This includes:
-			//  - Loading downstream key for client SIG(0) verification
-			//  - Loading upstream key for signing UPDATEs to authoritative server
-			//  - Configuring upstream resolver for forwarding
+			// Setup handler with configuration for upstream coordination.
+			// Coordinator resolves authoritative NS from upstream_zone and sends UPDATE directly.
 			handlerCfg := cfg.Handlers["update"]
 			if handlerCfg != nil {
-				// Add resolver to config for upstream coordination
-				resolverCfg := make(map[string]interface{})
-				for k, v := range handlerCfg {
-					resolverCfg[k] = v
-				}
-				resolverCfg["upstream_resolver"] = srv.GetResolver()
-
-				if err := h.Setup(resolverCfg); err != nil {
+				if err := h.Setup(handlerCfg); err != nil {
 					logger.Warnf("Failed to setup %s: %v", moduleName, err)
 				} else {
 					logger.Infof("Phase 3: Upstream coordination configured for %s", moduleName)

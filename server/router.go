@@ -13,24 +13,19 @@ import (
 
 // Router routes DNS requests based on opcode to appropriate handlers or forwarder.
 type Router struct {
-	opcodeMap      map[uint8]string
-	defaultForward string
-	handlers       map[string]handlers.Handler
-	logger         *logging.Logger
-	resolver       *forward.Resolver
+	opcodeMap map[uint8]string
+	handlers  map[string]handlers.Handler
+	logger    *logging.Logger
+	resolver  *forward.Resolver
 }
 
 // NewRouter creates a new router instance.
-func NewRouter(opcodeMap map[uint8]string, defaultForward string, logger *logging.Logger, resolver *forward.Resolver) (*Router, error) {
-	if defaultForward == "" {
-		defaultForward = "8.8.8.8:53"
-	}
+func NewRouter(opcodeMap map[uint8]string, logger *logging.Logger, resolver *forward.Resolver) (*Router, error) {
 	return &Router{
-		opcodeMap:      opcodeMap,
-		defaultForward: defaultForward,
-		handlers:       make(map[string]handlers.Handler),
-		logger:         logger,
-		resolver:       resolver,
+		opcodeMap: opcodeMap,
+		handlers:  make(map[string]handlers.Handler),
+		logger:    logger,
+		resolver:  resolver,
 	}, nil
 }
 

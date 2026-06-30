@@ -7,7 +7,7 @@ OS := $(shell uname -s | tr '[:upper:]' '[:lower:]')
 VERSION ?= 0.1.0
 BUILD_DIR := ./bin/$(OS)
 
-.PHONY: all build build-client build-all build-client-all clean test test-full fmt vet lint run-server run-client deps docs release clean-binary
+.PHONY: all build build-client build-all build-client-all clean test test-unit test-integration test-register test-full fmt vet lint run-server run-client deps docs release clean-binary
 
 all: build build-client test
 
@@ -38,19 +38,34 @@ clean:
 	rm -rf $(BUILD_DIR)
 	go clean ./...
 
-# Run tests (skips packages that require full integration setup)
+# Run fast unit tests that do not require live integration environment.
 test: fmt vet
 	go test ./cmd/... ./config ./forward ./handlers ./pkg/keyrec ./pkg/lease ./pkg/srp/instruction ./pkg/srp/server -v
 
-# Run unit tests with keystore integration (requires KEYSTORE_DIR env var)
+# Run keystore-dependent unit tests.
+# Requires KEYSTORE_DIR or handlers.update.keystore_dir in config.yaml.
 test-unit: fmt vet
-	go test ./... -v -skip="TestLeaseCreation|TestLease" -run="TestLeaseCreation|TestLease"
+	go test ./pkg/sig0 -v
+	go test . -run "TestLease" -v
 
-# Run full end-to-end integration test (requires KEYSTORE_DIR env var)
+# Run full end-to-end integration workflow via test script.
+# Requires KEYSTORE_DIR or handlers.update.keystore_dir in config.yaml.
 test-integration: build build-client
 	./tests/test_integration.sh run
 
-# Run tests with keystore integration (requires KEYSTORE_DIR env var)
+# Run a single end-to-end registration using the built client binary.
+# Override variables as needed, e.g.:
+# make test-register ADDR=127.0.0.1:8053 ZONE=test.dev.zenr.io. KEYNAME=test.dev.zenr.io.
+ADDR ?= 127.0.0.1:8053
+ZONE ?= test.dev.zenr.io.
+KEYNAME ?= test.dev.zenr.io.
+LEASE ?= 300
+KEY_LEASE ?= 3600
+
+test-register: build build-client
+	./$(BUILD_DIR)/$(CLIENT_NAME) $(ADDR) register $(ZONE) $(KEYNAME) $(LEASE) $(KEY_LEASE)
+
+# Run the complete test matrix.
 test-full: fmt vet test-integration
 	go test ./... -v
 
