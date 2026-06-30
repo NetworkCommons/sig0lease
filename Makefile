@@ -42,8 +42,16 @@ clean:
 test: fmt vet
 	go test ./cmd/... ./config ./forward ./handlers ./pkg/keyrec ./pkg/lease ./pkg/srp/instruction ./pkg/srp/server -v
 
+# Run unit tests with keystore integration (requires KEYSTORE_DIR env var)
+test-unit: fmt vet
+	go test ./... -v -skip="TestLeaseCreation|TestLease" -run="TestLeaseCreation|TestLease"
+
+# Run full end-to-end integration test (requires KEYSTORE_DIR env var)
+test-integration: build build-client
+	./tests/test_integration.sh run
+
 # Run tests with keystore integration (requires KEYSTORE_DIR env var)
-test-full: fmt vet
+test-full: fmt vet test-integration
 	go test ./... -v
 
 # Run specific test file or package

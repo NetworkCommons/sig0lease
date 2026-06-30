@@ -7,7 +7,7 @@
 # Phase 2: Client-side key loading and UPDATE-LEASE message construction
 # Phase 3: Upstream coordination and protocol forwarding
 #
-# Usage: ./test_integration.sh [start|stop|clean]
+# Usage: tests/test_integration.sh [start|stop|clean]
 #
 
 set -euo pipefail
@@ -16,9 +16,9 @@ set -euo pipefail
 # Configuration
 OS=$(uname -s | tr '[:upper:]' '[:lower:]')
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-PROXY_BIN="${SCRIPT_DIR}/bin/${OS}/sig0lease"
-CLIENT_BIN="${SCRIPT_DIR}/bin/${OS}/sig0lease-client"
-CONFIG_FILE="${SCRIPT_DIR}/config.yaml"
+PROXY_BIN="${SCRIPT_DIR}/../bin/${OS}/sig0lease"
+CLIENT_BIN="${SCRIPT_DIR}/../bin/${OS}/sig0lease-client"
+CONFIG_FILE="${SCRIPT_DIR}/../config.yaml"
 
 # Test keystore with ED25519 keys from shared workspace sig0namectl
 # Get keystore from environment or config file
@@ -31,7 +31,7 @@ if [ -z "$TEST_KEYSTORE" ]; then
 fi
 # Final fallback if still not set
 if [ -z "$TEST_KEYSTORE" ]; then
-    TEST_KEYSTORE="../sig0namectl/keystore"
+    TEST_KEYSTORE="${SCRIPT_DIR}/../../sig0namectl/keystore"
 fi
 
 TEST_KEY_NAME="Ktest.dev.zenr.io.+015+05044"

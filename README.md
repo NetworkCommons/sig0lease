@@ -96,7 +96,7 @@ This pattern allows handlers to signal whether a packet is relevant to their pro
 dig @localhost -p 8053 example.com A +short
 
 # Run the full test suite
-./test.sh
+./tests/test.sh
 ```
 
 For standard port 53, run with sudo or change config to `:53`.
