@@ -3,7 +3,6 @@ package server
 
 import (
 	"context"
-	"encoding/binary"
 	"fmt"
 	"net"
 	"os"
@@ -168,44 +167,13 @@ func (s *Server) serveUDP(handler dns.HandlerFunc) error {
 		s.logger.Infof("UDP: Received %d bytes from %s", n, remoteAddr.String())
 		rawData := buf[:n]
 
-		// Extract EDNS options from raw data before unpacking
-		extractedOPT := extractEDNSFromWire(rawData)
-
-		// Try to strip EDNS from wire before unpacking to allow successful unpacking
-		dataWithoutOPT, _, stripErr := stripEDNSFromWire(rawData)
-		if stripErr != nil {
-			s.logger.Debugf("Could not strip EDNS: %v", stripErr)
-			dataWithoutOPT = rawData
-		}
-
-		// Unpack the message (without OPT if we stripped it)
+		// Strict parsing: unpack raw wire message only.
 		msg := new(dns.Msg)
-		msg.Data = make([]byte, len(dataWithoutOPT))
-		copy(msg.Data, dataWithoutOPT)
-		unpackErr := msg.Unpack()
-
-		// If unpacking still failed, try to at least parse the header
-		if unpackErr != nil {
-			s.logger.Debugf("Unpack error: %v (trying to parse header)", unpackErr)
-			// Try to parse at least the header from original data
-			if len(rawData) >= 12 {
-				// Parse header
-				msg.ID = binary.BigEndian.Uint16(rawData[0:2])
-				flags := binary.BigEndian.Uint16(rawData[2:4])
-				msg.Opcode = uint8(flags >> 11)
-
-				// Even if full unpack fails, use extracted EDNS
-				extractedOPT = extractEDNSFromWire(rawData)
-			} else {
-				s.logger.Errorf("Packet too small to parse")
-				continue
-			}
-		}
-
-		// If we extracted EDNS options from raw data, add them back
-		if extractedOPT != nil && len(msg.Extra) == 0 {
-			s.logger.Debugf("Restoring EDNS options from raw data: %d options", len(extractedOPT.Options))
-			msg.Extra = append(msg.Extra, extractedOPT)
+		msg.Data = make([]byte, len(rawData))
+		copy(msg.Data, rawData)
+		if err := msg.Unpack(); err != nil {
+			s.logger.Errorf("Dropping malformed DNS packet from %s: unpack failed: %v", remoteAddr.String(), err)
+			continue
 		}
 
 		// Debug: Log message structure

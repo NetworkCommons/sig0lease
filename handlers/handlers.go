@@ -51,7 +51,7 @@ type Handler interface {
 	// Handle processes a DNS message and returns a HandlerResult.
 	// The result status determines how the router handles the response:
 	//   - StatusProcessed: Send the response message to the client
-	//   - StatusNotRelevant: Packet not relevant to this handler, apply fallback action (e.g., forward)
+	//   - StatusNotRelevant: Packet not relevant to this handler, apply default upstream routing
 	//   - StatusError: Error occurred, send error response to client
 	Handle(ctx context.Context, w dns.ResponseWriter, r *dns.Msg) *HandlerResult
 

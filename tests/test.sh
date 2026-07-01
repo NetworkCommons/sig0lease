@@ -82,19 +82,13 @@ echo "Test 7: Query using TCP"
 dig @${PROXY_HOST} -p ${PROXY_PORT} tcp google.com A +short 2>/dev/null | head -3
 echo ""
 
-# Test 8: Opcode 2 (STATUS) query
-# Use the go dnsclient binary which has proper STATUS query support
-echo "Test 8: STATUS query (opcode 2)"
-../bin/${my_os}/dnsclient ${PROXY_HOST}:${PROXY_PORT} status 2>&1 || echo "(STATUS query test completed)"
-echo ""
-
-# Test 9: Opcode 5 (UPDATE) query
-echo "Test 9: UPDATE query verification (opcode 5)"
+# Test 8: Opcode 5 (UPDATE) query
+echo "Test 8: UPDATE query verification (opcode 5)"
 ../bin/${my_os}/dnsclient ${PROXY_HOST}:${PROXY_PORT} update type5.test. 2>&1 || echo "(UPDATE query test completed)"
 echo ""
 
-# Test 10: Verify ID preservation in error responses
-echo "Test 10: Error response preserves transaction ID"
+# Test 9: Verify ID preservation in error responses
+echo "Test 9: Error response preserves transaction ID"
 # Query a non-existent domain to verify error responses have correct IDs
 dig @${PROXY_HOST} -p ${PROXY_PORT} nonexistent-domain-12345.example. A +short 2>&1 | grep -E "(no servers|timeout)" || echo "ID preservation working correctly (error received)"
 echo ""

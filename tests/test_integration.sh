@@ -1,11 +1,12 @@
 #!/bin/bash
 #
 # Comprehensive Integration Test for sig0lease Proxy
-# 
-# This test demonstrates the full end-to-end workflow of the sig0lease DNS proxy:
-# Phase 1: Lease registration via client with SIG(0) authentication
-# Phase 2: Client-side key loading and UPDATE-LEASE message construction
-# Phase 3: Upstream coordination and protocol forwarding
+#
+# This suite intentionally runs real process-level integration tests only:
+# - real proxy binary
+# - real client binary
+# - real DNS keys from keystore
+# - real authoritative path for zenr.io (via proxy update forwarding)
 #
 # Usage: tests/test_integration.sh [start|stop|clean]
 #
@@ -19,8 +20,9 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROXY_BIN="${SCRIPT_DIR}/../bin/${OS}/sig0lease"
 CLIENT_BIN="${SCRIPT_DIR}/../bin/${OS}/sig0lease-client"
 CONFIG_FILE="${SCRIPT_DIR}/../config.yaml"
+LOG_FILE="/tmp/sig0lease_proxy.log"
+TMP_CONFIG_FILE=""
 
-# Test keystore with ED25519 keys from shared workspace sig0namectl
 # Get keystore from environment or config file
 TEST_KEYSTORE="${KEYSTORE_DIR:-}"
 if [ -z "$TEST_KEYSTORE" ]; then
@@ -34,15 +36,17 @@ if [ -z "$TEST_KEYSTORE" ]; then
     TEST_KEYSTORE="${SCRIPT_DIR}/../../sig0namectl/keystore"
 fi
 
-TEST_KEY_NAME="Ktest.dev.zenr.io.+015+05044"
-PROXY_ADDR="127.0.0.1"
-PROXY_PORT="8053"
+PROXY_ADDR="${PROXY_ADDR:-127.0.0.1}"
+PROXY_PORT="${PROXY_PORT:-8053}"
 PROXY_URL="$PROXY_ADDR:$PROXY_PORT"
 
-# Test zones and keys
+# Real zones/keys
 DOWNSTREAM_ZONE="test.dev.zenr.io."
 UPSTREAM_ZONE="dev.zenr.io."
-CLIENT_KEY_NAME="client.test.dev.zenr.io."
+CLIENT_KEY_NAME="test.dev.zenr.io."
+WRONG_CLIENT_KEY_NAME="farback.dev.zenr.io."
+LEASE_SECONDS=30
+REFRESH_SECONDS=30
 
 # Color output
 RED='\033[0;31m'
@@ -62,218 +66,233 @@ log_step() {
 }
 
 log_success() {
-    echo -e "${GREEN}✓ $1${NC}"
+    echo -e "${GREEN}[OK] $1${NC}"
 }
 
 log_error() {
-    echo -e "${RED}✗ $1${NC}"
+    echo -e "${RED}[FAIL] $1${NC}"
 }
 
 cleanup() {
     log_section "CLEANUP"
-    
-    # Kill proxy if running
+
     if [ ! -z "${PROXY_PID:-}" ] && kill -0 "$PROXY_PID" 2>/dev/null; then
         log_step "Stopping sig0lease proxy (PID: $PROXY_PID)"
         kill "$PROXY_PID" || true
         sleep 1
         log_success "Proxy stopped"
     fi
+
+    if [ -n "$TMP_CONFIG_FILE" ] && [ -f "$TMP_CONFIG_FILE" ]; then
+        rm -f "$TMP_CONFIG_FILE"
+    fi
+}
+
+stop_proxy() {
+    if [ ! -z "${PROXY_PID:-}" ] && kill -0 "$PROXY_PID" 2>/dev/null; then
+        kill "$PROXY_PID" || true
+        sleep 1
+    fi
+    PROXY_PID=""
+}
+
+restart_proxy() {
+    stop_proxy
+    start_proxy
+}
+
+run_client() {
+    KEYSTORE_DIR="$TEST_KEYSTORE" "$CLIENT_BIN" "$@"
+}
+
+require_command() {
+    if ! command -v "$1" >/dev/null 2>&1; then
+        log_error "Required command not found: $1"
+        exit 1
+    fi
+}
+
+assert_proxy_log_contains() {
+    local pattern="$1"
+    if grep -q "$pattern" "$LOG_FILE"; then
+        return 0
+    fi
+    log_error "Expected proxy log pattern not found: $pattern"
+    tail -n 120 "$LOG_FILE" || true
+    return 1
 }
 
 setup_keystore() {
-    log_section "SETUP: Test Keystore"
-    
+    log_section "SETUP: Real Keystore"
+
     if [ ! -d "$TEST_KEYSTORE" ]; then
         log_error "Test keystore directory not found: $TEST_KEYSTORE"
         exit 1
     fi
-    
+
     log_step "Verifying test keys in keystore: $TEST_KEYSTORE"
-    if [ ! -f "$TEST_KEYSTORE/Ktest.dev.zenr.io.+015+05044.key" ]; then
-        log_error "Test key not found: Ktest.dev.zenr.io.+015+05044.key (ED25519)"
+    if ! ls "$TEST_KEYSTORE"/Ktest.dev.zenr.io.+015+*.key >/dev/null 2>&1; then
+        log_error "Expected key for zone $DOWNSTREAM_ZONE not found in $TEST_KEYSTORE"
         exit 1
     fi
-    if [ ! -f "$TEST_KEYSTORE/Kdev.zenr.io.+015+35317.key" ]; then
-        log_error "Upstream key not found: Kdev.zenr.io.+015+35317.key (ED25519)"
+    if ! ls "$TEST_KEYSTORE"/Kdev.zenr.io.+015+*.key >/dev/null 2>&1; then
+        log_error "Expected key for upstream zone $UPSTREAM_ZONE not found in $TEST_KEYSTORE"
         exit 1
     fi
-    
+    if ! ls "$TEST_KEYSTORE"/Kfarback.dev.zenr.io.+015+*.key >/dev/null 2>&1; then
+        log_error "Expected second real key for unauthorized test ($WRONG_CLIENT_KEY_NAME) not found"
+        exit 1
+    fi
+
     log_success "Test keystore verified"
-    ls -lh "$TEST_KEYSTORE"
+    ls -1 "$TEST_KEYSTORE" | sed -n '1,50p'
 }
 
 start_proxy() {
-    log_section "PHASE 1: Starting sig0lease Proxy"
-    
+    log_section "START: Proxy Process"
+
     if ! [ -x "$PROXY_BIN" ]; then
         log_error "Proxy binary not found or not executable: $PROXY_BIN"
         exit 1
     fi
-    
-    log_step "Starting proxy on $PROXY_URL with config: $CONFIG_FILE"
-    
-    # Start proxy in background, capture PID
-    "$PROXY_BIN" "$CONFIG_FILE" > /tmp/sig0lease_proxy.log 2>&1 &
+
+    log_step "Preparing runtime config for listen address $PROXY_ADDR:$PROXY_PORT"
+
+    TMP_CONFIG_FILE="$(mktemp /tmp/sig0lease-config.XXXXXX)"
+    cp "$CONFIG_FILE" "$TMP_CONFIG_FILE"
+    sed -i.bak "s|^  address:.*$|  address: \"$PROXY_ADDR:$PROXY_PORT\"|" "$TMP_CONFIG_FILE"
+    rm -f "$TMP_CONFIG_FILE.bak"
+
+    log_step "Starting proxy on $PROXY_URL with config: $TMP_CONFIG_FILE"
+
+    "$PROXY_BIN" "$TMP_CONFIG_FILE" > "$LOG_FILE" 2>&1 &
     PROXY_PID=$!
-    
-    # Wait for proxy to start and listen
+
     sleep 2
-    
+
     if ! kill -0 "$PROXY_PID" 2>/dev/null; then
         log_error "Proxy failed to start. Check logs:"
-        cat /tmp/sig0lease_proxy.log
+        cat "$LOG_FILE"
+        if grep -q "address already in use" "$LOG_FILE"; then
+            log_error "Port $PROXY_PORT is already in use. Re-run with a free port: PROXY_PORT=18053 tests/test_integration.sh run"
+        fi
         exit 1
     fi
-    
+
     log_success "Proxy started successfully (PID: $PROXY_PID)"
-    log_success "Proxy log: tail -f /tmp/sig0lease_proxy.log"
+    log_success "Proxy log: tail -f $LOG_FILE"
+}
+
+build_binaries() {
+    log_section "BUILD"
+    log_step "Building proxy and client binaries"
+    (cd "$SCRIPT_DIR/.." && go build -o "$PROXY_BIN" ./cmd/sig0lease)
+    (cd "$SCRIPT_DIR/.." && go build -o "$CLIENT_BIN" ./cmd/sig0lease-client)
+    log_success "Binaries built"
 }
 
 test_list_keys() {
-    log_section "PHASE 2: Client - List Available Keys"
-    
-    if ! [ -x "$CLIENT_BIN" ]; then
-        log_error "Client binary not found or not executable: $CLIENT_BIN"
-        return 1
-    fi
-    
-    log_step "Listing keys in keystore: $TEST_KEYSTORE"
-    log_step "Command: $CLIENT_BIN dummy list-keys $TEST_KEYSTORE"
-    echo ""
-    
-    if "$CLIENT_BIN" dummy list-keys "$TEST_KEYSTORE"; then
-        log_success "Key listing successful"
-    else
-        log_error "Key listing failed"
-        return 1
-    fi
+    log_section "CHECK: Key Listing"
+    log_step "Listing keys from real keystore"
+    run_client dummy list-keys "$TEST_KEYSTORE"
+    log_success "Key listing successful"
 }
 
-test_register_lease() {
-    log_section "PHASE 2: Client - Register Key with Lease"
-    
-    log_step "Registering key with sig0lease proxy"
-    log_step "Command: $CLIENT_BIN $PROXY_URL register $DOWNSTREAM_ZONE $CLIENT_KEY_NAME"
-    echo ""
-    
-    # Register with 1 hour lease (3600 seconds)
-    if "$CLIENT_BIN" "$PROXY_URL" register "$DOWNSTREAM_ZONE" "$CLIENT_KEY_NAME"; then
-        log_success "Lease registration successful"
-    else
-        log_error "Lease registration failed"
+test_case_register_expire_remove() {
+    log_section "CASE 1: Register -> Expire -> Removed"
+
+    log_step "Registering lease ($LEASE_SECONDS seconds)"
+    run_client "$PROXY_URL" register "$DOWNSTREAM_ZONE" "$CLIENT_KEY_NAME" "$LEASE_SECONDS" 3600
+
+    log_step "Waiting for lease to expire"
+    sleep $((LEASE_SECONDS + 3))
+
+    log_step "Attempting refresh after expiry (must fail)"
+    if run_client "$PROXY_URL" refresh "$DOWNSTREAM_ZONE" "$CLIENT_KEY_NAME" "$REFRESH_SECONDS"; then
+        log_error "Refresh succeeded after expiry, expected failure"
         return 1
     fi
+
+    assert_proxy_log_contains "refresh rejected: lease does not exist"
+    log_success "Expired lease no longer refreshable"
 }
 
-test_verify_registration() {
-    log_section "PHASE 2: Client - Verify Key Registration"
-    
-    sleep 1  # Small delay to ensure lease is registered
-    
-    log_step "Verifying registered key: $TEST_KEY_NAME"
-    log_step "Command: $CLIENT_BIN $PROXY_URL verify $DOWNSTREAM_ZONE $CLIENT_KEY_NAME"
-    echo ""
-    
-    if "$CLIENT_BIN" "$PROXY_URL" verify "$DOWNSTREAM_ZONE" "$CLIENT_KEY_NAME"; then
-        log_success "Key verification successful"
-    else
-        log_error "Key verification failed"
-        return 1
-    fi
+test_case_register_refresh_not_prematurely_removed() {
+    log_section "CASE 2: Register -> Refresh -> Not Prematurely Removed"
+
+    log_step "Registering initial lease"
+    run_client "$PROXY_URL" register "$DOWNSTREAM_ZONE" "$CLIENT_KEY_NAME" "$LEASE_SECONDS" 3600
+
+    log_step "Sleeping before expiry then refreshing"
+    sleep 20
+    run_client "$PROXY_URL" refresh "$DOWNSTREAM_ZONE" "$CLIENT_KEY_NAME" "$REFRESH_SECONDS"
+
+    log_step "Sleeping past original expiry window"
+    sleep 15
+
+    log_step "Refreshing again (must still succeed if not removed prematurely)"
+    run_client "$PROXY_URL" refresh "$DOWNSTREAM_ZONE" "$CLIENT_KEY_NAME" "$REFRESH_SECONDS"
+    log_success "Lease remained active after renewal"
 }
 
-test_standard_update_forward() {
-    log_section "PHASE 3: Protocol Forwarding - Standard UPDATE"
-    
-    log_step "Sending standard UPDATE query (without UPDATE-LEASE) to proxy"
-    log_step "Expected: Proxy forwards to upstream (127.0.0.1:53)"
-    log_step "Command: dig @$PROXY_ADDR -p $PROXY_PORT +opcode=5 miek.nl. SOA +nocookie"
-    echo ""
-    
-    # Try to send UPDATE - will likely fail since no real upstream, but shows forwarding
-    if dig @"$PROXY_ADDR" -p "$PROXY_PORT" +opcode=5 miek.nl. SOA +nocookie 2>&1; then
-        log_success "Protocol forwarding routing successful (response received)"
-    else
-        log_success "Protocol forwarding routing initiated (query forwarded as expected)"
-    fi
-}
+test_case_unauthorized_refresh_rejected_then_expires() {
+    log_section "CASE 3: Unauthorized Refresh Rejected -> Lease Expires"
 
-test_lease_expiration() {
-    log_section "PHASE 3: Lease Expiration Verification"
-    
-    log_step "Registering key with short lease duration (10 seconds)"
-    
-    # Register with 10 second lease
-    if "$CLIENT_BIN" "$PROXY_URL" register "$DOWNSTREAM_ZONE" "short-ttl.$CLIENT_KEY_NAME" 10; then
-        log_success "Short-lived lease registered"
-    else
-        log_error "Failed to register short-lived lease"
-        return 1
-    fi
-    
-    log_step "Waiting 12 seconds for lease to expire..."
-    sleep 12
-    
-    log_step "Verifying lease is no longer active (should fail gracefully)"
-    if "$CLIENT_BIN" "$PROXY_URL" verify "$DOWNSTREAM_ZONE" "short-ttl.$CLIENT_KEY_NAME" 2>&1; then
-        log_error "Lease still active - expiration not working"
-        return 1
-    else
-        log_success "Lease correctly expired"
-    fi
-}
+    log_step "Registering lease under authorized key ($CLIENT_KEY_NAME)"
+    run_client "$PROXY_URL" register "$DOWNSTREAM_ZONE" "$CLIENT_KEY_NAME" "$LEASE_SECONDS" 3600
 
-test_proxy_status() {
-    log_section "PHASE 1: Proxy Status Query"
-    
-    log_step "Sending STATUS query (opcode 2) to proxy"
-    log_step "Command: dig @$PROXY_ADDR -p $PROXY_PORT +opcode=2 . TXT +nocookie"
-    echo ""
-    
-    if dig @"$PROXY_ADDR" -p "$PROXY_PORT" +opcode=2 . TXT +nocookie; then
-        log_success "Status query successful"
-    else
-        log_error "Status query failed"
+    log_step "Unauthorized refresh attempt using different real key ($WRONG_CLIENT_KEY_NAME)"
+    if run_client "$PROXY_URL" refresh "$DOWNSTREAM_ZONE" "$WRONG_CLIENT_KEY_NAME" "$REFRESH_SECONDS"; then
+        log_error "Unauthorized refresh unexpectedly succeeded"
         return 1
     fi
+
+    log_step "Waiting until original lease expires"
+    sleep $((LEASE_SECONDS + 3))
+
+    log_step "Original key refresh after expiry must fail"
+    if run_client "$PROXY_URL" refresh "$DOWNSTREAM_ZONE" "$CLIENT_KEY_NAME" "$REFRESH_SECONDS"; then
+        log_error "Lease still active after expiry, expected removal"
+        return 1
+    fi
+
+    log_success "Unauthorized refresh rejected and lease expired as expected"
 }
 
 run_all_tests() {
     log_section "SIG0LEASE INTEGRATION TEST SUITE"
-    echo "This test demonstrates the full sig0lease workflow:"
-    echo "  - Phase 1: Handler status code pattern for protocol routing"
-    echo "  - Phase 2: Client-side key loading and UPDATE-LEASE message construction"
-    echo "  - Phase 3: Upstream coordination and protocol forwarding"
+    echo "This suite uses live components only (no stubs/mocks):"
+    echo "  - real proxy process"
+    echo "  - real client process"
+    echo "  - real key files"
+    echo "  - real authoritative forwarding path for zenr.io"
     echo ""
-    
+
     trap cleanup EXIT
-    
+
+    require_command grep
+    require_command ls
+    build_binaries
     setup_keystore
-    start_proxy
-    
-    log_section "TESTING PHASE 2: CLIENT OPERATIONS"
+    log_section "TESTING LIVE LEASE LIFECYCLE"
     test_list_keys
-    test_register_lease
-    test_verify_registration
-    
-    log_section "TESTING PHASE 3: PROXY OPERATIONS"
-    test_proxy_status
-    test_standard_update_forward
-    test_lease_expiration
-    
+    start_proxy
+    test_case_register_expire_remove
+    restart_proxy
+    test_case_register_refresh_not_prematurely_removed
+    restart_proxy
+    test_case_unauthorized_refresh_rejected_then_expires
+
     log_section "TEST RESULTS"
     echo -e "${GREEN}All integration tests completed successfully!${NC}"
     echo ""
     echo "Summary of what was tested:"
-    echo "  ✓ Handler response codes for protocol routing (Phase 1)"
-    echo "  ✓ Client key loading and lease registration (Phase 2)"
-    echo "  ✓ Proxy routing and upstream forwarding (Phase 3)"
-    echo "  ✓ Lease expiration and cleanup"
+    echo "  [OK] Register -> expire -> removed"
+    echo "  [OK] Register -> refresh -> not prematurely removed"
+    echo "  [OK] Unauthorized refresh rejected, lease still expires"
     echo ""
-    echo "Proxy is still running at $PROXY_URL"
-    echo "View logs: tail -f /tmp/sig0lease_proxy.log"
-    echo "Kill proxy: kill $PROXY_PID"
+    echo "Proxy process was exercised at $PROXY_URL"
+    echo "Logs: $LOG_FILE"
 }
 
 case "${1:-run}" in
@@ -285,8 +304,8 @@ case "${1:-run}" in
         ;;
     *)
         echo "Usage: $0 [run|cleanup]"
-        echo "  run     - Run all integration tests"
-        echo "  cleanup - Stop proxy and clean up test keystore"
+        echo "  run     - Run all live integration tests"
+        echo "  cleanup - Stop proxy"
         exit 1
         ;;
 esac

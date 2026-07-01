@@ -1,131 +1,122 @@
 # sig0lease
 
-A modular DNS proxy server implementing the Service Registration Protocol (SRP) for secure dynamic DNS-SD updates, using SIG(0) authentication.
+sig0lease is a DNS proxy for SIG(0)-authenticated UPDATE-LEASE registration flows. It accepts DNS UPDATE packets, validates the downstream SIG(0) signature, applies the lease/update policy, and forwards the resulting UPDATE to the authoritative server selected for the zone.
 
-## Features
+## What It Does
 
-- Accepts DNS queries on UDP and TCP (port 8053 by default)
-- Routes queries based on DNS opcode to processing modules
-- Configurable opcode-to-module mapping via YAML config
-- Sig(0) signing for DNS update requests
-- Forwarding of unhandled opcodes to upstream resolvers
-- Concurrent upstream queries with first-response-wins
+The project is intended to provide a small, explicit control point for DNS-SD style registration traffic:
 
-## Architecture
+- Receive DNS queries over UDP and TCP.
+- Route the registration opcode to the update handler and forward unrelated traffic upstream.
+- Process DNS UPDATE requests carrying an UPDATE-LEASE EDNS option.
+- Verify downstream SIG(0) signatures before the proxy accepts the request.
+- Re-sign the upstream UPDATE with the proxy’s zone key before forwarding.
+- Forward unhandled opcodes to the configured upstream resolver path.
 
-```
-┌─────────────┐     ┌──────────────────┐     ┌───────────────┐
-│   DNS       │     │  Router (based   │     │               │
-│  Client     │────►│  on opcode)      │────►│  Processing   │
-└─────────────┘     └──────────────────┘     │    Modules    │
-                                             │  (SIG(0), etc)│
-                                             └───────────────┘
-                                                     │
-                                              ┌──────┴──────┐
-                                              │ Forwarding  │
-                                              │ to Upstream │
-                                              └─────────────┘
-```
+## Main Commands
 
-## Directory Structure
-
-- `cmd/sig0lease/` - Main binary entry point
-- `pkg/` - Library modules
-  - `sig0/` - SIG(0) signing and verification (RFC 2931)
-  - `lease/` - Update Lease EDNS option (RFC 9664)
-  - `keyrec/` - KEY record handling (RFC 2539, RFC 4034)
-  - `srp/` - Service Registration Protocol (RFC 9665)
-- `config/` - Configuration handling with YAML support
-- `forward/` - Upstream forwarding logic
-- `handlers/` - Processing modules interface and stubs
-- `logging/` - Structured logging
-
-## Usage
-
-### Build
+Build the server and client:
 
 ```bash
 make build
+make build-client
 ```
 
-### Run with Config File
+Run the proxy with a config file:
 
 ```bash
-./bin/<your OS>/sig0lease ./config.yaml
-```
-
-If no config file is provided, default settings are used:
-- Listen on port **8053** (UDP/TCP) - non-privileged by default
-- Forward to `8.8.8.8:53` for unhandled opcodes
-
-## Processing Modules
-
-Modules implement the `handlers.Handler` interface:
-
-```go
-type Handler interface {
-    Name() string
-    CanHandle(opcode uint8) bool
-    Handle(ctx context.Context, w dns.ResponseWriter, r *dns.Msg) *HandlerResult
-    Setup(cfg map[string]any) error
-}
-```
-
-### Handler Response Types
-
-Handlers return a `HandlerResult` with a status code indicating how the router should process the packet:
-
-- **StatusProcessed (0)** - Handler successfully processed the packet; return response to client
-- **StatusNotRelevant (1)** - Packet is valid but not relevant to this protocol (e.g., UPDATE without UPDATE-LEASE EDNS option); router forwards to default upstream resolver
-- **StatusError (2)** - Handler encountered an error during processing; return error response to client
-
-This pattern allows handlers to signal whether a packet is relevant to their protocol without throwing exceptions, enabling clean fallback forwarding for packets that don't match the expected protocol structure.
-
-### Available Modules
-
-- `status_handler` - Handles opcode 2 (STATUS queries)  
-- `update_handler` - Handles opcode 5 (UPDATE queries with sig0lease authentication per RFC 9664)
-
-## Testing
-
-```bash
-# Fast unit tests (no live integration environment)
-make test
-
-# Keystore-dependent unit tests
-make test-unit
-
-# Full integration test (starts proxy and uses sig0lease-client)
-make test-integration
-
-# Single e2e registration using built client binary
-make test-register ADDR=127.0.0.1:8053 ZONE=dev.zenr.io. KEYNAME=test.dev.zenr.io.
-```
-
-Manual smoke test:
-
-```bash
-# Start the proxy
 make run-server
-
-# Send one registration through the client binary
-make run-client ADDR=127.0.0.1:8053 CMD="register dev.zenr.io. test.dev.zenr.io."
 ```
 
-For standard port 53, run with sudo or change config to `:53`.
+or directly:
 
-## Standards Compliance
+```bash
+./bin/darwin/sig0lease ./config.yaml
+```
 
-This proxy implements:
-- **RFC 9664** - Update Lease EDNS(0) option
-- **RFC 2539, RFC 4034** - KEY records for DNSSEC
-- **RFC 2931** - SIG(0) request/response signing
-- **RFC 9665** - Service Registration Protocol (SRP)
+Run the client against a proxy:
 
-## Future Enhancements
+```bash
+make run-client ADDR=127.0.0.1:8053 CMD="register test.dev.zenr.io. test.dev.zenr.io."
+```
 
-- Implement actual SRP processing logic in modules
-- Support DNS over HTTPS (DoH) upstream forwarding
-- Support DNS over TLS (DoT) upstream forwarding
-- Cache layer integration for response caching
-- Statistics and metrics collection (prometheus compatible)
+The client requires an explicit keystore directory:
+
+```bash
+KEYSTORE_DIR=/path/to/keystore ./bin/darwin/sig0lease-client 127.0.0.1:8053 register test.dev.zenr.io. test.dev.zenr.io.
+```
+
+Useful end-to-end commands:
+
+```bash
+make test-register ADDR=127.0.0.1:8053 CLIENT_KEYSTORE_DIR=/path/to/keystore ZONE=test.dev.zenr.io. KEYNAME=test.dev.zenr.io.
+make test-register-badsig ADDR=127.0.0.1:8053 CLIENT_KEYSTORE_DIR=/path/to/keystore ZONE=test.dev.zenr.io. KEYNAME=test.dev.zenr.io.
+make test-integration
+```
+
+## Client Use Cases
+
+The client binary currently supports these flows:
+
+- `register` - create and send a signed UPDATE-LEASE registration request.
+- `register-tamper` - sign the request, then flip one payload bit to confirm the proxy rejects a bad SIG(0).
+- `verify` - query whether a registration is currently active.
+- `list-keys` - list available keystore entries.
+
+Examples:
+
+```bash
+sig0lease-client 127.0.0.1:8053 register test.dev.zenr.io. test.dev.zenr.io. 300 3600
+sig0lease-client 127.0.0.1:8053 register-tamper test.dev.zenr.io. test.dev.zenr.io. 300 3600
+sig0lease-client 127.0.0.1:8053 verify test.dev.zenr.io. test.dev.zenr.io.
+sig0lease-client 127.0.0.1:8053 list-keys /path/to/keystore
+```
+
+## Proxy Use Cases
+
+The proxy is designed to support two practical scenarios:
+
+- Registration: a client submits an authenticated UPDATE-LEASE request and the proxy forwards a signed UPDATE to the authoritative server.
+- Pass-through routing: non-registration traffic is forwarded according to the configured opcode routing and upstream settings.
+
+## Configuration
+
+`config.yaml` controls:
+
+- listening address and enabled transport networks;
+- default upstream resolvers;
+- handler-specific settings such as the upstream zone and keystore directory for the update handler;
+- opcode-to-module routing.
+
+The update handler uses the configured zone to discover the authoritative server for the effective zone, then sends the rewritten UPDATE there.
+
+## Project Layout
+
+- `cmd/sig0lease/` - proxy entrypoint
+- `cmd/sig0lease-client/` - client entrypoint
+- `config/` - YAML config loading and validation
+- `forward/` - upstream forwarding logic
+- `handlers/` - opcode handlers and result types
+- `pkg/keyrec/` - KEY RR parsing and keystore helpers
+- `pkg/lease/` - UPDATE-LEASE option encoding helpers
+- `pkg/sig0/` - SIG(0) signing and verification helpers
+- `server/` - UDP/TCP listener and request dispatch
+
+## Validation
+
+```bash
+go test ./server ./handlers ./client ./pkg/lease
+go build ./cmd/sig0lease ./cmd/sig0lease-client
+```
+
+For a complete behavior check, run the registration and tamper flows against a live proxy instance.
+
+## Protocol Notes
+
+This repository focuses on the UPDATE-LEASE + SIG(0) path defined by RFC 9664 / RFC 2931, with the proxy forwarding the resulting UPDATE to the authoritative server for the target zone. The code also supports standard DNS routing for packets that are not relevant to this flow.
+
+The current implementation depends on `codeberg.org/miekg/dns`, but several library edge cases required compatibility shims. See [IMPLEMENTATION_STATUS.md](IMPLEMENTATION_STATUS.md) for details.
+
+## Related Documentation
+
+- [IMPLEMENTATION_STATUS.md](IMPLEMENTATION_STATUS.md)

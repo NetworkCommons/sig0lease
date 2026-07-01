@@ -39,7 +39,7 @@ func (r *Router) RegisterHandler(h handlers.Handler) {
 //  1. Check if opcode has a registered handler
 //  2. If yes, call handler and check result status:
 //     - StatusProcessed: Return response to client
-//     - StatusNotRelevant: Apply default forward (fallback action)
+//     - StatusNotRelevant: Apply default upstream routing
 //     - StatusError: Return error response to client
 //  3. If no handler, apply default forward
 func (r *Router) Route(ctx context.Context, w dns.ResponseWriter, rMsg *dns.Msg) *dns.Msg {
@@ -78,7 +78,7 @@ func (r *Router) Route(ctx context.Context, w dns.ResponseWriter, rMsg *dns.Msg)
 
 	case handlers.StatusNotRelevant:
 		// Packet not relevant to this handler (e.g., UPDATE without UPDATE-LEASE EDNS option)
-		// Apply fallback action: forward to upstream
+		// Apply default upstream routing.
 		r.logger.Infof("Handler declined packet (not relevant), forwarding to upstream")
 		resp := r.forwardToUpstream(rMsg)
 		return resp

@@ -15,7 +15,7 @@ const (
 
 	// StatusNotRelevant indicates the handler determined this packet is not
 	// relevant to its protocol (e.g., UPDATE without UPDATE-LEASE EDNS option).
-	// The router should apply a fallback action (e.g., default forward).
+	// The router should apply its default upstream routing.
 	StatusNotRelevant
 
 	// StatusError indicates the handler encountered an error.
@@ -39,12 +39,12 @@ func (s HandlerStatus) String() string {
 
 // HandlerResult encapsulates a handler's response and status code.
 type HandlerResult struct {
-	// Status indicates whether the packet was processed or if router should take fallback action.
+	// Status indicates whether the packet was processed or if router should take default routing path.
 	Status HandlerStatus
 
 	// Message is the DNS response message.
 	// For StatusProcessed or StatusError, this is sent to the client.
-	// For StatusNotRelevant, this may be nil (router will use default action).
+	// For StatusNotRelevant, this may be nil (router will use default routing).
 	Message *dns.Msg
 
 	// Reason is a human-readable explanation of the status (useful for logging).

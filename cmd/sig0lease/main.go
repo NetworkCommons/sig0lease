@@ -9,6 +9,7 @@ import (
 	"github.com/NetworkCommons/sig0lease/config"
 	"github.com/NetworkCommons/sig0lease/handlers"
 	"github.com/NetworkCommons/sig0lease/logging"
+	_ "github.com/NetworkCommons/sig0lease/pkg/dnscompat"
 	"github.com/NetworkCommons/sig0lease/server"
 )
 
@@ -42,13 +43,6 @@ func main() {
 	opcodeMap := cfg.GetOpcodeMap()
 	for opcode, moduleName := range opcodeMap {
 		switch moduleName {
-		case "status_handler":
-			h := handlers.NewStatusHandler()
-			h.SetLogger(logger)
-			srv.RegisterHandler(h)
-			logger.Infof("Registered %s for opcode %d (%s)",
-				moduleName, opcode, dns.OpcodeToString[opcode])
-
 		case "update_handler":
 			h := handlers.NewUpdateHandler()
 			h.SetLogger(logger)

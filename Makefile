@@ -7,7 +7,7 @@ OS := $(shell uname -s | tr '[:upper:]' '[:lower:]')
 VERSION ?= 0.1.0
 BUILD_DIR := ./bin/$(OS)
 
-.PHONY: all build build-client build-all build-client-all clean test test-unit test-integration test-register test-full fmt vet lint run-server run-client deps docs release clean-binary
+.PHONY: all build build-client build-all build-client-all clean test test-unit test-integration test-register test-register-badsig test-full fmt vet lint run-server run-client deps docs release clean-binary
 
 all: build build-client test
 
@@ -61,9 +61,15 @@ ZONE ?= test.dev.zenr.io.
 KEYNAME ?= test.dev.zenr.io.
 LEASE ?= 300
 KEY_LEASE ?= 3600
+CLIENT_KEYSTORE_DIR ?=
 
 test-register: build build-client
-	./$(BUILD_DIR)/$(CLIENT_NAME) $(ADDR) register $(ZONE) $(KEYNAME) $(LEASE) $(KEY_LEASE)
+	KEYSTORE_DIR=$(CLIENT_KEYSTORE_DIR) ./$(BUILD_DIR)/$(CLIENT_NAME) $(ADDR) register $(ZONE) $(KEYNAME) $(LEASE) $(KEY_LEASE)
+
+# Run a registration with one post-signature payload bit flip to validate
+# proxy-side SIG(0) cryptographic verification rejects tampered payloads.
+test-register-badsig: build build-client
+	KEYSTORE_DIR=$(CLIENT_KEYSTORE_DIR) ./$(BUILD_DIR)/$(CLIENT_NAME) $(ADDR) register-tamper $(ZONE) $(KEYNAME) $(LEASE) $(KEY_LEASE)
 
 # Run the complete test matrix.
 test-full: fmt vet test-integration
@@ -97,7 +103,7 @@ run-server: build
 # Run client (requires proxy addr and command)
 # Usage: make run-client ADDR=127.0.0.1:8053 CMD="register test.dev.zenr.io. client.test.dev.zenr.io."
 run-client: build-client
-	./$(BUILD_DIR)/$(CLIENT_NAME) $(ADDR) $(CMD)
+	KEYSTORE_DIR=$(CLIENT_KEYSTORE_DIR) ./$(BUILD_DIR)/$(CLIENT_NAME) $(ADDR) $(CMD)
 
 # Install dependencies
 deps:

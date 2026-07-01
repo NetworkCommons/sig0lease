@@ -5,9 +5,9 @@
 # and forwards all other opcodes to upstream resolvers.
 #
 # Protocol-Specific Routing:
-# - UPDATE queries WITH UPDATE-LEASE EDNS option (RFC 9664) are handled by sig0lease handler
-# - UPDATE queries WITHOUT UPDATE-LEASE EDNS option are forwarded to default upstream resolver
-# - This allows the proxy to distinguish sig0lease registration requests from standard RFC 2136 updates
+# - UPDATE queries WITH UPDATE-LEASE EDNS option (RFC 9664) are handled by the update handler
+# - UPDATE queries WITHOUT UPDATE-LEASE EDNS option are forwarded to the default upstream resolver
+# - Other opcodes are routed according to the configured processing rules or forwarded upstream
 
 server:
   # Address to listen on (port 8053 by default - non-privileged)
@@ -46,11 +46,6 @@ handlers:
 
 # Processing rules map opcodes to module names
 processing_rules:
-  # Route opcode 2 (STATUS) to a status processor module
-  # Modules must be registered in cmd/sig0lease_proxy/main.go to handle this opcode
-  - opcode: 2
-    module: "status_handler"
-
   # Route opcode 5 (UPDATE) to an update handler module
   # UPDATE queries are used for dynamic DNS updates (RFC 2136)
   - opcode: 5

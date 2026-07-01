@@ -17,7 +17,6 @@ func main() {
 		fmt.Fprintf(os.Stderr, "Usage: %s <server> <command> [args...]\n", os.Args[0])
 		fmt.Fprintf(os.Stderr, "Commands:\n")
 		fmt.Fprintf(os.Stderr, "  query <name> [type]        - Send standard DNS query\n")
-		fmt.Fprintf(os.Stderr, "  status [server_name]       - Send STATUS query (opcode 2)\n")
 		fmt.Fprintf(os.Stderr, "  update <zone>              - Send UPDATE query (opcode 5)\n")
 		fmt.Fprintf(os.Stderr, "  opcode <name> <type> <op>  - Send query with custom opcode\n")
 		os.Exit(1)
@@ -48,19 +47,6 @@ func main() {
 		resp, err := c.Query(msg)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "Query error: %v\n", err)
-			os.Exit(1)
-		}
-		printResponse(resp)
-
-	case "status":
-		serverName := "."
-		if len(os.Args) > 3 {
-			serverName = os.Args[3]
-		}
-		msg := client.MakeStatusQuery(serverName)
-		resp, err := c.Query(msg)
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "STATUS query error: %v\n", err)
 			os.Exit(1)
 		}
 		printResponse(resp)

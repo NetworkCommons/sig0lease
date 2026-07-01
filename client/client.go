@@ -176,20 +176,6 @@ func MakeQuery(name string, qtype uint16, opcode uint8) *dns.Msg {
 	return m
 }
 
-// MakeStatusQuery creates a STATUS query (opcode 2).
-func MakeStatusQuery(serverName string) *dns.Msg {
-	if serverName == "" {
-		serverName = "."
-	}
-	// Create message with ANY type
-	m := dns.NewMsg(serverName, dns.TypeANY)
-	if m == nil {
-		return nil
-	}
-	m.Opcode = dns.OpcodeStatus
-	return m
-}
-
 // MakeUpdateQuery creates an UPDATE query (opcode 5).
 func MakeUpdateQuery(zone string, rr dns.RR) *dns.Msg {
 	// Create message with SOA type
