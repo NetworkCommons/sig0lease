@@ -11,8 +11,8 @@ import (
 	"time"
 
 	"codeberg.org/miekg/dns"
-	"github.com/NetworkCommons/sig0lease/client"
 	"github.com/NetworkCommons/sig0lease/pkg/keyrec"
+	"github.com/NetworkCommons/sig0lease/pkg/sig0"
 )
 
 // LeaseRecord represents an active lease for a client key.
@@ -241,6 +241,23 @@ func (u *DefaultUpstreamCoordinator) resolveAuthoritativeServer(ctx context.Cont
 	return "", fmt.Errorf("no authoritative zone with NS records found for %q", zone)
 }
 
+func (u *DefaultUpstreamCoordinator) resolveAuthoritativeZone(ctx context.Context, zone string) (string, error) {
+	zone = strings.TrimSuffix(zone, ".")
+	if zone == "" {
+		return "", fmt.Errorf("upstream zone is empty")
+	}
+
+	for candidate := zone; candidate != ""; candidate = parentZone(candidate) {
+		nsRecords, err := net.DefaultResolver.LookupNS(ctx, candidate)
+		if err != nil || len(nsRecords) == 0 {
+			continue
+		}
+		return candidate + ".", nil
+	}
+
+	return "", fmt.Errorf("no authoritative zone with NS records found for %q", zone)
+}
+
 func parentZone(zone string) string {
 	zone = strings.TrimSuffix(zone, ".")
 	if zone == "" {
@@ -432,8 +449,20 @@ func (h *UpdateHandler) Handle(ctx context.Context, w dns.ResponseWriter, r *dns
 
 	h.Debugf("Lease registered for %s (duration: %d seconds)", clientKeyName, leaseDuration)
 
-	// Construct UPDATE message for upstream zone
-	upstreamUpdate, err := h.constructUpstreamUpdate(clientKeyName, clientKeyRR, h.upstreamZone)
+	effectiveUpstreamZone := h.upstreamZone
+	if dc, ok := h.upstreamCoordinator.(*DefaultUpstreamCoordinator); ok {
+		resolvedZone, err := dc.resolveAuthoritativeZone(ctx, h.upstreamZone)
+		if err != nil {
+			h.Debugf("Failed to resolve effective upstream zone from %s: %v", h.upstreamZone, err)
+			msg := h.makeErrorResponse(r, dns.RcodeServerFailure, fmt.Sprintf("upstream zone resolution failed: %v", err))
+			return NewErrorResult(msg, fmt.Sprintf("upstream zone resolution failed: %v", err), err)
+		}
+		effectiveUpstreamZone = resolvedZone
+		h.Debugf("Resolved effective upstream zone: configured=%s effective=%s", h.upstreamZone, effectiveUpstreamZone)
+	}
+
+	// Construct UPDATE message for effective upstream zone
+	upstreamUpdate, err := h.constructUpstreamUpdate(clientKeyName, clientKeyRR, effectiveUpstreamZone)
 	if err != nil {
 		h.Debugf("Failed to construct upstream UPDATE: %v", err)
 		msg := h.makeErrorResponse(r, dns.RcodeServerFailure, fmt.Sprintf("upstream construction failed: %v", err))
@@ -447,8 +476,8 @@ func (h *UpdateHandler) Handle(ctx context.Context, w dns.ResponseWriter, r *dns
 		return NewErrorResult(msg, "upstream coordinator not configured", fmt.Errorf("upstream coordinator is nil"))
 	}
 
-	h.Debugf("Sending UPDATE to upstream zone=%s, key=%s", h.upstreamZone, clientKeyName)
-	upstreamResp, err := h.upstreamCoordinator.SendUpdate(ctx, h.upstreamZone, upstreamUpdate)
+	h.Debugf("Sending UPDATE to upstream zone=%s (configured=%s), key=%s", effectiveUpstreamZone, h.upstreamZone, clientKeyName)
+	upstreamResp, err := h.upstreamCoordinator.SendUpdate(ctx, effectiveUpstreamZone, upstreamUpdate)
 	if err != nil {
 		h.Debugf("Upstream UPDATE transport/processing error for zone=%s key=%s: %v", h.upstreamZone, clientKeyName, err)
 		_ = h.leaseManager.Delete(clientKeyName)
@@ -679,18 +708,12 @@ func (h *UpdateHandler) constructUpstreamUpdate(clientKeyName string, clientKeyR
 	// Phase 1: Sign upstream UPDATE with upstream key if available
 	// Provenance: Inspired by sig0namectl's SignUpdate() in update.go
 	if h.upstreamKeyRecord != nil && h.upstreamKeyRecord.PrivateKey != nil {
-		// Use the client's proven Sig0Signer implementation
-		signer, err := client.NewSig0Signer(h.upstreamKeyRecord.PublicKey, h.upstreamKeyRecord.PrivateKey)
+		signedMsg, err := sig0.SignMessage(msg, h.upstreamKeyRecord.PublicKey, h.upstreamKeyRecord.PrivateKey)
 		if err != nil {
-			h.Debugf("WARNING: Failed to create SIG(0) signer: %v (sending unsigned)", err)
+			h.Debugf("WARNING: Failed to sign upstream UPDATE with SIG(0): %v (sending unsigned)", err)
 		} else {
-			signedMsg, err := signer.SignMessage(msg)
-			if err != nil {
-				h.Debugf("WARNING: Failed to sign upstream UPDATE with SIG(0): %v (sending unsigned)", err)
-			} else {
-				msg = signedMsg // Use the signed message
-				h.Debugf("Signed upstream UPDATE with key: %s", h.upstreamKeyRecord)
-			}
+			msg = signedMsg // Use the signed message
+			h.Debugf("Signed upstream UPDATE with key: %s", h.upstreamKeyRecord)
 		}
 	}
 

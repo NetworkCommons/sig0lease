@@ -320,57 +320,63 @@ func (s *Signer) SignUpdate() (*dns.Msg, error) {
 
 	log.Println("-- Signing DNS UPDATE message with SIG(0) --")
 
-	// Create SIG record for SIG(0) signing
-	// Provenance: dns.SIG0Sign() requires a properly initialized SIG with:
-	// - SignerName, KeyTag, Algorithm, Inception, Expiration
+	msg, err := SignMessage(s.update, s.keyRR, s.private)
+	if err != nil {
+		return nil, fmt.Errorf("failed to sign update with SIG(0): %w", err)
+	}
+
+	log.Println("-- SIG(0) signing successful --")
+
+	m := msg
+	s.update = nil
+	return m, nil
+}
+
+// SignMessage signs any DNS message with SIG(0) using shared logic for both client and server paths.
+func SignMessage(msg *dns.Msg, keyRR *dns.KEY, privateKey crypto.PrivateKey) (*dns.Msg, error) {
+	if msg == nil {
+		return nil, fmt.Errorf("message cannot be nil")
+	}
+	if keyRR == nil {
+		return nil, fmt.Errorf("KEY RR cannot be nil")
+	}
+	if privateKey == nil {
+		return nil, fmt.Errorf("private key cannot be nil")
+	}
+
+	cryptoSigner, ok := privateKey.(crypto.Signer)
+	if !ok {
+		return nil, fmt.Errorf("private key does not implement crypto.Signer interface")
+	}
+
 	now := uint32(time.Now().Unix())
 	sigRR := new(dns.SIG)
 	sigRR.Hdr.Name = "."
 	sigRR.Hdr.Class = dns.ClassANY
 	sigRR.Hdr.TTL = 0
-	sigRR.Algorithm = s.keyRR.Algorithm
-	sigRR.Inception = now - 300  // 5 minutes before now (clock skew tolerance)
-	sigRR.Expiration = now + 300 // 5 minutes after now (signature validity)
-	sigRR.KeyTag = s.keyRR.KeyTag()
-	sigRR.SignerName = s.keyRR.Hdr.Name
+	sigRR.Algorithm = keyRR.Algorithm
+	sigRR.Inception = now - 300
+	sigRR.Expiration = now + 300
+	sigRR.KeyTag = keyRR.KeyTag()
+	sigRR.SignerName = keyRR.Hdr.Name
 
-	log.Printf("-- SIG(0) with Algorithm=%d, KeyTag=%d, Signer=%s",
-		sigRR.Algorithm, sigRR.KeyTag, sigRR.SignerName)
-
-	// Add the SIG record to the Pseudo section (not Extra!)
-	// dns.SIG0Sign expects the SIG record to be in m.Pseudo section
-	// The Pseudo section is for OPT and TSIG/SIG(0) records
-	s.update.Pseudo = append(s.update.Pseudo, sigRR)
-
-	// Create CryptoSIG0 signer for dns.SIG0Sign()
-	// Provenance: codeberg/miekg/dns pattern for SIG(0) implementation
-	cryptoSigner, ok := s.private.(crypto.Signer)
-	if !ok {
-		return nil, fmt.Errorf("private key does not implement crypto.Signer interface")
-	}
+	msg.Pseudo = append(msg.Pseudo, sigRR)
 
 	baseSigner := dns.CryptoSIG0{
 		CryptoSigner: cryptoSigner,
-		PublicKey:    s.keyRR,
+		PublicKey:    keyRR,
 	}
 	wrappedSigner := sig0SignerImpl{
 		base:      baseSigner,
-		algorithm: s.keyRR.Algorithm, // Pass algorithm for ED25519 support
+		algorithm: keyRR.Algorithm,
 	}
 
-	// Sign the message using SIG0Sign from codeberg/miekg/dns
-	// This fills in the signature on the SIG record we added to Pseudo above
-	options := dns.SIG0Option{} // Empty options struct for SIG0Sign
-	err := dns.SIG0Sign(s.update, wrappedSigner, &options)
-	if err != nil {
-		return nil, fmt.Errorf("failed to sign UPDATE with SIG(0): %w", err)
+	options := dns.SIG0Option{}
+	if err := dns.SIG0Sign(msg, wrappedSigner, &options); err != nil {
+		return nil, err
 	}
 
-	log.Println("-- SIG(0) signing successful --")
-
-	m := s.update
-	s.update = nil
-	return m, nil
+	return msg, nil
 }
 
 // VerifySignature verifies a SIG(0) signature on a message.
