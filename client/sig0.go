@@ -42,7 +42,7 @@ func (s *Sig0Signer) SignMessage(msg *dns.Msg) (*dns.Msg, error) {
 	return sharedsig0.SignMessage(msg, s.PublicKey, s.PrivateKey)
 }
 
-// MakeRegistrationRequest creates a Phase 1 registration request with 8-byte lease EDNS option.
+// MakeRegistrationRequest creates a registration request with 8-byte lease EDNS option.
 // This sends a KEY RR to be registered under the downstream zone.
 // Provenance: RFC 9664 Section 3 (Lease Option Format)
 func MakeRegistrationRequest(downstreamZone string, keyRR *dns.KEY, leaseDuration uint32) (*dns.Msg, error) {
@@ -98,7 +98,7 @@ func MakeRegistrationRequest(downstreamZone string, keyRR *dns.KEY, leaseDuratio
 	return msg, nil
 }
 
-// MakeRefreshRequest creates a Phase 2 refresh request to extend an existing lease.
+// MakeRefreshRequest creates a refresh request to extend an existing lease.
 // Provenance: RFC 9664 Section 3 - Refresh variant uses same EDNS structure
 func MakeRefreshRequest(downstreamZone string, keyName string, newLeaseDuration uint32) (*dns.Msg, error) {
 	if downstreamZone == "" {

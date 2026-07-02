@@ -39,7 +39,7 @@ func main() {
 	}
 
 	// Register processing module handlers based on configuration
-	// Phase 3 setup: Prepare handler configuration with upstream resolver for SIG(0) signing
+	// Prepare handler configuration with upstream resolver for SIG(0) signing
 	opcodeMap := cfg.GetOpcodeMap()
 	for opcode, moduleName := range opcodeMap {
 		switch moduleName {
@@ -54,7 +54,7 @@ func main() {
 				if err := h.Setup(handlerCfg); err != nil {
 					logger.Warnf("Failed to setup %s: %v", moduleName, err)
 				} else {
-					logger.Infof("Phase 3: Upstream coordination configured for %s", moduleName)
+					logger.Infof("Upstream coordination configured for %s", moduleName)
 				}
 			}
 

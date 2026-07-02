@@ -79,14 +79,25 @@ The following project-side patches are currently in place:
 
 1. The proxy still forwards non-registration UPDATE traffic to the authoritative path rather than implementing a full SRP policy engine.
 2. The config and handler model are still oriented around the current registration flow; more protocol-specific workflows will need clearer abstractions if they are added later.
-3. Some comments and terminology still mention “fallback” in older places and should be normalized to the stricter behavior model.
+
+## Current Limitations (Phase 1)
+
+1. `KEY-LEASE` is not used for policy decisions in the registration flow.
+The client currently sends an 8-byte lease option with `KEY-LEASE` set to `0`, and the handler logic effectively enforces behavior from `LEASE` only. This limits lifetime-policy expressiveness where key lifetime and lease lifetime should be controlled separately.
+
+2. The handler processes a single client `KEY` RR per request.
+In the current flow, the update handler extracts the first `KEY` RR and proceeds. Multi-key updates in one transaction are not implemented as a first-class feature.
+
+3. Upstream forwarding reuses the client `KEY` RR without rewrite.
+The forwarded UPDATE uses the client-provided `KEY` RR as-is. This phase does not yet apply rewrite policy (for example, owner-name mapping or TTL normalization) before sending to the authoritative server.
 
 ## Next Steps
 
 1. Add focused tests for the UPDATE-LEASE decode shape so the `ERFC3597` compatibility path is locked in.
-2. Add a regression test for the live registration flow that asserts the proxy responds with `NOERROR` on a valid signed request.
-3. Add a regression test for tampered registration that asserts `REFUSED` or the expected signature-failure response.
-4. Audit remaining comments and debug logs for old “fallback” terminology.
+2. Implement explicit `KEY-LEASE` handling semantics in the handler (validation, storage, and refresh policy), then add integration coverage.
+3. Support the registration of more RR types with a registered key, and check that the lease expiry is different for keys and other records.
+3. Decide and document behavior for requests containing multiple `KEY` RRs (reject with clear rcode vs explicit batch support).
+4. Define upstream rewrite policy for `KEY` RR forwarding (owner-name mapping and TTL policy) and enforce it in the handler.
 
 ## Verification Status
 

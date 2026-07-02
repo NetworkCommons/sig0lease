@@ -24,7 +24,7 @@ TMP_CONFIG_FILE=""
 AUTH_SERVER="${AUTH_SERVER:-ns1.free2air.org}"
 MIN_LEASE_SECONDS=30
 
-# Get keystore from environment or config file
+# Get keystore from environment
 TEST_KEYSTORE="${KEYSTORE_DIR:-}"
 if [ -z "$TEST_KEYSTORE" ]; then
     echo "ERROR: KEYSTORE_DIR environment variable not set"

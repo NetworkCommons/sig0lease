@@ -25,7 +25,7 @@ func getKeystoreDir(t *testing.T) string {
 		}
 	}
 
-	// No fallback - keystore path must be configured
+	// Keystore path must be configured
 	t.Fatalf("KEYSTORE_DIR environment variable or config.yaml keystore_dir must be defined")
 	return ""
 }

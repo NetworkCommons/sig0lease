@@ -1,1 +1,3 @@
 bin
+keystore/client
+keystore/server

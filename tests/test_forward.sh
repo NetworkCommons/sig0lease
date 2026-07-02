@@ -28,6 +28,9 @@ if [ ! -f "../bin/${my_os}/sig0lease" ]; then
     go build -o "../bin/${my_os}/sig0lease" ../cmd/sig0lease
 fi
 
+echo "Building client binaries..."
+go build -o "../bin/${my_os}/sig0lease-client" ../cmd/sig0lease-client
+
 # Start proxy in background
 cd .. > /dev/null 
 ./bin/${my_os}/sig0lease ./config.yaml &

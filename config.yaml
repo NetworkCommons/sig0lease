@@ -31,7 +31,7 @@ upstreams:
     protocol: "udp"
     timeout: "5s"
 
-# Phase 1 Handler Configuration for SIG(0) Registration Requests
+# Handler Configuration for SIG(0) Registration Requests
 # Proxy acts as intermediary between downstream client and upstream authoritative server
 handlers:
   update:
@@ -41,8 +41,7 @@ handlers:
 
     # Keystore directory containing DNSSEC keys in sig0namectl format
     # Keys must be named: Kzone.+015+keytag.key and Kzone.+015+keytag.private
-    # Points to the shared sig0namectl keystore at workspace root level
-    keystore_dir: "../sig0namectl/keystore"
+    keystore_dir: "./keystore/server"
 
 # Processing rules map opcodes to module names
 processing_rules:
