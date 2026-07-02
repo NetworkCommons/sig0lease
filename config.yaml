@@ -20,7 +20,7 @@ server:
     - tcp
 
 upstreams:
-  # Generic upstream resolvers used for non-processed opcodes and fallback forwarding.
+  # Generic upstream resolvers used for non-processed opcodes.
   # UPDATE handler primarily resolves authoritative server from handlers.update.upstream_zone.
   - address: "8.8.8.8:53"
     protocol: "udp"

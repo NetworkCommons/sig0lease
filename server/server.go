@@ -65,7 +65,7 @@ func (s *Server) RegisterHandler(h handlers.Handler) {
 }
 
 // GetResolver returns the upstream resolver for handlers to use.
-// Used for Phase 3 upstream coordination.
+// Used for upstream coordination.
 func (s *Server) GetResolver() *forward.Resolver {
 	return s.resolver
 }

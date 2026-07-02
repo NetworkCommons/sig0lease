@@ -364,12 +364,12 @@ func (u *DefaultUpstreamCoordinator) SendUpdate(ctx context.Context, upstreamZon
 
 // UpdateHandler handles DNS opcode 5 (UPDATE queries).
 //
-// This is a Phase 1 implementation supporting:
+// This implementation supports the following features:
 //   - Basic key registration with 8-byte lease EDNS(0) option (RFC 9664)
 //   - SIG(0) client authentication (RFC 2931)
 //   - Upstream UPDATE coordination
 //   - In-memory lease tracking with configurable persistence hooks
-//   - Future SRP support (Phase 2+)
+//   - Future SRP support
 type UpdateHandler struct {
 	BaseHandler
 	upstreamZone        string            // Upstream authoritative zone (e.g., "dev.zenr.io.")
@@ -523,7 +523,7 @@ func (h *UpdateHandler) processExpiredLease(ctx context.Context, keyName string)
 //   - Must contain EDNS(0) OPT RR with OPTION_CODE 2 (UPDATE-LEASE)
 //   - If UPDATE-LEASE is absent, packet is not sig0lease relevant → StatusNotRelevant
 //
-// Phase 1 Registration Flow (if UPDATE-LEASE present):
+// Registration Flow (if UPDATE-LEASE present):
 //  1. Validate message structure (single question for downstream zone)
 //  2. Parse 8-byte lease EDNS(0) option (RFC 9664)
 //  3. Extract and validate client SIG(0) signature (RFC 2931)
@@ -536,11 +536,11 @@ func (h *UpdateHandler) processExpiredLease(ctx context.Context, keyName string)
 //
 // The DNS UPDATE message format:
 //   - Question section: Downstream zone name and class (typically ClassINET)
-//   - Answer section: Prerequisite records (unused in Phase 1)
+//   - Answer section: Prerequisite records (unused in this implementation)
 //   - Authority section: Update records (typically KEY RRs being registered)
 //   - Additional section: EDNS options (including 8-byte Update Lease and SIG(0))
 func (h *UpdateHandler) Handle(ctx context.Context, w dns.ResponseWriter, r *dns.Msg) *HandlerResult {
-	h.Debugf("Phase 1 UPDATE handler: Processing message from %s", w.RemoteAddr().String())
+	h.Debugf("UPDATE handler: Processing message from %s", w.RemoteAddr().String())
 
 	// Validate message structure
 	if r == nil {
@@ -842,7 +842,7 @@ func (h *UpdateHandler) parseLease(msg *dns.Msg) (uint32, bool, error) {
 		}
 	}
 
-	// No lease option found - Phase 1 requires it
+	// No lease option found
 	return 0, false, fmt.Errorf("no Update Lease EDNS option found")
 }
 
@@ -952,7 +952,7 @@ func (h *UpdateHandler) constructUpstreamUpdate(clientKeyName string, clientKeyR
 	msg.Ns = nil
 
 	// Update section: Add the client's KEY RR to upstream zone
-	// For Phase 1, we just use the original KEY RR from the client
+	// We just use the original KEY RR from the client
 	// In future phases, we may need to modify it (e.g., adjust TTL or name)
 	msg.Ns = append(msg.Ns, clientKeyRR)
 
@@ -985,7 +985,7 @@ func (h *UpdateHandler) makeErrorResponse(req *dns.Msg, rcode uint16, msg string
 	resp.Response = true
 	resp.Rcode = rcode
 
-	// Note: In Phase 1, we don't include detailed error messages in the response.
+	// Note: we don't include detailed error messages in the response.
 	// Errors are logged locally but responses use standard DNS rcodes.
 	// In future versions, we can add extended error EDNS options.
 
@@ -996,7 +996,6 @@ func (h *UpdateHandler) makeErrorResponse(req *dns.Msg, rcode uint16, msg string
 //
 // Configuration options:
 //   - "upstream_zone": Authoritative zone (e.g., "dev.zenr.io.") [REQUIRED]
-//   - "downstream_key": Path to downstream private key file [OPTIONAL, Phase 1 doesn't sign responses]
 //   - "upstream_key": Path to upstream private key file [OPTIONAL, needed for upstream UPDATE signing]
 //   - "upstream_coordinator": Custom UpstreamCoordinator implementation [OPTIONAL]
 //   - "lease_manager": Custom LeaseManager implementation [OPTIONAL, defaults to InMemoryLeaseManager]

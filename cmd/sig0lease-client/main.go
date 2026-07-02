@@ -88,7 +88,6 @@ func main() {
 
 func keystore_available() {
 	// Client keystore must be explicitly provided.
-	// Never fallback to server config to avoid accidental key sharing.
 	keystoreDir = os.Getenv("KEYSTORE_DIR")
 	if keystoreDir == "" {
 		fmt.Fprintf(os.Stderr, "ERROR: KEYSTORE_DIR is required for sig0lease-client\n")
