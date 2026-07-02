@@ -1,14 +1,13 @@
 #!/bin/bash
 #
-# Comprehensive Integration Test for sig0lease Proxy
+# Comprehensive Update Test for sig0lease Proxy
 #
-# This suite intentionally runs real process-level integration tests only:
+# This suite runs real process-level update tests only:
 # - real proxy binary
 # - real client binary
 # - real DNS keys from keystore
 # - real authoritative path for zenr.io (via proxy update forwarding)
 #
-# Usage: tests/test_integration.sh [start|stop|clean]
 #
 
 set -euo pipefail
@@ -321,7 +320,7 @@ start_proxy() {
         log_error "Proxy failed to start. Check logs:"
         cat "$LOG_FILE"
         if grep -q "address already in use" "$LOG_FILE"; then
-            log_error "Port $PROXY_PORT is already in use. Re-run with a free port: PROXY_PORT=18053 tests/test_integration.sh run"
+            log_error "Port $PROXY_PORT is already in use. Re-run with a free port: PROXY_PORT=18053 tests/test_update.sh run"
         fi
         exit 1
     fi

@@ -48,10 +48,10 @@ test-unit: fmt vet
 	go test ./pkg/sig0 -v
 	go test . -run "TestLease" -v
 
-# Run full end-to-end integration workflow via test script.
+# Run full end-to-end update workflow via test script.
 # Requires KEYSTORE_DIR or handlers.update.keystore_dir in config.yaml.
-test-integration: build build-client
-	./tests/test_integration.sh run
+test-update: build build-client
+	./tests/test_update.sh run
 
 # Run a single end-to-end registration using the built client binary.
 # Override variables as needed, e.g.:

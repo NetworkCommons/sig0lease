@@ -3,13 +3,20 @@
 # DNS Proxy Test Script
 # Start proxy, run tests, then shut down
 
+set -euo pipefail
+
+RED='\033[0;31m'
+NC='\033[0m' # No Color
+
 cd "$(dirname "$0")/." || exit 1
 
 PROXY_HOST="${1:-127.0.0.1}"
 PROXY_PORT="${2:-8053}"
+DOWNSTREAM_ZONE="test.dev.zenr.io."
+CLIENT_KEY_NAME="test.dev.zenr.io."
 
 echo "======================================"
-echo "DNS Proxy Testing Commands"
+echo "DNS Proxy forward functionality test"
 echo "======================================"
 echo ""
 
@@ -18,29 +25,42 @@ my_os=$(uname -s | tr '[:upper:]' '[:lower:]')
 # Build the binaries if they don't exist
 if [ ! -f "../bin/${my_os}/sig0lease" ]; then
     echo "Building proxy binaries..."
-    go build -o "../bin/${my_os}/sig0lease" ./cmd/sig0lease
-fi
-
-# Build the binaries if they don't exist
-if [ ! -f "../bin/${my_os}/dnsclient" ]; then
-    echo "Building client binary..."
-    go build -o "../bin/${my_os}/dnsclient" ./cmd/dnsclient
+    go build -o "../bin/${my_os}/sig0lease" ../cmd/sig0lease
 fi
 
 # Start proxy in background
-../bin/${my_os}/sig0lease ../config.yaml &
+cd .. > /dev/null 
+./bin/${my_os}/sig0lease ./config.yaml &
 PROXY_PID=$!
+cd - > /dev/null 
 sleep 2
 
-# Verify port is listening
-if [ "${my_os}" = "darwin" ]; then
-    netcmd="lsof -i:${PROXY_PORT} -sTCP:LISTEN"
-else
-    netcmd="ss -tuln -p 2>/dev/null | grep \":${PROXY_PORT}\""
+# Verify proxy process is still alive (bind/listener failures should terminate it).
+if ! kill -0 "$PROXY_PID" 2>/dev/null; then
+    echo -e "${RED}ERROR: Proxy failed to start (process exited).${NC}"
+    exit 1
 fi
-if ! $netcmd > /dev/null; then
-    echo "ERROR: Port ${PROXY_PORT} is not listening"
-    kill $PROXY_PID 2>/dev/null || true
+
+# Verify our proxy PID owns at least one listener on the target port.
+is_listening=true
+if [ "${my_os}" = "darwin" ]
+then
+    if ! lsof -nP -a -p "$PROXY_PID" -iTCP:"${PROXY_PORT}" -sTCP:LISTEN >/dev/null 2>&1 && \
+       ! lsof -nP -a -p "$PROXY_PID" -iUDP:"${PROXY_PORT}" >/dev/null 2>&1
+    then
+        is_listening=false
+    fi
+else
+    if ! ss -tulnp 2>/dev/null | grep -E ":${PROXY_PORT}\\b" | grep -q "pid=${PROXY_PID},"
+    then
+        is_listening=false
+    fi
+fi
+
+if [ "${is_listening}" = false ]
+then
+    echo -e "${RED}ERROR: Proxy PID $PROXY_PID is not listening on port ${PROXY_PORT}${NC}"
+    kill "$PROXY_PID" 2>/dev/null || true
     exit 1
 fi
 
@@ -82,13 +102,8 @@ echo "Test 7: Query using TCP"
 dig @${PROXY_HOST} -p ${PROXY_PORT} tcp google.com A +short 2>/dev/null | head -3
 echo ""
 
-# Test 8: Opcode 5 (UPDATE) query
-echo "Test 8: UPDATE query verification (opcode 5)"
-../bin/${my_os}/dnsclient ${PROXY_HOST}:${PROXY_PORT} update type5.test. 2>&1 || echo "(UPDATE query test completed)"
-echo ""
-
-# Test 9: Verify ID preservation in error responses
-echo "Test 9: Error response preserves transaction ID"
+# Test 8: Verify ID preservation in error responses
+echo "Test 8: Error response preserves transaction ID"
 # Query a non-existent domain to verify error responses have correct IDs
 dig @${PROXY_HOST} -p ${PROXY_PORT} nonexistent-domain-12345.example. A +short 2>&1 | grep -E "(no servers|timeout)" || echo "ID preservation working correctly (error received)"
 echo ""
@@ -97,5 +112,5 @@ echo ""
 kill $PROXY_PID 2>/dev/null || true
 
 echo "======================================"
-echo "Testing Complete!"
+echo "Testing forward functionality Complete!"
 echo "======================================"

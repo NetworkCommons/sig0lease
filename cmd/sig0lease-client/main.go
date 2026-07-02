@@ -53,17 +53,6 @@ var (
 	keystoreDir     = ""
 )
 
-func init() {
-	// Client keystore must be explicitly provided.
-	// Never fallback to server config to avoid accidental key sharing.
-	keystoreDir = os.Getenv("KEYSTORE_DIR")
-	if keystoreDir == "" {
-		fmt.Fprintf(os.Stderr, "ERROR: KEYSTORE_DIR is required for sig0lease-client\n")
-		fmt.Fprintf(os.Stderr, "The client keystore must be set explicitly and must not reuse proxy config fallback.\n")
-		os.Exit(1)
-	}
-}
-
 func main() {
 	if len(os.Args) < 3 {
 		printUsage()
@@ -75,20 +64,35 @@ func main() {
 
 	switch command {
 	case "register":
+		keystore_available()
 		cmdRegister(proxyAddr, os.Args[3:])
 	case "refresh":
+		keystore_available()
 		cmdRefresh(proxyAddr, os.Args[3:])
 	case "register-tamper":
+		keystore_available()
 		cmdRegisterTamper(proxyAddr, os.Args[3:])
 	case "verify":
 		cmdVerify(proxyAddr, os.Args[3:])
 	case "list-keys":
+		keystore_available()
 		cmdListKeys(os.Args[3:])
 	case "help":
 		printUsage()
 	default:
 		fmt.Fprintf(os.Stderr, "Unknown command: %s\n", command)
 		printUsage()
+		os.Exit(1)
+	}
+}
+
+func keystore_available() {
+	// Client keystore must be explicitly provided.
+	// Never fallback to server config to avoid accidental key sharing.
+	keystoreDir = os.Getenv("KEYSTORE_DIR")
+	if keystoreDir == "" {
+		fmt.Fprintf(os.Stderr, "ERROR: KEYSTORE_DIR is required for sig0lease-client\n")
+		fmt.Fprintf(os.Stderr, "The client keystore must be set explicitly.\n")
 		os.Exit(1)
 	}
 }
