@@ -21,22 +21,59 @@ build-client:
 
 # Cross-compile server for multiple platforms
 build-all:
-	GOOS=linux GOARCH=amd64 go build -o $(BUILD_DIR)/$(BINARY_NAME)-linux-amd64 ./cmd/sig0lease
-	GOOS=darwin GOARCH=amd64 go build -o $(BUILD_DIR)/$(BINARY_NAME)-darwin-amd64 ./cmd/sig0lease
-	GOOS=darwin GOARCH=arm64 go build -o $(BUILD_DIR)/$(BINARY_NAME)-darwin-arm64 ./cmd/sig0lease
-	GOOS=windows GOARCH=amd64 go build -o $(BUILD_DIR)/$(BINARY_NAME).exe ./cmd/sig0lease
+	GOOS=linux GOARCH=amd64 go build -o ./bin/linux/$(BINARY_NAME)-linux-amd64 ./cmd/sig0lease
+	GOOS=darwin GOARCH=amd64 go build -o ./bin/darwin/$(BINARY_NAME)-darwin-amd64 ./cmd/sig0lease
+	GOOS=darwin GOARCH=arm64 go build -o ./bin/darwin/$(BINARY_NAME)-darwin-arm64 ./cmd/sig0lease
+	GOOS=windows GOARCH=amd64 go build -o ./bin/windows/$(BINARY_NAME).exe ./cmd/sig0lease
 
 # Cross-compile client for multiple platforms
 build-client-all:
-	GOOS=linux GOARCH=amd64 go build -o $(BUILD_DIR)/$(CLIENT_NAME)-linux-amd64 ./cmd/sig0lease-client
-	GOOS=darwin GOARCH=amd64 go build -o $(BUILD_DIR)/$(CLIENT_NAME)-darwin-amd64 ./cmd/sig0lease-client
-	GOOS=darwin GOARCH=arm64 go build -o $(BUILD_DIR)/$(CLIENT_NAME)-darwin-arm64 ./cmd/sig0lease-client
-	GOOS=windows GOARCH=amd64 go build -o $(BUILD_DIR)/$(CLIENT_NAME).exe ./cmd/sig0lease-client
+	GOOS=linux GOARCH=amd64 go build -o ./bin/linux/$(CLIENT_NAME)-linux-amd64 ./cmd/sig0lease-client
+	GOOS=darwin GOARCH=amd64 go build -o ./bin/darwin/$(CLIENT_NAME)-darwin-amd64 ./cmd/sig0lease-client
+	GOOS=darwin GOARCH=arm64 go build -o ./bin/darwin/$(CLIENT_NAME)-darwin-arm64 ./cmd/sig0lease-client
+	GOOS=windows GOARCH=amd64 go build -o ./bin/windows/$(CLIENT_NAME).exe ./cmd/sig0lease-client
+
+# Create release archive
+release: build-all build-client-all
+	tar -czf $(BINARY_NAME)-$(VERSION).tar.gz -C ./bin/ .
 
 # Clean build artifacts
 clean:
 	rm -rf $(BUILD_DIR)
 	go clean ./...
+
+# Clean only binaries, keep cache
+clean-binary:
+	rm -f $(BUILD_DIR)/$(BINARY_NAME)*
+	rm -f $(BUILD_DIR)/$(CLIENT_NAME)*
+
+# Clean all build artifacts
+clean-all:
+	rm -rf ./bin/*
+	rm -f $(BINARY_NAME)-*.tar.gz
+	go clean ./...
+
+# Install dependencies
+deps:
+	go mod tidy
+	go mod download
+
+# Generate documentation
+docs:
+	mkdir -p docs
+	go doc -all ./... > docs/packages.md 2>/dev/null || true
+
+# Format code
+fmt:
+	go fmt ./...
+
+# Verify code without building
+vet:
+	go vet ./...
+
+# Lint code (requires golangci-lint)
+lint:
+	golangci-lint run ./...
 
 # Run fast unit tests that do not require live integration environment.
 test: fmt vet
@@ -84,18 +121,6 @@ test-cover:
 	go test ./... -coverprofile=coverage.out
 	go tool cover -func=coverage.out
 
-# Format code
-fmt:
-	go fmt ./...
-
-# Verify code without building
-vet:
-	go vet ./...
-
-# Lint code (requires golangci-lint)
-lint:
-	golangci-lint run ./...
-
 # Build and run the proxy with example config
 run-server: build
 	./$(BUILD_DIR)/$(BINARY_NAME) ./config.yaml
@@ -105,21 +130,3 @@ run-server: build
 run-client: build-client
 	KEYSTORE_DIR=$(CLIENT_KEYSTORE_DIR) ./$(BUILD_DIR)/$(CLIENT_NAME) $(ADDR) $(CMD)
 
-# Install dependencies
-deps:
-	go mod tidy
-	go mod download
-
-# Generate documentation
-docs:
-	mkdir -p docs
-	go doc -all ./... > docs/packages.md 2>/dev/null || true
-
-# Create release archive
-release: build-all build-client-all
-	tar -czf $(BINARY_NAME)-$(VERSION)-$(OS).tar.gz -C $(BUILD_DIR) .
-
-# Clean only binaries, keep cache
-clean-binary:
-	rm -f $(BUILD_DIR)/$(BINARY_NAME)*
-	rm -f $(BUILD_DIR)/$(CLIENT_NAME)*
