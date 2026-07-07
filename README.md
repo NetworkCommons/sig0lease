@@ -43,7 +43,7 @@ make run-client ADDR=127.0.0.1:8053 CMD="register test.dev.zenr.io. test.dev.zen
 The client requires an explicit keystore directory:
 
 ```bash
-KEYSTORE_DIR=/path/to/keystore ./bin/darwin/sig0lease-client 127.0.0.1:8053 register test.dev.zenr.io. test.dev.zenr.io.
+CLIENT_KEYSTORE_DIR=/path/to/keystore ./bin/darwin/sig0lease-client 127.0.0.1:8053 register test.dev.zenr.io. test.dev.zenr.io.
 ```
 
 Useful end-to-end commands:

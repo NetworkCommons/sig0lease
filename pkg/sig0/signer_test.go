@@ -6,7 +6,6 @@ import (
 	"time"
 
 	"codeberg.org/miekg/dns"
-	"github.com/NetworkCommons/sig0lease/config"
 	"github.com/NetworkCommons/sig0lease/pkg/keyrec"
 )
 
@@ -14,19 +13,12 @@ import (
 // Returns error if not defined - keystore path must be explicitly configured.
 func getKeystoreDir(t *testing.T) string {
 	// Priority 1: Environment variable
-	if dir := os.Getenv("KEYSTORE_DIR"); dir != "" {
+	if dir := os.Getenv("CLIENT_KEYSTORE_DIR"); dir != "" {
 		return dir
 	}
 
-	// Priority 2: Config file
-	if cfg, err := config.LoadConfig("config.yaml"); err == nil {
-		if dir := cfg.GetKeystoreDir(); dir != "" {
-			return dir
-		}
-	}
-
 	// Keystore path must be configured
-	t.Fatalf("KEYSTORE_DIR environment variable or config.yaml keystore_dir must be defined")
+	t.Fatalf("CLIENT_KEYSTORE_DIR environment variable")
 	return ""
 }
 

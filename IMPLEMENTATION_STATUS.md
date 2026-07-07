@@ -29,7 +29,7 @@ The proxy avoids parser recovery paths that would hide malformed messages. If th
 
 ### 4. Explicit key boundaries
 
-The client keystore and the proxy keystore are separate concerns. The client must provide `KEYSTORE_DIR` explicitly, and the proxy uses its configured handler keystore path. This prevents accidental trust boundary collapse.
+The client keystore and the proxy keystore are separate concerns. The client must provide `CLIENT_KEYSTORE_DIR` explicitly, and the proxy uses its configured handler keystore path. This prevents accidental trust boundary collapse.
 
 ### 5. Authoritative routing via the effective zone
 
@@ -90,6 +90,56 @@ In the current flow, the update handler extracts the first `KEY` RR and proceeds
 
 3. Upstream forwarding reuses the client `KEY` RR without rewrite.
 The forwarded UPDATE uses the client-provided `KEY` RR as-is. This phase does not yet apply rewrite policy (for example, owner-name mapping or TTL normalization) before sending to the authoritative server.
+
+## Unused / Unreachable Code Inventory
+
+This inventory is based on `deadcode ./...` run from the module root on 2026-07-07.
+
+Scope note:
+- `deadcode` reports symbols unreachable from current entrypoints in this module.
+- Exported library APIs can still be intentionally public even when unreachable from local binaries/tests.
+
+Confirmed in handler chain module:
+- `handlers.Chain` is currently unreachable from active server routing paths.
+- `handlers.HandlerFunc` is only used as the type of `handlers.Chain`, and has no other current references.
+
+Current unreachable functions by package:
+
+1. `client/client.go`
+`Client.QueryWithTimeout`, `Client.QueryMultiple`, `MakeQuery`, `MakeUpdateQuery`, `Client.QueryWithOpcode`.
+
+2. `client/sig0.go`
+`MakeRegistrationRequest`, `MakeRefreshRequest`.
+
+3. `dnsmsg/dnsmsg.go`
+`ProcessOpcode`, `MakeResponse`, `SetReply`, `ExtractQuestionInfo`, `MakeStatusResponse`.
+
+4. `forward/forward.go`
+`extractDomain`, `Resolver.SetServers`.
+
+5. (Left for future use/completeness) `handlers/handlers.go`
+`Chain`, `NewBaseHandler`.
+
+6. `pkg/keyrec/keyrec.go`
+`KeyRecord.Parse`, `FromKEY`, `KeyRecord.ToKEY`, `calculateKeyTag`, `KeyRecord.KeyTag`, `KeyRecord.AlgorithmName`, `KeyRecord.String`.
+
+7. `pkg/lease/lease.go`
+`LeaseOption.Decode`.
+
+8. `pkg/sig0/signer.go`
+`NewSigner`, `Signer.StartUpdate`, `Signer.UpdateRR`, `Signer.RemoveRR`, `Signer.UpdateParsedRR`, `Signer.RemoveParsedRR`, `Signer.SignUpdate`.
+
+9. `pkg/srp/client/client.go`
+`New`, `NewWithDefaults`, `Client.Register`, `Client.Update`, `Client.Delete`, `Client.Send`, `Client.signMessage`, `Client.sendUpdate`, `Client.RegisterService`, `Client.RegisterServiceWithTXT`, `Client.DeleteService`, `Client.CreateUpdateMessage`, `Client.VerifyResponse`, `ensureFQDN`.
+
+10. `pkg/srp/instruction/instruction.go`
+`New`, `Instruction.SetService`, `Instruction.SetTXT`, `Instruction.SetDNSKEY`, `Instruction.IsServiceDelete`, `ServiceDelete`, `NewService`, `Instruction.Validate`, `Service.Validate`, `validateDNSKEY`, `Instruction.Encode`, `Instruction.Decode`, `encodeTXT`, `decodeTXT`, `encodeDNSKEY`, `decodeDNSKEY`, `Instruction.ToRR`, `Instruction.ParseRR`.
+
+11. `pkg/srp/server/server.go`
+`NewDefaultKeyStore`, `DefaultKeyStore.AddKey`, `DefaultKeyStore.GetKey`, `DefaultKeyStore.GetKeysByZone`, `DefaultKeyStore.VerifySignature`, `New`, `NewWithKeyStore`, `Server.Process`, `Server.validateMessage`, `Server.verifySIG0`, `Server.findSIG0`, `Server.findDNSKEY`, `Server.processPrerequisites`, `Server.processInstructions`, `Server.parseInstruction`, `Server.buildResponse`, `Server.createSOA`, `Server.errorResponse`, `Server.ProcessUpdateMessage`, `Server.GetZone`, `Server.RegisterKey`, `Server.KeyStore`, `ensureFQDN`.
+
+12. `server/server.go`
+`Server.GetResolver`.
 
 ## Next Steps
 

@@ -25,9 +25,9 @@ AUTH_SERVER="${AUTH_SERVER:-ns1.free2air.org}"
 MIN_LEASE_SECONDS=30
 
 # Get keystore from environment
-TEST_KEYSTORE="${KEYSTORE_DIR:-}"
+TEST_KEYSTORE="${CLIENT_KEYSTORE_DIR:-}"
 if [ -z "$TEST_KEYSTORE" ]; then
-    echo "ERROR: KEYSTORE_DIR environment variable not set"
+    echo "ERROR: CLIENT_KEYSTORE_DIR environment variable not set"
     exit 1
 fi
 
@@ -105,7 +105,7 @@ restart_proxy() {
 }
 
 run_client() {
-    KEYSTORE_DIR="$TEST_KEYSTORE" "$CLIENT_BIN" "$@"
+    CLIENT_KEYSTORE_DIR="$TEST_KEYSTORE" "$CLIENT_BIN" "$@"
 }
 
 require_command() {

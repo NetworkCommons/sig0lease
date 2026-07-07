@@ -6,8 +6,9 @@ CLIENT_NAME=sig0lease-client
 OS := $(shell uname -s | tr '[:upper:]' '[:lower:]')
 VERSION ?= 0.1.0
 BUILD_DIR := ./bin/$(OS)
+CLIENT_KEYSTORE_DIR ?=
 
-.PHONY: all build build-all build-client build-client-all clean clean-binary deps docs fmt lint release run-client run-server test test-full test-integration test-register test-register-badsig test-unit vet
+.PHONY: all build build-all build-client build-client-all clean clean-binary deps docs fmt lint release run-client run-server test-full test-register test-register-badsig test-unit test-unit-keystore vet
 
 all: build build-client test
 
@@ -76,19 +77,34 @@ lint:
 	golangci-lint run ./...
 
 # Run fast unit tests that do not require live integration environment.
-test: fmt vet
-	go test ./cmd/... ./config ./forward ./handlers ./pkg/keyrec ./pkg/lease ./pkg/srp/instruction ./pkg/srp/server -v
+test-unit: fmt vet
+	go test ./handlers ./pkg/lease ./pkg/keyrec ./pkg/srp/server ./pkg/srp/instruction ./pkg/srp/client -v
 
 # Run keystore-dependent unit tests.
-# Requires KEYSTORE_DIR or handlers.update.keystore_dir in config.yaml.
-test-unit: fmt vet
-	go test ./pkg/sig0 -v
-	go test . -run "TestLease" -v
+# Requires CLIENT_KEYSTORE_DIR for the client key, ex. CLIENT_KEYSTORE_DIR=${PWD}/keystore/client make test-unit
+test-unit-keystore: fmt vet
+	CLIENT_KEYSTORE_DIR=$(CLIENT_KEYSTORE_DIR) go test ./tests/ ./pkg/sig0 -v
+
+# Run the complete test matrix.
+# Requires CLIENT_KEYSTORE_DIR for the client key, ex. CLIENT_KEYSTORE_DIR=${PWD}/keystore/client make test-unit
+test-full: fmt vet
+	CLIENT_KEYSTORE_DIR=$(CLIENT_KEYSTORE_DIR) go test ./... -v
+
+# Run specific test file or package
+# Example: make test-pkg PKG=./pkg/sig0
+test-pkg:
+	go test $(PKG) -v
+
+# Run tests with coverage
+# Requires CLIENT_KEYSTORE_DIR for the client key, ex. CLIENT_KEYSTORE_DIR=${PWD}/keystore/client make test-cover
+test-cover:
+	CLIENT_KEYSTORE_DIR=$(CLIENT_KEYSTORE_DIR) go test ./... -coverprofile=coverage.out
+	go tool cover -func=coverage.out
 
 # Run full end-to-end update workflow via test script.
-# Requires KEYSTORE_DIR or handlers.update.keystore_dir in config.yaml.
+# Requires CLIENT_KEYSTORE_DIR for the client key, ex. CLIENT_KEYSTORE_DIR=${PWD}/keystore/client make test-update 
 test-update: build build-client
-	./tests/test_update.sh run
+	CLIENT_KEYSTORE_DIR=$(CLIENT_KEYSTORE_DIR) ./tests/test_update.sh run
 
 # Run a single end-to-end registration using the built client binary.
 # Override variables as needed, e.g.:
@@ -98,28 +114,14 @@ ZONE ?= test.dev.zenr.io.
 KEYNAME ?= test.dev.zenr.io.
 LEASE ?= 300
 KEY_LEASE ?= 3600
-CLIENT_KEYSTORE_DIR ?=
 
 test-register: build build-client
-	KEYSTORE_DIR=$(CLIENT_KEYSTORE_DIR) ./$(BUILD_DIR)/$(CLIENT_NAME) $(ADDR) register $(ZONE) $(KEYNAME) $(LEASE) $(KEY_LEASE)
+	CLIENT_KEYSTORE_DIR=$(CLIENT_KEYSTORE_DIR) ./$(BUILD_DIR)/$(CLIENT_NAME) $(ADDR) register $(ZONE) $(KEYNAME) $(LEASE) $(KEY_LEASE)
 
 # Run a registration with one post-signature payload bit flip to validate
 # proxy-side SIG(0) cryptographic verification rejects tampered payloads.
 test-register-badsig: build build-client
-	KEYSTORE_DIR=$(CLIENT_KEYSTORE_DIR) ./$(BUILD_DIR)/$(CLIENT_NAME) $(ADDR) register-tamper $(ZONE) $(KEYNAME) $(LEASE) $(KEY_LEASE)
-
-# Run the complete test matrix.
-test-full: fmt vet test-integration
-	go test ./... -v
-
-# Run specific test file or package
-test-pkg:
-	go test $(PKG) -v
-
-# Run tests with coverage
-test-cover:
-	go test ./... -coverprofile=coverage.out
-	go tool cover -func=coverage.out
+	CLIENT_KEYSTORE_DIR=$(CLIENT_KEYSTORE_DIR) ./$(BUILD_DIR)/$(CLIENT_NAME) $(ADDR) register-tamper $(ZONE) $(KEYNAME) $(LEASE) $(KEY_LEASE)
 
 # Build and run the proxy with example config
 run-server: build
@@ -128,5 +130,5 @@ run-server: build
 # Run client (requires proxy addr and command)
 # Usage: make run-client ADDR=127.0.0.1:8053 CMD="register test.dev.zenr.io. client.test.dev.zenr.io."
 run-client: build-client
-	KEYSTORE_DIR=$(CLIENT_KEYSTORE_DIR) ./$(BUILD_DIR)/$(CLIENT_NAME) $(ADDR) $(CMD)
+	CLIENT_KEYSTORE_DIR=$(CLIENT_KEYSTORE_DIR) ./$(BUILD_DIR)/$(CLIENT_NAME) $(ADDR) $(CMD)
 

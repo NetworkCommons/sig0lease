@@ -88,9 +88,9 @@ func main() {
 
 func keystore_available() {
 	// Client keystore must be explicitly provided.
-	keystoreDir = os.Getenv("KEYSTORE_DIR")
+	keystoreDir = os.Getenv("CLIENT_KEYSTORE_DIR")
 	if keystoreDir == "" {
-		fmt.Fprintf(os.Stderr, "ERROR: KEYSTORE_DIR is required for sig0lease-client\n")
+		fmt.Fprintf(os.Stderr, "ERROR: CLIENT_KEYSTORE_DIR is required for sig0lease-client\n")
 		fmt.Fprintf(os.Stderr, "The client keystore must be set explicitly.\n")
 		os.Exit(1)
 	}
@@ -579,6 +579,6 @@ Examples:
      sig0lease-client 127.0.0.1:8053 verify test.dev.zenr.io. client.test.dev.zenr.io.
 
 Environment:
-  KEYSTORE_DIR: Keystore directory path (required - must be set via environment or config.yaml)
+  CLIENT_KEYSTORE_DIR: Keystore directory path (required - must be set via environment variable for client to load keys)
 `)
 }

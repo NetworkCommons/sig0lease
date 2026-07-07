@@ -3,18 +3,37 @@ package handlers
 
 import (
 	"context"
-	"log"
+	"fmt"
 
 	"codeberg.org/miekg/dns"
+	"github.com/NetworkCommons/sig0lease/logging"
 )
 
 // HandlerFunc is a function type that handles a DNS request.
-// FIXME: why not to reuse dns.HandlerFunc? Because we want to return a response message and context, not just write to the ResponseWriter.
 type HandlerFunc func(context.Context, dns.ResponseWriter, *dns.Msg) (*dns.Msg, context.Context, error)
 
+func cloneRequest(msg *dns.Msg) (*dns.Msg, error) {
+	if msg == nil {
+		return nil, nil
+	}
+
+	tmp := msg.Copy()
+	err := tmp.Pack()
+	if err != nil {
+		return nil, fmt.Errorf("clone request pack failed: %w", err)
+	}
+
+	clone := new(dns.Msg)
+	clone.Data = make([]byte, len(tmp.Data))
+	copy(clone.Data, tmp.Data)
+	if err := clone.Unpack(); err != nil {
+		return nil, fmt.Errorf("clone request unpack failed: %w", err)
+	}
+
+	return clone, nil
+}
+
 // Chain builds a middleware chain from multiple handlers.
-// FIXME: This function is not used, and the type HandlerFunc is not used.
-// opcode processing modules do not implement this interface
 func Chain(handlers ...HandlerFunc) HandlerFunc {
 	if len(handlers) == 0 {
 		return func(ctx context.Context, _ dns.ResponseWriter, r *dns.Msg) (*dns.Msg, context.Context, error) {
@@ -24,16 +43,23 @@ func Chain(handlers ...HandlerFunc) HandlerFunc {
 
 	return func(ctx context.Context, w dns.ResponseWriter, r *dns.Msg) (*dns.Msg, context.Context, error) {
 		if len(handlers) == 1 {
-			return handlers[0](ctx, w, r)
+			req, err := cloneRequest(r)
+			if err != nil {
+				return nil, ctx, err
+			}
+			return handlers[0](ctx, w, req)
 		}
 
 		for i := range handlers {
-			resp, newCtx, err := handlers[i](ctx, w, r)
+			req, err := cloneRequest(r)
+			if err != nil {
+				return nil, ctx, err
+			}
+			resp, newCtx, err := handlers[i](ctx, w, req)
 			if err != nil || resp != nil {
 				return resp, newCtx, err
 			}
 			ctx = newCtx
-			r = new(dns.Msg) // Get fresh message for next handler
 		}
 
 		return nil, ctx, nil
@@ -59,21 +85,12 @@ type Handler interface {
 	Setup(cfg map[string]any) error
 }
 
-// Logger is an interface for logging with Debugf method.
-type Logger interface {
-	Debug(msg string, keysAndValues ...any)
-	Info(msg string, keysAndValues ...any)
-	Warn(msg string, keysAndValues ...any)
-	Error(msg string, keysAndValues ...any)
-	Debugf(format string, args ...any)
-}
-
 // BaseHandler provides common functionality for handlers.
 type BaseHandler struct {
 	name    string
 	opcodes []uint8
 	config  map[string]any
-	logger  Logger
+	logger  *logging.Logger
 	// FIXME: this is not implemented
 	canaryFunc func() bool // For testing
 }
@@ -87,18 +104,8 @@ func NewBaseHandler(name string, opcodes []uint8) *BaseHandler {
 }
 
 // SetLogger sets the logger for this handler.
-func (b *BaseHandler) SetLogger(logger Logger) {
+func (b *BaseHandler) SetLogger(logger *logging.Logger) {
 	b.logger = logger
-}
-
-// Debugf logs a formatted debug message through the configured logger.
-// If no logger is configured, it falls back to the standard logger so this is never silent.
-func (b *BaseHandler) Debugf(format string, args ...any) {
-	if b.logger != nil {
-		b.logger.Debugf(format, args...)
-		return
-	}
-	log.Printf("WARN: handler logger is nil; debug message: "+format, args...)
 }
 
 // SetConfig sets configuration for the handler.
