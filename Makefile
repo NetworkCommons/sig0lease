@@ -7,7 +7,7 @@ OS := $(shell uname -s | tr '[:upper:]' '[:lower:]')
 VERSION ?= 0.1.0
 BUILD_DIR := ./bin/$(OS)
 
-.PHONY: all build build-client build-all build-client-all clean test test-unit test-integration test-register test-register-badsig test-full fmt vet lint run-server run-client deps docs release clean-binary
+.PHONY: all build build-all build-client build-client-all clean clean-binary deps docs fmt lint release run-client run-server test test-full test-integration test-register test-register-badsig test-unit vet
 
 all: build build-client test
 
