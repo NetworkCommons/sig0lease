@@ -4,6 +4,7 @@ package main
 import (
 	"fmt"
 	"os"
+	"strconv"
 
 	"codeberg.org/miekg/dns"
 	"github.com/NetworkCommons/sig0lease/config"
@@ -12,6 +13,43 @@ import (
 	_ "github.com/NetworkCommons/sig0lease/pkg/dnscompat"
 	"github.com/NetworkCommons/sig0lease/server"
 )
+
+func setUintEnv(dst map[string]any, envName string, field string) {
+	if v := os.Getenv(envName); v != "" {
+		n, err := strconv.ParseUint(v, 10, 32)
+		if err == nil {
+			dst[field] = uint32(n)
+		}
+	}
+}
+
+func applyUpdateHandlerEnvOverrides(cfg map[string]any) map[string]any {
+	out := make(map[string]any)
+	for k, v := range cfg {
+		out[k] = v
+	}
+
+	if v := os.Getenv("UPSTREAM_ZONE"); v != "" {
+		out["upstream_zone"] = v
+	}
+	if v := os.Getenv("KEYSTORE_DIR"); v != "" {
+		out["keystore_dir"] = v
+	}
+
+	rawPolicy, _ := out["ttl_policy"].(map[string]any)
+	if rawPolicy == nil {
+		rawPolicy = make(map[string]any)
+	}
+	setUintEnv(rawPolicy, "TTL_POLICY_MIN_KEY_TTL", "min_key_ttl")
+	setUintEnv(rawPolicy, "TTL_POLICY_MAX_KEY_TTL", "max_key_ttl")
+	setUintEnv(rawPolicy, "TTL_POLICY_MIN_RR_TTL", "min_rr_ttl")
+	setUintEnv(rawPolicy, "TTL_POLICY_MAX_RR_TTL", "max_rr_ttl")
+	if len(rawPolicy) > 0 {
+		out["ttl_policy"] = rawPolicy
+	}
+
+	return out
+}
 
 func main() {
 	cfgPath := "config.yaml"
@@ -28,8 +66,16 @@ func main() {
 	}
 
 	// Create logger
-	logger := logging.NewLogger("debug", "text")
+	logLevel := os.Getenv("DEBUG_LEVEL")
+	if logLevel == "" {
+		logLevel = "debug"
+	}
+	logger := logging.NewLogger(logLevel, "text")
 	logger.Infof("Starting DNS Proxy")
+
+	if v := os.Getenv("SERVER_ADDRESS"); v != "" {
+		cfg.Server.Address = v
+	}
 
 	// Create server
 	srv, err := server.New(cfg, logger)
@@ -49,7 +95,7 @@ func main() {
 
 			// Setup handler with configuration for upstream coordination.
 			// Coordinator resolves authoritative NS from upstream_zone and sends UPDATE directly.
-			handlerCfg := cfg.Handlers["update"]
+			handlerCfg := applyUpdateHandlerEnvOverrides(cfg.Handlers["update"])
 			if handlerCfg != nil {
 				if err := h.Setup(handlerCfg); err != nil {
 					logger.Warnf("Failed to setup %s: %v", moduleName, err)

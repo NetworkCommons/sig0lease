@@ -91,6 +91,7 @@ The proxy is designed to support two practical scenarios:
 The update handler uses the configured zone to discover the authoritative server for the effective zone, then sends the rewritten UPDATE there.
 
 ## Project Layout
+(FIXME: to be updated)
 
 - `cmd/sig0lease/` - proxy entrypoint
 - `cmd/sig0lease-client/` - client entrypoint
@@ -103,10 +104,10 @@ The update handler uses the configured zone to discover the authoritative server
 - `server/` - UDP/TCP listener and request dispatch
 
 ## Validation
-
+(requires client key, see this [README](./keystore/README.md))
 ```bash
-go test ./server ./handlers ./client ./pkg/lease
-go build ./cmd/sig0lease ./cmd/sig0lease-client
+CLIENT_KEYSTORE_DIR=${PWD}/keystore/client make test-full
+make build
 ```
 
 For a complete behavior check, run the registration and tamper flows against a live proxy instance.

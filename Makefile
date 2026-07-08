@@ -115,8 +115,11 @@ KEYNAME ?= test.dev.zenr.io.
 LEASE ?= 300
 KEY_LEASE ?= 3600
 
-test-register: build build-client
+test-register-key: build build-client
 	CLIENT_KEYSTORE_DIR=$(CLIENT_KEYSTORE_DIR) ./$(BUILD_DIR)/$(CLIENT_NAME) $(ADDR) register $(ZONE) $(KEYNAME) $(LEASE) $(KEY_LEASE)
+
+test-register-txt: build build-client
+	CLIENT_KEYSTORE_DIR=$(CLIENT_KEYSTORE_DIR) ./$(BUILD_DIR)/$(CLIENT_NAME) $(ADDR) register $(ZONE) $(KEYNAME) $(LEASE) $(KEY_LEASE) 'txt:Ciao from $(shell date +"%FT%T")'
 
 # Run a registration with one post-signature payload bit flip to validate
 # proxy-side SIG(0) cryptographic verification rejects tampered payloads.

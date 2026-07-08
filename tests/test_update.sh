@@ -11,18 +11,12 @@
 #
 
 set -euo pipefail
-
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "$SCRIPT_DIR/utils.sh"
 
 # Configuration
-OS=$(uname -s | tr '[:upper:]' '[:lower:]')
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-PROXY_BIN="${SCRIPT_DIR}/../bin/${OS}/sig0lease"
-CLIENT_BIN="${SCRIPT_DIR}/../bin/${OS}/sig0lease-client"
-CONFIG_FILE="${SCRIPT_DIR}/../config.yaml"
-LOG_FILE="/tmp/sig0lease_proxy.log"
 TMP_CONFIG_FILE=""
 AUTH_SERVER="${AUTH_SERVER:-ns1.free2air.org}"
-MIN_LEASE_SECONDS=30
 
 # Get keystore from environment
 TEST_KEYSTORE="${CLIENT_KEYSTORE_DIR:-}"
@@ -31,42 +25,22 @@ if [ -z "$TEST_KEYSTORE" ]; then
     exit 1
 fi
 
-PROXY_ADDR="${PROXY_ADDR:-127.0.0.1}"
-PROXY_PORT="${PROXY_PORT:-8053}"
-PROXY_URL="$PROXY_ADDR:$PROXY_PORT"
-
 # Real zones/keys
 DOWNSTREAM_ZONE="test.dev.zenr.io."
 UPSTREAM_ZONE="dev.zenr.io."
 CLIENT_KEY_NAME="test.dev.zenr.io."
 WRONG_CLIENT_KEY_NAME="farback.dev.zenr.io."
-LEASE_SECONDS=30
-REFRESH_SECONDS=30
 
-# Color output
-RED='\033[0;31m'
-GREEN='\033[0;32m'
-YELLOW='\033[1;33m'
-BLUE='\033[0;34m'
-NC='\033[0m' # No Color
+# Lease times
+MIN_LEASE_SECONDS=10
+LEASE_SECONDS=12
+REFRESH_SECONDS=12
+KEY_LEASE_SECONDS=22
+MIN_KEY_LEASE_SECONDS=20
+# Case 2 validates refresh behavior under split-lease policy: keep KEY alive longer.
+REFRESH_CASE_KEY_LEASE_SECONDS="${REFRESH_CASE_KEY_LEASE_SECONDS:-3600}"
 
-log_section() {
-    echo -e "\n${BLUE}===================================================${NC}"
-    echo -e "${BLUE}$1${NC}"
-    echo -e "${BLUE}===================================================${NC}\n"
-}
 
-log_step() {
-    echo -e "${YELLOW}→ $1${NC}"
-}
-
-log_success() {
-    echo -e "${GREEN}[OK] $1${NC}"
-}
-
-log_error() {
-    echo -e "${RED}[FAIL] $1${NC}"
-}
 
 cleanup() {
     set +e
@@ -77,31 +51,13 @@ cleanup() {
         ensure_key_absent "$CLIENT_KEY_NAME" || true
     fi
 
-    if [ ! -z "${PROXY_PID:-}" ] && kill -0 "$PROXY_PID" 2>/dev/null; then
-        log_step "Stopping sig0lease proxy (PID: $PROXY_PID)"
-        kill "$PROXY_PID" || true
-        sleep 1
-        log_success "Proxy stopped"
-    fi
+    stop_proxy
 
     if [ -n "$TMP_CONFIG_FILE" ] && [ -f "$TMP_CONFIG_FILE" ]; then
         rm -f "$TMP_CONFIG_FILE"
     fi
 
     set -e
-}
-
-stop_proxy() {
-    if [ ! -z "${PROXY_PID:-}" ] && kill -0 "$PROXY_PID" 2>/dev/null; then
-        kill "$PROXY_PID" || true
-        sleep 1
-    fi
-    PROXY_PID=""
-}
-
-restart_proxy() {
-    stop_proxy
-    start_proxy
 }
 
 run_client() {
@@ -129,12 +85,12 @@ query_key_at_authoritative() {
     local name="$1"
     local cmd="dig +time=3 +tries=1 +short @${AUTH_SERVER} ${name} KEY"
     local out
-    out=$(dig +time=3 +tries=1 +short @"$AUTH_SERVER" "$name" KEY)
-    log_step "[dig] $cmd" >&2
+    out=$(eval ${cmd})
+    log_step "[dig] $cmd"
     if [ -n "$out" ]; then
-        echo "$out" >&2
+        echo "$out"
     else
-        echo "(no records)" >&2
+        echo "(no records)"
     fi
     printf '%s\n' "$out"
 }
@@ -149,22 +105,20 @@ key_is_present() {
 wait_for_key_state() {
     local name="$1"
     local state="$2"   # present|absent
-    local timeout="$3"
+    local timeout=10
 
     local start
     start=$(date +%s)
 
     while true; do
-        local answer
-        answer=$(query_key_at_authoritative "$name" | tail -n 1 || true)
 
         if [ "$state" = "present" ]; then
-            if [ -n "$answer" ]; then
+            if key_is_present "$name"; then
                 log_success "KEY present for $name on $AUTH_SERVER"
                 return 0
             fi
         else
-            if [ -z "$answer" ]; then
+            if ! key_is_present "$name"; then
                 log_success "KEY absent for $name on $AUTH_SERVER"
                 return 0
             fi
@@ -172,8 +126,6 @@ wait_for_key_state() {
 
         if [ $(( $(date +%s) - start )) -ge "$timeout" ]; then
             log_error "Timed out waiting for KEY state=$state for $name on $AUTH_SERVER"
-            echo "Last answer:"
-            echo "$answer"
             return 1
         fi
 
@@ -262,13 +214,13 @@ ensure_key_absent() {
     cleanup_start=$(date +%s)
 
     # Re-register with minimum supported lease so cleanup reaches absence quickly.
-    if ! run_client "$PROXY_URL" register "$DOWNSTREAM_ZONE" "$key_name" "$MIN_LEASE_SECONDS" 3600 >/dev/null 2>&1; then
+    if ! run_client "$PROXY_URL" register "$DOWNSTREAM_ZONE" "$key_name" "$MIN_LEASE_SECONDS" "$MIN_KEY_LEASE_SECONDS" >/dev/null 2>&1; then
         log_error "Cleanup registration failed for $key_name"
         return 1
     fi
 
     wait_until_lease_expired "$cleanup_start" "$MIN_LEASE_SECONDS" 3
-    wait_for_key_state "$key_name" absent 90
+    wait_for_key_state "$key_name" absent
     log_success "Cleanup complete: $key_name absent on $AUTH_SERVER"
 }
 
@@ -281,11 +233,11 @@ setup_keystore() {
     fi
 
     log_step "Verifying test keys in keystore: $TEST_KEYSTORE"
-    if ! ls "$TEST_KEYSTORE"/Ktest.dev.zenr.io.+015+*.key >/dev/null 2>&1; then
+    if ! ls "$TEST_KEYSTORE"/K${CLIENT_KEY_NAME}+015+*.key >/dev/null 2>&1; then
         log_error "Expected key for zone $DOWNSTREAM_ZONE not found in $TEST_KEYSTORE"
         exit 1
     fi
-    if ! ls "$TEST_KEYSTORE"/Kfarback.dev.zenr.io.+015+*.key >/dev/null 2>&1; then
+    if ! ls "$TEST_KEYSTORE"/K${WRONG_CLIENT_KEY_NAME}+015+*.key >/dev/null 2>&1; then
         log_error "Expected second real key for unauthorized test ($WRONG_CLIENT_KEY_NAME) not found"
         exit 1
     fi
@@ -294,40 +246,6 @@ setup_keystore() {
     ls -1 "$TEST_KEYSTORE" | sed -n '1,50p'
 }
 
-start_proxy() {
-    log_section "START: Proxy Process"
-
-    if ! [ -x "$PROXY_BIN" ]; then
-        log_error "Proxy binary not found or not executable: $PROXY_BIN"
-        exit 1
-    fi
-
-    log_step "Preparing runtime config for listen address $PROXY_ADDR:$PROXY_PORT"
-
-    TMP_CONFIG_FILE="$(mktemp /tmp/sig0lease-config.XXXXXX)"
-    cp "$CONFIG_FILE" "$TMP_CONFIG_FILE"
-    sed -i.bak "s|^  address:.*$|  address: \"$PROXY_ADDR:$PROXY_PORT\"|" "$TMP_CONFIG_FILE"
-    rm -f "$TMP_CONFIG_FILE.bak"
-
-    log_step "Starting proxy on $PROXY_URL with config: $TMP_CONFIG_FILE"
-
-    "$PROXY_BIN" "$TMP_CONFIG_FILE" > "$LOG_FILE" 2>&1 &
-    PROXY_PID=$!
-
-    sleep 2
-
-    if ! kill -0 "$PROXY_PID" 2>/dev/null; then
-        log_error "Proxy failed to start. Check logs:"
-        cat "$LOG_FILE"
-        if grep -q "address already in use" "$LOG_FILE"; then
-            log_error "Port $PROXY_PORT is already in use. Re-run with a free port: PROXY_PORT=18053 tests/test_update.sh run"
-        fi
-        exit 1
-    fi
-
-    log_success "Proxy started successfully (PID: $PROXY_PID)"
-    log_success "Proxy log: tail -f $LOG_FILE"
-}
 
 build_binaries() {
     log_section "BUILD"
@@ -351,8 +269,8 @@ test_case_register_expire_remove() {
     case_start=$(date +%s)
     log_step "Registering lease ($LEASE_SECONDS seconds)"
     lease_start=$(date +%s)
-    run_client "$PROXY_URL" register "$DOWNSTREAM_ZONE" "$CLIENT_KEY_NAME" "$LEASE_SECONDS" 3600
-    wait_for_key_state "$CLIENT_KEY_NAME" present 30
+    run_client "$PROXY_URL" register "$DOWNSTREAM_ZONE" "$CLIENT_KEY_NAME" "$LEASE_SECONDS" "$KEY_LEASE_SECONDS"
+    wait_for_key_state "$CLIENT_KEY_NAME" present
     assert_proxy_consistent_with_authoritative "$CLIENT_KEY_NAME" present
 
     log_step "Waiting until lease expiry boundary"
@@ -363,7 +281,7 @@ test_case_register_expire_remove() {
         log_error "Refresh succeeded after expiry, expected failure"
         return 1
     fi
-    wait_for_key_state "$CLIENT_KEY_NAME" absent 45
+    wait_for_key_state "$CLIENT_KEY_NAME" absent
     assert_proxy_consistent_with_authoritative "$CLIENT_KEY_NAME" absent
 
     assert_proxy_log_contains "refresh rejected: lease does not exist"
@@ -382,38 +300,38 @@ test_case_register_refresh_not_prematurely_removed() {
     case_start=$(date +%s)
     log_step "Registering initial lease"
     lease_start=$(date +%s)
-    run_client "$PROXY_URL" register "$DOWNSTREAM_ZONE" "$CLIENT_KEY_NAME" "$LEASE_SECONDS" 3600
-    wait_for_key_state "$CLIENT_KEY_NAME" present 30
+    run_client "$PROXY_URL" register "$DOWNSTREAM_ZONE" "$CLIENT_KEY_NAME" "$LEASE_SECONDS" "$REFRESH_CASE_KEY_LEASE_SECONDS"
+    wait_for_key_state "$CLIENT_KEY_NAME" present
     assert_proxy_consistent_with_authoritative "$CLIENT_KEY_NAME" present
 
     log_step "Waiting to near-expiry checkpoint then refreshing"
     wait_until_epoch $((lease_start + 20))
     refresh_start=$(date +%s)
     run_client "$PROXY_URL" refresh "$DOWNSTREAM_ZONE" "$CLIENT_KEY_NAME" "$REFRESH_SECONDS"
-    wait_for_key_state "$CLIENT_KEY_NAME" present 20
+    wait_for_key_state "$CLIENT_KEY_NAME" present
     assert_proxy_consistent_with_authoritative "$CLIENT_KEY_NAME" present
 
     log_step "Waiting past original expiry window"
     wait_until_lease_expired "$lease_start" "$LEASE_SECONDS" 5
-    wait_for_key_state "$CLIENT_KEY_NAME" present 30
+    wait_for_key_state "$CLIENT_KEY_NAME" present
     assert_proxy_consistent_with_authoritative "$CLIENT_KEY_NAME" present
 
     log_step "Refreshing again (must still succeed if not removed prematurely)"
     run_client "$PROXY_URL" refresh "$DOWNSTREAM_ZONE" "$CLIENT_KEY_NAME" "$REFRESH_SECONDS"
-    wait_for_key_state "$CLIENT_KEY_NAME" present 20
+    wait_for_key_state "$CLIENT_KEY_NAME" present
     assert_proxy_consistent_with_authoritative "$CLIENT_KEY_NAME" present
 
-    log_step "Waiting for refreshed lease to expire and restoring absence"
+    log_step "Waiting for refreshed data lease window while key-lease remains active"
     wait_until_lease_expired "$refresh_start" "$REFRESH_SECONDS" 5
-    wait_for_key_state "$CLIENT_KEY_NAME" absent 90
-    assert_proxy_consistent_with_authoritative "$CLIENT_KEY_NAME" absent
+    wait_for_key_state "$CLIENT_KEY_NAME" present
+    assert_proxy_consistent_with_authoritative "$CLIENT_KEY_NAME" present
 
     expected_min=$((refresh_start + REFRESH_SECONDS + 5 - case_start))
     if [ "$expected_min" -lt 0 ]; then
         expected_min=0
     fi
     log_case_timing "case2" "$case_start" "$expected_min"
-    log_success "Lease remained active after renewal"
+    log_success "Lease remained active after renewal (with separate key-lease policy)"
 }
 
 test_case_unauthorized_refresh_rejected_then_expires() {
@@ -423,8 +341,8 @@ test_case_unauthorized_refresh_rejected_then_expires() {
     case_start=$(date +%s)
     log_step "Registering lease under authorized key ($CLIENT_KEY_NAME)"
     lease_start=$(date +%s)
-    run_client "$PROXY_URL" register "$DOWNSTREAM_ZONE" "$CLIENT_KEY_NAME" "$LEASE_SECONDS" 3600
-    wait_for_key_state "$CLIENT_KEY_NAME" present 30
+    run_client "$PROXY_URL" register "$DOWNSTREAM_ZONE" "$CLIENT_KEY_NAME" "$LEASE_SECONDS" "$KEY_LEASE_SECONDS"
+    wait_for_key_state "$CLIENT_KEY_NAME" present
     assert_proxy_consistent_with_authoritative "$CLIENT_KEY_NAME" present
 
     log_step "Unauthorized refresh attempt using different real key ($WRONG_CLIENT_KEY_NAME)"
@@ -432,20 +350,20 @@ test_case_unauthorized_refresh_rejected_then_expires() {
         log_error "Unauthorized refresh unexpectedly succeeded"
         return 1
     fi
-    wait_for_key_state "$CLIENT_KEY_NAME" present 20
+    wait_for_key_state "$CLIENT_KEY_NAME" present
     assert_proxy_consistent_with_authoritative "$CLIENT_KEY_NAME" present
 
     log_step "Waiting until original lease expires"
     wait_until_lease_expired "$lease_start" "$LEASE_SECONDS" 3
 
-    wait_for_key_state "$CLIENT_KEY_NAME" absent 45
+    wait_for_key_state "$CLIENT_KEY_NAME" absent
     assert_proxy_consistent_with_authoritative "$CLIENT_KEY_NAME" absent
     log_step "Original key refresh after expiry must fail"
     if run_client "$PROXY_URL" refresh "$DOWNSTREAM_ZONE" "$CLIENT_KEY_NAME" "$REFRESH_SECONDS"; then
         log_error "Lease still active after expiry, expected removal"
         return 1
     fi
-    wait_for_key_state "$CLIENT_KEY_NAME" absent 45
+    wait_for_key_state "$CLIENT_KEY_NAME" absent
     assert_proxy_consistent_with_authoritative "$CLIENT_KEY_NAME" absent
 
     expected_min=$((lease_start + LEASE_SECONDS + 3 - case_start))

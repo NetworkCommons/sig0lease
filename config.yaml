@@ -43,6 +43,14 @@ handlers:
     # Keys must be named: Kzone.+015+keytag.key and Kzone.+015+keytag.private
     keystore_dir: "./keystore/server"
 
+    # Optional TTL rewrite policy applied before forwarding UPDATE to upstream.
+    # KEY and non-KEY records are clamped separately.
+    ttl_policy:
+      min_key_ttl: 20
+      max_key_ttl: 30
+      min_rr_ttl: 10
+      max_rr_ttl: 20
+
 # Processing rules map opcodes to module names
 processing_rules:
   # Route opcode 5 (UPDATE) to an update handler module

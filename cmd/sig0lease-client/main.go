@@ -1,35 +1,5 @@
 // Package main implements a sig0lease client for sending UPDATE-LEASE requests
 // with SIG(0) authentication to the sig0lease proxy.
-//
-// Usage:
-//
-//	sig0lease-client <proxy> <command> [args...]
-//
-// Commands:
-//
-//	register <zone> <keyname> [lease] [key-lease]
-//	  Send a sig0lease UPDATE-LEASE registration request
-//	  zone: downstream zone (e.g., test.dev.zenr.io.)
-//	  keyname: key name to register (e.g., client.test.dev.zenr.io.)
-//	  lease: lease duration in seconds (default: 300)
-//	  key-lease: key-lease duration in seconds (default: 3600)
-//
-//	refresh <zone> <keyname> [lease]
-//	  Send a sig0lease UPDATE-LEASE refresh request (4-byte LEASE variant)
-//	  zone: downstream zone (e.g., test.dev.zenr.io.)
-//	  keyname: key name to refresh (must match existing active lease)
-//	  lease: new lease duration in seconds (default: 300)
-//
-//	verify <zone> <keyname>
-//	  Query if a key registration is active
-//
-//	list-keys <keystore-dir>
-//	  List available keys in keystore
-//
-// Examples:
-//
-//	sig0lease-client 127.0.0.1:8053 register test.dev.zenr.io. client.test.dev.zenr.io.
-//	sig0lease-client 127.0.0.1:8053 register test.dev.zenr.io. client.test.dev.zenr.io. 300 3600
 package main
 
 import (
@@ -43,8 +13,8 @@ import (
 	"codeberg.org/miekg/dns"
 	"github.com/NetworkCommons/sig0lease/client"
 	_ "github.com/NetworkCommons/sig0lease/pkg/dnscompat"
+	"github.com/NetworkCommons/sig0lease/pkg/dnsmsg"
 	"github.com/NetworkCommons/sig0lease/pkg/keyrec"
-	"github.com/NetworkCommons/sig0lease/pkg/lease"
 )
 
 var (
@@ -108,27 +78,41 @@ func cmdRegisterTamper(proxyAddr string, args []string) {
 
 func cmdRegisterWithMode(proxyAddr string, args []string, tamper bool) {
 	if len(args) < 2 {
-		fmt.Fprintf(os.Stderr, "Usage: sig0lease-client <proxy> register|register-tamper <zone> <keyname> [lease] [key-lease]\n")
+		fmt.Fprintf(os.Stderr, "Usage: sig0lease-client <proxy> register|register-tamper <zone> <keyname> [lease] [key-lease] [rr-spec...]\n")
 		os.Exit(1)
 	}
 
 	zone := args[0]
 	keyname := args[1]
 
-	// Parse optional lease durations
+	// Parse optional lease durations and optional rr-spec(s).
 	leaseDuration := uint32(defaultLease)
 	keyLeaseDuration := uint32(defaultKeyLease)
+	argIndex := 2
 
-	if len(args) > 2 {
-		if val, err := strconv.ParseUint(args[2], 10, 32); err == nil {
+	if argIndex < len(args) {
+		if val, err := strconv.ParseUint(args[argIndex], 10, 32); err == nil {
 			leaseDuration = uint32(val)
+			argIndex++
 		}
 	}
 
-	if len(args) > 3 {
-		if val, err := strconv.ParseUint(args[3], 10, 32); err == nil {
+	if argIndex < len(args) {
+		if val, err := strconv.ParseUint(args[argIndex], 10, 32); err == nil {
 			keyLeaseDuration = uint32(val)
+			argIndex++
 		}
+	}
+
+	additionalSpecs := args[argIndex:]
+	additionalRRs := make([]dns.RR, 0, len(additionalSpecs))
+	for _, spec := range additionalSpecs {
+		rr, err := dnsmsg.ParseAdditionalRRSpec(spec, keyname, leaseDuration)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "ERROR: Invalid rr-spec %q: %v\n", spec, err)
+			os.Exit(1)
+		}
+		additionalRRs = append(additionalRRs, rr)
 	}
 
 	fmt.Printf("=== sig0lease Client Registration ===\n")
@@ -140,6 +124,9 @@ func cmdRegisterWithMode(proxyAddr string, args []string, tamper bool) {
 	}
 	fmt.Printf("Lease: %d seconds\n", leaseDuration)
 	fmt.Printf("Key-Lease: %d seconds\n", keyLeaseDuration)
+	if len(additionalRRs) > 0 {
+		fmt.Printf("Additional RRs: %d\n", len(additionalRRs))
+	}
 	fmt.Printf("\n")
 
 	// Step 1: Load client key by keyname (same key used for payload and SIG(0) signing)
@@ -161,13 +148,10 @@ func cmdRegisterWithMode(proxyAddr string, args []string, tamper bool) {
 	fmt.Printf("    KeyTag: %d\n", clientKey.PublicKey.KeyTag())
 	fmt.Printf("    Name: %s\n", clientKey.PublicKey.Hdr.Name)
 
-	// Step 2: Create UPDATE message for downstream zone
-	fmt.Printf("\nStep 2: Creating UPDATE message\n")
-	msg := dns.NewMsg(zone, dns.TypeSOA)
-	msg.Opcode = dns.OpcodeUpdate
-	fmt.Printf("  ✓ Created UPDATE message for zone: %s\n", zone)
+	// Step 2/3: Build UPDATE payload using shared packet factory
+	fmt.Printf("\nStep 2: Building UPDATE message payload\n")
 
-	// Step 3: Add KEY RR to Authority section (UPDATE section in DNS UPDATE)
+	// Step 3: Build KEY RR for Authority section (UPDATE section in DNS UPDATE)
 	fmt.Printf("\nStep 3: Adding KEY RR to Authority section\n")
 	// Create a KEY RR with client key material
 	keyRR := new(dns.KEY)
@@ -178,24 +162,22 @@ func cmdRegisterWithMode(proxyAddr string, args []string, tamper bool) {
 	keyRR.Protocol = clientKey.PublicKey.Protocol
 	keyRR.Algorithm = clientKey.PublicKey.Algorithm
 	keyRR.PublicKey = clientKey.PublicKey.PublicKey
-	msg.Ns = append(msg.Ns, keyRR)
 	fmt.Printf("  ✓ Added KEY RR: %s\n", keyRR.String())
 
-	// Step 4: Add UPDATE-LEASE EDNS option (code 2)
-	fmt.Printf("\nStep 4: Adding UPDATE-LEASE EDNS option\n")
-	leaseOpt := lease.Encode8Byte(leaseDuration, keyLeaseDuration)
-	if err := leaseOpt.Validate(); err != nil {
-		fmt.Fprintf(os.Stderr, "ERROR: Invalid lease values: %v\n", err)
+	if len(additionalRRs) > 0 {
+		fmt.Printf("\nStep 3b: Adding additional RR(s) to Authority section\n")
+		for _, rr := range additionalRRs {
+			fmt.Printf("  ✓ Added RR: %s\n", rr.String())
+		}
+	}
+
+	msg, err := dnsmsg.NewRegistrationUpdate(zone, keyRR, additionalRRs, leaseDuration, keyLeaseDuration)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "ERROR: Failed to build registration update packet: %v\n", err)
 		os.Exit(1)
 	}
 
-	opt := &dns.OPT{Hdr: dns.Header{Name: "."}}
-	opt.SetUDPSize(uint16(dns.DefaultMsgSize))
-	if err := leaseOpt.Encode(opt); err != nil {
-		fmt.Fprintf(os.Stderr, "ERROR: Failed to encode lease option: %v\n", err)
-		os.Exit(1)
-	}
-	msg.Extra = append(msg.Extra, opt)
+	fmt.Printf("\nStep 4: Added UPDATE-LEASE EDNS option\n")
 	fmt.Printf("  ✓ Added UPDATE-LEASE EDNS option\n")
 	fmt.Printf("    LEASE: %d seconds\n", leaseDuration)
 	fmt.Printf("    KEY-LEASE: %d seconds\n", keyLeaseDuration)
@@ -303,19 +285,33 @@ func cmdRegisterWithMode(proxyAddr string, args []string, tamper bool) {
 	}
 }
 
-// cmdRefresh sends a sig0lease UPDATE-LEASE refresh request (4-byte LEASE option).
+// cmdRefresh sends a sig0lease UPDATE-LEASE refresh request.
+// Default is 8-byte variant (LEASE + KEY-LEASE); "4byte" forces 4-byte variant.
 func cmdRefresh(proxyAddr string, args []string) {
 	if len(args) < 2 {
-		fmt.Fprintf(os.Stderr, "Usage: sig0lease-client <proxy> refresh <zone> <keyname> [lease]\n")
+		fmt.Fprintf(os.Stderr, "Usage: sig0lease-client <proxy> refresh <zone> <keyname> [lease] [key-lease|4byte]\n")
 		os.Exit(1)
 	}
 
 	zone := args[0]
 	keyname := args[1]
 	leaseDuration := uint32(defaultLease)
+	keyLeaseDuration := uint32(defaultKeyLease)
+	use4Byte := false
 	if len(args) > 2 {
 		if val, err := strconv.ParseUint(args[2], 10, 32); err == nil {
 			leaseDuration = uint32(val)
+		}
+	}
+	if len(args) > 3 {
+		mode := strings.ToLower(strings.TrimSpace(args[3]))
+		if mode == "4" || mode == "4byte" || mode == "4-byte" {
+			use4Byte = true
+		} else if val, err := strconv.ParseUint(args[3], 10, 32); err == nil {
+			keyLeaseDuration = uint32(val)
+		} else {
+			fmt.Fprintf(os.Stderr, "ERROR: invalid refresh key-lease/mode %q (expected uint or 4byte)\n", args[3])
+			os.Exit(1)
 		}
 	}
 
@@ -323,7 +319,13 @@ func cmdRefresh(proxyAddr string, args []string) {
 	fmt.Printf("Proxy: %s\n", proxyAddr)
 	fmt.Printf("Zone: %s\n", zone)
 	fmt.Printf("Key Name: %s\n", keyname)
-	fmt.Printf("New Lease: %d seconds\n\n", leaseDuration)
+	fmt.Printf("New Lease: %d seconds\n", leaseDuration)
+	if use4Byte {
+		fmt.Printf("Lease Variant: 4-byte (test mode)\n\n")
+	} else {
+		fmt.Printf("Key-Lease: %d seconds\n", keyLeaseDuration)
+		fmt.Printf("Lease Variant: 8-byte\n\n")
+	}
 
 	fmt.Printf("Step 1: Loading client key for key name (%s) from keystore (%s)\n", keyname, keystoreDir)
 	clientKeyName, err := keyrec.FindKeyByZone(keystoreDir, keyname)
@@ -339,32 +341,20 @@ func cmdRefresh(proxyAddr string, args []string) {
 	}
 
 	fmt.Printf("Step 2: Creating UPDATE refresh message\n")
-	msg := dns.NewMsg(zone, dns.TypeSOA)
-	msg.Opcode = dns.OpcodeUpdate
 
 	keyRR := new(dns.KEY)
 	keyRR.Hdr.Name = keyname
 	keyRR.Hdr.Class = dns.ClassINET
-	keyRR.Hdr.TTL = defaultKeyLease
+	keyRR.Hdr.TTL = keyLeaseDuration
 	keyRR.Flags = clientKey.PublicKey.Flags
 	keyRR.Protocol = clientKey.PublicKey.Protocol
 	keyRR.Algorithm = clientKey.PublicKey.Algorithm
 	keyRR.PublicKey = clientKey.PublicKey.PublicKey
-	msg.Ns = append(msg.Ns, keyRR)
-
-	leaseOpt := lease.Encode4Byte(leaseDuration)
-	if err := leaseOpt.Validate(); err != nil {
-		fmt.Fprintf(os.Stderr, "ERROR: Invalid lease values: %v\n", err)
+	msg, err := dnsmsg.NewRefreshUpdate(zone, keyRR, leaseDuration, keyLeaseDuration, use4Byte)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "ERROR: Failed to build refresh update packet: %v\n", err)
 		os.Exit(1)
 	}
-
-	opt := &dns.OPT{Hdr: dns.Header{Name: "."}}
-	opt.SetUDPSize(uint16(dns.DefaultMsgSize))
-	if err := leaseOpt.Encode(opt); err != nil {
-		fmt.Fprintf(os.Stderr, "ERROR: Failed to encode lease option: %v\n", err)
-		os.Exit(1)
-	}
-	msg.Extra = append(msg.Extra, opt)
 
 	fmt.Printf("Step 3: Signing refresh request with SIG(0)\n")
 	signer, err := client.NewSig0Signer(clientKey.PublicKey, clientKey.PrivateKey)
@@ -526,27 +516,37 @@ Usage:
   sig0lease-client <proxy> <command> [args...]
 
 Commands:
-  register <zone> <keyname> [lease] [key-lease]
+	register <zone> <keyname> [lease] [key-lease] [rr-spec...]
     Send a sig0lease UPDATE-LEASE registration request
     
     zone: downstream zone (e.g., test.dev.zenr.io.)
     keyname: key name to register (e.g., client.test.dev.zenr.io.)
     lease: lease duration in seconds (default: 300)
     key-lease: key-lease duration in seconds (default: 3600)
+		rr-spec: optional additional RR in one of these forms:
+			txt:<text>
+			txt:<name>:<text>
+			a:<ipv4>
+			a:<name>:<ipv4>
+			aaaa:<ipv6>
+			aaaa:<name>:<ipv6>
     
     Example:
       sig0lease-client 127.0.0.1:8053 register test.dev.zenr.io. client.test.dev.zenr.io.
       sig0lease-client 127.0.0.1:8053 register test.dev.zenr.io. client.test.dev.zenr.io. 300 3600
 
-	refresh <zone> <keyname> [lease]
-		Send a sig0lease UPDATE-LEASE refresh request (4-byte LEASE variant)
+	refresh <zone> <keyname> [lease] [key-lease|4byte]
+		Send a sig0lease UPDATE-LEASE refresh request (8-byte by default)
+		Use 4byte as last arg only for explicit 4-byte variant tests
 
 		zone: downstream zone (e.g., test.dev.zenr.io.)
 		keyname: key name to refresh
 		lease: new lease duration in seconds (default: 300)
+		key-lease: key-lease duration in seconds (default: 3600, for 8-byte variant)
 
 		Example:
 			sig0lease-client 127.0.0.1:8053 refresh test.dev.zenr.io. client.test.dev.zenr.io. 300
+			sig0lease-client 127.0.0.1:8053 refresh test.dev.zenr.io. client.test.dev.zenr.io. 300 4byte
 
   verify <zone> <keyname>
     Query if a key registration is active

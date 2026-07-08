@@ -13,209 +13,39 @@ import (
 	"codeberg.org/miekg/dns"
 	"github.com/NetworkCommons/sig0lease/logging"
 	"github.com/NetworkCommons/sig0lease/pkg/keyrec"
+	leasepkg "github.com/NetworkCommons/sig0lease/pkg/lease"
 	"github.com/NetworkCommons/sig0lease/pkg/sig0"
 )
 
-// LeaseRecord represents an active lease for a client key.
-type LeaseRecord struct {
-	// Client's public key (KEY RR)
-	KeyRR *dns.KEY
+// LeaseRecord is the shared lease state record used by handlers.
+type LeaseRecord = leasepkg.Record
 
-	// Lease expiration time
-	ExpiresAt time.Time
-
-	// Original lease duration requested (in seconds)
+// DataLeaseRecord tracks non-KEY RR lease state linked to a key registration.
+type DataLeaseRecord struct {
+	Records       []dns.RR
+	ExpiresAt     time.Time
+	UpstreamZone  string
 	LeaseDuration uint32
-
-	// Upstream zone where the key is registered
-	UpstreamZone string
-
-	// When the lease was registered
-	RegisteredAt time.Time
+	Deleted       bool
 }
 
-// IsExpired returns true if the lease has expired.
-func (lr *LeaseRecord) IsExpired() bool {
-	return time.Now().After(lr.ExpiresAt)
+// TTLPolicy controls rewrite clamping for upstream forwarded RRs.
+type TTLPolicy struct {
+	MinKeyTTL uint32
+	MaxKeyTTL uint32
+	MinRRTTL  uint32
+	MaxRRTTL  uint32
 }
 
-// TimeRemaining returns the time until lease expiration.
-func (lr *LeaseRecord) TimeRemaining() time.Duration {
-	remaining := time.Until(lr.ExpiresAt)
-	if remaining < 0 {
-		return 0
-	}
-	return remaining
-}
+// LeaseManager is the shared lease manager abstraction.
+type LeaseManager = leasepkg.Manager
 
-// LeaseManager manages the lifecycle of client leases.
-// Implementations must be thread-safe.
-type LeaseManager interface {
-	// Register creates or updates a lease for a key.
-	// keyName is the FQDN of the key (e.g., "client.example.com.")
-	// Returns error if registration fails.
-	Register(ctx context.Context, keyName string, keyRR *dns.KEY, leaseDuration uint32, upstreamZone string) error
-
-	// Lookup retrieves an active lease for a key name.
-	// Returns nil if not found or expired.
-	Lookup(keyName string) *LeaseRecord
-
-	// Get retrieves a lease record regardless of expiry state.
-	// Returns nil if not found.
-	Get(keyName string) *LeaseRecord
-
-	// Delete removes a lease.
-	Delete(keyName string) error
-
-	// ListExpiring returns leases expiring within the next duration.
-	// Used for maintenance and refresh handling.
-	ListExpiring(within time.Duration) []*LeaseRecord
-
-	// PersistenceHook is called when a lease is registered or updated.
-	// Allows plugging in persistence backends (file, database, etc.).
-	// Implementation can be async if needed.
-	SetPersistenceHook(hook func(ctx context.Context, op string, record *LeaseRecord) error)
-}
-
-// InMemoryLeaseManager is a simple in-memory implementation of LeaseManager.
-type InMemoryLeaseManager struct {
-	mu              sync.RWMutex
-	leases          map[string]*LeaseRecord
-	persistenceHook func(ctx context.Context, op string, record *LeaseRecord) error
-	cleanupTicker   *time.Ticker
-	cleanupDone     chan struct{}
-}
+// InMemoryLeaseManager is a reusable in-memory lease manager implementation.
+type InMemoryLeaseManager = leasepkg.InMemoryManager
 
 // NewInMemoryLeaseManager creates a new in-memory lease manager.
 func NewInMemoryLeaseManager() *InMemoryLeaseManager {
-	m := &InMemoryLeaseManager{
-		leases:      make(map[string]*LeaseRecord),
-		cleanupDone: make(chan struct{}),
-	}
-
-	// Start cleanup goroutine to remove expired leases periodically
-	m.cleanupTicker = time.NewTicker(30 * time.Second)
-	go func() {
-		for {
-			select {
-			case <-m.cleanupTicker.C:
-				m.cleanupExpired()
-			case <-m.cleanupDone:
-				return
-			}
-		}
-	}()
-
-	return m
-}
-
-// Register creates or updates a lease.
-func (m *InMemoryLeaseManager) Register(ctx context.Context, keyName string, keyRR *dns.KEY, leaseDuration uint32, upstreamZone string) error {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-
-	record := &LeaseRecord{
-		KeyRR:         keyRR,
-		ExpiresAt:     time.Now().Add(time.Duration(leaseDuration) * time.Second),
-		LeaseDuration: leaseDuration,
-		UpstreamZone:  upstreamZone,
-		RegisteredAt:  time.Now(),
-	}
-
-	m.leases[keyName] = record
-
-	// Call persistence hook if configured
-	if m.persistenceHook != nil {
-		if err := m.persistenceHook(ctx, "register", record); err != nil {
-			// Log but don't fail - lease is still tracked in memory
-			// Caller should decide whether to propagate error
-		}
-	}
-
-	return nil
-}
-
-// Lookup retrieves an active lease.
-func (m *InMemoryLeaseManager) Lookup(keyName string) *LeaseRecord {
-	m.mu.RLock()
-	defer m.mu.RUnlock()
-
-	record, exists := m.leases[keyName]
-	if !exists {
-		return nil
-	}
-
-	if record.IsExpired() {
-		return nil
-	}
-
-	return record
-}
-
-// Get retrieves a lease record regardless of expiry state.
-func (m *InMemoryLeaseManager) Get(keyName string) *LeaseRecord {
-	m.mu.RLock()
-	defer m.mu.RUnlock()
-
-	record, exists := m.leases[keyName]
-	if !exists {
-		return nil
-	}
-
-	return record
-}
-
-// Delete removes a lease.
-func (m *InMemoryLeaseManager) Delete(keyName string) error {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-
-	delete(m.leases, keyName)
-	return nil
-}
-
-// ListExpiring returns leases expiring within the specified duration.
-func (m *InMemoryLeaseManager) ListExpiring(within time.Duration) []*LeaseRecord {
-	m.mu.RLock()
-	defer m.mu.RUnlock()
-
-	var expiring []*LeaseRecord
-	cutoff := time.Now().Add(within)
-
-	for _, record := range m.leases {
-		if !record.IsExpired() && record.ExpiresAt.Before(cutoff) {
-			expiring = append(expiring, record)
-		}
-	}
-
-	return expiring
-}
-
-// SetPersistenceHook sets a hook for persistence operations.
-func (m *InMemoryLeaseManager) SetPersistenceHook(hook func(ctx context.Context, op string, record *LeaseRecord) error) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	m.persistenceHook = hook
-}
-
-// cleanupExpired removes all expired leases.
-func (m *InMemoryLeaseManager) cleanupExpired() {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-
-	for keyName, record := range m.leases {
-		if record.IsExpired() {
-			delete(m.leases, keyName)
-		}
-	}
-}
-
-// Stop terminates the cleanup goroutine.
-func (m *InMemoryLeaseManager) Stop() {
-	if m.cleanupTicker != nil {
-		m.cleanupTicker.Stop()
-		close(m.cleanupDone)
-	}
+	return leasepkg.NewInMemoryManager()
 }
 
 // UpstreamCoordinator handles communication with the upstream authoritative server.
@@ -378,8 +208,11 @@ type UpdateHandler struct {
 	leaseManager        LeaseManager
 	upstreamCoordinator UpstreamCoordinator
 	keystoreDir         string
+	ttlPolicy           TTLPolicy
 	leaseTimersMu       sync.Mutex
 	leaseTimers         map[string]*time.Timer
+	dataLeasesMu        sync.RWMutex
+	dataLeases          map[string]*DataLeaseRecord
 }
 
 // NewUpdateHandler creates a new handler for opcode 5 (UPDATE) queries.
@@ -392,6 +225,7 @@ func NewUpdateHandler() *UpdateHandler {
 		leaseManager:        NewInMemoryLeaseManager(),
 		upstreamCoordinator: nil, // Must be configured via Setup()
 		leaseTimers:         make(map[string]*time.Timer),
+		dataLeases:          make(map[string]*DataLeaseRecord),
 	}
 }
 
@@ -406,6 +240,38 @@ func keyRREqual(a, b *dns.KEY) bool {
 		a.Protocol == b.Protocol &&
 		a.Algorithm == b.Algorithm &&
 		a.PublicKey == b.PublicKey
+}
+
+func copyRR(rr dns.RR) dns.RR {
+	if rr == nil {
+		return nil
+	}
+	return rr.Clone()
+}
+
+func clampTTL(ttl, min, max uint32) uint32 {
+	if min > 0 && ttl < min {
+		ttl = min
+	}
+	if max > 0 && ttl > max {
+		ttl = max
+	}
+	return ttl
+}
+
+func (h *UpdateHandler) applyTTLPolicy(keyRR *dns.KEY, other []dns.RR) (*dns.KEY, []dns.RR) {
+	newKey := copyRR(keyRR).(*dns.KEY)
+	newKey.Hdr.TTL = clampTTL(newKey.Hdr.TTL, h.ttlPolicy.MinKeyTTL, h.ttlPolicy.MaxKeyTTL)
+
+	newOther := make([]dns.RR, 0, len(other))
+	for _, rr := range other {
+		cpy := copyRR(rr)
+		hdr := cpy.Header()
+		hdr.TTL = clampTTL(hdr.TTL, h.ttlPolicy.MinRRTTL, h.ttlPolicy.MaxRRTTL)
+		newOther = append(newOther, cpy)
+	}
+
+	return newKey, newOther
 }
 
 func (h *UpdateHandler) validateRefreshOwnership(clientKeyRR *dns.KEY) error {
@@ -425,6 +291,90 @@ func (h *UpdateHandler) validateRefreshOwnership(clientKeyRR *dns.KEY) error {
 	return nil
 }
 
+func (h *UpdateHandler) setDataLease(keyName string, records []dns.RR, leaseDuration uint32, upstreamZone string) {
+	h.dataLeasesMu.Lock()
+	defer h.dataLeasesMu.Unlock()
+
+	h.dataLeases[keyName] = &DataLeaseRecord{
+		Records:       records,
+		ExpiresAt:     time.Now().Add(time.Duration(leaseDuration) * time.Second),
+		UpstreamZone:  upstreamZone,
+		LeaseDuration: leaseDuration,
+		Deleted:       false,
+	}
+}
+
+func (h *UpdateHandler) refreshDataLease(keyName string, leaseDuration uint32) error {
+	h.dataLeasesMu.Lock()
+	defer h.dataLeasesMu.Unlock()
+
+	rec, ok := h.dataLeases[keyName]
+	if !ok {
+		return fmt.Errorf("refresh rejected: lease does not exist")
+	}
+
+	rec.ExpiresAt = time.Now().Add(time.Duration(leaseDuration) * time.Second)
+	rec.LeaseDuration = leaseDuration
+	rec.Deleted = false
+	return nil
+}
+
+func (h *UpdateHandler) deleteDataLease(keyName string) {
+	h.dataLeasesMu.Lock()
+	defer h.dataLeasesMu.Unlock()
+	delete(h.dataLeases, keyName)
+}
+
+func (h *UpdateHandler) getDataLease(keyName string) *DataLeaseRecord {
+	h.dataLeasesMu.RLock()
+	defer h.dataLeasesMu.RUnlock()
+	rec, ok := h.dataLeases[keyName]
+	if !ok {
+		return nil
+	}
+	copyRec := *rec
+	copyRec.Records = append([]dns.RR(nil), rec.Records...)
+	return &copyRec
+}
+
+func (h *UpdateHandler) markDataLeaseDeleted(keyName string) {
+	h.dataLeasesMu.Lock()
+	defer h.dataLeasesMu.Unlock()
+	if rec, ok := h.dataLeases[keyName]; ok {
+		rec.Deleted = true
+	}
+}
+
+func (h *UpdateHandler) nextLeaseEventAfter(keyName string) (time.Duration, bool) {
+	var next *time.Time
+
+	if keyRec := h.leaseManager.Get(keyName); keyRec != nil {
+		t := keyRec.ExpiresAt
+		next = &t
+	}
+
+	if dataRec := h.getDataLease(keyName); dataRec != nil && !dataRec.Deleted {
+		t := dataRec.ExpiresAt
+		if next == nil || t.Before(*next) {
+			next = &t
+		}
+	}
+
+	if next == nil {
+		return 0, false
+	}
+
+	d := time.Until(*next)
+	if d < 0 {
+		d = 0
+	}
+	if d < 100*time.Millisecond {
+		d = 100 * time.Millisecond
+	}
+
+	return d, true
+}
+
 func (h *UpdateHandler) clearLeaseTimer(keyName string) {
 	h.leaseTimersMu.Lock()
 	defer h.leaseTimersMu.Unlock()
@@ -435,10 +385,14 @@ func (h *UpdateHandler) clearLeaseTimer(keyName string) {
 	}
 }
 
-func (h *UpdateHandler) scheduleLeaseExpiry(keyName string, leaseDuration uint32) {
+func (h *UpdateHandler) scheduleLeaseExpiry(keyName string) {
 	h.clearLeaseTimer(keyName)
 
-	d := time.Duration(leaseDuration) * time.Second
+	d, ok := h.nextLeaseEventAfter(keyName)
+	if !ok {
+		return
+	}
+
 	t := time.AfterFunc(d, func() {
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
@@ -482,14 +436,109 @@ func (h *UpdateHandler) constructUpstreamDelete(clientKeyRR *dns.KEY, upstreamZo
 	return signedMsg, nil
 }
 
+func (h *UpdateHandler) constructUpstreamDeleteForRecords(records []dns.RR, upstreamZone string) (*dns.Msg, error) {
+	msg := dns.NewMsg(upstreamZone, dns.TypeSOA)
+	if msg == nil {
+		return nil, fmt.Errorf("failed to create DNS delete message")
+	}
+
+	msg.Opcode = dns.OpcodeUpdate
+	msg.RecursionDesired = false
+	msg.Answer = nil
+	msg.Ns = nil
+
+	for _, rr := range records {
+		if rr == nil {
+			continue
+		}
+		hdr := rr.Header()
+		if hdr == nil {
+			continue
+		}
+
+		// RFC 2136 delete: class NONE + TTL 0 with full RDATA for RR delete.
+		cpy := copyRR(rr)
+		cpyHdr := cpy.Header()
+		cpyHdr.Class = dns.ClassNONE
+		cpyHdr.TTL = 0
+		msg.Ns = append(msg.Ns, cpy)
+	}
+
+	opt := &dns.OPT{Hdr: dns.Header{Name: "."}}
+	opt.SetUDPSize(uint16(dns.DefaultMsgSize))
+	msg.Extra = append(msg.Extra, opt)
+
+	if h.upstreamKeyRecord == nil || h.upstreamKeyRecord.PrivateKey == nil || h.upstreamKeyRecord.PublicKey == nil {
+		return nil, fmt.Errorf("upstream SIG(0) key is not configured")
+	}
+
+	signedMsg, err := sig0.SignMessage(msg, h.upstreamKeyRecord.PublicKey, h.upstreamKeyRecord.PrivateKey)
+	if err != nil {
+		return nil, fmt.Errorf("failed to sign upstream DELETE with SIG(0): %w", err)
+	}
+
+	return signedMsg, nil
+}
+
+func extractUpdateRecords(msg *dns.Msg) (*dns.KEY, []dns.RR, error) {
+	var keyRR *dns.KEY
+	other := make([]dns.RR, 0, len(msg.Ns))
+
+	for _, rr := range msg.Ns {
+		switch v := rr.(type) {
+		case *dns.KEY:
+			if keyRR != nil {
+				return nil, nil, fmt.Errorf("multiple KEY RRs are not supported")
+			}
+			keyRR = v
+		case *dns.TXT, *dns.A, *dns.AAAA:
+			other = append(other, rr)
+		default:
+			return nil, nil, fmt.Errorf("unsupported RR type %T in UPDATE section", rr)
+		}
+	}
+
+	if keyRR == nil {
+		return nil, nil, fmt.Errorf("no KEY RR found in update records")
+	}
+
+	return keyRR, other, nil
+}
+
 func (h *UpdateHandler) processExpiredLease(ctx context.Context, keyName string) {
-	defer h.clearLeaseTimer(keyName)
+	defer h.scheduleLeaseExpiry(keyName)
 
 	record := h.leaseManager.Get(keyName)
-	if record == nil {
+	dataLease := h.getDataLease(keyName)
+	if record == nil && dataLease == nil {
+		h.clearLeaseTimer(keyName)
 		return
 	}
-	if !record.IsExpired() {
+
+	now := time.Now()
+
+	if dataLease != nil && !dataLease.Deleted && !now.Before(dataLease.ExpiresAt) {
+		effectiveZone := dataLease.UpstreamZone
+		if dc, ok := h.upstreamCoordinator.(*DefaultUpstreamCoordinator); ok {
+			resolvedZone, err := dc.resolveAuthoritativeZone(ctx, dataLease.UpstreamZone)
+			if err == nil {
+				effectiveZone = resolvedZone
+			}
+		}
+
+		if h.upstreamCoordinator != nil && len(dataLease.Records) > 0 {
+			deleteMsg, err := h.constructUpstreamDeleteForRecords(dataLease.Records, effectiveZone)
+			if err != nil {
+				h.logger.Debugf("Failed to construct upstream data lease-expiry delete for %s: %v", keyName, err)
+			} else if _, err := h.upstreamCoordinator.SendUpdate(ctx, effectiveZone, deleteMsg); err != nil {
+				h.logger.Debugf("Upstream data lease-expiry delete failed for %s: %v", keyName, err)
+			}
+		}
+
+		h.markDataLeaseDeleted(keyName)
+	}
+
+	if record == nil || now.Before(record.ExpiresAt) {
 		return
 	}
 
@@ -515,6 +564,8 @@ func (h *UpdateHandler) processExpiredLease(ctx context.Context, keyName string)
 	if err := h.leaseManager.Delete(keyName); err != nil {
 		h.logger.Debugf("Failed to delete expired local lease for %s: %v", keyName, err)
 	}
+	h.deleteDataLease(keyName)
+	h.clearLeaseTimer(keyName)
 }
 
 // Handle processes an UPDATE query and returns a HandlerResult.
@@ -569,18 +620,31 @@ func (h *UpdateHandler) Handle(ctx context.Context, w dns.ResponseWriter, r *dns
 
 	h.logger.Debugf("UPDATE for zone: %s (class: %d)", zone, class)
 
-	leaseDuration, isRefresh, err := h.parseLease(r)
+	leaseDuration, keyLeaseDuration, isRefresh, err := h.parseLease(r)
 	if err != nil {
 		h.logger.Debugf("Lease parsing failed: %v", err)
 		msg := h.makeErrorResponse(r, uint16(16), fmt.Sprintf("invalid lease: %v", err))
 		return NewErrorResult(msg, fmt.Sprintf("lease parsing failed: %v", err), err)
 	}
 
-	h.logger.Debugf("Parsed lease duration: %d seconds (refresh=%v)", leaseDuration, isRefresh)
+	h.logger.Debugf("Parsed lease duration: %d seconds key-lease=%d (refresh=%v)", leaseDuration, keyLeaseDuration, isRefresh)
+
+	clientKeyRR, otherRecords, err := extractUpdateRecords(r)
+	if err != nil {
+		h.logger.Debugf("Invalid update records: %v", err)
+		msg := h.makeErrorResponse(r, dns.RcodeFormatError, err.Error())
+		return NewErrorResult(msg, err.Error(), err)
+	}
+
+	if isRefresh && len(otherRecords) > 0 {
+		err := fmt.Errorf("refresh requests must not include non-KEY records")
+		msg := h.makeErrorResponse(r, dns.RcodeFormatError, err.Error())
+		return NewErrorResult(msg, err.Error(), err)
+	}
 
 	// Extract and validate client SIG(0) against dynamic downstream zone key.
 	// The request zone itself is treated as downstream zone asserted by client.
-	sigRR, _, err := h.extractAndValidateSig0(r, zone)
+	sigRR, _, err := h.extractAndValidateSig0(r, zone, clientKeyRR)
 	if err != nil {
 		h.logger.Debugf("SIG(0) validation failed: %v", err)
 		msg := h.makeErrorResponse(r, dns.RcodeRefused, fmt.Sprintf("SIG(0) validation failed: %v", err))
@@ -589,23 +653,11 @@ func (h *UpdateHandler) Handle(ctx context.Context, w dns.ResponseWriter, r *dns
 
 	h.logger.Debugf("SIG(0) validated: Algorithm=%d, KeyTag=%d, Signer=%s",
 		sigRR.Algorithm, sigRR.KeyTag, sigRR.SignerName)
-
-	// Extract client's KEY RR from update records (Authority section)
-	// For Phase 1, we expect exactly one KEY RR
-	var clientKeyRR *dns.KEY
-	for _, rr := range r.Ns {
-		if key, ok := rr.(*dns.KEY); ok {
-			clientKeyRR = key
-			h.logger.Debugf("Extracted client KEY RR: %s", key.String())
-			break
-		}
+	if sigRR.Algorithm != 15 {
+		h.logger.Warnf("Non-default DNSSEC algorithm used in request signer: %d", sigRR.Algorithm)
 	}
 
-	if clientKeyRR == nil {
-		h.logger.Debugf("No KEY RR found in update records")
-		msg := h.makeErrorResponse(r, dns.RcodeFormatError, "no KEY RR in update")
-		return NewErrorResult(msg, "no KEY RR found in update records", nil)
-	}
+	h.logger.Debugf("Extracted client KEY RR: %s", clientKeyRR.String())
 
 	// Refresh requests must target an existing lease and present the same key material.
 	clientKeyName := clientKeyRR.Hdr.Name
@@ -614,20 +666,14 @@ func (h *UpdateHandler) Handle(ctx context.Context, w dns.ResponseWriter, r *dns
 			msg := h.makeErrorResponse(r, dns.RcodeRefused, err.Error())
 			return NewErrorResult(msg, err.Error(), err)
 		}
-	}
+		if err := h.refreshDataLease(clientKeyName, leaseDuration); err != nil {
+			msg := h.makeErrorResponse(r, dns.RcodeRefused, err.Error())
+			return NewErrorResult(msg, err.Error(), err)
+		}
+		h.scheduleLeaseExpiry(clientKeyName)
 
-	// Register lease in in-memory storage (for refresh this extends expiry).
-	if err := h.leaseManager.Register(ctx, clientKeyName, clientKeyRR, leaseDuration, h.upstreamZone); err != nil {
-		h.logger.Debugf("Failed to register lease: %v", err)
-		msg := h.makeErrorResponse(r, dns.RcodeServerFailure, fmt.Sprintf("lease registration failed: %v", err))
-		return NewErrorResult(msg, fmt.Sprintf("lease registration failed: %v", err), err)
-	}
+		h.logger.Debugf("Lease refreshed for %s (data lease=%d seconds)", clientKeyName, leaseDuration)
 
-	h.scheduleLeaseExpiry(clientKeyName, leaseDuration)
-
-	h.logger.Debugf("Lease registered/refreshed for %s (duration: %d seconds, refresh=%v)", clientKeyName, leaseDuration, isRefresh)
-
-	if isRefresh {
 		resp := &dns.Msg{
 			MsgHeader: r.MsgHeader,
 			Question:  r.Question,
@@ -644,6 +690,18 @@ func (h *UpdateHandler) Handle(ctx context.Context, w dns.ResponseWriter, r *dns
 		return NewProcessedResult(resp)
 	}
 
+	// Register key lease and RR-data lease separately.
+	if err := h.leaseManager.Register(ctx, clientKeyName, clientKeyRR, keyLeaseDuration, h.upstreamZone); err != nil {
+		h.logger.Debugf("Failed to register lease: %v", err)
+		msg := h.makeErrorResponse(r, dns.RcodeServerFailure, fmt.Sprintf("lease registration failed: %v", err))
+		return NewErrorResult(msg, fmt.Sprintf("lease registration failed: %v", err), err)
+	}
+	h.setDataLease(clientKeyName, otherRecords, leaseDuration, h.upstreamZone)
+
+	h.scheduleLeaseExpiry(clientKeyName)
+
+	h.logger.Debugf("Lease registered for %s (lease=%d seconds, key-lease=%d seconds)", clientKeyName, leaseDuration, keyLeaseDuration)
+
 	effectiveUpstreamZone := h.upstreamZone
 	if dc, ok := h.upstreamCoordinator.(*DefaultUpstreamCoordinator); ok {
 		resolvedZone, err := dc.resolveAuthoritativeZone(ctx, h.upstreamZone)
@@ -657,9 +715,12 @@ func (h *UpdateHandler) Handle(ctx context.Context, w dns.ResponseWriter, r *dns
 	}
 
 	// Construct UPDATE message for effective upstream zone
-	upstreamUpdate, err := h.constructUpstreamUpdate(clientKeyName, clientKeyRR, effectiveUpstreamZone)
+	upstreamUpdate, err := h.constructUpstreamUpdate(clientKeyRR, otherRecords, effectiveUpstreamZone)
 	if err != nil {
 		h.logger.Debugf("Failed to construct upstream UPDATE: %v", err)
+		h.deleteDataLease(clientKeyName)
+		_ = h.leaseManager.Delete(clientKeyName)
+		h.clearLeaseTimer(clientKeyName)
 		msg := h.makeErrorResponse(r, dns.RcodeServerFailure, fmt.Sprintf("upstream construction failed: %v", err))
 		return NewErrorResult(msg, fmt.Sprintf("upstream construction failed: %v", err), err)
 	}
@@ -667,6 +728,7 @@ func (h *UpdateHandler) Handle(ctx context.Context, w dns.ResponseWriter, r *dns
 	// Send UPDATE to upstream and fail-closed if upstream does not accept it.
 	if h.upstreamCoordinator == nil {
 		_ = h.leaseManager.Delete(clientKeyName)
+		h.deleteDataLease(clientKeyName)
 		h.clearLeaseTimer(clientKeyName)
 		msg := h.makeErrorResponse(r, dns.RcodeServerFailure, "upstream coordinator not configured")
 		return NewErrorResult(msg, "upstream coordinator not configured", fmt.Errorf("upstream coordinator is nil"))
@@ -677,6 +739,7 @@ func (h *UpdateHandler) Handle(ctx context.Context, w dns.ResponseWriter, r *dns
 	if err != nil {
 		h.logger.Debugf("Upstream UPDATE transport/processing error for zone=%s key=%s: %v", h.upstreamZone, clientKeyName, err)
 		_ = h.leaseManager.Delete(clientKeyName)
+		h.deleteDataLease(clientKeyName)
 		h.clearLeaseTimer(clientKeyName)
 		msg := h.makeErrorResponse(r, dns.RcodeServerFailure, fmt.Sprintf("upstream update failed: %v", err))
 		return NewErrorResult(msg, fmt.Sprintf("upstream update failed: %v", err), err)
@@ -684,6 +747,7 @@ func (h *UpdateHandler) Handle(ctx context.Context, w dns.ResponseWriter, r *dns
 	if upstreamResp == nil {
 		h.logger.Debugf("Upstream UPDATE returned nil response for zone=%s key=%s", h.upstreamZone, clientKeyName)
 		_ = h.leaseManager.Delete(clientKeyName)
+		h.deleteDataLease(clientKeyName)
 		h.clearLeaseTimer(clientKeyName)
 		msg := h.makeErrorResponse(r, dns.RcodeServerFailure, "upstream update returned nil response")
 		return NewErrorResult(msg, "upstream update returned nil response", fmt.Errorf("nil upstream response"))
@@ -693,6 +757,7 @@ func (h *UpdateHandler) Handle(ctx context.Context, w dns.ResponseWriter, r *dns
 		upstreamResp.Rcode, dns.RcodeToString[upstreamResp.Rcode], len(upstreamResp.Answer), len(upstreamResp.Ns), len(upstreamResp.Extra))
 	if upstreamResp.Rcode != dns.RcodeSuccess {
 		_ = h.leaseManager.Delete(clientKeyName)
+		h.deleteDataLease(clientKeyName)
 		h.clearLeaseTimer(clientKeyName)
 		msg := h.makeErrorResponse(r, uint16(upstreamResp.Rcode),
 			fmt.Sprintf("upstream rejected update: rcode=%d (%s)", upstreamResp.Rcode, dns.RcodeToString[upstreamResp.Rcode]))
@@ -773,53 +838,64 @@ func (h *UpdateHandler) hasUpdateLeaseOption(msg *dns.Msg) bool {
 	return false
 }
 
-// parseLease extracts the 8-byte lease EDNS(0) option from the message.
-// Returns the lease duration in seconds, or an error if the option is invalid.
-func (h *UpdateHandler) parseLease(msg *dns.Msg) (uint32, bool, error) {
+// parseLease extracts UPDATE-LEASE EDNS(0) data.
+// Returns LEASE, KEY-LEASE, refresh-flag, and error if invalid.
+func (h *UpdateHandler) parseLease(msg *dns.Msg) (uint32, uint32, bool, error) {
 	const MinLeaseDuration = 30 // RFC 9664 minimum
-	parseERFC := func(erfc *dns.ERFC3597) (uint32, bool, bool, error) {
+	parseERFC := func(erfc *dns.ERFC3597) (uint32, uint32, bool, bool, error) {
 		if erfc.EDNS0Code != 2 {
-			return 0, false, false, nil
+			return 0, 0, false, false, nil
 		}
 
 		data := erfc.Code
 		if data == "" {
-			return 0, false, true, fmt.Errorf("empty lease option data")
+			return 0, 0, false, true, fmt.Errorf("empty lease option data")
 		}
 
 		// Decode hex string to binary
 		binary, err := hex.DecodeString(data)
 		if err != nil {
-			return 0, false, true, fmt.Errorf("invalid hex in lease option: %w", err)
+			return 0, 0, false, true, fmt.Errorf("invalid hex in lease option: %w", err)
 		}
 		if len(binary) != 4 && len(binary) != 8 {
-			return 0, false, true, fmt.Errorf("invalid lease option length: %d bytes", len(binary))
+			return 0, 0, false, true, fmt.Errorf("invalid lease option length: %d bytes", len(binary))
 		}
 
 		// Parse 4-byte big-endian LEASE value
 		lease := uint32(binary[0])<<24 | uint32(binary[1])<<16 | uint32(binary[2])<<8 | uint32(binary[3])
 
 		if lease < MinLeaseDuration {
-			return 0, false, true, fmt.Errorf("lease duration %d below minimum %d", lease, MinLeaseDuration)
+			return 0, 0, false, true, fmt.Errorf("lease duration %d below minimum %d", lease, MinLeaseDuration)
 		}
 
 		// Refresh requests use 4-byte LEASE variant.
 		isRefresh := len(binary) == 4
+		if isRefresh {
+			return lease, 0, true, true, nil
+		}
 
-		return lease, isRefresh, true, nil
+		keyLease := uint32(binary[4])<<24 | uint32(binary[5])<<16 | uint32(binary[6])<<8 | uint32(binary[7])
+		if keyLease < MinLeaseDuration {
+			return 0, 0, false, true, fmt.Errorf("key-lease duration %d below minimum %d", keyLease, MinLeaseDuration)
+		}
+		if lease > keyLease {
+			return 0, 0, false, true, fmt.Errorf("lease duration %d cannot exceed key-lease duration %d", lease, keyLease)
+		}
+
+		return lease, keyLease, false, true, nil
 	}
 
 	for _, rr := range msg.Pseudo {
 		if erfc, ok := rr.(*dns.ERFC3597); ok {
-			if lease, isRefresh, matched, err := parseERFC(erfc); matched {
-				return lease, isRefresh, err
+			if lease, keyLease, isRefresh, matched, err := parseERFC(erfc); matched {
+				return lease, keyLease, isRefresh, err
 			}
 		}
 		if opt, ok := rr.(*dns.OPT); ok {
 			for _, option := range opt.Options {
 				if erfc, ok := option.(*dns.ERFC3597); ok && erfc.EDNS0Code == 2 {
-					if lease, isRefresh, matched, err := parseERFC(erfc); matched {
-						return lease, isRefresh, err
+					if lease, keyLease, isRefresh, matched, err := parseERFC(erfc); matched {
+						return lease, keyLease, isRefresh, err
 					}
 				}
 			}
@@ -828,15 +904,15 @@ func (h *UpdateHandler) parseLease(msg *dns.Msg) (uint32, bool, error) {
 
 	for _, rr := range msg.Extra {
 		if erfc, ok := rr.(*dns.ERFC3597); ok {
-			if lease, isRefresh, matched, err := parseERFC(erfc); matched {
-				return lease, isRefresh, err
+			if lease, keyLease, isRefresh, matched, err := parseERFC(erfc); matched {
+				return lease, keyLease, isRefresh, err
 			}
 		}
 		if opt, ok := rr.(*dns.OPT); ok {
 			for _, option := range opt.Options {
 				if erfc, ok := option.(*dns.ERFC3597); ok && erfc.EDNS0Code == 2 {
-					if lease, isRefresh, matched, err := parseERFC(erfc); matched {
-						return lease, isRefresh, err
+					if lease, keyLease, isRefresh, matched, err := parseERFC(erfc); matched {
+						return lease, keyLease, isRefresh, err
 					}
 				}
 			}
@@ -844,14 +920,14 @@ func (h *UpdateHandler) parseLease(msg *dns.Msg) (uint32, bool, error) {
 	}
 
 	// No lease option found
-	return 0, false, fmt.Errorf("no Update Lease EDNS option found")
+	return 0, 0, false, fmt.Errorf("no Update Lease EDNS option found")
 }
 
 // extractAndValidateSig0 extracts and validates SIG(0) from the message.
-// Returns the SIG RR, KEY RR, and error (if validation failed).
-func (h *UpdateHandler) extractAndValidateSig0(msg *dns.Msg, downstreamZone string) (*dns.SIG, *dns.KEY, error) {
+// expectedKey must be the single validated KEY RR extracted from update records.
+func (h *UpdateHandler) extractAndValidateSig0(msg *dns.Msg, downstreamZone string, expectedKey *dns.KEY) (*dns.SIG, *dns.KEY, error) {
 	var sigRR *dns.SIG
-	var dnskey *dns.KEY
+	dnskey := expectedKey
 
 	// Look for SIG in Pseudo section first (RFC 2535 SIG(0))
 	for _, rr := range msg.Pseudo {
@@ -869,28 +945,12 @@ func (h *UpdateHandler) extractAndValidateSig0(msg *dns.Msg, downstreamZone stri
 		}
 	}
 
-	// Look for KEY in Ns section (Authority - where UPDATE sends it)
-	for _, rr := range msg.Ns {
-		if key, ok := rr.(*dns.KEY); ok && dnskey == nil {
-			dnskey = key
-		}
-	}
-
-	// Also look in Extra if not found in Ns
-	if dnskey == nil {
-		for _, rr := range msg.Extra {
-			if key, ok := rr.(*dns.KEY); ok && dnskey == nil {
-				dnskey = key
-			}
-		}
-	}
-
 	if sigRR == nil {
 		return nil, nil, fmt.Errorf("no SIG(0) in message")
 	}
 
 	if dnskey == nil {
-		return nil, nil, fmt.Errorf("no KEY RR in message payload")
+		return nil, nil, fmt.Errorf("no KEY RR provided for validation")
 	}
 	if downstreamZone == "" {
 		return nil, nil, fmt.Errorf("downstream zone is empty")
@@ -938,7 +998,7 @@ func (h *UpdateHandler) extractAndValidateSig0(msg *dns.Msg, downstreamZone stri
 // constructUpstreamUpdate builds an UPDATE message for the upstream zone.
 // This UPDATE will be sent to the authoritative server for the upstream zone.
 // If upstream key is loaded, it will be signed with SIG(0).
-func (h *UpdateHandler) constructUpstreamUpdate(clientKeyName string, clientKeyRR *dns.KEY, upstreamZone string) (*dns.Msg, error) {
+func (h *UpdateHandler) constructUpstreamUpdate(clientKeyRR *dns.KEY, otherRecords []dns.RR, upstreamZone string) (*dns.Msg, error) {
 	// Create UPDATE message for upstream zone using dns.NewMsg
 	msg := dns.NewMsg(upstreamZone, dns.TypeSOA)
 	if msg == nil {
@@ -952,10 +1012,11 @@ func (h *UpdateHandler) constructUpstreamUpdate(clientKeyName string, clientKeyR
 	msg.Answer = nil
 	msg.Ns = nil
 
-	// Update section: Add the client's KEY RR to upstream zone
-	// We just use the original KEY RR from the client
-	// In future phases, we may need to modify it (e.g., adjust TTL or name)
-	msg.Ns = append(msg.Ns, clientKeyRR)
+	policyKey, policyOther := h.applyTTLPolicy(clientKeyRR, otherRecords)
+
+	// Update section: KEY plus supported non-KEY records.
+	msg.Ns = append(msg.Ns, policyKey)
+	msg.Ns = append(msg.Ns, policyOther...)
 
 	// Add OPT for EDNS support
 	opt := &dns.OPT{Hdr: dns.Header{Name: "."}}
@@ -993,6 +1054,32 @@ func (h *UpdateHandler) makeErrorResponse(req *dns.Msg, rcode uint16, msg string
 	return resp
 }
 
+func toUint32(v any) (uint32, bool) {
+	switch n := v.(type) {
+	case int:
+		if n < 0 {
+			return 0, false
+		}
+		return uint32(n), true
+	case int64:
+		if n < 0 {
+			return 0, false
+		}
+		return uint32(n), true
+	case float64:
+		if n < 0 {
+			return 0, false
+		}
+		return uint32(n), true
+	case uint32:
+		return n, true
+	case uint64:
+		return uint32(n), true
+	default:
+		return 0, false
+	}
+}
+
 // Setup initializes the handler configuration.
 //
 // Configuration options:
@@ -1001,6 +1088,7 @@ func (h *UpdateHandler) makeErrorResponse(req *dns.Msg, rcode uint16, msg string
 //   - "upstream_coordinator": Custom UpstreamCoordinator implementation [OPTIONAL]
 //   - "lease_manager": Custom LeaseManager implementation [OPTIONAL, defaults to InMemoryLeaseManager]
 //   - "persistence_hook": Persistence function for leases [OPTIONAL]
+//   - "ttl_policy": Rewrite TTL bounds applied before upstream forwarding [OPTIONAL]
 func (h *UpdateHandler) Setup(cfg map[string]any) error {
 	// Extract upstream zone
 	if zone, ok := cfg["upstream_zone"].(string); ok && zone != "" {
@@ -1040,6 +1128,36 @@ func (h *UpdateHandler) Setup(cfg map[string]any) error {
 	if hook, ok := cfg["persistence_hook"].(func(context.Context, string, *LeaseRecord) error); ok {
 		h.leaseManager.SetPersistenceHook(hook)
 		h.logger.Debugf("Persistence hook configured for leases")
+	}
+
+	// Optional: TTL rewrite policy hook
+	if raw, ok := cfg["ttl_policy"]; ok {
+		policy, ok := raw.(map[string]any)
+		if !ok {
+			return fmt.Errorf("ttl_policy must be a map")
+		}
+		if v, ok := toUint32(policy["min_key_ttl"]); ok {
+			h.ttlPolicy.MinKeyTTL = v
+		}
+		if v, ok := toUint32(policy["max_key_ttl"]); ok {
+			h.ttlPolicy.MaxKeyTTL = v
+		}
+		if v, ok := toUint32(policy["min_rr_ttl"]); ok {
+			h.ttlPolicy.MinRRTTL = v
+		}
+		if v, ok := toUint32(policy["max_rr_ttl"]); ok {
+			h.ttlPolicy.MaxRRTTL = v
+		}
+
+		if h.ttlPolicy.MaxKeyTTL > 0 && h.ttlPolicy.MinKeyTTL > 0 && h.ttlPolicy.MinKeyTTL > h.ttlPolicy.MaxKeyTTL {
+			return fmt.Errorf("ttl_policy min_key_ttl cannot be greater than max_key_ttl")
+		}
+		if h.ttlPolicy.MaxRRTTL > 0 && h.ttlPolicy.MinRRTTL > 0 && h.ttlPolicy.MinRRTTL > h.ttlPolicy.MaxRRTTL {
+			return fmt.Errorf("ttl_policy min_rr_ttl cannot be greater than max_rr_ttl")
+		}
+
+		h.logger.Debugf("TTL policy configured: key[min=%d,max=%d] rr[min=%d,max=%d]",
+			h.ttlPolicy.MinKeyTTL, h.ttlPolicy.MaxKeyTTL, h.ttlPolicy.MinRRTTL, h.ttlPolicy.MaxRRTTL)
 	}
 
 	// Optional: Custom upstream coordinator
