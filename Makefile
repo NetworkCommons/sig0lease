@@ -86,7 +86,7 @@ test-unit-keystore: fmt vet
 	CLIENT_KEYSTORE_DIR=$(CLIENT_KEYSTORE_DIR) go test ./tests/ ./pkg/sig0 -v
 
 # Run the complete test matrix.
-# Requires CLIENT_KEYSTORE_DIR for the client key, ex. CLIENT_KEYSTORE_DIR=${PWD}/keystore/client make test-unit
+# Requires CLIENT_KEYSTORE_DIR for the client key, ex. CLIENT_KEYSTORE_DIR=${PWD}/keystore/client make test-full
 test-full: fmt vet
 	CLIENT_KEYSTORE_DIR=$(CLIENT_KEYSTORE_DIR) go test ./... -v
 
@@ -115,6 +115,7 @@ KEYNAME ?= test.dev.zenr.io.
 LEASE ?= 300
 KEY_LEASE ?= 3600
 
+# Requires CLIENT_KEYSTORE_DIR for the client key, ex. CLIENT_KEYSTORE_DIR=${PWD}/keystore/client make test-register-key
 test-register-key: build build-client
 	CLIENT_KEYSTORE_DIR=$(CLIENT_KEYSTORE_DIR) ./$(BUILD_DIR)/$(CLIENT_NAME) $(ADDR) register $(ZONE) $(KEYNAME) $(LEASE) $(KEY_LEASE)
 

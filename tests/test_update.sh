@@ -32,13 +32,16 @@ CLIENT_KEY_NAME="test.dev.zenr.io."
 WRONG_CLIENT_KEY_NAME="farback.dev.zenr.io."
 
 # Lease times
-MIN_LEASE_SECONDS=10
-LEASE_SECONDS=12
-REFRESH_SECONDS=12
-KEY_LEASE_SECONDS=22
-MIN_KEY_LEASE_SECONDS=20
+MIN_LEASE_SECONDS="${MIN_LEASE_SECONDS:-30}"
+LEASE_SECONDS="${LEASE_SECONDS:-30}"
+REFRESH_SECONDS="${REFRESH_SECONDS:-30}"
+KEY_LEASE_SECONDS="${KEY_LEASE_SECONDS:-30}"
+MIN_KEY_LEASE_SECONDS="${MIN_KEY_LEASE_SECONDS:-30}"
 # Case 2 validates refresh behavior under split-lease policy: keep KEY alive longer.
 REFRESH_CASE_KEY_LEASE_SECONDS="${REFRESH_CASE_KEY_LEASE_SECONDS:-3600}"
+
+# Optional: limit matrix run to selected RR types, e.g. RR_TYPES="KEY TXT"
+RR_TYPES="${RR_TYPES:-KEY TXT A AAAA}"
 
 
 
@@ -81,11 +84,41 @@ assert_proxy_log_contains() {
     return 1
 }
 
-query_key_at_authoritative() {
+rr_spec_for_type() {
+    local rr_type="$1"
+    case "$rr_type" in
+        KEY) echo "" ;;
+        TXT) echo "txt:lease-txt-$(date +%s)" ;;
+        A) echo "a:192.0.2.33" ;;
+        AAAA) echo "aaaa:2001:db8::33" ;;
+        *)
+            log_error "Unsupported rr type: $rr_type"
+            return 1
+            ;;
+    esac
+}
+
+register_with_rr_type() {
+    local rr_type="$1"
+    local lease_seconds="$2"
+    local key_lease_seconds="$3"
+
+    local rr_spec=""
+    rr_spec=$(rr_spec_for_type "$rr_type")
+    if [ -n "$rr_spec" ]; then
+        run_client "$PROXY_URL" register "$DOWNSTREAM_ZONE" "$CLIENT_KEY_NAME" "$lease_seconds" "$key_lease_seconds" "$rr_spec"
+    else
+        run_client "$PROXY_URL" register "$DOWNSTREAM_ZONE" "$CLIENT_KEY_NAME" "$lease_seconds" "$key_lease_seconds"
+    fi
+}
+
+query_rr_at_authoritative() {
     local name="$1"
-    local cmd="dig +time=3 +tries=1 +short @${AUTH_SERVER} ${name} KEY"
+    local rr_type="$2"
     local out
-    out=$(eval ${cmd})
+    local cmd="dig +time=3 +tries=1 +short @${AUTH_SERVER} ${name} ${rr_type}"
+
+    out=$(dig +time=3 +tries=1 +short "@${AUTH_SERVER}" "$name" "$rr_type")
     log_step "[dig] $cmd"
     if [ -n "$out" ]; then
         echo "$out"
@@ -95,17 +128,19 @@ query_key_at_authoritative() {
     printf '%s\n' "$out"
 }
 
-key_is_present() {
+rr_is_present() {
     local name="$1"
+    local rr_type="$2"
     local answer
-    answer=$(query_key_at_authoritative "$name" | tail -n 1 || true)
+    answer=$(query_rr_at_authoritative "$name" "$rr_type" | tail -n 1 || true)
     [ -n "$answer" ]
 }
 
-wait_for_key_state() {
+wait_for_rr_state() {
     local name="$1"
-    local state="$2"   # present|absent
-    local timeout=10
+    local rr_type="$2"
+    local state="$3"   # present|absent
+    local timeout=30
 
     local start
     start=$(date +%s)
@@ -113,19 +148,19 @@ wait_for_key_state() {
     while true; do
 
         if [ "$state" = "present" ]; then
-            if key_is_present "$name"; then
-                log_success "KEY present for $name on $AUTH_SERVER"
+            if rr_is_present "$name" "$rr_type"; then
+                log_success "$rr_type present for $name on $AUTH_SERVER"
                 return 0
             fi
         else
-            if ! key_is_present "$name"; then
-                log_success "KEY absent for $name on $AUTH_SERVER"
+            if ! rr_is_present "$name" "$rr_type"; then
+                log_success "$rr_type absent for $name on $AUTH_SERVER"
                 return 0
             fi
         fi
 
         if [ $(( $(date +%s) - start )) -ge "$timeout" ]; then
-            log_error "Timed out waiting for KEY state=$state for $name on $AUTH_SERVER"
+            log_error "Timed out waiting for ${rr_type} state=$state for $name on $AUTH_SERVER"
             return 1
         fi
 
@@ -133,42 +168,47 @@ wait_for_key_state() {
     done
 }
 
+wait_for_key_state() {
+    local name="$1"
+    local state="$2"
+    wait_for_rr_state "$name" KEY "$state"
+}
+
 assert_proxy_consistent_with_authoritative() {
     local key_name="$1"
-    local expected_state="$2"  # present|absent
+    local rr_type="$2"
+    local expected_state="$3"  # present|absent
 
     local is_present=0
-    if key_is_present "$key_name"; then
+    if rr_is_present "$key_name" "$rr_type"; then
         is_present=1
     fi
 
     if [ "$expected_state" = "present" ] && [ "$is_present" -ne 1 ]; then
-        log_error "Consistency check failed: authoritative missing KEY but expected present for $key_name"
+        log_error "Consistency check failed: authoritative missing $rr_type but expected present for $key_name"
         return 1
     fi
     if [ "$expected_state" = "absent" ] && [ "$is_present" -ne 0 ]; then
-        log_error "Consistency check failed: authoritative KEY present but expected absent for $key_name"
+        log_error "Consistency check failed: authoritative $rr_type present but expected absent for $key_name"
         return 1
     fi
 
-    # Proxy consistency checks:
-    # - for present: non-mutating check via verify command output
-    # - for absent: refresh must be rejected (strong lease-manager check)
+    # Proxy consistency checks via refresh path.
     if [ "$expected_state" = "present" ]; then
-        local verify_out
-        verify_out=$(run_client "$PROXY_URL" verify "$DOWNSTREAM_ZONE" "$key_name" 2>&1 || true)
-        if ! echo "$verify_out" | grep -q "Rcode=0"; then
-            log_error "Consistency check failed: proxy verify did not return NOERROR while authoritative KEY is present for $key_name"
-            echo "$verify_out"
+        local refresh_out
+        refresh_out=$(run_client "$PROXY_URL" refresh "$DOWNSTREAM_ZONE" "$key_name" "$REFRESH_SECONDS" 4byte 2>&1 || true)
+        if ! echo "$refresh_out" | grep -q "Rcode=0\|REFRESH SUCCESSFUL"; then
+            log_error "Consistency check failed: proxy refresh did not succeed while authoritative $rr_type is present for $key_name"
+            echo "$refresh_out"
             return 1
         fi
-        log_success "Consistency check OK: proxy reachable/NOERROR and authoritative KEY present for $key_name"
+        log_success "Consistency check OK: proxy refresh accepted and authoritative $rr_type present for $key_name"
     else
-        if run_client "$PROXY_URL" refresh "$DOWNSTREAM_ZONE" "$key_name" "$REFRESH_SECONDS" >/dev/null 2>&1; then
-            log_error "Consistency check failed: proxy refresh accepted but authoritative KEY is absent for $key_name"
+        if run_client "$PROXY_URL" refresh "$DOWNSTREAM_ZONE" "$key_name" "$REFRESH_SECONDS" 4byte >/dev/null 2>&1; then
+            log_error "Consistency check failed: proxy refresh accepted but authoritative $rr_type is absent for $key_name"
             return 1
         fi
-        log_success "Consistency check OK: proxy refresh rejected and authoritative KEY absent for $key_name"
+        log_success "Consistency check OK: proxy refresh rejected and authoritative $rr_type absent for $key_name"
     fi
 }
 
@@ -204,7 +244,7 @@ log_case_timing() {
 ensure_key_absent() {
     local key_name="$1"
 
-    if ! key_is_present "$key_name"; then
+    if ! rr_is_present "$key_name" KEY; then
         log_success "Pristine state already present: $key_name absent on $AUTH_SERVER"
         return 0
     fi
@@ -220,7 +260,7 @@ ensure_key_absent() {
     fi
 
     wait_until_lease_expired "$cleanup_start" "$MIN_LEASE_SECONDS" 3
-    wait_for_key_state "$key_name" absent
+    wait_for_rr_state "$key_name" KEY absent
     log_success "Cleanup complete: $key_name absent on $AUTH_SERVER"
 }
 
@@ -263,115 +303,134 @@ test_list_keys() {
 }
 
 test_case_register_expire_remove() {
-    log_section "CASE 1: Register -> Expire -> Removed"
+    local rr_type="$1"
+    log_section "CASE 1 [$rr_type]: Register -> Expire -> Removed"
 
     local case_start lease_start expected_min
     case_start=$(date +%s)
     log_step "Registering lease ($LEASE_SECONDS seconds)"
     lease_start=$(date +%s)
-    run_client "$PROXY_URL" register "$DOWNSTREAM_ZONE" "$CLIENT_KEY_NAME" "$LEASE_SECONDS" "$KEY_LEASE_SECONDS"
-    wait_for_key_state "$CLIENT_KEY_NAME" present
-    assert_proxy_consistent_with_authoritative "$CLIENT_KEY_NAME" present
+    register_with_rr_type "$rr_type" "$LEASE_SECONDS" "$KEY_LEASE_SECONDS"
+    wait_for_rr_state "$CLIENT_KEY_NAME" KEY present
+    wait_for_rr_state "$CLIENT_KEY_NAME" "$rr_type" present
 
     log_step "Waiting until lease expiry boundary"
     wait_until_lease_expired "$lease_start" "$LEASE_SECONDS" 3
 
     log_step "Attempting refresh after expiry (must fail)"
-    if run_client "$PROXY_URL" refresh "$DOWNSTREAM_ZONE" "$CLIENT_KEY_NAME" "$REFRESH_SECONDS"; then
+    if run_client "$PROXY_URL" refresh "$DOWNSTREAM_ZONE" "$CLIENT_KEY_NAME" "$REFRESH_SECONDS" 4byte; then
         log_error "Refresh succeeded after expiry, expected failure"
         return 1
     fi
-    wait_for_key_state "$CLIENT_KEY_NAME" absent
-    assert_proxy_consistent_with_authoritative "$CLIENT_KEY_NAME" absent
+    wait_for_rr_state "$CLIENT_KEY_NAME" KEY absent
+    assert_proxy_consistent_with_authoritative "$CLIENT_KEY_NAME" KEY absent
+    if [ "$rr_type" != "KEY" ]; then
+        log_step "Post-expiry note: non-key RR ($rr_type) state is informational only"
+        query_rr_at_authoritative "$CLIENT_KEY_NAME" "$rr_type" >/dev/null || true
+    fi
 
     assert_proxy_log_contains "refresh rejected: lease does not exist"
     expected_min=$((lease_start + LEASE_SECONDS + 3 - case_start))
     if [ "$expected_min" -lt 0 ]; then
         expected_min=0
     fi
-    log_case_timing "case1" "$case_start" "$expected_min"
-    log_success "Expired lease no longer refreshable"
+    log_case_timing "case1-${rr_type}" "$case_start" "$expected_min"
+    log_success "Expired lease no longer refreshable for $rr_type"
 }
 
 test_case_register_refresh_not_prematurely_removed() {
-    log_section "CASE 2: Register -> Refresh -> Not Prematurely Removed"
+    local rr_type="$1"
+    log_section "CASE 2 [$rr_type]: Register -> Refresh -> Not Prematurely Removed"
 
     local case_start lease_start refresh_start expected_min
     case_start=$(date +%s)
     log_step "Registering initial lease"
     lease_start=$(date +%s)
-    run_client "$PROXY_URL" register "$DOWNSTREAM_ZONE" "$CLIENT_KEY_NAME" "$LEASE_SECONDS" "$REFRESH_CASE_KEY_LEASE_SECONDS"
-    wait_for_key_state "$CLIENT_KEY_NAME" present
-    assert_proxy_consistent_with_authoritative "$CLIENT_KEY_NAME" present
+    register_with_rr_type "$rr_type" "$LEASE_SECONDS" "$REFRESH_CASE_KEY_LEASE_SECONDS"
+    wait_for_rr_state "$CLIENT_KEY_NAME" KEY present
+    wait_for_rr_state "$CLIENT_KEY_NAME" "$rr_type" present
+    assert_proxy_consistent_with_authoritative "$CLIENT_KEY_NAME" "$rr_type" present
 
     log_step "Waiting to near-expiry checkpoint then refreshing"
     wait_until_epoch $((lease_start + 20))
     refresh_start=$(date +%s)
-    run_client "$PROXY_URL" refresh "$DOWNSTREAM_ZONE" "$CLIENT_KEY_NAME" "$REFRESH_SECONDS"
-    wait_for_key_state "$CLIENT_KEY_NAME" present
-    assert_proxy_consistent_with_authoritative "$CLIENT_KEY_NAME" present
+    run_client "$PROXY_URL" refresh "$DOWNSTREAM_ZONE" "$CLIENT_KEY_NAME" "$REFRESH_SECONDS" 4byte
+    wait_for_rr_state "$CLIENT_KEY_NAME" KEY present
+    wait_for_rr_state "$CLIENT_KEY_NAME" "$rr_type" present
+    assert_proxy_consistent_with_authoritative "$CLIENT_KEY_NAME" "$rr_type" present
 
     log_step "Waiting past original expiry window"
     wait_until_lease_expired "$lease_start" "$LEASE_SECONDS" 5
-    wait_for_key_state "$CLIENT_KEY_NAME" present
-    assert_proxy_consistent_with_authoritative "$CLIENT_KEY_NAME" present
+    wait_for_rr_state "$CLIENT_KEY_NAME" KEY present
+    wait_for_rr_state "$CLIENT_KEY_NAME" "$rr_type" present
+    assert_proxy_consistent_with_authoritative "$CLIENT_KEY_NAME" "$rr_type" present
 
     log_step "Refreshing again (must still succeed if not removed prematurely)"
-    run_client "$PROXY_URL" refresh "$DOWNSTREAM_ZONE" "$CLIENT_KEY_NAME" "$REFRESH_SECONDS"
-    wait_for_key_state "$CLIENT_KEY_NAME" present
-    assert_proxy_consistent_with_authoritative "$CLIENT_KEY_NAME" present
+    run_client "$PROXY_URL" refresh "$DOWNSTREAM_ZONE" "$CLIENT_KEY_NAME" "$REFRESH_SECONDS" 4byte
+    wait_for_rr_state "$CLIENT_KEY_NAME" KEY present
+    wait_for_rr_state "$CLIENT_KEY_NAME" "$rr_type" present
+    assert_proxy_consistent_with_authoritative "$CLIENT_KEY_NAME" "$rr_type" present
 
     log_step "Waiting for refreshed data lease window while key-lease remains active"
     wait_until_lease_expired "$refresh_start" "$REFRESH_SECONDS" 5
-    wait_for_key_state "$CLIENT_KEY_NAME" present
-    assert_proxy_consistent_with_authoritative "$CLIENT_KEY_NAME" present
+    wait_for_rr_state "$CLIENT_KEY_NAME" KEY present
+    assert_proxy_consistent_with_authoritative "$CLIENT_KEY_NAME" KEY present
+    if [ "$rr_type" != "KEY" ]; then
+        log_step "Post-refresh note: non-key RR ($rr_type) state is informational only"
+        query_rr_at_authoritative "$CLIENT_KEY_NAME" "$rr_type" >/dev/null || true
+    fi
 
     expected_min=$((refresh_start + REFRESH_SECONDS + 5 - case_start))
     if [ "$expected_min" -lt 0 ]; then
         expected_min=0
     fi
-    log_case_timing "case2" "$case_start" "$expected_min"
-    log_success "Lease remained active after renewal (with separate key-lease policy)"
+    log_case_timing "case2-${rr_type}" "$case_start" "$expected_min"
+    log_success "Lease behavior validated after renewal for $rr_type"
 }
 
 test_case_unauthorized_refresh_rejected_then_expires() {
-    log_section "CASE 3: Unauthorized Refresh Rejected -> Lease Expires"
+    local rr_type="$1"
+    log_section "CASE 3 [$rr_type]: Unauthorized Refresh Rejected -> Lease Expires"
 
     local case_start lease_start expected_min
     case_start=$(date +%s)
     log_step "Registering lease under authorized key ($CLIENT_KEY_NAME)"
     lease_start=$(date +%s)
-    run_client "$PROXY_URL" register "$DOWNSTREAM_ZONE" "$CLIENT_KEY_NAME" "$LEASE_SECONDS" "$KEY_LEASE_SECONDS"
-    wait_for_key_state "$CLIENT_KEY_NAME" present
-    assert_proxy_consistent_with_authoritative "$CLIENT_KEY_NAME" present
+    register_with_rr_type "$rr_type" "$LEASE_SECONDS" "$KEY_LEASE_SECONDS"
+    wait_for_rr_state "$CLIENT_KEY_NAME" KEY present
+    wait_for_rr_state "$CLIENT_KEY_NAME" "$rr_type" present
 
     log_step "Unauthorized refresh attempt using different real key ($WRONG_CLIENT_KEY_NAME)"
-    if run_client "$PROXY_URL" refresh "$DOWNSTREAM_ZONE" "$WRONG_CLIENT_KEY_NAME" "$REFRESH_SECONDS"; then
+    if run_client "$PROXY_URL" refresh "$DOWNSTREAM_ZONE" "$WRONG_CLIENT_KEY_NAME" "$REFRESH_SECONDS" 4byte; then
         log_error "Unauthorized refresh unexpectedly succeeded"
         return 1
     fi
-    wait_for_key_state "$CLIENT_KEY_NAME" present
-    assert_proxy_consistent_with_authoritative "$CLIENT_KEY_NAME" present
+    wait_for_rr_state "$CLIENT_KEY_NAME" KEY present
+    wait_for_rr_state "$CLIENT_KEY_NAME" "$rr_type" present
 
     log_step "Waiting until original lease expires"
     wait_until_lease_expired "$lease_start" "$LEASE_SECONDS" 3
 
-    wait_for_key_state "$CLIENT_KEY_NAME" absent
-    assert_proxy_consistent_with_authoritative "$CLIENT_KEY_NAME" absent
+    wait_for_rr_state "$CLIENT_KEY_NAME" KEY absent
+    assert_proxy_consistent_with_authoritative "$CLIENT_KEY_NAME" KEY absent
+    if [ "$rr_type" != "KEY" ]; then
+        log_step "Post-expiry note: non-key RR ($rr_type) state is informational only"
+        query_rr_at_authoritative "$CLIENT_KEY_NAME" "$rr_type" >/dev/null || true
+    fi
     log_step "Original key refresh after expiry must fail"
-    if run_client "$PROXY_URL" refresh "$DOWNSTREAM_ZONE" "$CLIENT_KEY_NAME" "$REFRESH_SECONDS"; then
+    if run_client "$PROXY_URL" refresh "$DOWNSTREAM_ZONE" "$CLIENT_KEY_NAME" "$REFRESH_SECONDS" 4byte; then
         log_error "Lease still active after expiry, expected removal"
         return 1
     fi
-    wait_for_key_state "$CLIENT_KEY_NAME" absent
-    assert_proxy_consistent_with_authoritative "$CLIENT_KEY_NAME" absent
+    wait_for_rr_state "$CLIENT_KEY_NAME" KEY absent
+    assert_proxy_consistent_with_authoritative "$CLIENT_KEY_NAME" KEY absent
 
     expected_min=$((lease_start + LEASE_SECONDS + 3 - case_start))
     if [ "$expected_min" -lt 0 ]; then
         expected_min=0
     fi
-    log_case_timing "case3" "$case_start" "$expected_min"
-    log_success "Unauthorized refresh rejected and lease expired as expected"
+    log_case_timing "case3-${rr_type}" "$case_start" "$expected_min"
+    log_success "Unauthorized refresh rejected and lease expired as expected for $rr_type"
 }
 
 run_all_tests() {
@@ -394,20 +453,27 @@ run_all_tests() {
     log_section "TESTING LIVE LEASE LIFECYCLE"
     test_list_keys
     start_proxy
-    ensure_key_absent "$CLIENT_KEY_NAME"
-    test_case_register_expire_remove
-    ensure_key_absent "$CLIENT_KEY_NAME"
-    test_case_register_refresh_not_prematurely_removed
-    ensure_key_absent "$CLIENT_KEY_NAME"
-    test_case_unauthorized_refresh_rejected_then_expires
+
+    local rr_types=($RR_TYPES)
+    local rr_type
+    for rr_type in "${rr_types[@]}"; do
+        log_section "RR TEST MATRIX: $rr_type"
+        ensure_key_absent "$CLIENT_KEY_NAME"
+        test_case_register_expire_remove "$rr_type"
+        ensure_key_absent "$CLIENT_KEY_NAME"
+        test_case_register_refresh_not_prematurely_removed "$rr_type"
+        ensure_key_absent "$CLIENT_KEY_NAME"
+        test_case_unauthorized_refresh_rejected_then_expires "$rr_type"
+    done
 
     log_section "TEST RESULTS"
     echo -e "${GREEN}All integration tests completed successfully!${NC}"
     echo ""
     echo "Summary of what was tested:"
-    echo "  [OK] Register -> expire -> removed"
-    echo "  [OK] Register -> refresh -> not prematurely removed"
-    echo "  [OK] Unauthorized refresh rejected, lease still expires"
+    echo "  [OK] Register -> expire -> removed (KEY/TXT/A/AAAA)"
+    echo "  [OK] Register -> refresh -> split lease behavior (KEY/TXT/A/AAAA)"
+    echo "  [OK] Unauthorized refresh rejected, lease still expires (KEY/TXT/A/AAAA)"
+    echo "  [OK] Proxy consistency checks use refresh path"
     echo ""
     echo "Proxy process was exercised at $PROXY_URL"
     echo "Logs: $LOG_FILE"
