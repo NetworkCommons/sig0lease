@@ -6,4 +6,4 @@ description: "'sig zero lease' - sustainable service discovery"
 #cascade:
 featured_image: '/images/sig0-tree.jpg'
 ---
-sig0lease - global collaborative service discovery
+sig0lease - sustainable collaborative service discovery
