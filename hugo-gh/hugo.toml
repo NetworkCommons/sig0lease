@@ -1,0 +1,25 @@
+baseURL = 'https://sig0lease.networkcommons.org/'
+languageCode = 'en-us'
+title = 'sig0lease'
+theme = ["hugo-embed-pdf-shortcode", "ananke"]
+enableInlineShortcodes = true
+[params]
+  subtitle = 'sustainable service discovery management'
+  toc = true
+  # site_logo = "images/mycosystem-section-cut.jpg"
+  custom_css = ["custom.css"]
+  [[params.ananke_socials]]
+    name = "github"
+    url = "https://github.com/networkcommons/sig0lease"
+[markup]
+  [markup.tableOfContents]
+    endLevel = 2
+    ordered = false
+    startLevel = 2
+  [markup.goldmark.renderer]
+    unsafe = true
+[menu]
+[[menu.main]]
+identifier = "home"
+name = "Home"
+url = "/"
