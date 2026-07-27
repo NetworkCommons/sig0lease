@@ -4,6 +4,7 @@ package server
 import (
 	"context"
 	"fmt"
+	"strings"
 
 	"codeberg.org/miekg/dns"
 	"github.com/NetworkCommons/sig0lease/forward"
@@ -36,13 +37,19 @@ func (r *Router) RegisterHandler(h handlers.Handler) {
 
 // Route determines how to handle a DNS message based on its opcode.
 // Flow:
-//  1. Check if opcode has a registered handler
-//  2. If yes, call handler and check result status:
+//  1. Check for internal dump query (admin/debug endpoint)
+//  2. Check if opcode has a registered handler
+//  3. If yes, call handler and check result status:
 //     - StatusProcessed: Return response to client
 //     - StatusNotRelevant: Apply default upstream routing
 //     - StatusError: Return error response to client
-//  3. If no handler, apply default forward
+//  4. If no handler, apply default forward
 func (r *Router) Route(ctx context.Context, w dns.ResponseWriter, rMsg *dns.Msg) *dns.Msg {
+	// Check for internal dump query (admin/debug endpoint).
+	if r.isDumpQuery(rMsg) {
+		return r.handleDumpQuery(rMsg)
+	}
+
 	moduleName, found := r.moduleForOpcode(rMsg.Opcode)
 
 	r.logger.Infof("Route: Opcode=%d, FoundModule=%v, Module=%s", rMsg.Opcode, found, moduleName)
@@ -107,6 +114,92 @@ func (r *Router) Route(ctx context.Context, w dns.ResponseWriter, rMsg *dns.Msg)
 func (r *Router) moduleForOpcode(opcode uint8) (string, bool) {
 	moduleName, found := r.opcodeMap[opcode]
 	return moduleName, found
+
+}
+
+// dumpQueryName is the internal domain used for lease dump queries.
+const dumpQueryName = "__dump.sig0lease.internal."
+
+// dumpQueryDebugName is the internal domain for DEBUG-level lease dump queries.
+const dumpQueryDebugName = "__dump.sig0lease.internal.debug."
+
+// isDumpQuery checks if the message is a dump query (either INFO or DEBUG level).
+func (r *Router) isDumpQuery(m *dns.Msg) bool {
+	if len(m.Question) == 0 {
+		return false
+	}
+	q := m.Question[0].Header()
+	if dns.RRToType(m.Question[0]) != dns.TypeTXT {
+		return false
+	}
+	return strings.EqualFold(q.Name, dumpQueryName) || strings.EqualFold(q.Name, dumpQueryDebugName)
+}
+
+// dumpLevelFromQuery extracts the log level from the query name.
+// Returns "info" for __dump.sig0lease.internal. and "debug" for __dump.sig0lease.internal.debug.
+func dumpLevelFromQuery(m *dns.Msg) string {
+	if len(m.Question) == 0 {
+		return "info"
+	}
+	q := m.Question[0].Header()
+	if strings.EqualFold(q.Name, dumpQueryDebugName) {
+		return "debug"
+	}
+	return "info"
+}
+
+// handleDumpQuery returns the lease store dump as a TXT record.
+// Uses INFO level (summary) by default, DEBUG level (full dump) when queried via dumpQueryDebugName.
+func (r *Router) handleDumpQuery(m *dns.Msg) *dns.Msg {
+	level := dumpLevelFromQuery(m)
+	var sb strings.Builder
+
+	hasAny := false
+	for _, h := range r.handlers {
+		if dumper, ok := h.(interface{ DumpLeasesLevel(string) string }); ok {
+			sb.WriteString(dumper.DumpLeasesLevel(level))
+			hasAny = true
+		} else if dumper, ok := h.(interface{ DumpLeases() string }); ok {
+			// Fallback: if handler only has DumpLeases (no level support), use it.
+			sb.WriteString(dumper.DumpLeases())
+			hasAny = true
+		}
+	}
+	if !hasAny {
+		if level == "debug" {
+			sb.WriteString("=== Lease Store Dump ===\n")
+		} else {
+			sb.WriteString("=== Lease Store Summary ===\n")
+		}
+		sb.WriteString("(no dump-capable handlers configured)\n")
+	}
+
+	dumpText := sb.String()
+	resp := new(dns.Msg)
+	resp.ID = m.ID
+	resp.Response = true
+	resp.Authoritative = true
+	resp.Question = m.Question
+
+	// Split long dump into multiple TXT chunks (max 255 bytes each).
+	const maxTxtLen = 240 // leave room for quotes
+	for i := 0; i < len(dumpText); i += maxTxtLen {
+		end := i + maxTxtLen
+		if end > len(dumpText) {
+			end = len(dumpText)
+		}
+		txt := &dns.TXT{
+			Hdr: dns.Header{
+				Name:  dumpQueryName,
+				Class: dns.ClassINET,
+				TTL:   0,
+			},
+		}
+		txt.TXT.Txt = append(txt.TXT.Txt, dumpText[i:end])
+		resp.Extra = append(resp.Extra, txt)
+	}
+
+	return resp
 }
 
 // forwardToUpstream forwards a DNS message to the upstream resolver.

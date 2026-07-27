@@ -2,7 +2,6 @@ package dnsmsg
 
 import (
 	"fmt"
-	"net/netip"
 	"strings"
 
 	"codeberg.org/miekg/dns"
@@ -75,99 +74,62 @@ func NewRefreshUpdate(zone string, keyRR *dns.KEY, leaseDuration, keyLeaseDurati
 	return msg, nil
 }
 
-// EnsureFQDN returns name with a trailing dot if missing.
-func EnsureFQDN(name string) string {
-	if name == "" {
-		return name
-	}
-	if strings.HasSuffix(name, ".") {
-		return name
-	}
-	return name + "."
-}
-
-func isLikelyDNSName(s string) bool {
-	s = strings.TrimSpace(strings.TrimSuffix(s, "."))
-	if s == "" {
-		return false
-	}
-	for _, r := range s {
-		if (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') || r == '-' || r == '.' || r == '_' {
-			continue
-		}
-		return false
-	}
-	return strings.Contains(s, ".") || strings.HasPrefix(s, "@") || strings.HasPrefix(s, "*")
-}
-
-// ParseAdditionalRRSpec parses rr-spec values accepted by sig0lease-client register command:
-// txt:<text>, txt:<name>:<text>, a:<ipv4>, a:<name>:<ipv4>, aaaa:<ipv6>, aaaa:<name>:<ipv6>.
+// ParseAdditionalRRSpec parses a DNS RR in standard presentation format.
+//
+// Required form:
+//
+//	owner ttl class type rdata...
 func ParseAdditionalRRSpec(spec string, fallbackName string, ttl uint32) (dns.RR, error) {
-	kv := strings.SplitN(spec, ":", 2)
-	if len(kv) != 2 {
-		return nil, fmt.Errorf("expected kind:value or kind:name:value")
+	_ = fallbackName
+	_ = ttl
+
+	spec = strings.TrimSpace(spec)
+	if spec == "" {
+		return nil, fmt.Errorf("rr spec cannot be empty")
 	}
 
-	kind := strings.ToLower(strings.TrimSpace(kv[0]))
-	rest := strings.TrimSpace(kv[1])
-	if rest == "" {
-		return nil, fmt.Errorf("record value cannot be empty")
+	rr, err := dns.New(spec)
+	if err != nil {
+		return nil, fmt.Errorf("invalid rr spec %q: expected full RR presentation (owner ttl class type rdata): %w", spec, err)
+	}
+	if rr == nil {
+		return nil, fmt.Errorf("invalid rr spec %q: parser returned nil RR", spec)
 	}
 
-	switch kind {
-	case "txt":
-		name := EnsureFQDN(fallbackName)
-		value := rest
-		if idx := strings.Index(rest, ":"); idx > 0 {
-			candidateName := strings.TrimSpace(rest[:idx])
-			candidateValue := strings.TrimSpace(rest[idx+1:])
-			if candidateValue != "" && isLikelyDNSName(candidateName) {
-				name = EnsureFQDN(candidateName)
-				value = candidateValue
-			}
-		}
-		rr := &dns.TXT{Hdr: dns.Header{Name: name, Class: dns.ClassINET, TTL: ttl}}
-		rr.TXT.Txt = []string{value}
-		return rr, nil
-	case "a":
-		name := EnsureFQDN(fallbackName)
-		addrText := rest
-		if addr, err := netip.ParseAddr(rest); err == nil && addr.Is4() {
-			rr := &dns.A{Hdr: dns.Header{Name: name, Class: dns.ClassINET, TTL: ttl}}
-			rr.A.Addr = addr
-			return rr, nil
-		}
-		if idx := strings.Index(rest, ":"); idx > 0 {
-			name = EnsureFQDN(strings.TrimSpace(rest[:idx]))
-			addrText = strings.TrimSpace(rest[idx+1:])
-		}
-		addr, err := netip.ParseAddr(addrText)
-		if err != nil || !addr.Is4() {
-			return nil, fmt.Errorf("invalid IPv4 address %q", addrText)
-		}
-		rr := &dns.A{Hdr: dns.Header{Name: name, Class: dns.ClassINET, TTL: ttl}}
-		rr.A.Addr = addr
-		return rr, nil
-	case "aaaa":
-		name := EnsureFQDN(fallbackName)
-		addrText := rest
-		if addr, err := netip.ParseAddr(rest); err == nil && addr.Is6() && !addr.Is4In6() {
-			rr := &dns.AAAA{Hdr: dns.Header{Name: name, Class: dns.ClassINET, TTL: ttl}}
-			rr.AAAA.Addr = addr
-			return rr, nil
-		}
-		if idx := strings.Index(rest, ":"); idx > 0 {
-			name = EnsureFQDN(strings.TrimSpace(rest[:idx]))
-			addrText = strings.TrimSpace(rest[idx+1:])
-		}
-		addr, err := netip.ParseAddr(addrText)
-		if err != nil || !addr.Is6() || addr.Is4In6() {
-			return nil, fmt.Errorf("invalid IPv6 address %q", addrText)
-		}
-		rr := &dns.AAAA{Hdr: dns.Header{Name: name, Class: dns.ClassINET, TTL: ttl}}
-		rr.AAAA.Addr = addr
-		return rr, nil
-	default:
-		return nil, fmt.Errorf("unsupported rr kind %q (supported: txt,a,aaaa)", kind)
+	return rr, nil
+}
+
+// NewDataOnlyUpdate builds a DNS UPDATE message with only data RRs (no KEY RR) and
+// an 8-byte UPDATE-LEASE EDNS option with KEY-LEASE = 0.
+// Per RFC 9664 §4, KEY-LEASE == 0 means "no KEY RRs are being registered".
+// This is used for data-only operations where the client's key is resolved
+// from the lease store or DNS server on the proxy side.
+func NewDataOnlyUpdate(zone string, additional []dns.RR, leaseDuration uint32) (*dns.Msg, error) {
+	if strings.TrimSpace(zone) == "" {
+		return nil, fmt.Errorf("zone cannot be empty")
 	}
+	// Additional RRs are optional — a refresh with KEY-LEASE == 0 may not
+	// include any data RRs; the proxy resolves them from the lease store.
+
+	msg := dns.NewMsg(zone, dns.TypeSOA)
+	if msg == nil {
+		return nil, fmt.Errorf("failed to create DNS message")
+	}
+	msg.Opcode = dns.OpcodeUpdate
+
+	// Only data RRs in the authority section — no KEY RR.
+	msg.Ns = append(msg.Ns, additional...)
+
+	// 8-byte UPDATE-LEASE with KEY-LEASE = 0 (no KEY RRs being registered).
+	leaseOpt := lease.Encode8Byte(leaseDuration, 0)
+	if err := leaseOpt.Validate(); err != nil {
+		return nil, err
+	}
+	opt := &dns.OPT{Hdr: dns.Header{Name: "."}}
+	opt.SetUDPSize(uint16(dns.DefaultMsgSize))
+	if err := leaseOpt.Encode(opt); err != nil {
+		return nil, fmt.Errorf("failed to encode lease option: %w", err)
+	}
+	msg.Extra = append(msg.Extra, opt)
+	return msg, nil
 }

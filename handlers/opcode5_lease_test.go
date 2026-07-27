@@ -30,7 +30,7 @@ func TestLeaseExpiresAndRemoved(t *testing.T) {
 	ctx := context.Background()
 	key := testKeyRR("test.dev.zenr.io.", "AAAATESTKEY111=")
 
-	if err := h.leaseManager.Register(ctx, key.Hdr.Name, key, 1, "dev.zenr.io."); err != nil {
+	if err := h.leaseManager.Register(ctx, key.Hdr.Name, key, 1, 1, "dev.zenr.io."); err != nil {
 		t.Fatalf("register lease: %v", err)
 	}
 	h.scheduleLeaseExpiry(key.Hdr.Name)
@@ -52,7 +52,7 @@ func TestLeaseRenewedAndNotRemovedPrematurely(t *testing.T) {
 	ctx := context.Background()
 	key := testKeyRR("test.dev.zenr.io.", "AAAATESTKEY222=")
 
-	if err := h.leaseManager.Register(ctx, key.Hdr.Name, key, 1, "dev.zenr.io."); err != nil {
+	if err := h.leaseManager.Register(ctx, key.Hdr.Name, key, 1, 1, "dev.zenr.io."); err != nil {
 		t.Fatalf("register lease: %v", err)
 	}
 	h.scheduleLeaseExpiry(key.Hdr.Name)
@@ -60,7 +60,7 @@ func TestLeaseRenewedAndNotRemovedPrematurely(t *testing.T) {
 
 	time.Sleep(500 * time.Millisecond)
 
-	if err := h.leaseManager.Register(ctx, key.Hdr.Name, key, 2, "dev.zenr.io."); err != nil {
+	if err := h.leaseManager.Register(ctx, key.Hdr.Name, key, 2, 2, "dev.zenr.io."); err != nil {
 		t.Fatalf("refresh lease: %v", err)
 	}
 	h.scheduleLeaseExpiry(key.Hdr.Name)
@@ -82,7 +82,7 @@ func TestRefreshRejectedForDifferentKeyAndExpires(t *testing.T) {
 	leaseKey := testKeyRR("test.dev.zenr.io.", "AAAATESTKEY333=")
 	otherKeySameName := testKeyRR("test.dev.zenr.io.", "BBBBOTHERKEY999=")
 
-	if err := h.leaseManager.Register(ctx, leaseKey.Hdr.Name, leaseKey, 1, "dev.zenr.io."); err != nil {
+	if err := h.leaseManager.Register(ctx, leaseKey.Hdr.Name, leaseKey, 1, 1, "dev.zenr.io."); err != nil {
 		t.Fatalf("register lease: %v", err)
 	}
 	h.scheduleLeaseExpiry(leaseKey.Hdr.Name)

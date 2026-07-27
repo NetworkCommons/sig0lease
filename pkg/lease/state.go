@@ -2,6 +2,7 @@ package lease
 
 import (
 	"context"
+	"strings"
 	"sync"
 	"time"
 
@@ -34,11 +35,12 @@ func (r *Record) TimeRemaining() time.Duration {
 
 // Manager manages lifecycle of client leases. Implementations must be thread-safe.
 type Manager interface {
-	Register(ctx context.Context, keyName string, keyRR *dns.KEY, leaseDuration uint32, upstreamZone string) error
+	Register(ctx context.Context, keyName string, keyRR *dns.KEY, leaseDuration uint32, keyLeaseDuration uint32, upstreamZone string) error
 	Lookup(keyName string) *Record
 	Get(keyName string) *Record
 	Delete(keyName string) error
 	ListExpiring(within time.Duration) []*Record
+	ListAll() []*Record
 	SetPersistenceHook(hook func(ctx context.Context, op string, record *Record) error)
 }
 
@@ -72,15 +74,18 @@ func NewInMemoryManager() *InMemoryManager {
 }
 
 // Register creates or updates a lease.
-func (m *InMemoryManager) Register(ctx context.Context, keyName string, keyRR *dns.KEY, leaseDuration uint32, upstreamZone string) error {
+func (m *InMemoryManager) Register(ctx context.Context, keyName string, keyRR *dns.KEY, leaseDuration uint32, keyLeaseDuration uint32, upstreamZone string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+
+	// Normalize key name for consistent storage and lookup.
+	keyName = strings.TrimSuffix(strings.ToLower(keyName), ".")
 
 	record := &Record{
 		KeyRR:            keyRR,
 		ExpiresAt:        time.Now().Add(time.Duration(leaseDuration) * time.Second),
 		LeaseDuration:    leaseDuration,
-		KeyLeaseDuration: leaseDuration,
+		KeyLeaseDuration: keyLeaseDuration, // Store actual KEY-LEASE value (0 when no KEY RRs registered)
 		UpstreamZone:     upstreamZone,
 		RegisteredAt:     time.Now(),
 	}
@@ -96,6 +101,9 @@ func (m *InMemoryManager) Lookup(keyName string) *Record {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 
+	// Normalize key name for consistent lookup.
+	keyName = strings.TrimSuffix(strings.ToLower(keyName), ".")
+
 	record, exists := m.leases[keyName]
 	if !exists || record.IsExpired() {
 		return nil
@@ -107,6 +115,10 @@ func (m *InMemoryManager) Lookup(keyName string) *Record {
 func (m *InMemoryManager) Get(keyName string) *Record {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
+
+	// Normalize key name for consistent lookup.
+	keyName = strings.TrimSuffix(strings.ToLower(keyName), ".")
+
 	return m.leases[keyName]
 }
 
@@ -114,6 +126,10 @@ func (m *InMemoryManager) Get(keyName string) *Record {
 func (m *InMemoryManager) Delete(keyName string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+
+	// Normalize key name for consistent deletion.
+	keyName = strings.TrimSuffix(strings.ToLower(keyName), ".")
+
 	delete(m.leases, keyName)
 	return nil
 }
@@ -131,6 +147,18 @@ func (m *InMemoryManager) ListExpiring(within time.Duration) []*Record {
 		}
 	}
 	return expiring
+}
+
+// ListAll returns all leases regardless of expiry status.
+func (m *InMemoryManager) ListAll() []*Record {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	var all []*Record
+	for _, record := range m.leases {
+		all = append(all, record)
+	}
+	return all
 }
 
 // SetPersistenceHook sets callback for persistence operations.

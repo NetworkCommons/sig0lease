@@ -89,7 +89,7 @@ The client currently sends an 8-byte lease option with `KEY-LEASE` set to `0`, a
 In the current flow, the update handler extracts the first `KEY` RR and proceeds. Multi-key updates in one transaction are not implemented as a first-class feature.
 
 3. Upstream forwarding reuses the client `KEY` RR without rewrite.
-The forwarded UPDATE uses the client-provided `KEY` RR as-is. This phase does not yet apply rewrite policy (for example, owner-name mapping or TTL normalization) before sending to the authoritative server.
+The forwarded UPDATE uses the client-provided `KEY` RR as-is. This phase does not yet apply rewrite policy (for example, owner-name mapping or Lease time normalization) before sending to the authoritative server.
 
 ## Unused / Unreachable Code Inventory
 
@@ -147,14 +147,5 @@ Current unreachable functions by package:
 2. Implement explicit `KEY-LEASE` handling semantics in the handler (validation, storage, and refresh policy), then add integration coverage.
 3. Support the registration of more RR types with a registered key, and check that the lease expiry is different for keys and other records.
 3. Decide and document behavior for requests containing multiple `KEY` RRs (reject with clear rcode vs explicit batch support).
-4. Define upstream rewrite policy for `KEY` RR forwarding (owner-name mapping and TTL policy) and enforce it in the handler.
-
-## Verification Status
-
-Validated locally:
-
-- proxy build succeeds;
-- client build succeeds;
-- valid registration succeeds against a live proxy;
-- tampered registration is rejected;
-- the proxy logs show strict unpack, strict SIG(0) verification, and authoritative forwarding.
+4. Define upstream rewrite policy for `KEY` RR forwarding (owner-name mapping and Lease policy) and enforce it in the handler.
+5. Check when a returned lease time is different from the requested one, that the client uses the returned one.

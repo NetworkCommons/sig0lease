@@ -81,7 +81,7 @@ test-unit: fmt vet
 	go test ./handlers ./pkg/lease ./pkg/keyrec ./pkg/srp/server ./pkg/srp/instruction ./pkg/srp/client -v
 
 # Run keystore-dependent unit tests.
-# Requires CLIENT_KEYSTORE_DIR for the client key, ex. CLIENT_KEYSTORE_DIR=${PWD}/keystore/client make test-unit
+# Requires CLIENT_KEYSTORE_DIR for the client key, ex. CLIENT_KEYSTORE_DIR=${PWD}/keystore/client make test-unit-keystore
 test-unit-keystore: fmt vet
 	CLIENT_KEYSTORE_DIR=$(CLIENT_KEYSTORE_DIR) go test ./tests/ ./pkg/sig0 -v
 
@@ -120,7 +120,7 @@ test-register-key: build build-client
 	CLIENT_KEYSTORE_DIR=$(CLIENT_KEYSTORE_DIR) ./$(BUILD_DIR)/$(CLIENT_NAME) $(ADDR) register $(ZONE) $(KEYNAME) $(LEASE) $(KEY_LEASE)
 
 test-register-txt: build build-client
-	CLIENT_KEYSTORE_DIR=$(CLIENT_KEYSTORE_DIR) ./$(BUILD_DIR)/$(CLIENT_NAME) $(ADDR) register $(ZONE) $(KEYNAME) $(LEASE) $(KEY_LEASE) 'txt:Ciao from $(shell date +"%FT%T")'
+	CLIENT_KEYSTORE_DIR=$(CLIENT_KEYSTORE_DIR) ./$(BUILD_DIR)/$(CLIENT_NAME) $(ADDR) register $(ZONE) $(KEYNAME) $(LEASE) $(KEY_LEASE) '$(KEYNAME) $(LEASE) IN TXT "Ciao from $(shell date +"%FT%T")"'
 
 # Run a registration with one post-signature payload bit flip to validate
 # proxy-side SIG(0) cryptographic verification rejects tampered payloads.

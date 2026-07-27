@@ -24,6 +24,11 @@ const (
 
 	// MAX_KEY_LEASE is the maximum key-lease value
 	MAX_KEY_LEASE = 0xFFFFFFFF
+
+	// defaultKeyLease is used for registration requests when no KEY RR
+	// is registered (no second lease value needed). The 8-byte variant
+	// is always used, with this value serving as the KEY-LEASE placeholder.
+	defaultKeyLease = 0
 )
 
 // LeaseOption represents the Update Lease EDNS(0) option.
@@ -33,6 +38,8 @@ type LeaseOption struct {
 }
 
 // Encode4Byte creates a LeaseOption with only LEASE (4-byte variant).
+// Deprecated: For backward compatibility when 4-byte variant is enabled via config.
+// The 8-byte variant is now the default for all lease requests.
 func Encode4Byte(lease uint32) *LeaseOption {
 	return &LeaseOption{Lease: lease, KeyLease: nil}
 }
@@ -44,38 +51,44 @@ func Encode8Byte(lease, keyLease uint32) *LeaseOption {
 
 // Validate checks that the lease values are valid per RFC 9664/9665.
 func (lo *LeaseOption) Validate() error {
-	if lo.Lease < MIN_LEASE {
+	if lo.Lease != 0 && lo.Lease < MIN_LEASE {
 		return fmt.Errorf("LEASE %d is below minimum %d", lo.Lease, MIN_LEASE)
 	}
-	if lo.KeyLease != nil && *lo.KeyLease < MIN_KEY_LEASE {
-		return fmt.Errorf("KEY-LEASE %d is below minimum %d", *lo.KeyLease, MIN_KEY_LEASE)
-	}
-	if lo.KeyLease != nil && lo.Lease > *lo.KeyLease {
-		return fmt.Errorf("LEASE %d exceeds KEY-LEASE %d", lo.Lease, *lo.KeyLease)
+	if lo.KeyLease != nil {
+		// KEY-LEASE = 0 is a special sentinel meaning "no additional RRs registered"
+		// (used for 8-byte variant when only LEASE is needed). This bypasses MIN_KEY_LEASE
+		// and the LEASE > KeyLease check.
+		if *lo.KeyLease != 0 {
+			if *lo.KeyLease < MIN_KEY_LEASE {
+				return fmt.Errorf("KEY-LEASE %d is below minimum %d", *lo.KeyLease, MIN_KEY_LEASE)
+			}
+			if lo.Lease != 0 && lo.Lease > *lo.KeyLease {
+				return fmt.Errorf("LEASE %d exceeds KEY-LEASE %d", lo.Lease, *lo.KeyLease)
+			}
+		}
 	}
 	return nil
 }
 
 // Encode encodes the LeaseOption into an OPT RR per RFC 6891.
+// The 8-byte variant is always used (LEASE + KEY-LEASE).
+// When KeyLease == nil, KEY-LEASE is set to defaultKeyLease (0).
 func (lo *LeaseOption) Encode(opt *dns.OPT) error {
 	if err := lo.Validate(); err != nil {
 		return err
 	}
 
-	var data string
-
-	if lo.KeyLease == nil {
-		// 4-byte variant: only LEASE
-		buf := make([]byte, 4)
-		binary.BigEndian.PutUint32(buf, lo.Lease)
-		data = hex.EncodeToString(buf)
-	} else {
-		// 8-byte variant: LEASE + KEY-LEASE
-		buf := make([]byte, 8)
-		binary.BigEndian.PutUint32(buf[:4], lo.Lease)
-		binary.BigEndian.PutUint32(buf[4:], *lo.KeyLease)
-		data = hex.EncodeToString(buf)
+	// Always use 8-byte variant: LEASE + KEY-LEASE
+	// If KeyLease is nil (no KEY-LEASE provided), use defaultKeyLease (0)
+	keyLease := uint32(defaultKeyLease)
+	if lo.KeyLease != nil {
+		keyLease = *lo.KeyLease
 	}
+
+	buf := make([]byte, 8)
+	binary.BigEndian.PutUint32(buf[:4], lo.Lease)
+	binary.BigEndian.PutUint32(buf[4:], keyLease)
+	data := hex.EncodeToString(buf)
 
 	opt.Options = append(opt.Options, &dns.ERFC3597{
 		EDNS0Code: OPTION_CODE,

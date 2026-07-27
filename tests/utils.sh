@@ -4,6 +4,7 @@
 OS=$(uname -s | tr '[:upper:]' '[:lower:]')
 PROXY_BIN="${SCRIPT_DIR}/../bin/${OS}/sig0lease"
 CLIENT_BIN="${SCRIPT_DIR}/../bin/${OS}/sig0lease-client"
+BLACKLISTED_TESTER_BIN="${SCRIPT_DIR}/../bin/${OS}/blacklisted_tester"
 CONFIG_FILE="${SCRIPT_DIR}/../config.yaml"
 LOG_FILE="/tmp/sig0lease_proxy.log"
 
@@ -38,6 +39,18 @@ log_error() {
     echo -e "${RED}[FAIL] $1${NC}"
 }
 
+# Log levels for test script (independent from proxy logging).
+# DEBUG: detailed output (full dump, verbose traces).
+# INFO: summary output (high-level status, results).
+
+log_debug() {
+    echo -e "  [DEBUG] $1"
+}
+
+log_info() {
+    echo -e "  [INFO] $1"
+}
+
 start_proxy() {
     log_section "START: Proxy Process"
 
@@ -70,6 +83,7 @@ start_proxy() {
     fi
     # Verify our proxy PID owns at least one listener on the target port.
     is_listening=true
+    PORT_HEX=$(printf '%04X' "$PROXY_PORT")
     if [ "${OS}" = "darwin" ]
     then
         if ! lsof -nP -a -p "$PROXY_PID" -iTCP:"${PROXY_PORT}" -sTCP:LISTEN >/dev/null 2>&1 && \
@@ -77,11 +91,24 @@ start_proxy() {
         then
             is_listening=false
         fi
-    else
+    elif command -v ss >/dev/null 2>&1
+    then
         if ! ss -tulnp 2>/dev/null | grep -E ":${PROXY_PORT}\\b" | grep -q "pid=${PROXY_PID},"
         then
             is_listening=false
         fi
+    elif [ -f /proc/net/tcp ] || [ -f /proc/net/udp ]
+    then
+        # Fallback for container environments without lsof/ss:
+        # Check /proc/net/tcp (state 0A = LISTEN) and /proc/net/udp for the port.
+        if ! grep ":${PORT_HEX} " /proc/net/tcp 2>/dev/null | grep -q " 0A " && \
+           ! grep ":${PORT_HEX} " /proc/net/udp 2>/dev/null | grep -q " 07 "
+        then
+            is_listening=false
+        fi
+    else
+        log_error "Cannot verify proxy listening: no lsof, ss, or /proc/net available"
+        exit 1
     fi
 
     if [ "${is_listening}" = false ]

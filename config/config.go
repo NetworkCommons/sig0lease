@@ -149,3 +149,16 @@ func (c *Config) GetKeystoreDir() string {
 	}
 	return ""
 }
+
+// Use4ByteVariant returns true if 4-byte variant is explicitly enabled via config.
+// Returns false by default (8-byte variant is the default for all lease requests).
+func (c *Config) Use4ByteVariant() bool {
+	if c.Handlers != nil {
+		if updateHandlerCfg, ok := c.Handlers["update"]; ok {
+			if prefer, ok := updateHandlerCfg["prefer_4byte_variant"].(bool); ok {
+				return prefer
+			}
+		}
+	}
+	return false
+}

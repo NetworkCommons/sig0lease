@@ -61,28 +61,19 @@ func MakeRegistrationRequest(downstreamZone string, keyRR *dns.KEY, leaseDuratio
 }
 
 // MakeRefreshRequest creates a refresh request to extend an existing lease.
-// Provenance: RFC 9664 Section 3 - Refresh variant uses same EDNS structure
-func MakeRefreshRequest(downstreamZone string, keyName string, newLeaseDuration uint32) (*dns.Msg, error) {
+// A full KEY RR must be provided; header-only or omitted KEY RRs are rejected.
+func MakeRefreshRequest(downstreamZone string, keyRR *dns.KEY, leaseDuration, keyLeaseDuration uint32) (*dns.Msg, error) {
 	if downstreamZone == "" {
 		return nil, fmt.Errorf("downstream zone cannot be empty")
 	}
-	if keyName == "" {
-		return nil, fmt.Errorf("key name cannot be empty")
+	if keyRR == nil {
+		return nil, fmt.Errorf("KEY RR cannot be nil")
 	}
-	if newLeaseDuration < 30 {
+	if keyRR.Algorithm == 0 || keyRR.Protocol == 0 || keyRR.PublicKey == "" {
+		return nil, fmt.Errorf("incomplete KEY RR: full RDATA is required")
+	}
+	if leaseDuration < 30 {
 		return nil, fmt.Errorf("lease duration must be at least 30 seconds")
 	}
-
-	// For refresh, we add an empty KEY RR with just the name (no RDATA)
-	// This signals a refresh rather than a new registration
-	emptyKeyRR := &dns.KEY{
-		DNSKEY: dns.DNSKEY{
-			Hdr: dns.Header{
-				Name:  keyName,
-				Class: dns.ClassINET,
-				TTL:   0,
-			},
-		},
-	}
-	return dnsmsg.NewRefreshUpdate(downstreamZone, emptyKeyRR, newLeaseDuration, newLeaseDuration, true)
+	return dnsmsg.NewRefreshUpdate(downstreamZone, keyRR, leaseDuration, keyLeaseDuration, false)
 }

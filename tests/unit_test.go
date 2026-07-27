@@ -235,8 +235,10 @@ func TestLeaseRefreshRequest(t *testing.T) {
 	// Create a refresh request
 	keyRRName := fmt.Sprintf("leasekey-%d.test.dev.zenr.io.", time.Now().Unix())
 	newLeaseDuration := uint32(30) // 30 seconds (minimum allowed)
+	refreshKey := loadedKey.PublicKey.Clone().(*dns.KEY)
+	refreshKey.Hdr.Name = keyRRName
 
-	refreshReq, err := client.MakeRefreshRequest("test.dev.zenr.io.", keyRRName, newLeaseDuration)
+	refreshReq, err := client.MakeRefreshRequest("test.dev.zenr.io.", refreshKey, newLeaseDuration, newLeaseDuration)
 	if err != nil {
 		t.Fatalf("Failed to create refresh request: %v", err)
 	}
@@ -312,8 +314,9 @@ func TestLeaseTimingCycle(t *testing.T) {
 	t.Log("  Waiting 5 seconds (17% of 30-second lease)...")
 	time.Sleep(5 * time.Second)
 
-	refreshReq, err := client.MakeRefreshRequest("test.dev.zenr.io.",
-		fmt.Sprintf("testkey-%d.test.dev.zenr.io.", time.Now().Unix()), shortLease)
+	refreshKey := loadedKey.PublicKey.Clone().(*dns.KEY)
+	refreshKey.Hdr.Name = fmt.Sprintf("testkey-%d.test.dev.zenr.io.", time.Now().Unix())
+	refreshReq, err := client.MakeRefreshRequest("test.dev.zenr.io.", refreshKey, shortLease, shortLease)
 	if err != nil {
 		t.Fatalf("Failed to create refresh request: %v", err)
 	}

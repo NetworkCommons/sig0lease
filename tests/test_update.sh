@@ -41,7 +41,17 @@ MIN_KEY_LEASE_SECONDS="${MIN_KEY_LEASE_SECONDS:-30}"
 REFRESH_CASE_KEY_LEASE_SECONDS="${REFRESH_CASE_KEY_LEASE_SECONDS:-3600}"
 
 # Optional: limit matrix run to selected RR types, e.g. RR_TYPES="KEY TXT"
+# Supported types: KEY TXT A AAAA NULL NXNAME WALLET CLA IPN
+# Note: NULL and NXNAME cannot be constructed from presentation format in
+# miekg/dns (they lack a text representation). They are tested at the
+# unit-test level (opcode5_phase3_test.go). The integration test can
+# only exercise types that the client binary can construct.
+# To test blacklisted types, set BLACKLISTED_RR_TYPES, e.g.:
+#   BLACKLISTED_RR_TYPES="NULL NXNAME WALLET CLA IPN"
+# When set, these types are tested against the configured blacklist:
+# the proxy should reject them with RcodeFormatError.
 RR_TYPES="${RR_TYPES:-KEY TXT A AAAA}"
+BLACKLISTED_RR_TYPES="${BLACKLISTED_RR_TYPES:-NULL NXNAME WALLET CLA IPN}"
 
 
 
@@ -86,16 +96,71 @@ assert_proxy_log_contains() {
 
 rr_spec_for_type() {
     local rr_type="$1"
+    local owner="$2"
+    local ttl="$3"
     case "$rr_type" in
         KEY) echo "" ;;
-        TXT) echo "txt:lease-txt-$(date +%s)" ;;
-        A) echo "a:192.0.2.33" ;;
-        AAAA) echo "aaaa:2001:db8::33" ;;
+        TXT) echo "${owner} ${ttl} IN TXT \"lease-txt-$(date +%s)\"" ;;
+        A) echo "${owner} ${ttl} IN A 192.0.2.33" ;;
+        AAAA) echo "${owner} ${ttl} IN AAAA 2001:db8::33" ;;
+        # NULL and NXNAME have no presentation format in miekg/dns,
+        # so they cannot be constructed via the client binary's
+        # ParseAdditionalRRSpec (which uses dns.New). They are
+        # tested at the unit-test level (opcode5_phase3_test.go).
+        NULL) log_step "Skipping NULL: no presentation format in miekg/dns" ;;
+        NXNAME) log_step "Skipping NXNAME: no presentation format in miekg/dns" ;;
+        WALLET) echo "${owner} ${ttl} IN WALLET \"wallet-data\"" ;;
+        CLA) echo "${owner} ${ttl} IN CLA \"cla-data\"" ;;
+        IPN) echo "${owner} ${ttl} IN IPN 42" ;;
         *)
             log_error "Unsupported rr type: $rr_type"
             return 1
             ;;
     esac
+}
+
+# Test blacklisted RR types by constructing them programmatically.
+# NULL and NXNAME cannot be constructed via presentation format (miekg/dns limitation),
+# so we use a small Go helper that constructs these records directly and sends them.
+test_blacklisted_type() {
+    local rr_type="$1"
+    log_section "BLACKLISTED [$rr_type]: Proxy Rejects Blacklisted Type"
+
+    log_step "Registering lease under authorized key ($CLIENT_KEY_NAME) with blacklisted type"
+    local case_start lease_start
+    case_start=$(date +%s)
+    lease_start=$(date +%s)
+
+    # For NULL/NXNAME, use the Go helper to construct the record directly.
+    # For WALLET/CLA/IPN, use the standard client binary.
+    local rr_spec=""
+    local reg_out=""
+    case "$rr_type" in
+        NULL|NXNAME)
+            # Construct the record programmatically via the Go helper.
+            # This bypasses ParseAdditionalRRSpec and constructs the RR directly.
+            log_step "Using Go helper to construct $rr_type record directly"
+            # blacklisted_tester sends the request directly to the proxy and prints the response.
+            reg_out=$(cd "$SCRIPT_DIR/.." && go run -ldflags="-X main.rrType=$rr_type -X main.rrOwner=$CLIENT_KEY_NAME -X main.leaseDuration=$LEASE_SECONDS -X main.keyLeaseSeconds=$KEY_LEASE_SECONDS -X main.proxyAddr=$PROXY_URL -X main.zone=$DOWNSTREAM_ZONE" ./cmd/blacklisted_tester 2>&1) || true
+            ;;
+        *)
+            rr_spec=$(rr_spec_for_type "$rr_type" "$CLIENT_KEY_NAME" "$LEASE_SECONDS")
+            log_step "Attempting registration with blacklisted type $rr_type"
+            reg_out=$(run_client "$PROXY_URL" register "$DOWNSTREAM_ZONE" "$CLIENT_KEY_NAME" "$LEASE_SECONDS" "$KEY_LEASE_SECONDS" "$rr_spec" 2>&1) || true
+            ;;
+    esac
+
+    # Check the response for rejection (should be Rcode=1 FormatError).
+    if echo "$reg_out" | grep -q "Rcode=1\|FormatError\|REGISTRATION FAILED"; then
+        log_success "Proxy correctly rejected blacklisted type $rr_type with format error"
+    else
+        log_error "Proxy should have rejected blacklisted type $rr_type, got: $reg_out"
+        return 1
+    fi
+
+    # Verify no KEY RR was created (registration should be atomic - all or nothing).
+    wait_for_key_state "$CLIENT_KEY_NAME" absent
+    log_success "Blacklisted type $rr_type rejected and no lease created"
 }
 
 register_with_rr_type() {
@@ -104,7 +169,7 @@ register_with_rr_type() {
     local key_lease_seconds="$3"
 
     local rr_spec=""
-    rr_spec=$(rr_spec_for_type "$rr_type")
+    rr_spec=$(rr_spec_for_type "$rr_type" "$CLIENT_KEY_NAME" "$lease_seconds")
     if [ -n "$rr_spec" ]; then
         run_client "$PROXY_URL" register "$DOWNSTREAM_ZONE" "$CLIENT_KEY_NAME" "$lease_seconds" "$key_lease_seconds" "$rr_spec"
     else
@@ -116,14 +181,51 @@ query_rr_at_authoritative() {
     local name="$1"
     local rr_type="$2"
     local out
-    local cmd="dig +time=3 +tries=1 +short @${AUTH_SERVER} ${name} ${rr_type}"
 
-    out=$(dig +time=3 +tries=1 +short "@${AUTH_SERVER}" "$name" "$rr_type")
-    log_step "[dig] $cmd"
+    # Use simpledig (Go-based dig replacement) to query the authoritative server
+    out=$("$SCRIPT_DIR/../bin/${OS}/simpledig" "@${AUTH_SERVER}" "$name" "$rr_type" 2>/dev/null) || true
+    log_step "[simpledig] @${AUTH_SERVER} ${name} ${rr_type}"
     if [ -n "$out" ]; then
         echo "$out"
     else
         echo "(no records)"
+    fi
+    printf '%s\n' "$out"
+}
+
+# Query the running proxy for lease store dump at the specified log level.
+# Usage: query_lease_dump <level>
+#   level: "debug" → full details via __dump.sig0lease.internal.debug.
+#          "info"  → summary via __dump.sig0lease.internal.
+# Returns the concatenated TXT dump text from the proxy.
+query_lease_dump() {
+    local level="${1:-info}"
+    local query_domain dump_label
+    case "$level" in
+        debug)
+            query_domain="__dump.sig0lease.internal.debug."
+            dump_label="DEBUG/full"
+            ;;
+        info|*)
+            query_domain="__dump.sig0lease.internal."
+            dump_label="INFO/summary"
+            ;;
+    esac
+
+    local out
+    out=$("$SCRIPT_DIR/../bin/${OS}/simpledig" "@${PROXY_URL}" "${query_domain}" TXT 2>/dev/null) || true
+
+    # Use test script's own log levels (independent from proxy logging).
+    if [ "$level" = "debug" ]; then
+        log_debug "[simpledig] @${PROXY_URL} ${query_domain} TXT (${dump_label})"
+    else
+        log_info "[simpledig] @${PROXY_URL} ${query_domain} TXT (${dump_label})"
+    fi
+
+    if [ -n "$out" ]; then
+        echo "$out"
+    else
+        echo "(no dump response)"
     fi
     printf '%s\n' "$out"
 }
@@ -292,6 +394,8 @@ build_binaries() {
     log_step "Building proxy and client binaries"
     (cd "$SCRIPT_DIR/.." && go build -o "$PROXY_BIN" ./cmd/sig0lease)
     (cd "$SCRIPT_DIR/.." && go build -o "$CLIENT_BIN" ./cmd/sig0lease-client)
+    (cd "$SCRIPT_DIR/.." && go build -o "$BLACKLISTED_TESTER_BIN" ./cmd/blacklisted_tester)
+    (cd "$SCRIPT_DIR/.." && go build -o "$SCRIPT_DIR/../bin/${OS}/simpledig" ./cmd/simpledig)
     log_success "Binaries built"
 }
 
@@ -313,6 +417,10 @@ test_case_register_expire_remove() {
     register_with_rr_type "$rr_type" "$LEASE_SECONDS" "$KEY_LEASE_SECONDS"
     wait_for_rr_state "$CLIENT_KEY_NAME" KEY present
     wait_for_rr_state "$CLIENT_KEY_NAME" "$rr_type" present
+
+    # Verify lease store via dump query (INFO level summary).
+    log_step "Verifying lease store state via dump query (INFO)"
+    query_lease_dump "info"
 
     log_step "Waiting until lease expiry boundary"
     wait_until_lease_expired "$lease_start" "$LEASE_SECONDS" 3
@@ -350,6 +458,10 @@ test_case_register_refresh_not_prematurely_removed() {
     wait_for_rr_state "$CLIENT_KEY_NAME" KEY present
     wait_for_rr_state "$CLIENT_KEY_NAME" "$rr_type" present
     assert_proxy_consistent_with_authoritative "$CLIENT_KEY_NAME" "$rr_type" present
+
+    # Verify lease store via dump query (INFO level summary).
+    log_step "Verifying lease store state via dump query (INFO) after initial registration"
+    query_lease_dump "info"
 
     log_step "Waiting to near-expiry checkpoint then refreshing"
     wait_until_epoch $((lease_start + 20))
@@ -446,7 +558,6 @@ run_all_tests() {
 
     require_command grep
     require_command ls
-    require_command dig
     build_binaries
     setup_keystore
     log_success "Using authoritative server for KEY checks: $AUTH_SERVER"

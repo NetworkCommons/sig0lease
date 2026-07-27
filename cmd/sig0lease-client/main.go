@@ -285,11 +285,10 @@ func cmdRegisterWithMode(proxyAddr string, args []string, tamper bool) {
 	}
 }
 
-// cmdRefresh sends a sig0lease UPDATE-LEASE refresh request.
-// Default is 8-byte variant (LEASE + KEY-LEASE); "4byte" forces 4-byte variant.
+// cmdRefresh sends a sig0lease UPDATE-LEASE refresh request (8-byte variant).
 func cmdRefresh(proxyAddr string, args []string) {
 	if len(args) < 2 {
-		fmt.Fprintf(os.Stderr, "Usage: sig0lease-client <proxy> refresh <zone> <keyname> [lease] [key-lease|4byte]\n")
+		fmt.Fprintf(os.Stderr, "Usage: sig0lease-client <proxy> refresh <zone> <keyname> [lease] [key-lease]\n")
 		os.Exit(1)
 	}
 
@@ -297,20 +296,16 @@ func cmdRefresh(proxyAddr string, args []string) {
 	keyname := args[1]
 	leaseDuration := uint32(defaultLease)
 	keyLeaseDuration := uint32(defaultKeyLease)
-	use4Byte := false
 	if len(args) > 2 {
 		if val, err := strconv.ParseUint(args[2], 10, 32); err == nil {
 			leaseDuration = uint32(val)
 		}
 	}
 	if len(args) > 3 {
-		mode := strings.ToLower(strings.TrimSpace(args[3]))
-		if mode == "4" || mode == "4byte" || mode == "4-byte" {
-			use4Byte = true
-		} else if val, err := strconv.ParseUint(args[3], 10, 32); err == nil {
+		if val, err := strconv.ParseUint(args[3], 10, 32); err == nil {
 			keyLeaseDuration = uint32(val)
 		} else {
-			fmt.Fprintf(os.Stderr, "ERROR: invalid refresh key-lease/mode %q (expected uint or 4byte)\n", args[3])
+			fmt.Fprintf(os.Stderr, "ERROR: invalid refresh key-lease %q (expected uint)\n", args[3])
 			os.Exit(1)
 		}
 	}
@@ -320,12 +315,8 @@ func cmdRefresh(proxyAddr string, args []string) {
 	fmt.Printf("Zone: %s\n", zone)
 	fmt.Printf("Key Name: %s\n", keyname)
 	fmt.Printf("New Lease: %d seconds\n", leaseDuration)
-	if use4Byte {
-		fmt.Printf("Lease Variant: 4-byte (test mode)\n\n")
-	} else {
-		fmt.Printf("Key-Lease: %d seconds\n", keyLeaseDuration)
-		fmt.Printf("Lease Variant: 8-byte\n\n")
-	}
+	fmt.Printf("Key-Lease: %d seconds\n", keyLeaseDuration)
+	fmt.Printf("Lease Variant: 8-byte\n\n")
 
 	fmt.Printf("Step 1: Loading client key for key name (%s) from keystore (%s)\n", keyname, keystoreDir)
 	clientKeyName, err := keyrec.FindKeyByZone(keystoreDir, keyname)
@@ -350,7 +341,7 @@ func cmdRefresh(proxyAddr string, args []string) {
 	keyRR.Protocol = clientKey.PublicKey.Protocol
 	keyRR.Algorithm = clientKey.PublicKey.Algorithm
 	keyRR.PublicKey = clientKey.PublicKey.PublicKey
-	msg, err := dnsmsg.NewRefreshUpdate(zone, keyRR, leaseDuration, keyLeaseDuration, use4Byte)
+	msg, err := client.MakeRefreshRequest(zone, keyRR, leaseDuration, keyLeaseDuration)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "ERROR: Failed to build refresh update packet: %v\n", err)
 		os.Exit(1)
@@ -523,21 +514,16 @@ Commands:
     keyname: key name to register (e.g., client.test.dev.zenr.io.)
     lease: lease duration in seconds (default: 300)
     key-lease: key-lease duration in seconds (default: 3600)
-		rr-spec: optional additional RR in one of these forms:
-			txt:<text>
-			txt:<name>:<text>
-			a:<ipv4>
-			a:<name>:<ipv4>
-			aaaa:<ipv6>
-			aaaa:<name>:<ipv6>
+		rr-spec: optional additional RR in DNS presentation format:
+			<owner> <ttl> <class> <type> <rdata...>
     
     Example:
       sig0lease-client 127.0.0.1:8053 register test.dev.zenr.io. client.test.dev.zenr.io.
       sig0lease-client 127.0.0.1:8053 register test.dev.zenr.io. client.test.dev.zenr.io. 300 3600
+      sig0lease-client 127.0.0.1:8053 register test.dev.zenr.io. client.test.dev.zenr.io. 300 3600 "client.test.dev.zenr.io. 300 IN TXT \"hello\""
 
-	refresh <zone> <keyname> [lease] [key-lease|4byte]
-		Send a sig0lease UPDATE-LEASE refresh request (8-byte by default)
-		Use 4byte as last arg only for explicit 4-byte variant tests
+	refresh <zone> <keyname> [lease] [key-lease]
+		Send a sig0lease UPDATE-LEASE refresh request (8-byte variant)
 
 		zone: downstream zone (e.g., test.dev.zenr.io.)
 		keyname: key name to refresh
@@ -546,7 +532,6 @@ Commands:
 
 		Example:
 			sig0lease-client 127.0.0.1:8053 refresh test.dev.zenr.io. client.test.dev.zenr.io. 300
-			sig0lease-client 127.0.0.1:8053 refresh test.dev.zenr.io. client.test.dev.zenr.io. 300 4byte
 
   verify <zone> <keyname>
     Query if a key registration is active

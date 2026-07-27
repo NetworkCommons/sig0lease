@@ -13,41 +13,7 @@ func TestEncode4Byte(t *testing.T) {
 	}
 }
 
-func TestEncode8Byte(t *testing.T) {
-	opt := Encode8Byte(7200, 1209600)
-	if opt.Lease != 7200 || opt.KeyLease == nil || *opt.KeyLease != 1209600 {
-		t.Errorf("Expected Lease=7200, KeyLease=1209600, got Lease=%d, KeyLease=%v", opt.Lease, opt.KeyLease)
-	}
-}
-
-func TestValidate(t *testing.T) {
-	tests := []struct {
-		name    string
-		opt     *LeaseOption
-		wantErr bool
-	}{
-		{"Valid 4-byte", Encode4Byte(7200), false},
-		{"Valid 8-byte", Encode8Byte(7200, 1209600), false},
-		{"LEASE < MIN", Encode4Byte(29), true},
-		{"KeyLease < MIN", func() *LeaseOption {
-			opt := Encode8Byte(7200, 29)
-			return opt
-		}(), true},
-		{"LEASE > KeyLease", func() *LeaseOption {
-			opt := Encode8Byte(1209600, 7200)
-			return opt
-		}(), true},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			err := tt.opt.Validate()
-			if (err != nil) != tt.wantErr {
-				t.Errorf("Validate() error = %v, wantErr %v", err, tt.wantErr)
-			}
-		})
-	}
-}
+func uintPtr(v uint32) *uint32 { return &v }
 
 func TestEncodeDecode4Byte(t *testing.T) {
 	opt1 := Encode4Byte(7200)
@@ -64,8 +30,49 @@ func TestEncodeDecode4Byte(t *testing.T) {
 		t.Fatalf("Decode() error = %v", err)
 	}
 
-	if opt2.Lease != 7200 || opt2.KeyLease != nil {
+	// With 8-byte always mode, Encode4Byte encodes 8 bytes with KEY-LEASE=0,
+	// so Decode will produce KeyLease=&0 (not nil).
+	if opt2.Lease != 7200 || opt2.KeyLease == nil || *opt2.KeyLease != 0 {
 		t.Errorf("Round-trip failed: got Lease=%d, KeyLease=%v", opt2.Lease, opt2.KeyLease)
+	}
+}
+
+func TestEncode8Byte(t *testing.T) {
+	opt := Encode8Byte(7200, 1209600)
+	if opt.Lease != 7200 || opt.KeyLease == nil || *opt.KeyLease != 1209600 {
+		t.Errorf("Expected Lease=7200, KeyLease=1209600, got Lease=%d, KeyLease=%v", opt.Lease, opt.KeyLease)
+	}
+}
+
+func TestValidate(t *testing.T) {
+	tests := []struct {
+		name    string
+		opt     *LeaseOption
+		wantErr bool
+	}{
+		{"Valid 4-byte", Encode4Byte(7200), false},
+		{"Valid 8-byte", Encode8Byte(7200, 1209600), false},
+		{"KeyLease = 0 sentinel (no additional RRs)", func() *LeaseOption {
+			return &LeaseOption{Lease: 7200, KeyLease: uintPtr(0)}
+		}(), false},
+		{"LEASE < MIN", Encode4Byte(29), true},
+		{"KeyLease < MIN (non-zero)", func() *LeaseOption {
+			opt := Encode8Byte(7200, 29)
+			return opt
+		}(), true},
+		{"LEASE > KeyLease", func() *LeaseOption {
+			opt := Encode8Byte(1209600, 7200)
+			return opt
+		}(), true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := tt.opt.Validate()
+			if (err != nil) != tt.wantErr {
+				t.Errorf("Validate() error = %v, wantErr %v", err, tt.wantErr)
+			}
+		})
 	}
 }
 

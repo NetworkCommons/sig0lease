@@ -36,16 +36,16 @@ func applyUpdateHandlerEnvOverrides(cfg map[string]any) map[string]any {
 		out["keystore_dir"] = v
 	}
 
-	rawPolicy, _ := out["ttl_policy"].(map[string]any)
+	rawPolicy, _ := out["lease_policy"].(map[string]any)
 	if rawPolicy == nil {
 		rawPolicy = make(map[string]any)
 	}
-	setUintEnv(rawPolicy, "TTL_POLICY_MIN_KEY_TTL", "min_key_ttl")
-	setUintEnv(rawPolicy, "TTL_POLICY_MAX_KEY_TTL", "max_key_ttl")
-	setUintEnv(rawPolicy, "TTL_POLICY_MIN_RR_TTL", "min_rr_ttl")
-	setUintEnv(rawPolicy, "TTL_POLICY_MAX_RR_TTL", "max_rr_ttl")
+	setUintEnv(rawPolicy, "POLICY_MIN_KEY_LEASE", "min_key_lease_sec")
+	setUintEnv(rawPolicy, "POLICY_MAX_KEY_LEASE", "max_key_lease_sec")
+	setUintEnv(rawPolicy, "POLICY_MIN_RR_LEASE", "min_rr_lease_sec")
+	setUintEnv(rawPolicy, "POLICY_MAX_RR_LEASE", "max_rr_lease_sec")
 	if len(rawPolicy) > 0 {
-		out["ttl_policy"] = rawPolicy
+		out["lease_policy"] = rawPolicy
 	}
 
 	return out
@@ -53,9 +53,19 @@ func applyUpdateHandlerEnvOverrides(cfg map[string]any) map[string]any {
 
 func main() {
 	cfgPath := "config.yaml"
+	dumpMode := false
+	dumpLevel := "info" // default: INFO (summary)
 
-	if len(os.Args) > 1 {
-		cfgPath = os.Args[1]
+	for i := 1; i < len(os.Args); i++ {
+		switch os.Args[i] {
+		case "--dump":
+			dumpMode = true
+		case "--dump-debug":
+			dumpMode = true
+			dumpLevel = "debug"
+		default:
+			cfgPath = os.Args[i]
+		}
 	}
 
 	// Load configuration
@@ -71,6 +81,35 @@ func main() {
 		logLevel = "debug"
 	}
 	logger := logging.NewLogger(logLevel, "text")
+
+	if dumpMode {
+		// Dump mode: create handler, print lease state, exit.
+		opcodeMap := cfg.GetOpcodeMap()
+		for _, moduleName := range opcodeMap {
+			if moduleName == "update_handler" {
+				h := handlers.NewUpdateHandler()
+				h.SetLogger(logger)
+
+				handlerCfg := applyUpdateHandlerEnvOverrides(cfg.Handlers["update"])
+				if handlerCfg != nil {
+					if err := h.Setup(handlerCfg); err != nil {
+						logger.Warnf("Failed to setup %s: %v", moduleName, err)
+					}
+				}
+
+				fmt.Print(h.DumpLeasesLevel(dumpLevel))
+				return
+			}
+		}
+		if dumpLevel == "debug" {
+			fmt.Println("=== Lease Store Dump ===")
+		} else {
+			fmt.Println("=== Lease Store Summary ===")
+		}
+		fmt.Println("(no update_handler configured)")
+		return
+	}
+
 	logger.Infof("Starting DNS Proxy")
 
 	if v := os.Getenv("SERVER_ADDRESS"); v != "" {
