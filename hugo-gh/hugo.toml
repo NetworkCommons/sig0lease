@@ -4,10 +4,13 @@ title = 'sig0lease'
 theme = ["hugo-embed-pdf-shortcode", "gohugo-theme-ananke"]
 enableInlineShortcodes = true
 [params]
-  subtitle = 'sustainable collaborative service discovery'
+  subtitle = 'collaborative service discovery'
   toc = true
   # site_logo = "images/mycosystem-section-cut.jpg"
   custom_css = ["custom.css"]
+  [[params.ananke_socials]]
+    name = "mastodon"
+    url = "https://https://hachyderm.io/@sig0lease"
   [[params.ananke_socials]]
     name = "github"
     url = "https://github.com/networkcommons/sig0lease"
