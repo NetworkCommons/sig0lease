@@ -15,6 +15,7 @@ import (
 	_ "github.com/NetworkCommons/sig0lease/pkg/dnscompat"
 	"github.com/NetworkCommons/sig0lease/pkg/dnsmsg"
 	"github.com/NetworkCommons/sig0lease/pkg/keyrec"
+	"github.com/NetworkCommons/sig0lease/pkg/sig0"
 )
 
 var (
@@ -194,13 +195,7 @@ func cmdRegisterWithMode(proxyAddr string, args []string, tamper bool) {
 		fmt.Printf("      Extra[%d]: %T = %v\n", i, rr, rr)
 	}
 
-	signer, err := client.NewSig0Signer(clientKey.PublicKey, clientKey.PrivateKey)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "ERROR: Failed to create signer: %v\n", err)
-		os.Exit(1)
-	}
-
-	signedMsg, err := signer.SignMessage(msg)
+	signedMsg, err := sig0.SignMessage(msg, clientKey.PublicKey, clientKey.PrivateKey)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "ERROR: Failed to sign message: %v\n", err)
 		os.Exit(1)
@@ -342,20 +337,14 @@ func cmdRefresh(proxyAddr string, args []string) {
 	keyRR.Protocol = clientKey.PublicKey.Protocol
 	keyRR.Algorithm = clientKey.PublicKey.Algorithm
 	keyRR.PublicKey = clientKey.PublicKey.PublicKey
-	msg, err := client.MakeRefreshRequest(zone, keyRR, leaseDuration, keyLeaseDuration)
+	msg, err := dnsmsg.NewRefreshUpdate(zone, keyRR, leaseDuration, keyLeaseDuration, false)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "ERROR: Failed to build refresh update packet: %v\n", err)
 		os.Exit(1)
 	}
 
 	fmt.Printf("Step 3: Signing refresh request with SIG(0)\n")
-	signer, err := client.NewSig0Signer(clientKey.PublicKey, clientKey.PrivateKey)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "ERROR: Failed to create signer: %v\n", err)
-		os.Exit(1)
-	}
-
-	signedMsg, err := signer.SignMessage(msg)
+	signedMsg, err := sig0.SignMessage(msg, clientKey.PublicKey, clientKey.PrivateKey)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "ERROR: Failed to sign message: %v\n", err)
 		os.Exit(1)

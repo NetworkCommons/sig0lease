@@ -9,7 +9,7 @@ import (
 	"time"
 
 	"codeberg.org/miekg/dns"
-	"github.com/NetworkCommons/sig0lease/client"
+	"github.com/NetworkCommons/sig0lease/pkg/dnsmsg"
 	"github.com/NetworkCommons/sig0lease/pkg/keyrec"
 	"github.com/NetworkCommons/sig0lease/pkg/sig0"
 )
@@ -45,18 +45,12 @@ func TestLeaseCreationAndSigning(t *testing.T) {
 	subdomain := "lease1.test.dev.zenr.io"
 	leaseDuration := uint32(30) // 30 seconds (minimum allowed)
 
-	regReq, err := client.MakeRegistrationRequest("test.dev.zenr.io.", loadedKey.PublicKey, leaseDuration)
+	regReq, err := dnsmsg.NewRegistrationUpdate("test.dev.zenr.io.", loadedKey.PublicKey, nil, leaseDuration, leaseDuration)
 	if err != nil {
 		t.Fatalf("Failed to create registration request: %v", err)
 	}
 
-	// Create a client signer and sign the request
-	clientSigner, err := client.NewSig0Signer(loadedKey.PublicKey, loadedKey.PrivateKey)
-	if err != nil {
-		t.Fatalf("Failed to create client signer: %v", err)
-	}
-
-	signedReq, err := clientSigner.SignMessage(regReq)
+	signedReq, err := sig0.SignMessage(regReq, loadedKey.PublicKey, loadedKey.PrivateKey)
 	if err != nil {
 		t.Fatalf("Failed to sign registration request: %v", err)
 	}
@@ -104,18 +98,13 @@ func TestLeaseVerification(t *testing.T) {
 	}
 
 	// Create a registration request
-	regReq, err := client.MakeRegistrationRequest("test.dev.zenr.io.", loadedKey.PublicKey, 30)
+	regReq, err := dnsmsg.NewRegistrationUpdate("test.dev.zenr.io.", loadedKey.PublicKey, nil, 30, 30)
 	if err != nil {
 		t.Fatalf("Failed to create registration request: %v", err)
 	}
 
-	// Sign it with the client
-	clientSigner, err := client.NewSig0Signer(loadedKey.PublicKey, loadedKey.PrivateKey)
-	if err != nil {
-		t.Fatalf("Failed to create client signer: %v", err)
-	}
-
-	signedReq, err := clientSigner.SignMessage(regReq)
+	// Sign it with SIG(0)
+	signedReq, err := sig0.SignMessage(regReq, loadedKey.PublicKey, loadedKey.PrivateKey)
 	if err != nil {
 		t.Fatalf("Failed to sign registration request: %v", err)
 	}
@@ -238,18 +227,13 @@ func TestLeaseRefreshRequest(t *testing.T) {
 	refreshKey := loadedKey.PublicKey.Clone().(*dns.KEY)
 	refreshKey.Hdr.Name = keyRRName
 
-	refreshReq, err := client.MakeRefreshRequest("test.dev.zenr.io.", refreshKey, newLeaseDuration, newLeaseDuration)
+	refreshReq, err := dnsmsg.NewRefreshUpdate("test.dev.zenr.io.", refreshKey, newLeaseDuration, newLeaseDuration, false)
 	if err != nil {
 		t.Fatalf("Failed to create refresh request: %v", err)
 	}
 
-	// Sign it with the client
-	clientSigner, err := client.NewSig0Signer(loadedKey.PublicKey, loadedKey.PrivateKey)
-	if err != nil {
-		t.Fatalf("Failed to create client signer: %v", err)
-	}
-
-	signedRefresh, err := clientSigner.SignMessage(refreshReq)
+	// Sign it with SIG(0)
+	signedRefresh, err := sig0.SignMessage(refreshReq, loadedKey.PublicKey, loadedKey.PrivateKey)
 	if err != nil {
 		t.Fatalf("Failed to sign refresh request: %v", err)
 	}
@@ -283,21 +267,15 @@ func TestLeaseTimingCycle(t *testing.T) {
 		t.Skipf("Could not load test key: %v", err)
 	}
 
-	// Create a signer
-	clientSigner, err := client.NewSig0Signer(loadedKey.PublicKey, loadedKey.PrivateKey)
-	if err != nil {
-		t.Fatalf("Failed to create client signer: %v", err)
-	}
-
 	// Test 1: Create initial lease
 	t.Log("Test 1: Creating lease registration request...")
 	shortLease := uint32(30) // 30 seconds (minimum allowed)
-	regReq, err := client.MakeRegistrationRequest("test.dev.zenr.io.", loadedKey.PublicKey, shortLease)
+	regReq, err := dnsmsg.NewRegistrationUpdate("test.dev.zenr.io.", loadedKey.PublicKey, nil, shortLease, shortLease)
 	if err != nil {
 		t.Fatalf("Failed to create registration request: %v", err)
 	}
 
-	signedReq, err := clientSigner.SignMessage(regReq)
+	signedReq, err := sig0.SignMessage(regReq, loadedKey.PublicKey, loadedKey.PrivateKey)
 	if err != nil {
 		t.Fatalf("Failed to sign registration request: %v", err)
 	}
@@ -316,12 +294,12 @@ func TestLeaseTimingCycle(t *testing.T) {
 
 	refreshKey := loadedKey.PublicKey.Clone().(*dns.KEY)
 	refreshKey.Hdr.Name = fmt.Sprintf("testkey-%d.test.dev.zenr.io.", time.Now().Unix())
-	refreshReq, err := client.MakeRefreshRequest("test.dev.zenr.io.", refreshKey, shortLease, shortLease)
+	refreshReq, err := dnsmsg.NewRefreshUpdate("test.dev.zenr.io.", refreshKey, shortLease, shortLease, false)
 	if err != nil {
 		t.Fatalf("Failed to create refresh request: %v", err)
 	}
 
-	signedRefresh, err := clientSigner.SignMessage(refreshReq)
+	signedRefresh, err := sig0.SignMessage(refreshReq, loadedKey.PublicKey, loadedKey.PrivateKey)
 	if err != nil {
 		t.Fatalf("Failed to sign refresh request: %v", err)
 	}
@@ -371,7 +349,7 @@ func TestLeaseSignatureVariations(t *testing.T) {
 
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
-			regReq, err := client.MakeRegistrationRequest("test.dev.zenr.io.", loadedKey.PublicKey, tc.leaseDuration)
+			regReq, err := dnsmsg.NewRegistrationUpdate("test.dev.zenr.io.", loadedKey.PublicKey, nil, tc.leaseDuration, tc.leaseDuration)
 
 			if tc.shouldFail {
 				if err == nil {
@@ -385,12 +363,7 @@ func TestLeaseSignatureVariations(t *testing.T) {
 			}
 
 			// Sign the request
-			clientSigner, err := client.NewSig0Signer(loadedKey.PublicKey, loadedKey.PrivateKey)
-			if err != nil {
-				t.Fatalf("Failed to create client signer: %v", err)
-			}
-
-			signedReq, err := clientSigner.SignMessage(regReq)
+			signedReq, err := sig0.SignMessage(regReq, loadedKey.PublicKey, loadedKey.PrivateKey)
 			if err != nil {
 				t.Fatalf("Failed to sign request: %v", err)
 			}

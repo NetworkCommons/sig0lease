@@ -24,7 +24,7 @@ type LeaseRecord = leasepkg.Record
 // Records are tracked individually by their full RDATA, so each record
 // can have its own lease duration and expiry time.
 type DataLeaseRecord struct {
-	Records       map[string]*dataRecordEntry // key = name/class/type/rdata (TTL ignored)
+	Records       map[string]*dataRecordEntry // key = full RR presentation (includes TTL)
 	ExpiresAt     time.Time
 	UpstreamZone  string
 	LeaseDuration uint32
@@ -39,19 +39,13 @@ type dataRecordEntry struct {
 	Deleted       bool
 }
 
-// recordKey returns a stable identity key for a DNS RR using
-// name/class/type/rdata while ignoring TTL. TTL is lease metadata and not
-// part of DNS RR identity for registration/duplicate checks.
+// recordKey returns a unique key for a DNS RR using full presentation form,
+// including TTL. Records differing in any field are tracked as distinct.
 func recordKey(rr dns.RR) string {
 	if rr == nil {
 		return ""
 	}
-	cpy := copyRR(rr)
-	if cpy == nil || cpy.Header() == nil {
-		return ""
-	}
-	cpy.Header().TTL = 0
-	return cpy.String()
+	return rr.String()
 }
 
 // LeasePolicy controls rewrite clamping for upstream forwarded RRs.
@@ -1590,15 +1584,11 @@ func isNameAtOrAbove(baseName, candidate string) bool {
 	return strings.HasSuffix(base, "."+c)
 }
 
-func rrEqualIgnoringTTL(a, b dns.RR) bool {
+func rrEqual(a, b dns.RR) bool {
 	if a == nil || b == nil {
 		return false
 	}
-	aa := copyRR(a)
-	bb := copyRR(b)
-	aa.Header().TTL = 0
-	bb.Header().TTL = 0
-	return dns.Equal(aa, bb)
+	return dns.Equal(a, b)
 }
 
 func (h *UpdateHandler) queryAuthoritativeRRs(ctx context.Context, zoneHint string, fqdn string, rrType uint16) ([]dns.RR, error) {
@@ -1655,7 +1645,7 @@ func (h *UpdateHandler) authoritativeHasRR(ctx context.Context, zoneHint string,
 		return false, err
 	}
 	for _, existing := range rrs {
-		if rrEqualIgnoringTTL(existing, rr) {
+		if rrEqual(existing, rr) {
 			return true, nil
 		}
 	}
@@ -1735,7 +1725,7 @@ func (h *UpdateHandler) extractAndValidateSig0(ctx context.Context, msg *dns.Msg
 		return nil, nil, fmt.Errorf("SIG(0) signer %q is outside allowed hierarchy for lease owner %q", sigRR.SignerName, leaseOwner)
 	}
 
-	verifyCandidates := make([]*dns.KEY, 0, 2)
+	verifyCandidates := make([]*dns.KEY, 0, 3)
 	if requestKey != nil && strings.EqualFold(canonicalName(requestKey.Hdr.Name), signerCanon) {
 		if requestKey.KeyTag() == sigRR.KeyTag && requestKey.Algorithm == sigRR.Algorithm {
 			verifyCandidates = append(verifyCandidates, requestKey)
@@ -1746,18 +1736,31 @@ func (h *UpdateHandler) extractAndValidateSig0(ctx context.Context, msg *dns.Msg
 	if err != nil {
 		return nil, nil, fmt.Errorf("failed to resolve signer KEY from authoritative DNS: %w", err)
 	}
+	authMatched := false
 	for _, rr := range authRRS {
 		key, ok := rr.(*dns.KEY)
 		if !ok {
 			continue
 		}
 		if key.KeyTag() == sigRR.KeyTag && key.Algorithm == sigRR.Algorithm {
+			authMatched = true
 			verifyCandidates = append(verifyCandidates, key)
 		}
 	}
 
+	// If authoritative DNS is reachable but has no matching signer key,
+	// allow fallback to lease-store key material.
+	if !authMatched {
+		if leaseRec := h.leaseManager.Lookup(sigRR.SignerName); leaseRec != nil && leaseRec.KeyRR != nil {
+			key := leaseRec.KeyRR
+			if strings.EqualFold(canonicalName(key.Hdr.Name), signerCanon) && key.KeyTag() == sigRR.KeyTag && key.Algorithm == sigRR.Algorithm {
+				verifyCandidates = append(verifyCandidates, key)
+			}
+		}
+	}
+
 	if len(verifyCandidates) == 0 {
-		return nil, nil, fmt.Errorf("no authoritative/request KEY candidate found for signer %q", sigRR.SignerName)
+		return nil, nil, fmt.Errorf("no authoritative/request/lease-store KEY candidate found for signer %q", sigRR.SignerName)
 	}
 
 	var lastErr error

@@ -337,18 +337,18 @@ func TestKeyLeaseZeroDeleteKeyNoOtherRecords_Expires(t *testing.T) {
 	}
 }
 
-func TestRecordKey_SameRecordDifferentTTL_ProducesSameKey(t *testing.T) {
-	// Same name+type+rdata with different TTLs must map to the same key.
+func TestRecordKey_SameRecordDifferentTTL_ProducesDifferentKeys(t *testing.T) {
+	// Same name+type+rdata but different TTLs are distinct records.
 	mx1 := &dns.MX{Hdr: dns.Header{Name: "mailtrap.io.", Class: dns.ClassINET, TTL: 60}, MX: rdata.MX{Preference: 5, Mx: "mail1.mailtrap.io."}}
 	mx2 := &dns.MX{Hdr: dns.Header{Name: "mailtrap.io.", Class: dns.ClassINET, TTL: 300}, MX: rdata.MX{Preference: 5, Mx: "mail1.mailtrap.io."}}
 
 	key1 := recordKey(mx1)
 	key2 := recordKey(mx2)
-	if key1 != key2 {
-		t.Fatalf("same MX record with different TTLs produced different keys: %q vs %q", key1, key2)
+	if key1 == key2 {
+		t.Fatalf("same MX record with different TTLs produced same key (expected different): %q vs %q", key1, key2)
 	}
-	if strings.Contains(key1, " 60 ") {
-		t.Fatalf("record key should not include original TTL, got: %q", key1)
+	if strings.Contains(key1, "60") == false {
+		t.Fatalf("record key should contain TTL, got: %q", key1)
 	}
 }
 
@@ -408,7 +408,7 @@ func TestFilterDuplicateRegistrations_SkipsOnlyDuplicateRecords(t *testing.T) {
 	if len(accepted) != 1 {
 		t.Fatalf("expected one accepted record, got %d", len(accepted))
 	}
-	if !rrEqualIgnoringTTL(accepted[0], newRec) {
+	if !rrEqual(accepted[0], newRec) {
 		t.Fatalf("expected non-duplicate record to be accepted")
 	}
 	if len(notes) != 1 {
@@ -429,9 +429,9 @@ func TestRecordKey_DistinguishesDifferentTypes(t *testing.T) {
 	}
 }
 
-func TestSetDataLease_SameRecordDifferentTTL_UpdatesSingleEntry(t *testing.T) {
+func TestSetDataLease_SameRecordDifferentTTL_CreatesDistinctEntries(t *testing.T) {
 	// Register a record with TTL=60, then same record at TTL=120.
-	// TTL must not create a second lease entry.
+	// TTL difference makes this a distinct leased record.
 	h := NewUpdateHandler()
 	ctx := context.Background()
 
@@ -456,8 +456,8 @@ func TestSetDataLease_SameRecordDifferentTTL_UpdatesSingleEntry(t *testing.T) {
 	h.setDataLease(key.Hdr.Name, []dns.RR{txt2}, 120, "dev.zenr.io.")
 
 	dataLease = h.getDataLease(key.Hdr.Name)
-	if len(dataLease.Records) != 1 {
-		t.Fatalf("expected 1 record (TTL ignored for identity), got %d", len(dataLease.Records))
+	if len(dataLease.Records) != 2 {
+		t.Fatalf("expected 2 records (distinct TTLs = distinct keys), got %d", len(dataLease.Records))
 	}
 }
 

@@ -9,9 +9,9 @@ sig0lease handles SIG(0)-authenticated DNS UPDATE requests with UPDATE-LEASE sem
 1. Signature verification
 - UPDATE requests must carry a valid SIG(0).
 - The signer key must be at or above the leased FQDN hierarchy.
-- Verification uses authoritative DNS as the source of truth for signer key resolution.
+- Verification uses authoritative DNS as the primary source for signer key resolution.
 - If authoritative DNS cannot be reached for signer-key lookup, the request fails.
-- Lease-store keys are not used as fallback for signature verification.
+- If authoritative DNS is reachable but returns no matching signer KEY, lease-store key material may be used as fallback.
 
 2. KEY RR in UPDATE section
 - KEY RR in the UPDATE section is optional.
@@ -48,8 +48,8 @@ sig0lease handles SIG(0)-authenticated DNS UPDATE requests with UPDATE-LEASE sem
 
 2. Non-KEY lease storage
 - Non-KEY records are tracked individually under each key owner.
-- Record identity ignores TTL and uses name/class/type/rdata semantics.
-- This allows correct refresh/duplicate behavior for records that differ only in lease metadata.
+- Record identity includes full RR presentation (including TTL).
+- Records that differ in any field are treated as distinct records.
 
 ## Authoritative Forwarding
 
@@ -66,10 +66,28 @@ sig0lease handles SIG(0)-authenticated DNS UPDATE requests with UPDATE-LEASE sem
 
 2. Integration tests
 - Integration scripts and integration helpers are under tests.
-- The blacklisted type helper is now at tests/blacklisted_tester.
+- The blacklisted type helper is now at tests/blacklisted_tester.go.
 
 ## Client Behavior
 
 1. Lease adoption from server response
 - Client expiry calculations now adopt server-returned UPDATE-LEASE values when present.
 - If no lease option is returned, client falls back to requested lease duration.
+
+## Cleanup Scope (Current PR)
+
+1. Removed obsolete top-level DNS message helpers
+- Deleted legacy top-level dnsmsg package (`dnsmsg/dnsmsg.go`).
+- Active code uses pkg/dnsmsg instead.
+
+2. Removed obsolete test utility command
+- Deleted cmd/simpledig.
+- Integration scripts now use system dig directly.
+
+3. Reduced client surface to active usage
+- Removed unused query helper APIs from client/client.go.
+- Kept the minimal Query path used by current proxy/client workflows.
+
+4. Unified SIG(0) signing API
+- Replaced client-level SIG(0) signer wrapper usage with direct pkg/sig0 signing calls.
+- Removed redundant signer wrapper implementation from client/sig0.go.

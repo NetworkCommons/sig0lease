@@ -82,9 +82,15 @@ func TestNewDataOnlyUpdateEmptyZone(t *testing.T) {
 }
 
 func TestNewDataOnlyUpdateNoRecords(t *testing.T) {
-	_, err := NewDataOnlyUpdate("dev.zenr.io.", nil, 300)
-	if err == nil {
-		t.Fatalf("expected error for no data records")
+	msg, err := NewDataOnlyUpdate("dev.zenr.io.", nil, 300)
+	if err != nil {
+		t.Fatalf("expected no error for empty data-only update, got: %v", err)
+	}
+	if msg == nil {
+		t.Fatalf("expected non-nil message")
+	}
+	if len(msg.Ns) != 0 {
+		t.Fatalf("expected no authority records, got %d", len(msg.Ns))
 	}
 }
 

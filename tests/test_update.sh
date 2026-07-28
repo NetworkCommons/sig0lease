@@ -141,7 +141,7 @@ test_blacklisted_type() {
             # This bypasses ParseAdditionalRRSpec and constructs the RR directly.
             log_step "Using Go helper to construct $rr_type record directly"
             # blacklisted_tester sends the request directly to the proxy and prints the response.
-            reg_out=$(cd "$SCRIPT_DIR/.." && go run -ldflags="-X main.rrType=$rr_type -X main.rrOwner=$CLIENT_KEY_NAME -X main.leaseDuration=$LEASE_SECONDS -X main.keyLeaseSec=$KEY_LEASE_SECONDS -X main.proxyAddr=$PROXY_URL -X main.zone=$DOWNSTREAM_ZONE" ./tests/blacklisted_tester 2>&1) || true
+            reg_out=$(cd "$SCRIPT_DIR/.." && go run -ldflags="-X main.rrType=$rr_type -X main.rrOwner=$CLIENT_KEY_NAME -X main.leaseDuration=$LEASE_SECONDS -X main.keyLeaseSec=$KEY_LEASE_SECONDS -X main.proxyAddr=$PROXY_URL -X main.zone=$DOWNSTREAM_ZONE" ./tests/blacklisted_tester.go 2>&1) || true
             ;;
         *)
             rr_spec=$(rr_spec_for_type "$rr_type" "$CLIENT_KEY_NAME" "$LEASE_SECONDS")
@@ -408,7 +408,7 @@ build_binaries() {
     log_step "Building proxy and client binaries"
     (cd "$SCRIPT_DIR/.." && go build -o "$PROXY_BIN" ./cmd/sig0lease)
     (cd "$SCRIPT_DIR/.." && go build -o "$CLIENT_BIN" ./cmd/sig0lease-client)
-    (cd "$SCRIPT_DIR/.." && go build -o "$BLACKLISTED_TESTER_BIN" ./tests/blacklisted_tester)
+    (cd "$SCRIPT_DIR/.." && go build -o "$BLACKLISTED_TESTER_BIN" ./tests/blacklisted_tester.go)
     log_success "Binaries built"
 }
 

@@ -1,3 +1,5 @@
+package main
+
 // Package main implements a blacklisted RR type tester for the sig0lease proxy.
 //
 // This tool constructs NULL and NXNAME records programmatically (which cannot be
@@ -7,8 +9,7 @@
 //
 // Build with ldflags to inject test parameters:
 //
-//	go build -ldflags="-X main.rrType=NULL -X main.rrOwner=test.dev.zenr.io. -X main.leaseDuration=30 -X main.keyLeaseSec=30 -X main.proxyAddr=127.0.0.1:8053 -X main.zone=test.dev.zenr.io." ./tests/blacklisted_tester
-package main
+// 	go build -ldflags="-X main.rrType=NULL -X main.rrOwner=test.dev.zenr.io. -X main.leaseDuration=30 -X main.keyLeaseSec=30 -X main.proxyAddr=127.0.0.1:8053 -X main.zone=test.dev.zenr.io." ./tests/blacklisted_tester.go
 
 import (
 	"fmt"
@@ -21,6 +22,7 @@ import (
 	_ "github.com/NetworkCommons/sig0lease/pkg/dnscompat"
 	"github.com/NetworkCommons/sig0lease/pkg/dnsmsg"
 	"github.com/NetworkCommons/sig0lease/pkg/keyrec"
+	"github.com/NetworkCommons/sig0lease/pkg/sig0"
 )
 
 var (
@@ -131,13 +133,7 @@ func main() {
 
 	// Step 5: Sign with SIG(0)
 	fmt.Printf("\nStep 4: Signing with SIG(0)\n")
-	signer, err := client.NewSig0Signer(clientKey.PublicKey, clientKey.PrivateKey)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "ERROR: Failed to create signer: %v\n", err)
-		os.Exit(1)
-	}
-
-	signedMsg, err := signer.SignMessage(msg)
+	signedMsg, err := sig0.SignMessage(msg, clientKey.PublicKey, clientKey.PrivateKey)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "ERROR: Failed to sign message: %v\n", err)
 		os.Exit(1)
