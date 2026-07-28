@@ -7,7 +7,7 @@
 //
 // Build with ldflags to inject test parameters:
 //
-//	go build -ldflags="-X main.rrType=NULL -X main.rrOwner=test.dev.zenr.io. -X main.leaseDuration=30 -X main.keyLeaseSeconds=30 -X main.proxyAddr=127.0.0.1:8053 -X main.zone=test.dev.zenr.io." ./cmd/blacklisted_tester
+//	go build -ldflags="-X main.rrType=NULL -X main.rrOwner=test.dev.zenr.io. -X main.leaseDuration=30 -X main.keyLeaseSec=30 -X main.proxyAddr=127.0.0.1:8053 -X main.zone=test.dev.zenr.io." ./tests/blacklisted_tester
 package main
 
 import (
@@ -99,9 +99,9 @@ func main() {
 		// Field name is NULL (capital), containing rdata.NULL struct with Null string field
 		nullRR := &dns.NULL{
 			Hdr: dns.Header{
-				Name: rrOwner,
+				Name:  rrOwner,
 				Class: dns.ClassINET,
-				TTL:  leaseDuration,
+				TTL:   leaseDuration,
 			},
 			NULL: rdata.NULL{Null: "\x00\x01"},
 		}
@@ -112,9 +112,9 @@ func main() {
 		// NXNAME RR: has NO rdata (no struct to embed), only Header
 		nxnameRR := &dns.NXNAME{
 			Hdr: dns.Header{
-				Name: rrOwner,
+				Name:  rrOwner,
 				Class: dns.ClassINET,
-				TTL:  leaseDuration,
+				TTL:   leaseDuration,
 			},
 		}
 		additionalRR = nxnameRR

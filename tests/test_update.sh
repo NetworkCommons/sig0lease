@@ -44,7 +44,7 @@ REFRESH_CASE_KEY_LEASE_SECONDS="${REFRESH_CASE_KEY_LEASE_SECONDS:-3600}"
 # Supported types: KEY TXT A AAAA NULL NXNAME WALLET CLA IPN
 # Note: NULL and NXNAME cannot be constructed from presentation format in
 # miekg/dns (they lack a text representation). They are tested at the
-# unit-test level (opcode5_phase3_test.go). The integration test can
+# unit-test level (handlers opcode5 behavior tests). The integration test can
 # only exercise types that the client binary can construct.
 # To test blacklisted types, set BLACKLISTED_RR_TYPES, e.g.:
 #   BLACKLISTED_RR_TYPES="NULL NXNAME WALLET CLA IPN"
@@ -106,7 +106,7 @@ rr_spec_for_type() {
         # NULL and NXNAME have no presentation format in miekg/dns,
         # so they cannot be constructed via the client binary's
         # ParseAdditionalRRSpec (which uses dns.New). They are
-        # tested at the unit-test level (opcode5_phase3_test.go).
+        # tested at the unit-test level (handlers opcode5 behavior tests).
         NULL) log_step "Skipping NULL: no presentation format in miekg/dns" ;;
         NXNAME) log_step "Skipping NXNAME: no presentation format in miekg/dns" ;;
         WALLET) echo "${owner} ${ttl} IN WALLET \"wallet-data\"" ;;
@@ -141,7 +141,7 @@ test_blacklisted_type() {
             # This bypasses ParseAdditionalRRSpec and constructs the RR directly.
             log_step "Using Go helper to construct $rr_type record directly"
             # blacklisted_tester sends the request directly to the proxy and prints the response.
-            reg_out=$(cd "$SCRIPT_DIR/.." && go run -ldflags="-X main.rrType=$rr_type -X main.rrOwner=$CLIENT_KEY_NAME -X main.leaseDuration=$LEASE_SECONDS -X main.keyLeaseSeconds=$KEY_LEASE_SECONDS -X main.proxyAddr=$PROXY_URL -X main.zone=$DOWNSTREAM_ZONE" ./cmd/blacklisted_tester 2>&1) || true
+            reg_out=$(cd "$SCRIPT_DIR/.." && go run -ldflags="-X main.rrType=$rr_type -X main.rrOwner=$CLIENT_KEY_NAME -X main.leaseDuration=$LEASE_SECONDS -X main.keyLeaseSec=$KEY_LEASE_SECONDS -X main.proxyAddr=$PROXY_URL -X main.zone=$DOWNSTREAM_ZONE" ./tests/blacklisted_tester 2>&1) || true
             ;;
         *)
             rr_spec=$(rr_spec_for_type "$rr_type" "$CLIENT_KEY_NAME" "$LEASE_SECONDS")
@@ -177,14 +177,28 @@ register_with_rr_type() {
     fi
 }
 
+dig_query_short() {
+    local endpoint="$1"
+    local name="$2"
+    local rr_type="$3"
+
+    local host="$endpoint"
+    local port="53"
+    if [[ "$endpoint" == *:* ]]; then
+        host="${endpoint%:*}"
+        port="${endpoint##*:}"
+    fi
+
+    dig +short +time=2 +tries=1 @"$host" -p "$port" "$name" "$rr_type" 2>/dev/null || true
+}
+
 query_rr_at_authoritative() {
     local name="$1"
     local rr_type="$2"
     local out
 
-    # Use simpledig (Go-based dig replacement) to query the authoritative server
-    out=$("$SCRIPT_DIR/../bin/${OS}/simpledig" "@${AUTH_SERVER}" "$name" "$rr_type" 2>/dev/null) || true
-    log_step "[simpledig] @${AUTH_SERVER} ${name} ${rr_type}"
+    out=$(dig_query_short "$AUTH_SERVER" "$name" "$rr_type")
+    log_step "[dig] @${AUTH_SERVER} ${name} ${rr_type}"
     if [ -n "$out" ]; then
         echo "$out"
     else
@@ -213,13 +227,13 @@ query_lease_dump() {
     esac
 
     local out
-    out=$("$SCRIPT_DIR/../bin/${OS}/simpledig" "@${PROXY_URL}" "${query_domain}" TXT 2>/dev/null) || true
+    out=$(dig_query_short "$PROXY_URL" "${query_domain}" TXT)
 
     # Use test script's own log levels (independent from proxy logging).
     if [ "$level" = "debug" ]; then
-        log_debug "[simpledig] @${PROXY_URL} ${query_domain} TXT (${dump_label})"
+        log_debug "[dig] @${PROXY_URL} ${query_domain} TXT (${dump_label})"
     else
-        log_info "[simpledig] @${PROXY_URL} ${query_domain} TXT (${dump_label})"
+        log_info "[dig] @${PROXY_URL} ${query_domain} TXT (${dump_label})"
     fi
 
     if [ -n "$out" ]; then
@@ -298,7 +312,7 @@ assert_proxy_consistent_with_authoritative() {
     # Proxy consistency checks via refresh path.
     if [ "$expected_state" = "present" ]; then
         local refresh_out
-        refresh_out=$(run_client "$PROXY_URL" refresh "$DOWNSTREAM_ZONE" "$key_name" "$REFRESH_SECONDS" 4byte 2>&1 || true)
+        refresh_out=$(run_client "$PROXY_URL" refresh "$DOWNSTREAM_ZONE" "$key_name" "$REFRESH_SECONDS" 2>&1 || true)
         if ! echo "$refresh_out" | grep -q "Rcode=0\|REFRESH SUCCESSFUL"; then
             log_error "Consistency check failed: proxy refresh did not succeed while authoritative $rr_type is present for $key_name"
             echo "$refresh_out"
@@ -306,7 +320,7 @@ assert_proxy_consistent_with_authoritative() {
         fi
         log_success "Consistency check OK: proxy refresh accepted and authoritative $rr_type present for $key_name"
     else
-        if run_client "$PROXY_URL" refresh "$DOWNSTREAM_ZONE" "$key_name" "$REFRESH_SECONDS" 4byte >/dev/null 2>&1; then
+        if run_client "$PROXY_URL" refresh "$DOWNSTREAM_ZONE" "$key_name" "$REFRESH_SECONDS" >/dev/null 2>&1; then
             log_error "Consistency check failed: proxy refresh accepted but authoritative $rr_type is absent for $key_name"
             return 1
         fi
@@ -394,8 +408,7 @@ build_binaries() {
     log_step "Building proxy and client binaries"
     (cd "$SCRIPT_DIR/.." && go build -o "$PROXY_BIN" ./cmd/sig0lease)
     (cd "$SCRIPT_DIR/.." && go build -o "$CLIENT_BIN" ./cmd/sig0lease-client)
-    (cd "$SCRIPT_DIR/.." && go build -o "$BLACKLISTED_TESTER_BIN" ./cmd/blacklisted_tester)
-    (cd "$SCRIPT_DIR/.." && go build -o "$SCRIPT_DIR/../bin/${OS}/simpledig" ./cmd/simpledig)
+    (cd "$SCRIPT_DIR/.." && go build -o "$BLACKLISTED_TESTER_BIN" ./tests/blacklisted_tester)
     log_success "Binaries built"
 }
 
@@ -426,7 +439,7 @@ test_case_register_expire_remove() {
     wait_until_lease_expired "$lease_start" "$LEASE_SECONDS" 3
 
     log_step "Attempting refresh after expiry (must fail)"
-    if run_client "$PROXY_URL" refresh "$DOWNSTREAM_ZONE" "$CLIENT_KEY_NAME" "$REFRESH_SECONDS" 4byte; then
+    if run_client "$PROXY_URL" refresh "$DOWNSTREAM_ZONE" "$CLIENT_KEY_NAME" "$REFRESH_SECONDS"; then
         log_error "Refresh succeeded after expiry, expected failure"
         return 1
     fi
@@ -466,7 +479,7 @@ test_case_register_refresh_not_prematurely_removed() {
     log_step "Waiting to near-expiry checkpoint then refreshing"
     wait_until_epoch $((lease_start + 20))
     refresh_start=$(date +%s)
-    run_client "$PROXY_URL" refresh "$DOWNSTREAM_ZONE" "$CLIENT_KEY_NAME" "$REFRESH_SECONDS" 4byte
+    run_client "$PROXY_URL" refresh "$DOWNSTREAM_ZONE" "$CLIENT_KEY_NAME" "$REFRESH_SECONDS"
     wait_for_rr_state "$CLIENT_KEY_NAME" KEY present
     wait_for_rr_state "$CLIENT_KEY_NAME" "$rr_type" present
     assert_proxy_consistent_with_authoritative "$CLIENT_KEY_NAME" "$rr_type" present
@@ -478,7 +491,7 @@ test_case_register_refresh_not_prematurely_removed() {
     assert_proxy_consistent_with_authoritative "$CLIENT_KEY_NAME" "$rr_type" present
 
     log_step "Refreshing again (must still succeed if not removed prematurely)"
-    run_client "$PROXY_URL" refresh "$DOWNSTREAM_ZONE" "$CLIENT_KEY_NAME" "$REFRESH_SECONDS" 4byte
+    run_client "$PROXY_URL" refresh "$DOWNSTREAM_ZONE" "$CLIENT_KEY_NAME" "$REFRESH_SECONDS"
     wait_for_rr_state "$CLIENT_KEY_NAME" KEY present
     wait_for_rr_state "$CLIENT_KEY_NAME" "$rr_type" present
     assert_proxy_consistent_with_authoritative "$CLIENT_KEY_NAME" "$rr_type" present
@@ -513,7 +526,7 @@ test_case_unauthorized_refresh_rejected_then_expires() {
     wait_for_rr_state "$CLIENT_KEY_NAME" "$rr_type" present
 
     log_step "Unauthorized refresh attempt using different real key ($WRONG_CLIENT_KEY_NAME)"
-    if run_client "$PROXY_URL" refresh "$DOWNSTREAM_ZONE" "$WRONG_CLIENT_KEY_NAME" "$REFRESH_SECONDS" 4byte; then
+    if run_client "$PROXY_URL" refresh "$DOWNSTREAM_ZONE" "$WRONG_CLIENT_KEY_NAME" "$REFRESH_SECONDS"; then
         log_error "Unauthorized refresh unexpectedly succeeded"
         return 1
     fi
@@ -530,7 +543,7 @@ test_case_unauthorized_refresh_rejected_then_expires() {
         query_rr_at_authoritative "$CLIENT_KEY_NAME" "$rr_type" >/dev/null || true
     fi
     log_step "Original key refresh after expiry must fail"
-    if run_client "$PROXY_URL" refresh "$DOWNSTREAM_ZONE" "$CLIENT_KEY_NAME" "$REFRESH_SECONDS" 4byte; then
+    if run_client "$PROXY_URL" refresh "$DOWNSTREAM_ZONE" "$CLIENT_KEY_NAME" "$REFRESH_SECONDS"; then
         log_error "Lease still active after expiry, expected removal"
         return 1
     fi
@@ -558,6 +571,7 @@ run_all_tests() {
 
     require_command grep
     require_command ls
+    require_command dig
     build_binaries
     setup_keystore
     log_success "Using authoritative server for KEY checks: $AUTH_SERVER"

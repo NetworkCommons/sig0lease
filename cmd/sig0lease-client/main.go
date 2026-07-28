@@ -259,11 +259,12 @@ func cmdRegisterWithMode(proxyAddr string, args []string, tamper bool) {
 	fmt.Printf("  Flags: AA=%v, RD=%v, RA=%v\n", resp.Authoritative, resp.RecursionDesired, resp.RecursionAvailable)
 
 	if resp.Rcode == dns.RcodeSuccess {
+		effectiveLease := client.EffectiveLeaseDuration(resp, leaseDuration)
 		fmt.Printf("\n✓ REGISTRATION SUCCESSFUL\n")
 		fmt.Printf("  Lease granted for: %s\n", keyname)
-		fmt.Printf("  Lease duration: %d seconds (%d minutes)\n", leaseDuration, leaseDuration/60)
+		fmt.Printf("  Lease duration: %d seconds (%d minutes)\n", effectiveLease, effectiveLease/60)
 		fmt.Printf("  Key-lease duration: %d seconds (%d hours)\n", keyLeaseDuration, keyLeaseDuration/3600)
-		fmt.Printf("  Expiration time: %s\n", time.Now().Add(time.Duration(leaseDuration)*time.Second).Format(time.RFC3339))
+		fmt.Printf("  Expiration time: %s\n", client.ExpiryFromResponse(time.Now(), leaseDuration, resp).Format(time.RFC3339))
 
 		if len(resp.Answer) > 0 {
 			fmt.Printf("\nAnswer Section:\n")

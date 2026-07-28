@@ -147,8 +147,8 @@ func TestSetupKeyRetrievalModeConfig(t *testing.T) {
 			h := NewUpdateHandler()
 			h.SetLogger(logging.NewLogger("debug", "text"))
 			cfg := map[string]any{
-				"upstream_zone":    "dev.zenr.io.",
-				"keystore_dir":     keystoreDir,
+				"upstream_zone":      "dev.zenr.io.",
+				"keystore_dir":       keystoreDir,
 				"key_retrieval_mode": tt.mode,
 			}
 			err := h.Setup(cfg)
@@ -210,4 +210,3 @@ func copyFile(src, dst string) error {
 	_, err = io.Copy(dstFile, srcFile)
 	return err
 }
-

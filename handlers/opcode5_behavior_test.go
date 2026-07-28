@@ -143,7 +143,7 @@ func TestDataLeaseExpiresBeforeKeyLease(t *testing.T) {
 }
 
 func TestExtractUpdateRecordsWithNoKEYRR(t *testing.T) {
-	// KEY RR is mandatory for signed requests.
+	// KEY RR is optional in UPDATE records; non-KEY records are still extracted.
 	msg := dns.NewMsg("test.dev.zenr.io.", dns.TypeSOA)
 	if msg == nil {
 		t.Fatalf("expected message")
@@ -155,17 +155,20 @@ func TestExtractUpdateRecordsWithNoKEYRR(t *testing.T) {
 	txt.TXT.Txt = []string{"payload"}
 	msg.Ns = append(msg.Ns, txt)
 
-	_, _, err := extractUpdateRecords(msg, nil)
-	if err == nil {
-		t.Fatalf("expected missing KEY RR error")
+	keyRR, other, err := extractUpdateRecords(msg, nil)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
 	}
-	if !strings.Contains(err.Error(), "no KEY RR") {
-		t.Fatalf("expected no KEY RR error, got %v", err)
+	if keyRR != nil {
+		t.Fatalf("expected no KEY RR, got %+v", keyRR)
+	}
+	if len(other) != 1 {
+		t.Fatalf("expected 1 non-KEY RR, got %d", len(other))
 	}
 }
 
 func TestExtractUpdateRecordsNoKEYRR_NoOtherRecords(t *testing.T) {
-	// KEY RR is mandatory even when other records are absent.
+	// Empty update section is accepted by extraction; caller validates matrix semantics.
 	msg := dns.NewMsg("test.dev.zenr.io.", dns.TypeSOA)
 	if msg == nil {
 		t.Fatalf("expected message")
@@ -173,12 +176,15 @@ func TestExtractUpdateRecordsNoKEYRR_NoOtherRecords(t *testing.T) {
 	msg.Opcode = dns.OpcodeUpdate
 	// Empty Ns section — no KEY RR, no other RRs.
 
-	_, _, err := extractUpdateRecords(msg, nil)
-	if err == nil {
-		t.Fatalf("expected missing KEY RR error")
+	keyRR, other, err := extractUpdateRecords(msg, nil)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
 	}
-	if !strings.Contains(err.Error(), "no KEY RR") {
-		t.Fatalf("expected no KEY RR error, got %v", err)
+	if keyRR != nil {
+		t.Fatalf("expected nil KEY RR")
+	}
+	if len(other) != 0 {
+		t.Fatalf("expected no non-KEY records, got %d", len(other))
 	}
 }
 
@@ -331,21 +337,18 @@ func TestKeyLeaseZeroDeleteKeyNoOtherRecords_Expires(t *testing.T) {
 	}
 }
 
-func TestRecordKey_SameRecordDifferentTTL_ProdDifferentKeys(t *testing.T) {
-	// Same name+type+rdata but different TTLs now produce DIFFERENT keys.
-	// This is the expected behavior: TTL is part of the record's string
-	// representation and acts as a distinctiveness factor in the record key.
+func TestRecordKey_SameRecordDifferentTTL_ProducesSameKey(t *testing.T) {
+	// Same name+type+rdata with different TTLs must map to the same key.
 	mx1 := &dns.MX{Hdr: dns.Header{Name: "mailtrap.io.", Class: dns.ClassINET, TTL: 60}, MX: rdata.MX{Preference: 5, Mx: "mail1.mailtrap.io."}}
 	mx2 := &dns.MX{Hdr: dns.Header{Name: "mailtrap.io.", Class: dns.ClassINET, TTL: 300}, MX: rdata.MX{Preference: 5, Mx: "mail1.mailtrap.io."}}
 
 	key1 := recordKey(mx1)
 	key2 := recordKey(mx2)
-	if key1 == key2 {
-		t.Fatalf("same MX record with different TTLs produced same key (expected different): %q vs %q", key1, key2)
+	if key1 != key2 {
+		t.Fatalf("same MX record with different TTLs produced different keys: %q vs %q", key1, key2)
 	}
-	// Verify the key DOES contain the TTL value (TTL is part of the key).
-	if strings.Contains(key1, "60") == false {
-		t.Fatalf("record key should contain TTL, got: %q", key1)
+	if strings.Contains(key1, " 60 ") {
+		t.Fatalf("record key should not include original TTL, got: %q", key1)
 	}
 }
 
@@ -358,6 +361,58 @@ func TestRecordKey_DistinguishesDifferentPriorities(t *testing.T) {
 	keyHigh := recordKey(mxHigh)
 	if keyLow == keyHigh {
 		t.Fatalf("different MX priorities produced same key: %q", keyLow)
+	}
+}
+
+func TestSetDataLease_StoresMXRecordsWithDifferentPriority(t *testing.T) {
+	h := NewUpdateHandler()
+	ctx := context.Background()
+
+	key := testKeyRR("test.dev.zenr.io.", "AAAAMXPRIORITYKEY=")
+	if err := h.leaseManager.Register(ctx, key.Hdr.Name, key, 120, 120, "dev.zenr.io."); err != nil {
+		t.Fatalf("register key lease: %v", err)
+	}
+
+	mxLow := &dns.MX{Hdr: dns.Header{Name: key.Hdr.Name, Class: dns.ClassINET, TTL: 60}, MX: rdata.MX{Preference: 10, Mx: "mx1.test.dev.zenr.io."}}
+	mxHigh := &dns.MX{Hdr: dns.Header{Name: key.Hdr.Name, Class: dns.ClassINET, TTL: 60}, MX: rdata.MX{Preference: 20, Mx: "mx1.test.dev.zenr.io."}}
+
+	h.setDataLease(key.Hdr.Name, []dns.RR{mxLow, mxHigh}, 120, "dev.zenr.io.")
+
+	dataLease := h.getDataLease(key.Hdr.Name)
+	if dataLease == nil {
+		t.Fatalf("expected data lease")
+	}
+	if len(dataLease.Records) != 2 {
+		t.Fatalf("expected 2 distinct MX records, got %d", len(dataLease.Records))
+	}
+}
+
+func TestFilterDuplicateRegistrations_SkipsOnlyDuplicateRecords(t *testing.T) {
+	h := NewUpdateHandler()
+	existing := &dns.TXT{Hdr: dns.Header{Name: "test.dev.zenr.io.", Class: dns.ClassINET, TTL: 60}}
+	existing.TXT.Txt = []string{"existing"}
+	newRec := &dns.TXT{Hdr: dns.Header{Name: "test.dev.zenr.io.", Class: dns.ClassINET, TTL: 60}}
+	newRec.TXT.Txt = []string{"new"}
+
+	h.authoritativeLookup = func(ctx context.Context, zoneHint, fqdn string, rrType uint16) ([]dns.RR, error) {
+		if rrType != dns.TypeTXT {
+			return nil, nil
+		}
+		return []dns.RR{existing}, nil
+	}
+
+	accepted, notes, err := h.filterDuplicateRegistrations(context.Background(), "test.dev.zenr.io.", "test.dev.zenr.io.", []dns.RR{existing, newRec})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(accepted) != 1 {
+		t.Fatalf("expected one accepted record, got %d", len(accepted))
+	}
+	if !rrEqualIgnoringTTL(accepted[0], newRec) {
+		t.Fatalf("expected non-duplicate record to be accepted")
+	}
+	if len(notes) != 1 {
+		t.Fatalf("expected one duplicate note, got %d", len(notes))
 	}
 }
 
@@ -374,9 +429,9 @@ func TestRecordKey_DistinguishesDifferentTypes(t *testing.T) {
 	}
 }
 
-func TestSetDataLease_SameRecordDifferentTTL_CreatesDistinctEntries(t *testing.T) {
-	// Register a record with TTL=60, then register the same record at TTL=120.
-	// Since the record key now includes TTL, these are two distinct entries.
+func TestSetDataLease_SameRecordDifferentTTL_UpdatesSingleEntry(t *testing.T) {
+	// Register a record with TTL=60, then same record at TTL=120.
+	// TTL must not create a second lease entry.
 	h := NewUpdateHandler()
 	ctx := context.Background()
 
@@ -396,15 +451,13 @@ func TestSetDataLease_SameRecordDifferentTTL_CreatesDistinctEntries(t *testing.T
 	}
 
 	// Second registration: same record, but TTL 120 (different from 60).
-	// Since recordKey now includes TTL, this creates a distinct entry
-	// (the first entry will expire and be cleaned up by compaction).
 	txt2 := &dns.TXT{Hdr: dns.Header{Name: "test.dev.zenr.io.", Class: dns.ClassINET, TTL: 120}}
 	txt2.Txt = []string{"hello"}
 	h.setDataLease(key.Hdr.Name, []dns.RR{txt2}, 120, "dev.zenr.io.")
 
 	dataLease = h.getDataLease(key.Hdr.Name)
-	if len(dataLease.Records) != 2 {
-		t.Fatalf("expected 2 records (distinct TTLs = distinct keys), got %d", len(dataLease.Records))
+	if len(dataLease.Records) != 1 {
+		t.Fatalf("expected 1 record (TTL ignored for identity), got %d", len(dataLease.Records))
 	}
 }
 
