@@ -881,8 +881,8 @@ func (h *UpdateHandler) constructUpstreamDeleteForRecords(records []dns.RR, upst
 	return signedMsg, nil
 }
 
-func extractUpdateRecords(msg *dns.Msg, blacklistedTypes map[uint16]struct{}) (*dns.KEY, []dns.RR, error) {
-	var keyRR *dns.KEY
+func extractUpdateRecords(msg *dns.Msg, blacklistedTypes map[uint16]struct{}) ([]*dns.KEY, []dns.RR, error) {
+	var keyRRs []*dns.KEY
 	other := make([]dns.RR, 0, len(msg.Ns))
 
 	for _, rr := range msg.Ns {
@@ -891,13 +891,10 @@ func extractUpdateRecords(msg *dns.Msg, blacklistedTypes map[uint16]struct{}) (*
 		}
 		switch v := rr.(type) {
 		case *dns.KEY:
-			if keyRR != nil {
-				return nil, nil, fmt.Errorf("multiple KEY RRs are not supported")
-			}
 			if v.Algorithm == 0 || v.Protocol == 0 || strings.TrimSpace(v.PublicKey) == "" {
 				return nil, nil, fmt.Errorf("incomplete KEY RR in update records: full KEY RDATA is required")
 			}
-			keyRR = v
+			keyRRs = append(keyRRs, v)
 		default:
 			// Check blacklist: reject blacklisted RR types.
 			if blacklistedTypes != nil {
@@ -910,7 +907,7 @@ func extractUpdateRecords(msg *dns.Msg, blacklistedTypes map[uint16]struct{}) (*
 		}
 	}
 
-	return keyRR, other, nil
+	return keyRRs, other, nil
 }
 
 func (h *UpdateHandler) processExpiredLease(ctx context.Context, keyName string) {
@@ -1041,16 +1038,17 @@ func (h *UpdateHandler) Handle(ctx context.Context, w dns.ResponseWriter, r *dns
 
 	h.logger.Debugf("Parsed lease duration: %d seconds key-lease=%d", leaseDuration, keyLeaseDuration)
 
-	clientKeyRR, otherRecords, err := extractUpdateRecords(r, h.blacklistedTypes)
+	clientKeyRRs, otherRecords, err := extractUpdateRecords(r, h.blacklistedTypes)
 	if err != nil {
 		h.logger.Debugf("Invalid update records: %v", err)
 		msg := h.makeErrorResponse(r, dns.RcodeFormatError, err.Error())
 		return NewErrorResult(msg, err.Error(), err)
 	}
 
+	// Determine leaseOwner from the first KEY RR, or from the first non-KEY RR if no KEY RRs present.
 	leaseOwner := ""
-	if clientKeyRR != nil {
-		leaseOwner = clientKeyRR.Hdr.Name
+	if len(clientKeyRRs) > 0 {
+		leaseOwner = clientKeyRRs[0].Hdr.Name
 	} else if len(otherRecords) > 0 && otherRecords[0] != nil && otherRecords[0].Header() != nil {
 		leaseOwner = otherRecords[0].Header().Name
 	}
@@ -1066,7 +1064,7 @@ func (h *UpdateHandler) Handle(ctx context.Context, w dns.ResponseWriter, r *dns
 	isRefresh := existingLease != nil
 
 	// Validate SIG(0) using request KEY (if matching signer) and authoritative DNS.
-	sigRR, signerKey, err := h.extractAndValidateSig0(ctx, r, zone, leaseOwner, clientKeyRR)
+	sigRR, signerKey, err := h.extractAndValidateSig0(ctx, r, zone, leaseOwner, clientKeyRRs[0])
 	if err != nil {
 		h.logger.Debugf("SIG(0) validation failed: %v", err)
 		msg := h.makeErrorResponse(r, dns.RcodeRefused, fmt.Sprintf("SIG(0) validation failed: %v", err))
@@ -1080,314 +1078,309 @@ func (h *UpdateHandler) Handle(ctx context.Context, w dns.ResponseWriter, r *dns
 	}
 	h.logger.Debugf("Resolved signer KEY: %s", signerKey.Hdr.Name)
 
-	if clientKeyRR != nil {
-		h.logger.Debugf("Extracted request KEY RR: %s", clientKeyRR.String())
+	// Log all extracted request KEY RRs.
+	for i, keyRR := range clientKeyRRs {
+		h.logger.Debugf("Extracted request KEY RR[%d]: %s", i, keyRR.String())
 	}
 
 	// KEY-LEASE!=0, LEASE!=0 requires KEY + at least one non-KEY RR.
 	if keyLeaseDuration != 0 && leaseDuration != 0 {
-		if clientKeyRR == nil || len(otherRecords) == 0 {
+		if len(clientKeyRRs) == 0 || len(otherRecords) == 0 {
 			msg := h.makeErrorResponse(r, dns.RcodeFormatError,
 				"KEY-LEASE!=0 and LEASE!=0 requires KEY RR and at least one non-KEY RR")
 			return NewErrorResult(msg, "invalid update matrix for register/refresh", fmt.Errorf("missing required KEY/non-KEY records"))
 		}
-		clientKeyName = clientKeyRR.Hdr.Name
 	}
 
-	// Case 3: KEY-LEASE == 0, LEASE == 0 (delete matrix).
-	if keyLeaseDuration == 0 && leaseDuration == 0 {
-		notes := make([]string, 0)
-		if clientKeyRR == nil && len(otherRecords) == 0 {
-			msg := h.makeErrorResponse(r, dns.RcodeFormatError, "KEY-LEASE=0 and LEASE=0 requires KEY and/or non-KEY records")
-			return NewErrorResult(msg, "invalid delete request", fmt.Errorf("no records to delete"))
-		}
-		if clientKeyRR != nil {
-			if h.leaseManager.Lookup(clientKeyName) == nil {
-				notes = append(notes, fmt.Sprintf("KEY %s not found for delete", clientKeyName))
-			}
-			if err := h.leaseManager.Delete(clientKeyName); err != nil {
-				h.logger.Debugf("Failed to delete key lease for %s: %v", clientKeyName, err)
-			}
-		}
-		h.clearLeaseTimer(clientKeyName)
+	// Process all KEY RRs through the appropriate case.
+	// Each KEY RR represents a separate key registration/refresh/delete.
+	var allNotes []string
+	var responseKeys []*dns.KEY
+	upstreamKeys := make([]*dns.KEY, 0)
+	var acceptedRecordsForUpstream []dns.RR
 
-		if len(otherRecords) > 0 {
-			for _, rr := range otherRecords {
-				if !h.hasActiveDataRecord(clientKeyName, rr) {
-					notes = append(notes, fmt.Sprintf("record not found for delete: %s", rr.String()))
+	for _, keyRR := range clientKeyRRs {
+		keyName := keyRR.Hdr.Name
+
+		// KEY-LEASE != 0, LEASE == 0: KEY lease registration (Case 4).
+		if keyLeaseDuration != 0 && leaseDuration == 0 {
+			notes := make([]string, 0)
+			if err := h.leaseManager.Register(ctx, keyName, keyRR, keyLeaseDuration, keyLeaseDuration, h.upstreamZone); err != nil {
+				msg := h.makeErrorResponse(r, dns.RcodeServerFailure, fmt.Sprintf("key registration failed for %s: %v", keyName, err))
+				return NewErrorResult(msg, fmt.Sprintf("key registration failed for %s: %v", keyName, err), err)
+			}
+			if len(otherRecords) > 0 {
+				for _, rr := range otherRecords {
+					if !h.hasActiveDataRecord(keyName, rr) {
+						notes = append(notes, fmt.Sprintf("record not found for delete: %s", rr.String()))
+					}
 				}
+				h.deleteDataLease(keyName)
 			}
-			h.deleteDataLease(clientKeyName)
-			h.logger.Debugf("Deleted key and non-key records for %s (KEY-LEASE=0, LEASE=0)", clientKeyName)
-		} else {
-			h.logger.Debugf("Deleted key for %s (KEY-LEASE=0, LEASE=0)", clientKeyName)
+			h.scheduleLeaseExpiry(keyName)
+
+			responseKeys = append(responseKeys, keyRR)
+			upstreamKeys = append(upstreamKeys, keyRR)
+			allNotes = append(allNotes, notes...)
+			continue
 		}
 
-		resp := &dns.Msg{MsgHeader: r.MsgHeader, Question: r.Question}
-		resp.Response = true
-		resp.Authoritative = true
-		resp.Rcode = dns.RcodeSuccess
-		appendStatusNotes(resp, zone, notes)
-		opt := &dns.OPT{Hdr: dns.Header{Name: "."}}
-		opt.SetUDPSize(uint16(dns.DefaultMsgSize))
-		resp.Extra = append(resp.Extra, opt)
-		return NewProcessedResult(resp)
-	}
+		// KEY-LEASE == 0, LEASE == 0: delete matrix (Case 3).
+		if keyLeaseDuration == 0 && leaseDuration == 0 {
+			notes := make([]string, 0)
+			if h.leaseManager.Lookup(keyName) == nil {
+				notes = append(notes, fmt.Sprintf("KEY %s not found for delete", keyName))
+			}
+			if err := h.leaseManager.Delete(keyName); err != nil {
+				h.logger.Debugf("Failed to delete key lease for %s: %v", keyName, err)
+			}
+			h.clearLeaseTimer(keyName)
 
-	// Case 2: KEY-LEASE == 0, LEASE != 0, no other RRs.
-	if keyLeaseDuration == 0 && leaseDuration != 0 && len(otherRecords) == 0 {
-		msg := h.makeErrorResponse(r, dns.RcodeRefused,
-			"KEY-LEASE=0 and LEASE!=0 requires at least one non-KEY RR")
-		return NewErrorResult(msg, "invalid data-only lease request", fmt.Errorf("no non-KEY RR present"))
-	}
+			if len(otherRecords) > 0 {
+				for _, rr := range otherRecords {
+					if !h.hasActiveDataRecord(keyName, rr) {
+						notes = append(notes, fmt.Sprintf("record not found for delete: %s", rr.String()))
+					}
+				}
+				h.deleteDataLease(keyName)
+			}
+			h.logger.Debugf("Deleted key for %s (KEY-LEASE=0, LEASE=0)", keyName)
 
-	// Case 1: KEY-LEASE == 0, LEASE != 0, other RRs present.
-	if keyLeaseDuration == 0 && leaseDuration != 0 && len(otherRecords) > 0 {
-		keyExists, err := h.authoritativeHasKeyAtName(ctx, zone, clientKeyName)
-		if err != nil {
-			msg := h.makeErrorResponse(r, dns.RcodeServerFailure, fmt.Sprintf("authoritative key lookup failed: %v", err))
-			return NewErrorResult(msg, "authoritative key lookup failed", err)
-		}
-		if !keyExists {
-			msg := h.makeErrorResponse(r, dns.RcodeRefused,
-				"KEY-LEASE=0 requires existing KEY at FQDN; cannot register KEY with zero key-lease")
-			return NewErrorResult(msg, "key missing for KEY-LEASE=0 data update", fmt.Errorf("missing existing key at FQDN"))
+			allNotes = append(allNotes, notes...)
+			continue
 		}
 
-		acceptedRecords, notes, err := h.filterDuplicateRegistrations(ctx, clientKeyName, zone, otherRecords)
+		// KEY-LEASE == 0, LEASE != 0: data-only lease (Case 1 or 2).
+		if keyLeaseDuration == 0 && leaseDuration != 0 {
+			// Case 2: no other RRs — error.
+			if len(otherRecords) == 0 {
+				msg := h.makeErrorResponse(r, dns.RcodeRefused,
+					"KEY-LEASE=0 and LEASE!=0 requires at least one non-KEY RR")
+				return NewErrorResult(msg, "invalid data-only lease request", fmt.Errorf("no non-KEY RR present"))
+			}
+
+			// Case 1: KEY-LEASE=0, LEASE!=0, other RRs present.
+			keyExists, err := h.authoritativeHasKeyAtName(ctx, zone, keyName)
+			if err != nil {
+				msg := h.makeErrorResponse(r, dns.RcodeServerFailure, fmt.Sprintf("authoritative key lookup failed: %v", err))
+				return NewErrorResult(msg, "authoritative key lookup failed", err)
+			}
+			if !keyExists {
+				msg := h.makeErrorResponse(r, dns.RcodeRefused,
+					"KEY-LEASE=0 requires existing KEY at FQDN; cannot register KEY with zero key-lease")
+				return NewErrorResult(msg, "key missing for KEY-LEASE=0 data update", fmt.Errorf("missing existing key at FQDN"))
+			}
+
+			acceptedRecords, notes, err := h.filterDuplicateRegistrations(ctx, keyName, zone, otherRecords)
+			if err != nil {
+				msg := h.makeErrorResponse(r, dns.RcodeServerFailure, fmt.Sprintf("authoritative duplicate check failed: %v", err))
+				return NewErrorResult(msg, "authoritative duplicate check failed", err)
+			}
+			if len(acceptedRecords) > 0 {
+				h.setDataLease(keyName, acceptedRecords, leaseDuration, h.upstreamZone)
+			}
+			h.scheduleLeaseExpiry(keyName)
+
+			allNotes = append(allNotes, notes...)
+			// For data-only leases, we don't add a KEY to the response.
+			continue
+		}
+
+		// KEY-LEASE != 0, LEASE != 0: normal registration (Case 1).
+		// This is the full registration path.
+		if isRefresh {
+			// Normal refresh: validate ownership and refresh key/data lease.
+			if err := h.validateRefreshOwnership(keyRR); err != nil {
+				// Ownership check failed (key mismatch). Promote to full registration
+				// if the key does not exist at the FQDN — the client is re-registering
+				// (they have valid lease-times from before and lost the key at the DNS).
+				existingKey := h.leaseManager.Lookup(keyName)
+				if existingKey == nil {
+					// Key not at FQDN: promote to full registration (both key and data RRs).
+					if err := h.leaseManager.Register(ctx, keyName, keyRR, leaseDuration, keyLeaseDuration, h.upstreamZone); err != nil {
+						msg := h.makeErrorResponse(r, dns.RcodeServerFailure, fmt.Sprintf("lease registration failed for %s: %v", keyName, err))
+						return NewErrorResult(msg, fmt.Sprintf("lease registration failed for %s: %v", keyName, err), err)
+					}
+					h.setDataLease(keyName, otherRecords, leaseDuration, h.upstreamZone)
+					h.scheduleLeaseExpiry(keyName)
+					h.logger.Debugf("Lease re-registered for %s (KEY-LEASE != 0, key not at FQDN, promoted from refresh)", keyName)
+
+					responseKeys = append(responseKeys, keyRR)
+					upstreamKeys = append(upstreamKeys, keyRR)
+					acceptedRecordsForUpstream = append(acceptedRecordsForUpstream, otherRecords...)
+					continue
+				}
+				// Key exists at FQDN: return ownership error (existing behavior).
+				msg := h.makeErrorResponse(r, dns.RcodeRefused, err.Error())
+				return NewErrorResult(msg, err.Error(), err)
+			}
+			if err := h.refreshDataLease(keyName, leaseDuration); err != nil {
+				msg := h.makeErrorResponse(r, dns.RcodeRefused, err.Error())
+				return NewErrorResult(msg, err.Error(), err)
+			}
+			h.scheduleLeaseExpiry(keyName)
+
+			h.logger.Debugf("Lease refreshed for %s (data lease=%d seconds)", keyName, leaseDuration)
+
+			responseKeys = append(responseKeys, keyRR)
+			acceptedRecordsForUpstream = append(acceptedRecordsForUpstream, otherRecords...)
+			continue
+		}
+
+		// Normal path (not refresh): KEY-LEASE != 0 and LEASE != 0.
+		partialNotes := make([]string, 0)
+		registerKey := true
+		if h.leaseManager.Lookup(keyName) == nil {
+			exists, err := h.authoritativeHasRR(ctx, zone, keyRR)
+			if err != nil {
+				msg := h.makeErrorResponse(r, dns.RcodeServerFailure, fmt.Sprintf("authoritative duplicate check failed: %v", err))
+				return NewErrorResult(msg, "authoritative duplicate check failed", err)
+			}
+			if exists {
+				registerKey = false
+				partialNotes = append(partialNotes, fmt.Sprintf("skipped duplicate registration for KEY %s", keyRR.Hdr.Name))
+			}
+		}
+
+		acceptedRecords, notes, err := h.filterDuplicateRegistrations(ctx, keyName, zone, otherRecords)
 		if err != nil {
 			msg := h.makeErrorResponse(r, dns.RcodeServerFailure, fmt.Sprintf("authoritative duplicate check failed: %v", err))
 			return NewErrorResult(msg, "authoritative duplicate check failed", err)
+		}
+		partialNotes = append(partialNotes, notes...)
+
+		if registerKey {
+			if err := h.leaseManager.Register(ctx, keyName, keyRR, leaseDuration, keyLeaseDuration, h.upstreamZone); err != nil {
+				h.logger.Debugf("Failed to register lease for %s: %v", keyName, err)
+				msg := h.makeErrorResponse(r, dns.RcodeServerFailure, fmt.Sprintf("lease registration failed for %s: %v", keyName, err))
+				return NewErrorResult(msg, fmt.Sprintf("lease registration failed for %s: %v", keyName, err), err)
+			}
 		}
 		if len(acceptedRecords) > 0 {
-			h.setDataLease(clientKeyName, acceptedRecords, leaseDuration, h.upstreamZone)
-		}
-		h.scheduleLeaseExpiry(clientKeyName)
-
-		resp := &dns.Msg{MsgHeader: r.MsgHeader, Question: r.Question}
-		resp.Response = true
-		resp.Authoritative = true
-		resp.Rcode = dns.RcodeSuccess
-		appendStatusNotes(resp, zone, notes)
-		opt := &dns.OPT{Hdr: dns.Header{Name: "."}}
-		opt.SetUDPSize(uint16(dns.DefaultMsgSize))
-		resp.Extra = append(resp.Extra, opt)
-		return NewProcessedResult(resp)
-	}
-
-	// Case 4: KEY-LEASE != 0, LEASE == 0 requires KEY RR; non-KEY RRs are deletes.
-	if keyLeaseDuration != 0 && leaseDuration == 0 {
-		notes := make([]string, 0)
-		if clientKeyRR == nil {
-			msg := h.makeErrorResponse(r, dns.RcodeFormatError,
-				"KEY-LEASE!=0 and LEASE=0 requires KEY RR")
-			return NewErrorResult(msg, "invalid KEY lease refresh/delete request", fmt.Errorf("missing KEY RR"))
-		}
-		clientKeyName = clientKeyRR.Hdr.Name
-
-		if err := h.leaseManager.Register(ctx, clientKeyName, clientKeyRR, keyLeaseDuration, keyLeaseDuration, h.upstreamZone); err != nil {
-			msg := h.makeErrorResponse(r, dns.RcodeServerFailure, fmt.Sprintf("key registration failed: %v", err))
-			return NewErrorResult(msg, fmt.Sprintf("key registration failed: %v", err), err)
-		}
-		if len(otherRecords) > 0 {
-			for _, rr := range otherRecords {
-				if !h.hasActiveDataRecord(clientKeyName, rr) {
-					notes = append(notes, fmt.Sprintf("record not found for delete: %s", rr.String()))
-				}
-			}
-			h.deleteDataLease(clientKeyName)
-		}
-		h.scheduleLeaseExpiry(clientKeyName)
-
-		resp := &dns.Msg{MsgHeader: r.MsgHeader, Question: r.Question}
-		resp.Response = true
-		resp.Authoritative = true
-		resp.Rcode = dns.RcodeSuccess
-		appendStatusNotes(resp, zone, notes)
-		resp.Answer = append(resp.Answer, clientKeyRR)
-		opt := &dns.OPT{Hdr: dns.Header{Name: "."}}
-		opt.SetUDPSize(uint16(dns.DefaultMsgSize))
-		resp.Extra = append(resp.Extra, opt)
-		return NewProcessedResult(resp)
-	}
-
-	if isRefresh {
-		// Normal refresh: validate ownership and refresh key/data lease.
-		if err := h.validateRefreshOwnership(clientKeyRR); err != nil {
-			// Ownership check failed (key mismatch). Promote to full registration
-			// if the key does not exist at the FQDN — the client is re-registering
-			// (they have valid lease-times from before and lost the key at the DNS).
-			existingKey := h.leaseManager.Lookup(clientKeyName)
-			if existingKey == nil {
-				// Key not at FQDN: promote to full registration (both key and data RRs).
-				if err := h.leaseManager.Register(ctx, clientKeyName, clientKeyRR, leaseDuration, keyLeaseDuration, h.upstreamZone); err != nil {
-					msg := h.makeErrorResponse(r, dns.RcodeServerFailure, fmt.Sprintf("lease registration failed: %v", err))
-					return NewErrorResult(msg, fmt.Sprintf("lease registration failed: %v", err), err)
-				}
-				h.setDataLease(clientKeyName, otherRecords, leaseDuration, h.upstreamZone)
-				h.scheduleLeaseExpiry(clientKeyName)
-				h.logger.Debugf("Lease re-registered for %s (KEY-LEASE != 0, key not at FQDN, promoted from refresh)", clientKeyName)
-
-				resp := &dns.Msg{
-					MsgHeader: r.MsgHeader,
-					Question:  r.Question,
-				}
-				resp.Response = true
-				resp.Authoritative = true
-				resp.Rcode = dns.RcodeSuccess
-				resp.Answer = append(resp.Answer, clientKeyRR)
-				opt := &dns.OPT{Hdr: dns.Header{Name: "."}}
-				opt.SetUDPSize(uint16(dns.DefaultMsgSize))
-				resp.Extra = append(resp.Extra, opt)
-
-				return NewProcessedResult(resp)
-			}
-			// Key exists at FQDN: return ownership error (existing behavior).
-			msg := h.makeErrorResponse(r, dns.RcodeRefused, err.Error())
-			return NewErrorResult(msg, err.Error(), err)
-		}
-		if err := h.refreshDataLease(clientKeyName, leaseDuration); err != nil {
-			msg := h.makeErrorResponse(r, dns.RcodeRefused, err.Error())
-			return NewErrorResult(msg, err.Error(), err)
-		}
-		h.scheduleLeaseExpiry(clientKeyName)
-
-		h.logger.Debugf("Lease refreshed for %s (data lease=%d seconds)", clientKeyName, leaseDuration)
-
-		resp := &dns.Msg{
-			MsgHeader: r.MsgHeader,
-			Question:  r.Question,
+			h.setDataLease(keyName, acceptedRecords, leaseDuration, h.upstreamZone)
 		}
 
-		resp.Response = true
-		resp.Authoritative = true
-		resp.Rcode = dns.RcodeSuccess
-		resp.Answer = append(resp.Answer, clientKeyRR)
-		opt := &dns.OPT{Hdr: dns.Header{Name: "."}}
-		opt.SetUDPSize(uint16(dns.DefaultMsgSize))
-		resp.Extra = append(resp.Extra, opt)
+		h.scheduleLeaseExpiry(keyName)
 
-		return NewProcessedResult(resp)
-	}
+		h.logger.Debugf("Lease processed for %s (lease=%d seconds, key-lease=%d seconds)", keyName, leaseDuration, keyLeaseDuration)
 
-	// Normal path: KEY-LEASE != 0 and LEASE != 0.
-	partialNotes := make([]string, 0)
-	registerKey := true
-	if h.leaseManager.Lookup(clientKeyName) == nil {
-		exists, err := h.authoritativeHasRR(ctx, zone, clientKeyRR)
-		if err != nil {
-			msg := h.makeErrorResponse(r, dns.RcodeServerFailure, fmt.Sprintf("authoritative duplicate check failed: %v", err))
-			return NewErrorResult(msg, "authoritative duplicate check failed", err)
-		}
-		if exists {
-			registerKey = false
-			partialNotes = append(partialNotes, fmt.Sprintf("skipped duplicate registration for KEY %s", clientKeyRR.Hdr.Name))
-		}
-	}
-
-	acceptedRecords, notes, err := h.filterDuplicateRegistrations(ctx, clientKeyName, zone, otherRecords)
-	if err != nil {
-		msg := h.makeErrorResponse(r, dns.RcodeServerFailure, fmt.Sprintf("authoritative duplicate check failed: %v", err))
-		return NewErrorResult(msg, "authoritative duplicate check failed", err)
-	}
-	partialNotes = append(partialNotes, notes...)
-
-	if registerKey {
-		if err := h.leaseManager.Register(ctx, clientKeyName, clientKeyRR, leaseDuration, keyLeaseDuration, h.upstreamZone); err != nil {
-			h.logger.Debugf("Failed to register lease: %v", err)
-			msg := h.makeErrorResponse(r, dns.RcodeServerFailure, fmt.Sprintf("lease registration failed: %v", err))
-			return NewErrorResult(msg, fmt.Sprintf("lease registration failed: %v", err), err)
-		}
-	}
-	if len(acceptedRecords) > 0 {
-		h.setDataLease(clientKeyName, acceptedRecords, leaseDuration, h.upstreamZone)
-	}
-
-	h.scheduleLeaseExpiry(clientKeyName)
-
-	h.logger.Debugf("Lease processed for %s (lease=%d seconds, key-lease=%d seconds)", clientKeyName, leaseDuration, keyLeaseDuration)
-
-	effectiveUpstreamZone := h.upstreamZone
-	if dc, ok := h.upstreamCoordinator.(*DefaultUpstreamCoordinator); ok {
-		resolvedZone, err := dc.resolveAuthoritativeZone(ctx, h.upstreamZone)
-		if err != nil {
-			h.logger.Debugf("Failed to resolve effective upstream zone from %s: %v", h.upstreamZone, err)
-			msg := h.makeErrorResponse(r, dns.RcodeServerFailure, fmt.Sprintf("upstream zone resolution failed: %v", err))
-			return NewErrorResult(msg, fmt.Sprintf("upstream zone resolution failed: %v", err), err)
-		}
-		effectiveUpstreamZone = resolvedZone
-		h.logger.Debugf("Resolved effective upstream zone: configured=%s effective=%s", h.upstreamZone, effectiveUpstreamZone)
-	}
-
-	// Construct UPDATE message for effective upstream zone.
-	forwardKey := clientKeyRR
-	if !registerKey {
-		forwardKey = nil
-	}
-	upstreamUpdate, err := h.constructUpstreamUpdate(forwardKey, acceptedRecords, effectiveUpstreamZone)
-	if err != nil {
-		h.logger.Debugf("Failed to construct upstream UPDATE: %v", err)
-		h.deleteDataLease(clientKeyName)
 		if registerKey {
-			_ = h.leaseManager.Delete(clientKeyName)
+			responseKeys = append(responseKeys, keyRR)
+			upstreamKeys = append(upstreamKeys, keyRR)
 		}
-		h.clearLeaseTimer(clientKeyName)
-		msg := h.makeErrorResponse(r, dns.RcodeServerFailure, fmt.Sprintf("upstream construction failed: %v", err))
-		return NewErrorResult(msg, fmt.Sprintf("upstream construction failed: %v", err), err)
+		acceptedRecordsForUpstream = append(acceptedRecordsForUpstream, acceptedRecords...)
+		allNotes = append(allNotes, partialNotes...)
 	}
-	if len(upstreamUpdate.Ns) == 0 {
+
+	// Build response.
+	if len(clientKeyRRs) == 0 {
+		// No KEY RRs at all — this was handled in the KEY-LEASE==0, LEASE!=0 case above
+		// (data-only lease). Return success.
 		resp := &dns.Msg{MsgHeader: r.MsgHeader, Question: r.Question}
 		resp.Response = true
 		resp.Authoritative = true
 		resp.Rcode = dns.RcodeSuccess
-		appendStatusNotes(resp, zone, partialNotes)
+		appendStatusNotes(resp, zone, allNotes)
 		opt := &dns.OPT{Hdr: dns.Header{Name: "."}}
 		opt.SetUDPSize(uint16(dns.DefaultMsgSize))
 		resp.Extra = append(resp.Extra, opt)
 		return NewProcessedResult(resp)
 	}
 
-	// Send UPDATE to upstream and fail-closed if upstream does not accept it.
-	if h.upstreamCoordinator == nil {
-		_ = h.leaseManager.Delete(clientKeyName)
-		h.deleteDataLease(clientKeyName)
-		h.clearLeaseTimer(clientKeyName)
-		msg := h.makeErrorResponse(r, dns.RcodeServerFailure, "upstream coordinator not configured")
-		return NewErrorResult(msg, "upstream coordinator not configured", fmt.Errorf("upstream coordinator is nil"))
+	// Upstream forwarding: forward KEY RRs that need to be registered upstream.
+	// This handles the case where some or all KEY RRs were registered locally
+	// but also need to be forwarded to the authoritative server.
+	if len(upstreamKeys) > 0 {
+		// Determine effective upstream zone from the upstream coordinator.
+		effectiveUpstreamZone := h.upstreamZone
+		if dc, ok := h.upstreamCoordinator.(*DefaultUpstreamCoordinator); ok {
+			resolvedZone, err := dc.resolveAuthoritativeZone(ctx, h.upstreamZone)
+			if err != nil {
+				h.logger.Debugf("Failed to resolve effective upstream zone from %s: %v", h.upstreamZone, err)
+				// Rollback: delete all registered leases.
+				for _, keyRR := range upstreamKeys {
+					_ = h.leaseManager.Delete(keyRR.Hdr.Name)
+				}
+				msg := h.makeErrorResponse(r, dns.RcodeServerFailure, fmt.Sprintf("upstream zone resolution failed: %v", err))
+				return NewErrorResult(msg, fmt.Sprintf("upstream zone resolution failed: %v", err), err)
+			}
+			effectiveUpstreamZone = resolvedZone
+			h.logger.Debugf("Resolved effective upstream zone: configured=%s effective=%s", h.upstreamZone, effectiveUpstreamZone)
+		}
+
+		upstreamUpdate, err := h.constructUpstreamUpdate(upstreamKeys, acceptedRecordsForUpstream, effectiveUpstreamZone)
+		if err != nil {
+			h.logger.Debugf("Failed to construct upstream UPDATE: %v", err)
+			// Rollback: delete all registered leases.
+			for _, keyRR := range upstreamKeys {
+				_ = h.leaseManager.Delete(keyRR.Hdr.Name)
+			}
+			msg := h.makeErrorResponse(r, dns.RcodeServerFailure, fmt.Sprintf("upstream construction failed: %v", err))
+			return NewErrorResult(msg, fmt.Sprintf("upstream construction failed: %v", err), err)
+		}
+		if len(upstreamUpdate.Ns) == 0 {
+			// No records to forward, just return success.
+			resp := &dns.Msg{MsgHeader: r.MsgHeader, Question: r.Question}
+			resp.Response = true
+			resp.Authoritative = true
+			resp.Rcode = dns.RcodeSuccess
+			appendStatusNotes(resp, zone, allNotes)
+			opt := &dns.OPT{Hdr: dns.Header{Name: "."}}
+			opt.SetUDPSize(uint16(dns.DefaultMsgSize))
+			resp.Extra = append(resp.Extra, opt)
+			return NewProcessedResult(resp)
+		}
+
+		// Send UPDATE to upstream and fail-closed if upstream does not accept it.
+		if h.upstreamCoordinator == nil {
+			for _, keyRR := range upstreamKeys {
+				_ = h.leaseManager.Delete(keyRR.Hdr.Name)
+			}
+			msg := h.makeErrorResponse(r, dns.RcodeServerFailure, "upstream coordinator not configured")
+			return NewErrorResult(msg, "upstream coordinator not configured", fmt.Errorf("upstream coordinator is nil"))
+		}
+
+		h.logger.Debugf("Sending UPDATE to upstream zone=%s (configured=%s), keys=%d",
+			effectiveUpstreamZone, h.upstreamZone, len(upstreamKeys))
+		upstreamResp, err := h.upstreamCoordinator.SendUpdate(ctx, effectiveUpstreamZone, upstreamUpdate)
+		if err != nil {
+			h.logger.Debugf("Upstream UPDATE transport/processing error for zone=%s keys=%d: %v",
+				h.upstreamZone, len(upstreamKeys), err)
+			// Rollback: delete all registered leases.
+			for _, keyRR := range upstreamKeys {
+				_ = h.leaseManager.Delete(keyRR.Hdr.Name)
+			}
+			msg := h.makeErrorResponse(r, dns.RcodeServerFailure, fmt.Sprintf("upstream update failed: %v", err))
+			return NewErrorResult(msg, fmt.Sprintf("upstream update failed: %v", err), err)
+		}
+		if upstreamResp == nil {
+			h.logger.Debugf("Upstream UPDATE returned nil response for zone=%s keys=%d",
+				h.upstreamZone, len(upstreamKeys))
+			for _, keyRR := range upstreamKeys {
+				_ = h.leaseManager.Delete(keyRR.Hdr.Name)
+			}
+			msg := h.makeErrorResponse(r, dns.RcodeServerFailure, "upstream update returned nil response")
+			return NewErrorResult(msg, "upstream update returned nil response", fmt.Errorf("nil upstream response"))
+		}
+
+		h.logger.Debugf("Upstream UPDATE response: Rcode=%d (%s), Answers=%d, Ns=%d, Extra=%d",
+			upstreamResp.Rcode, dns.RcodeToString[upstreamResp.Rcode],
+			len(upstreamResp.Answer), len(upstreamResp.Ns), len(upstreamResp.Extra))
+		if upstreamResp.Rcode != dns.RcodeSuccess {
+			// Rollback: delete all registered leases.
+			for _, keyRR := range upstreamKeys {
+				_ = h.leaseManager.Delete(keyRR.Hdr.Name)
+			}
+			msg := h.makeErrorResponse(r, dns.RcodeServerFailure,
+				fmt.Sprintf("upstream rejected update: rcode=%d (%s)",
+					upstreamResp.Rcode, dns.RcodeToString[upstreamResp.Rcode]))
+			return NewErrorResult(msg,
+				fmt.Sprintf("upstream rejected update: rcode=%d (%s)",
+					upstreamResp.Rcode, dns.RcodeToString[upstreamResp.Rcode]), nil)
+		}
 	}
 
-	h.logger.Debugf("Sending UPDATE to upstream zone=%s (configured=%s), key=%s", effectiveUpstreamZone, h.upstreamZone, clientKeyName)
-	upstreamResp, err := h.upstreamCoordinator.SendUpdate(ctx, effectiveUpstreamZone, upstreamUpdate)
-	if err != nil {
-		h.logger.Debugf("Upstream UPDATE transport/processing error for zone=%s key=%s: %v", h.upstreamZone, clientKeyName, err)
-		_ = h.leaseManager.Delete(clientKeyName)
-		h.deleteDataLease(clientKeyName)
-		h.clearLeaseTimer(clientKeyName)
-		msg := h.makeErrorResponse(r, dns.RcodeServerFailure, fmt.Sprintf("upstream update failed: %v", err))
-		return NewErrorResult(msg, fmt.Sprintf("upstream update failed: %v", err), err)
-	}
-	if upstreamResp == nil {
-		h.logger.Debugf("Upstream UPDATE returned nil response for zone=%s key=%s", h.upstreamZone, clientKeyName)
-		_ = h.leaseManager.Delete(clientKeyName)
-		h.deleteDataLease(clientKeyName)
-		h.clearLeaseTimer(clientKeyName)
-		msg := h.makeErrorResponse(r, dns.RcodeServerFailure, "upstream update returned nil response")
-		return NewErrorResult(msg, "upstream update returned nil response", fmt.Errorf("nil upstream response"))
-	}
-
-	h.logger.Debugf("Upstream UPDATE response: Rcode=%d (%s), Answers=%d, Ns=%d, Extra=%d",
-		upstreamResp.Rcode, dns.RcodeToString[upstreamResp.Rcode], len(upstreamResp.Answer), len(upstreamResp.Ns), len(upstreamResp.Extra))
-	if upstreamResp.Rcode != dns.RcodeSuccess {
-		_ = h.leaseManager.Delete(clientKeyName)
-		h.deleteDataLease(clientKeyName)
-		h.clearLeaseTimer(clientKeyName)
-		msg := h.makeErrorResponse(r, uint16(upstreamResp.Rcode),
-			fmt.Sprintf("upstream rejected update: rcode=%d (%s)", upstreamResp.Rcode, dns.RcodeToString[upstreamResp.Rcode]))
-		return NewErrorResult(msg,
-			fmt.Sprintf("upstream rejected update: rcode=%d (%s)", upstreamResp.Rcode, dns.RcodeToString[upstreamResp.Rcode]), nil)
-	}
-
-	// Create response to client
+	// Build response with all processed KEY RRs.
 	resp := &dns.Msg{
 		MsgHeader: r.MsgHeader,
 		Question:  r.Question,
@@ -1396,11 +1389,11 @@ func (h *UpdateHandler) Handle(ctx context.Context, w dns.ResponseWriter, r *dns
 	resp.Response = true
 	resp.Authoritative = true
 	resp.Rcode = dns.RcodeSuccess
-	appendStatusNotes(resp, zone, partialNotes)
+	appendStatusNotes(resp, zone, allNotes)
 
-	// Echo back the KEY RR in response to confirm registration
-	if registerKey {
-		resp.Answer = append(resp.Answer, clientKeyRR)
+	// Echo back the KEY RRs in response to confirm registration.
+	for _, key := range responseKeys {
+		resp.Answer = append(resp.Answer, key)
 	}
 
 	// Add OPT with response lease option
@@ -1408,7 +1401,7 @@ func (h *UpdateHandler) Handle(ctx context.Context, w dns.ResponseWriter, r *dns
 	opt.SetUDPSize(uint16(dns.DefaultMsgSize))
 	resp.Extra = append(resp.Extra, opt)
 
-	h.logger.Debugf("Sending success response for %s (lease: %d seconds)", clientKeyName, leaseDuration)
+	h.logger.Debugf("Sending success response (%d KEY RRs processed)", len(responseKeys))
 
 	return NewProcessedResult(resp)
 }
@@ -1778,7 +1771,7 @@ func (h *UpdateHandler) extractAndValidateSig0(ctx context.Context, msg *dns.Msg
 // constructUpstreamUpdate builds an UPDATE message for the upstream zone.
 // This UPDATE will be sent to the authoritative server for the upstream zone.
 // If upstream key is loaded, it will be signed with SIG(0).
-func (h *UpdateHandler) constructUpstreamUpdate(clientKeyRR *dns.KEY, otherRecords []dns.RR, upstreamZone string) (*dns.Msg, error) {
+func (h *UpdateHandler) constructUpstreamUpdate(clientKeyRRs []*dns.KEY, otherRecords []dns.RR, upstreamZone string) (*dns.Msg, error) {
 	// Create UPDATE message for upstream zone using dns.NewMsg
 	msg := dns.NewMsg(upstreamZone, dns.TypeSOA)
 	if msg == nil {
@@ -1793,10 +1786,12 @@ func (h *UpdateHandler) constructUpstreamUpdate(clientKeyRR *dns.KEY, otherRecor
 	msg.Ns = nil
 
 	var policyOther []dns.RR
-	if clientKeyRR != nil {
-		policyKey, other := h.applyLeasePolicy(clientKeyRR, otherRecords)
-		msg.Ns = append(msg.Ns, policyKey)
-		policyOther = other
+	if len(clientKeyRRs) > 0 {
+		for _, keyRR := range clientKeyRRs {
+			policyKey, other := h.applyLeasePolicy(keyRR, otherRecords)
+			msg.Ns = append(msg.Ns, policyKey)
+			policyOther = append(policyOther, other...)
+		}
 	} else {
 		policyOther = make([]dns.RR, 0, len(otherRecords))
 		for _, rr := range otherRecords {
@@ -1810,7 +1805,7 @@ func (h *UpdateHandler) constructUpstreamUpdate(clientKeyRR *dns.KEY, otherRecor
 		}
 	}
 
-	// Update section: optional KEY plus supported non-KEY records.
+	// Update section: optional KEYs plus supported non-KEY records.
 	msg.Ns = append(msg.Ns, policyOther...)
 	if len(msg.Ns) == 0 {
 		return msg, nil

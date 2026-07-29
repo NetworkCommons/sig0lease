@@ -79,9 +79,7 @@ func NewRefreshUpdate(zone string, keyRR *dns.KEY, leaseDuration, keyLeaseDurati
 // Required form:
 //
 //	owner ttl class type rdata...
-func ParseAdditionalRRSpec(spec string, fallbackName string, ttl uint32) (dns.RR, error) {
-	_ = fallbackName
-	_ = ttl
+func ParseAdditionalRRSpec(spec string) (dns.RR, error) {
 
 	spec = strings.TrimSpace(spec)
 	if spec == "" {

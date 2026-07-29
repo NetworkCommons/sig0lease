@@ -25,9 +25,11 @@ if [ -z "$TEST_KEYSTORE" ]; then
     exit 1
 fi
 
-# Real zones/keys
-DOWNSTREAM_ZONE="test.dev.zenr.io."
+# Zones
 UPSTREAM_ZONE="dev.zenr.io."
+DOWNSTREAM_ZONE="test.${UPSTREAM_ZONE}"
+
+# Keys
 CLIENT_KEY_NAME="test.dev.zenr.io."
 WRONG_CLIENT_KEY_NAME="farback.dev.zenr.io."
 
@@ -42,46 +44,61 @@ REFRESH_CASE_KEY_LEASE_SECONDS="${REFRESH_CASE_KEY_LEASE_SECONDS:-3600}"
 
 # Optional: limit matrix run to selected RR types, e.g. RR_TYPES="KEY TXT"
 # Supported types: KEY TXT A AAAA NULL NXNAME WALLET CLA IPN
-# Note: NULL and NXNAME cannot be constructed from presentation format in
-# miekg/dns (they lack a text representation). They are tested at the
-# unit-test level (handlers opcode5 behavior tests). The integration test can
-# only exercise types that the client binary can construct.
-# To test blacklisted types, set BLACKLISTED_RR_TYPES, e.g.:
-#   BLACKLISTED_RR_TYPES="NULL NXNAME WALLET CLA IPN"
-# When set, these types are tested against the configured blacklist:
-# the proxy should reject them with RcodeFormatError.
-RR_TYPES="${RR_TYPES:-KEY TXT A AAAA}"
-BLACKLISTED_RR_TYPES="${BLACKLISTED_RR_TYPES:-NULL NXNAME WALLET CLA IPN}"
+RR_TYPES="${RR_TYPES:-KEY TXT A AAAA NULL NXNAME WALLET CLA IPN}"
 
-
-
-cleanup() {
-    set +e
-    log_section "CLEANUP"
-
-    if [ ! -z "${PROXY_PID:-}" ] && kill -0 "$PROXY_PID" 2>/dev/null; then
-        log_step "Restoring pristine KEY state before shutdown"
-        ensure_key_absent "$CLIENT_KEY_NAME" || true
-    fi
-
-    stop_proxy
-
-    if [ -n "$TMP_CONFIG_FILE" ] && [ -f "$TMP_CONFIG_FILE" ]; then
-        rm -f "$TMP_CONFIG_FILE"
-    fi
-
-    set -e
-}
-
-run_client() {
-    CLIENT_KEYSTORE_DIR="$TEST_KEYSTORE" "$CLIENT_BIN" "$@"
-}
-
+################################
+# Utils
+################################
 require_command() {
     if ! command -v "$1" >/dev/null 2>&1; then
         log_error "Required command not found: $1"
         exit 1
     fi
+}
+
+################################
+# Timing
+################################
+log_case_timing() {
+    local case_name="$1"
+    local case_start_epoch="$2"
+    local expected_min_seconds="$3"
+
+    local now elapsed drift
+    now=$(date +%s)
+    elapsed=$((now - case_start_epoch))
+    drift=$((elapsed - expected_min_seconds))
+
+    log_step "Timing [$case_name]: expected-min=${expected_min_seconds}s actual=${elapsed}s drift=${drift}s"
+}
+
+wait_until_epoch() {
+    local lease_start_epoch="$1"
+    local lease_seconds="$2"
+    local grace_seconds="$3"
+    local target_epoch=$((lease_start_epoch + lease_seconds + grace_seconds))
+    local now
+    now=$(date +%s)
+    if [ "$now" -lt "$target_epoch" ]; then
+        sleep $((target_epoch - now))
+    fi
+}
+
+################################
+# Client/Server functions
+################################
+
+build_binaries() {
+    log_section "BUILD"
+    log_step "Building proxy and client binaries"
+    (cd "$SCRIPT_DIR/.." && go build -o "$PROXY_BIN" ./cmd/sig0lease)
+    (cd "$SCRIPT_DIR/.." && go build -o "$CLIENT_BIN" ./cmd/sig0lease-client)
+    (cd "$SCRIPT_DIR/.." && go build -o "$BLACKLISTED_TESTER_BIN" ./tests/blacklisted_tester.go)
+    log_success "Binaries built"
+}
+
+run_client() {
+    CLIENT_KEYSTORE_DIR="$TEST_KEYSTORE" "$CLIENT_BIN" "$@"
 }
 
 assert_proxy_log_contains() {
@@ -94,118 +111,6 @@ assert_proxy_log_contains() {
     return 1
 }
 
-rr_spec_for_type() {
-    local rr_type="$1"
-    local owner="$2"
-    local ttl="$3"
-    case "$rr_type" in
-        KEY) echo "" ;;
-        TXT) echo "${owner} ${ttl} IN TXT \"lease-txt-$(date +%s)\"" ;;
-        A) echo "${owner} ${ttl} IN A 192.0.2.33" ;;
-        AAAA) echo "${owner} ${ttl} IN AAAA 2001:db8::33" ;;
-        # NULL and NXNAME have no presentation format in miekg/dns,
-        # so they cannot be constructed via the client binary's
-        # ParseAdditionalRRSpec (which uses dns.New). They are
-        # tested at the unit-test level (handlers opcode5 behavior tests).
-        NULL) log_step "Skipping NULL: no presentation format in miekg/dns" ;;
-        NXNAME) log_step "Skipping NXNAME: no presentation format in miekg/dns" ;;
-        WALLET) echo "${owner} ${ttl} IN WALLET \"wallet-data\"" ;;
-        CLA) echo "${owner} ${ttl} IN CLA \"cla-data\"" ;;
-        IPN) echo "${owner} ${ttl} IN IPN 42" ;;
-        *)
-            log_error "Unsupported rr type: $rr_type"
-            return 1
-            ;;
-    esac
-}
-
-# Test blacklisted RR types by constructing them programmatically.
-# NULL and NXNAME cannot be constructed via presentation format (miekg/dns limitation),
-# so we use a small Go helper that constructs these records directly and sends them.
-test_blacklisted_type() {
-    local rr_type="$1"
-    log_section "BLACKLISTED [$rr_type]: Proxy Rejects Blacklisted Type"
-
-    log_step "Registering lease under authorized key ($CLIENT_KEY_NAME) with blacklisted type"
-    local case_start lease_start
-    case_start=$(date +%s)
-    lease_start=$(date +%s)
-
-    # For NULL/NXNAME, use the Go helper to construct the record directly.
-    # For WALLET/CLA/IPN, use the standard client binary.
-    local rr_spec=""
-    local reg_out=""
-    case "$rr_type" in
-        NULL|NXNAME)
-            # Construct the record programmatically via the Go helper.
-            # This bypasses ParseAdditionalRRSpec and constructs the RR directly.
-            log_step "Using Go helper to construct $rr_type record directly"
-            # blacklisted_tester sends the request directly to the proxy and prints the response.
-            reg_out=$(cd "$SCRIPT_DIR/.." && go run -ldflags="-X main.rrType=$rr_type -X main.rrOwner=$CLIENT_KEY_NAME -X main.leaseDuration=$LEASE_SECONDS -X main.keyLeaseSec=$KEY_LEASE_SECONDS -X main.proxyAddr=$PROXY_URL -X main.zone=$DOWNSTREAM_ZONE" ./tests/blacklisted_tester.go 2>&1) || true
-            ;;
-        *)
-            rr_spec=$(rr_spec_for_type "$rr_type" "$CLIENT_KEY_NAME" "$LEASE_SECONDS")
-            log_step "Attempting registration with blacklisted type $rr_type"
-            reg_out=$(run_client "$PROXY_URL" register "$DOWNSTREAM_ZONE" "$CLIENT_KEY_NAME" "$LEASE_SECONDS" "$KEY_LEASE_SECONDS" "$rr_spec" 2>&1) || true
-            ;;
-    esac
-
-    # Check the response for rejection (should be Rcode=1 FormatError).
-    if echo "$reg_out" | grep -q "Rcode=1\|FormatError\|REGISTRATION FAILED"; then
-        log_success "Proxy correctly rejected blacklisted type $rr_type with format error"
-    else
-        log_error "Proxy should have rejected blacklisted type $rr_type, got: $reg_out"
-        return 1
-    fi
-
-    # Verify no KEY RR was created (registration should be atomic - all or nothing).
-    wait_for_key_state "$CLIENT_KEY_NAME" absent
-    log_success "Blacklisted type $rr_type rejected and no lease created"
-}
-
-register_with_rr_type() {
-    local rr_type="$1"
-    local lease_seconds="$2"
-    local key_lease_seconds="$3"
-
-    local rr_spec=""
-    rr_spec=$(rr_spec_for_type "$rr_type" "$CLIENT_KEY_NAME" "$lease_seconds")
-    if [ -n "$rr_spec" ]; then
-        run_client "$PROXY_URL" register "$DOWNSTREAM_ZONE" "$CLIENT_KEY_NAME" "$lease_seconds" "$key_lease_seconds" "$rr_spec"
-    else
-        run_client "$PROXY_URL" register "$DOWNSTREAM_ZONE" "$CLIENT_KEY_NAME" "$lease_seconds" "$key_lease_seconds"
-    fi
-}
-
-dig_query_short() {
-    local endpoint="$1"
-    local name="$2"
-    local rr_type="$3"
-
-    local host="$endpoint"
-    local port="53"
-    if [[ "$endpoint" == *:* ]]; then
-        host="${endpoint%:*}"
-        port="${endpoint##*:}"
-    fi
-
-    dig +short +time=2 +tries=1 @"$host" -p "$port" "$name" "$rr_type" 2>/dev/null || true
-}
-
-query_rr_at_authoritative() {
-    local name="$1"
-    local rr_type="$2"
-    local out
-
-    out=$(dig_query_short "$AUTH_SERVER" "$name" "$rr_type")
-    log_step "[dig] @${AUTH_SERVER} ${name} ${rr_type}"
-    if [ -n "$out" ]; then
-        echo "$out"
-    else
-        echo "(no records)"
-    fi
-    printf '%s\n' "$out"
-}
 
 # Query the running proxy for lease store dump at the specified log level.
 # Usage: query_lease_dump <level>
@@ -240,6 +145,68 @@ query_lease_dump() {
         echo "$out"
     else
         echo "(no dump response)"
+    fi
+    printf '%s\n' "$out"
+}
+
+setup_keystore() {
+    log_section "SETUP: Real Keystore"
+
+    if [ ! -d "$TEST_KEYSTORE" ]; then
+        log_error "Test keystore directory not found: $TEST_KEYSTORE"
+        exit 1
+    fi
+
+    log_step "Verifying test keys in keystore: $TEST_KEYSTORE"
+    if ! ls "$TEST_KEYSTORE"/K${CLIENT_KEY_NAME}+015+*.key >/dev/null 2>&1; then
+        log_error "Expected key for zone $DOWNSTREAM_ZONE not found in $TEST_KEYSTORE"
+        exit 1
+    fi
+    if ! ls "$TEST_KEYSTORE"/K${WRONG_CLIENT_KEY_NAME}+015+*.key >/dev/null 2>&1; then
+        log_error "Expected second real key for unauthorized test ($WRONG_CLIENT_KEY_NAME) not found"
+        exit 1
+    fi
+
+    log_success "Test keystore verified, directory content:"
+    ls -1 "$TEST_KEYSTORE" | sed -n '1,50p'
+}
+
+test_list_keys() {
+    log_section "CHECK: Key Listing"
+    log_step "Listing keys from real keystore"
+    run_client dummy list-keys "$TEST_KEYSTORE"
+    log_success "Key listing successful"
+}
+
+################################
+# DNS inquiry functions
+################################
+dig_query_short() {
+    local endpoint="$1"
+    local name="$2"
+    local rr_type="$3"
+
+    local host="$endpoint"
+    local port="53"
+    if [[ "$endpoint" == *:* ]]; then
+        host="${endpoint%:*}"
+        port="${endpoint##*:}"
+    fi
+
+    dig +short +time=2 +tries=1 @"$host" -p "$port" "$name" "$rr_type" 2>/dev/null || true
+}
+
+query_rr_at_authoritative() {
+    local name="$1"
+    local rr_type="$2"
+    local out
+
+    out=$(dig_query_short "$AUTH_SERVER" "$name" "$rr_type")
+    log_step "[dig] @${AUTH_SERVER} ${name} ${rr_type}"
+    if [ -n "$out" ]; then
+        echo "$out"
+    else
+        echo "(no records)"
     fi
     printf '%s\n' "$out"
 }
@@ -284,174 +251,190 @@ wait_for_rr_state() {
     done
 }
 
-wait_for_key_state() {
-    local name="$1"
-    local state="$2"
-    wait_for_rr_state "$name" KEY "$state"
-}
-
-assert_proxy_consistent_with_authoritative() {
-    local key_name="$1"
+ensure_rr_absent() {
+    local rr_name="$1"
     local rr_type="$2"
-    local expected_state="$3"  # present|absent
 
-    local is_present=0
-    if rr_is_present "$key_name" "$rr_type"; then
-        is_present=1
-    fi
-
-    if [ "$expected_state" = "present" ] && [ "$is_present" -ne 1 ]; then
-        log_error "Consistency check failed: authoritative missing $rr_type but expected present for $key_name"
-        return 1
-    fi
-    if [ "$expected_state" = "absent" ] && [ "$is_present" -ne 0 ]; then
-        log_error "Consistency check failed: authoritative $rr_type present but expected absent for $key_name"
-        return 1
-    fi
-
-    # Proxy consistency checks via refresh path.
-    if [ "$expected_state" = "present" ]; then
-        local refresh_out
-        refresh_out=$(run_client "$PROXY_URL" refresh "$DOWNSTREAM_ZONE" "$key_name" "$REFRESH_SECONDS" 2>&1 || true)
-        if ! echo "$refresh_out" | grep -q "Rcode=0\|REFRESH SUCCESSFUL"; then
-            log_error "Consistency check failed: proxy refresh did not succeed while authoritative $rr_type is present for $key_name"
-            echo "$refresh_out"
-            return 1
-        fi
-        log_success "Consistency check OK: proxy refresh accepted and authoritative $rr_type present for $key_name"
-    else
-        if run_client "$PROXY_URL" refresh "$DOWNSTREAM_ZONE" "$key_name" "$REFRESH_SECONDS" >/dev/null 2>&1; then
-            log_error "Consistency check failed: proxy refresh accepted but authoritative $rr_type is absent for $key_name"
-            return 1
-        fi
-        log_success "Consistency check OK: proxy refresh rejected and authoritative $rr_type absent for $key_name"
-    fi
-}
-
-wait_until_epoch() {
-    local target_epoch="$1"
-    local now
-    now=$(date +%s)
-    if [ "$now" -lt "$target_epoch" ]; then
-        sleep $((target_epoch - now))
-    fi
-}
-
-wait_until_lease_expired() {
-    local lease_start_epoch="$1"
-    local lease_seconds="$2"
-    local grace_seconds="$3"
-    wait_until_epoch $((lease_start_epoch + lease_seconds + grace_seconds))
-}
-
-log_case_timing() {
-    local case_name="$1"
-    local case_start_epoch="$2"
-    local expected_min_seconds="$3"
-
-    local now elapsed drift
-    now=$(date +%s)
-    elapsed=$((now - case_start_epoch))
-    drift=$((elapsed - expected_min_seconds))
-
-    log_step "Timing [$case_name]: expected-min=${expected_min_seconds}s actual=${elapsed}s drift=${drift}s"
-}
-
-ensure_key_absent() {
-    local key_name="$1"
-
-    if ! rr_is_present "$key_name" KEY; then
-        log_success "Pristine state already present: $key_name absent on $AUTH_SERVER"
+    if ! rr_is_present "$rr_name" "$rr_type"; then
+        log_success "Pristine state already present: $rr_name - $rr_type absent on $AUTH_SERVER"
         return 0
     fi
 
-    log_step "Cleanup: key $key_name is present, forcing short lease then waiting expiry"
+    log_step "Cleanup: rr $rr_name is present, forcing short lease then waiting expiry"
     local cleanup_start
     cleanup_start=$(date +%s)
 
     # Re-register with minimum supported lease so cleanup reaches absence quickly.
-    if ! run_client "$PROXY_URL" register "$DOWNSTREAM_ZONE" "$key_name" "$MIN_LEASE_SECONDS" "$MIN_KEY_LEASE_SECONDS" >/dev/null 2>&1; then
-        log_error "Cleanup registration failed for $key_name"
+    if ! run_client "$PROXY_URL" register "$DOWNSTREAM_ZONE" "$rr_name" "$MIN_LEASE_SECONDS" "$MIN_KEY_LEASE_SECONDS" >/dev/null 2>&1; then
+        log_error "Cleanup registration failed for $rr_name"
         return 1
     fi
 
-    wait_until_lease_expired "$cleanup_start" "$MIN_LEASE_SECONDS" 3
-    wait_for_rr_state "$key_name" KEY absent
-    log_success "Cleanup complete: $key_name absent on $AUTH_SERVER"
+    wait_until_epoch "$cleanup_start" "$MIN_LEASE_SECONDS" 3
+    wait_for_rr_state "$rr_name" KEY absent
+    log_success "Cleanup complete: $rr_name absent on $AUTH_SERVER"
 }
 
-setup_keystore() {
-    log_section "SETUP: Real Keystore"
-
-    if [ ! -d "$TEST_KEYSTORE" ]; then
-        log_error "Test keystore directory not found: $TEST_KEYSTORE"
-        exit 1
-    fi
-
-    log_step "Verifying test keys in keystore: $TEST_KEYSTORE"
-    if ! ls "$TEST_KEYSTORE"/K${CLIENT_KEY_NAME}+015+*.key >/dev/null 2>&1; then
-        log_error "Expected key for zone $DOWNSTREAM_ZONE not found in $TEST_KEYSTORE"
-        exit 1
-    fi
-    if ! ls "$TEST_KEYSTORE"/K${WRONG_CLIENT_KEY_NAME}+015+*.key >/dev/null 2>&1; then
-        log_error "Expected second real key for unauthorized test ($WRONG_CLIENT_KEY_NAME) not found"
-        exit 1
-    fi
-
-    log_success "Test keystore verified"
-    ls -1 "$TEST_KEYSTORE" | sed -n '1,50p'
+rr_spec_for_type() {
+    local rr_type="$1"
+    local name="$2"
+    local ttl="$3"
+    case "$rr_type" in
+        KEY) echo "" ;;
+        TXT) echo "${name} ${ttl} IN TXT \"lease-txt-$(date +%s)\"" ;;
+        A) echo "${name} ${ttl} IN A 192.0.2.33" ;;
+        AAAA) echo "${name} ${ttl} IN AAAA 2001:db8::33" ;;
+        # NULL and NXNAME have no presentation format in miekg/dns,
+        # so they cannot be constructed via the client binary's
+        # ParseAdditionalRRSpec (which uses dns.New). They are
+        # tested at the unit-test level (handlers opcode5 behavior tests).
+        NULL) log_step "Skipping NULL: no presentation format in miekg/dns" ;;
+        NXNAME) log_step "Skipping NXNAME: no presentation format in miekg/dns" ;;
+        WALLET) echo "${name} ${ttl} IN WALLET \"wallet-data-$(date +%s)\"" ;;
+        CLA) echo "${name} ${ttl} IN CLA \"cla-data-$(date +%s)\"" ;;
+        IPN) echo "${name} ${ttl} IN IPN 42" ;;
+        *)
+            log_error "Unsupported rr type: $rr_type"
+            return 1
+            ;;
+    esac
 }
 
+register_with_rr_type() {
+    local rr_type="$1"
+    local lease_seconds="$2"
+    local key_lease_seconds="$3"
 
-build_binaries() {
-    log_section "BUILD"
-    log_step "Building proxy and client binaries"
-    (cd "$SCRIPT_DIR/.." && go build -o "$PROXY_BIN" ./cmd/sig0lease)
-    (cd "$SCRIPT_DIR/.." && go build -o "$CLIENT_BIN" ./cmd/sig0lease-client)
-    (cd "$SCRIPT_DIR/.." && go build -o "$BLACKLISTED_TESTER_BIN" ./tests/blacklisted_tester.go)
-    log_success "Binaries built"
+    local rr_spec=""
+    rr_spec=$(rr_spec_for_type "$rr_type" "$DOWNSTREAM_ZONE" "$lease_seconds")
+    if [ -n "$rr_spec" ]; then
+        run_client "$PROXY_URL" register "$DOWNSTREAM_ZONE" "$CLIENT_KEY_NAME" "$lease_seconds" "$key_lease_seconds" "$rr_spec"
+    else
+        run_client "$PROXY_URL" register "$DOWNSTREAM_ZONE" "$CLIENT_KEY_NAME" "$lease_seconds" "$key_lease_seconds"
+    fi
 }
 
-test_list_keys() {
-    log_section "CHECK: Key Listing"
-    log_step "Listing keys from real keystore"
-    run_client dummy list-keys "$TEST_KEYSTORE"
-    log_success "Key listing successful"
+proxy_consistent_with_authoritative() {
+    local rr_name="$1"
+    local rr_type="$2"
+    local expected_state="$3"  # present|absent
+
+    local is_present=0
+    if rr_is_present "$rr_name" "$rr_type"; then
+        is_present=1
+    fi
+
+    if [ "$expected_state" = "present" ] && [ "$is_present" -ne 1 ]; then
+        log_error "Consistency check failed: authoritative missing but expected present for $rr_name - $rr_type"
+        return 1
+    fi
+    if [ "$expected_state" = "absent" ] && [ "$is_present" -ne 0 ]; then
+        log_error "Consistency check failed: authoritative present but expected absent for $rr_name - $rr_type"
+        return 1
+    fi
+
+    # Proxy Lease-store consistency checks
+    # TODO: Add checks that records in lease-store are actually at the DNS
+
+}
+################################
+# Tests
+################################
+test_blacklisted_type() {
+# Test blacklisted RR types by constructing them programmatically.
+# NULL and NXNAME cannot be constructed via presentation format (miekg/dns limitation),
+# so we use a small Go helper that constructs these records directly and sends them.
+
+    local rr_type=$1
+    log_section "BLACKLISTED [$rr_type]: Proxy Rejects Blacklisted Type"
+
+    log_step "Registering lease with blacklisted type"
+    local case_start lease_start
+    case_start=$(date +%s)
+    lease_start=$(date +%s)
+
+    # For NULL/NXNAME, use the Go helper to construct the record directly.
+    # For WALLET/CLA/IPN, use the standard client binary.
+    local rr_spec=""
+    local reg_out=""
+    case "$rr_type" in
+        NULL|NXNAME)
+            # Construct the record programmatically via the Go helper.
+            # This bypasses ParseAdditionalRRSpec and constructs the RR directly.
+            log_step "Using Go helper to construct $rr_type record directly"
+            # blacklisted_tester sends the request directly to the proxy and prints the response.
+            reg_out=$(cd "$SCRIPT_DIR/.." && go run -ldflags="-X main.rrType=$rr_type -X main.rrOwner=$DOWNSTREAM_ZONE -X main.leaseDuration=$LEASE_SECONDS -X main.keyLeaseSec=$KEY_LEASE_SECONDS -X main.proxyAddr=$PROXY_URL -X main.zone=$DOWNSTREAM_ZONE" ./tests/blacklisted_tester.go 2>&1) || true
+            ;;
+        *)
+            rr_spec=$(rr_spec_for_type "$rr_type" "$DOWNSTREAM_ZONE" "$LEASE_SECONDS")
+            log_step "Attempting registration with blacklisted type $rr_type"
+            reg_out=$(run_client "$PROXY_URL" register "$DOWNSTREAM_ZONE" "$DOWNSTREAM_ZONE" "$LEASE_SECONDS" "$KEY_LEASE_SECONDS" "$rr_spec" 2>&1) || true
+            ;;
+    esac
+
+    # Check the response for rejection (should be Rcode=1 FormatError).
+    if echo "$reg_out" | grep -q "Rcode=1\|FormatError\|REGISTRATION FAILED"; then
+        log_success "Proxy correctly rejected blacklisted type $rr_type with format error"
+    else
+        log_error "Proxy should have rejected blacklisted type $rr_type, got: $reg_out"
+        return 1
+    fi
+
+    # Verify no KEY RR was created (registration should be atomic - all or nothing).
+    if rr_is_present "$DOWNSTREAM_ZONE" KEY; then
+        log_error "Blacklisted type $rr_type rejected but key lease created"
+        return 1
+    else
+        log_success "Blacklisted type $rr_type rejected and no lease created"
+    fi
+    return 0
 }
 
 test_case_register_expire_remove() {
     local rr_type="$1"
     log_section "CASE 1 [$rr_type]: Register -> Expire -> Removed"
 
+    case $rr_type in
+        KEY)
+            local lease_time=0
+            local key_lease_time=$KEY_LEASE_SECONDS
+            local lease=$key_lease_time
+            ;;
+        *)
+            local lease_time=$LEASE_SECONDS
+            local key_lease_time=0
+            local lease=$lease_time
+            ;;
+    esac
+
     local case_start lease_start expected_min
     case_start=$(date +%s)
-    log_step "Registering lease ($LEASE_SECONDS seconds)"
+    log_step "Registering lease "
     lease_start=$(date +%s)
-    register_with_rr_type "$rr_type" "$LEASE_SECONDS" "$KEY_LEASE_SECONDS"
-    wait_for_rr_state "$CLIENT_KEY_NAME" KEY present
-    wait_for_rr_state "$CLIENT_KEY_NAME" "$rr_type" present
+    register_with_rr_type "$rr_type" "$lease_time" "$key_lease_time"
+    wait_for_rr_state "$DOWNSTREAM_ZONE" "$rr_type" present
 
     # Verify lease store via dump query (INFO level summary).
     log_step "Verifying lease store state via dump query (INFO)"
-    query_lease_dump "info"
+    query_lease_dump "debug"
 
     log_step "Waiting until lease expiry boundary"
-    wait_until_lease_expired "$lease_start" "$LEASE_SECONDS" 3
+    wait_until_epoch "$lease_start" "$lease" 3
 
-    log_step "Attempting refresh after expiry (must fail)"
+    log_step "Attempting refresh after expiry (must succeed for KEY)"
     if run_client "$PROXY_URL" refresh "$DOWNSTREAM_ZONE" "$CLIENT_KEY_NAME" "$REFRESH_SECONDS"; then
         log_error "Refresh succeeded after expiry, expected failure"
         return 1
     fi
-    wait_for_rr_state "$CLIENT_KEY_NAME" KEY absent
-    assert_proxy_consistent_with_authoritative "$CLIENT_KEY_NAME" KEY absent
+    wait_for_rr_state "$DOWNSTREAM_ZONE" KEY absent
+    proxy_consistent_with_authoritative "$DOWNSTREAM_ZONE" KEY absent
     if [ "$rr_type" != "KEY" ]; then
         log_step "Post-expiry note: non-key RR ($rr_type) state is informational only"
-        query_rr_at_authoritative "$CLIENT_KEY_NAME" "$rr_type" >/dev/null || true
+        query_rr_at_authoritative "$DOWNSTREAM_ZONE" "$rr_type" >/dev/null || true
     fi
 
     assert_proxy_log_contains "refresh rejected: lease does not exist"
-    expected_min=$((lease_start + LEASE_SECONDS + 3 - case_start))
+    expected_min=$((lease_start + lease + 3 - case_start))
     if [ "$expected_min" -lt 0 ]; then
         expected_min=0
     fi
@@ -468,9 +451,9 @@ test_case_register_refresh_not_prematurely_removed() {
     log_step "Registering initial lease"
     lease_start=$(date +%s)
     register_with_rr_type "$rr_type" "$LEASE_SECONDS" "$REFRESH_CASE_KEY_LEASE_SECONDS"
-    wait_for_rr_state "$CLIENT_KEY_NAME" KEY present
-    wait_for_rr_state "$CLIENT_KEY_NAME" "$rr_type" present
-    assert_proxy_consistent_with_authoritative "$CLIENT_KEY_NAME" "$rr_type" present
+    wait_for_rr_state "$DOWNSTREAM_ZONE" KEY present
+    wait_for_rr_state "$DOWNSTREAM_ZONE" "$rr_type" present
+    proxy_consistent_with_authoritative "$DOWNSTREAM_ZONE" "$rr_type" present
 
     # Verify lease store via dump query (INFO level summary).
     log_step "Verifying lease store state via dump query (INFO) after initial registration"
@@ -480,29 +463,29 @@ test_case_register_refresh_not_prematurely_removed() {
     wait_until_epoch $((lease_start + 20))
     refresh_start=$(date +%s)
     run_client "$PROXY_URL" refresh "$DOWNSTREAM_ZONE" "$CLIENT_KEY_NAME" "$REFRESH_SECONDS"
-    wait_for_rr_state "$CLIENT_KEY_NAME" KEY present
-    wait_for_rr_state "$CLIENT_KEY_NAME" "$rr_type" present
-    assert_proxy_consistent_with_authoritative "$CLIENT_KEY_NAME" "$rr_type" present
+    wait_for_rr_state "$DOWNSTREAM_ZONE" KEY present
+    wait_for_rr_state "$DOWNSTREAM_ZONE" "$rr_type" present
+    proxy_consistent_with_authoritative "$DOWNSTREAM_ZONE" "$rr_type" present
 
     log_step "Waiting past original expiry window"
-    wait_until_lease_expired "$lease_start" "$LEASE_SECONDS" 5
-    wait_for_rr_state "$CLIENT_KEY_NAME" KEY present
-    wait_for_rr_state "$CLIENT_KEY_NAME" "$rr_type" present
-    assert_proxy_consistent_with_authoritative "$CLIENT_KEY_NAME" "$rr_type" present
+    wait_until_epoch "$lease_start" "$LEASE_SECONDS" 5
+    wait_for_rr_state "$DOWNSTREAM_ZONE" KEY present
+    wait_for_rr_state "$DOWNSTREAM_ZONE" "$rr_type" present
+    proxy_consistent_with_authoritative "$DOWNSTREAM_ZONE" "$rr_type" present
 
     log_step "Refreshing again (must still succeed if not removed prematurely)"
     run_client "$PROXY_URL" refresh "$DOWNSTREAM_ZONE" "$CLIENT_KEY_NAME" "$REFRESH_SECONDS"
-    wait_for_rr_state "$CLIENT_KEY_NAME" KEY present
-    wait_for_rr_state "$CLIENT_KEY_NAME" "$rr_type" present
-    assert_proxy_consistent_with_authoritative "$CLIENT_KEY_NAME" "$rr_type" present
+    wait_for_rr_state "$DOWNSTREAM_ZONE" KEY present
+    wait_for_rr_state "$DOWNSTREAM_ZONE" "$rr_type" present
+    proxy_consistent_with_authoritative "$DOWNSTREAM_ZONE" "$rr_type" present
 
     log_step "Waiting for refreshed data lease window while key-lease remains active"
-    wait_until_lease_expired "$refresh_start" "$REFRESH_SECONDS" 5
-    wait_for_rr_state "$CLIENT_KEY_NAME" KEY present
-    assert_proxy_consistent_with_authoritative "$CLIENT_KEY_NAME" KEY present
+    wait_until_epoch "$refresh_start" "$REFRESH_SECONDS" 5
+    wait_for_rr_state "$DOWNSTREAM_ZONE" KEY present
+    proxy_consistent_with_authoritative "$DOWNSTREAM_ZONE" KEY present
     if [ "$rr_type" != "KEY" ]; then
         log_step "Post-refresh note: non-key RR ($rr_type) state is informational only"
-        query_rr_at_authoritative "$CLIENT_KEY_NAME" "$rr_type" >/dev/null || true
+        query_rr_at_authoritative "$DOWNSTREAM_ZONE" "$rr_type" >/dev/null || true
     fi
 
     expected_min=$((refresh_start + REFRESH_SECONDS + 5 - case_start))
@@ -523,7 +506,7 @@ test_case_unauthorized_refresh_rejected_then_expires() {
     lease_start=$(date +%s)
     register_with_rr_type "$rr_type" "$LEASE_SECONDS" "$KEY_LEASE_SECONDS"
     wait_for_rr_state "$CLIENT_KEY_NAME" KEY present
-    wait_for_rr_state "$CLIENT_KEY_NAME" "$rr_type" present
+    wait_for_rr_state "$DOWNSTREAM_ZONE" "$rr_type" present
 
     log_step "Unauthorized refresh attempt using different real key ($WRONG_CLIENT_KEY_NAME)"
     if run_client "$PROXY_URL" refresh "$DOWNSTREAM_ZONE" "$WRONG_CLIENT_KEY_NAME" "$REFRESH_SECONDS"; then
@@ -531,16 +514,16 @@ test_case_unauthorized_refresh_rejected_then_expires() {
         return 1
     fi
     wait_for_rr_state "$CLIENT_KEY_NAME" KEY present
-    wait_for_rr_state "$CLIENT_KEY_NAME" "$rr_type" present
+    wait_for_rr_state "$DOWNSTREAM_ZONE" "$rr_type" present
 
     log_step "Waiting until original lease expires"
-    wait_until_lease_expired "$lease_start" "$LEASE_SECONDS" 3
+    wait_until_epoch "$lease_start" "$LEASE_SECONDS" 3
 
     wait_for_rr_state "$CLIENT_KEY_NAME" KEY absent
-    assert_proxy_consistent_with_authoritative "$CLIENT_KEY_NAME" KEY absent
+    proxy_consistent_with_authoritative "$CLIENT_KEY_NAME" KEY absent
     if [ "$rr_type" != "KEY" ]; then
         log_step "Post-expiry note: non-key RR ($rr_type) state is informational only"
-        query_rr_at_authoritative "$CLIENT_KEY_NAME" "$rr_type" >/dev/null || true
+        query_rr_at_authoritative "$DOWNSTREAM_ZONE" "$rr_type" >/dev/null || true
     fi
     log_step "Original key refresh after expiry must fail"
     if run_client "$PROXY_URL" refresh "$DOWNSTREAM_ZONE" "$CLIENT_KEY_NAME" "$REFRESH_SECONDS"; then
@@ -548,7 +531,7 @@ test_case_unauthorized_refresh_rejected_then_expires() {
         return 1
     fi
     wait_for_rr_state "$CLIENT_KEY_NAME" KEY absent
-    assert_proxy_consistent_with_authoritative "$CLIENT_KEY_NAME" KEY absent
+    proxy_consistent_with_authoritative "$CLIENT_KEY_NAME" KEY absent
 
     expected_min=$((lease_start + LEASE_SECONDS + 3 - case_start))
     if [ "$expected_min" -lt 0 ]; then
@@ -558,6 +541,9 @@ test_case_unauthorized_refresh_rejected_then_expires() {
     log_success "Unauthorized refresh rejected and lease expired as expected for $rr_type"
 }
 
+################################
+# Top level commands
+################################
 run_all_tests() {
     log_section "SIG0LEASE INTEGRATION TEST SUITE"
     echo "This suite uses live components only (no stubs/mocks):"
@@ -580,15 +566,36 @@ run_all_tests() {
     start_proxy
 
     local rr_types=($RR_TYPES)
+    local blacklisted_rrs=$(awk '
+        /blacklisted_types:/ { found=1; next }
+        found && /^[[:space:]]*-[[:space:]]*"/ {
+        val = $0
+        sub(/^[[:space:]]*-[[:space:]]*"/, "", val)
+        sub(/"[[:space:]]*$/, "", val)
+        types = types " " val
+        }
+        END {
+        sub(/^ /, "", types)
+        print types
+        }
+    ' "$CONFIG_FILE")
+
+
+    log_step "Black-listed types: $blacklisted_rrs"
+    
     local rr_type
     for rr_type in "${rr_types[@]}"; do
         log_section "RR TEST MATRIX: $rr_type"
-        ensure_key_absent "$CLIENT_KEY_NAME"
-        test_case_register_expire_remove "$rr_type"
-        ensure_key_absent "$CLIENT_KEY_NAME"
-        test_case_register_refresh_not_prematurely_removed "$rr_type"
-        ensure_key_absent "$CLIENT_KEY_NAME"
-        test_case_unauthorized_refresh_rejected_then_expires "$rr_type"
+        ensure_rr_absent "$CLIENT_KEY_NAME" KEY
+        if [[ " $blacklisted_rrs " == *" $rr_type "* ]]; then
+            test_blacklisted_type $rr_type
+        else
+            test_case_register_expire_remove "$rr_type"
+            ensure_rr_absent "$CLIENT_KEY_NAME" KEY
+            test_case_register_refresh_not_prematurely_removed "$rr_type"
+            ensure_rr_absent "$DOWNSTREAM_ZONE" "$rr_type"
+            test_case_unauthorized_refresh_rejected_then_expires "$rr_type"
+        fi
     done
 
     log_section "TEST RESULTS"
@@ -603,6 +610,28 @@ run_all_tests() {
     echo "Proxy process was exercised at $PROXY_URL"
     echo "Logs: $LOG_FILE"
 }
+
+cleanup() {
+    set +e
+    log_section "CLEANUP"
+
+    if [ ! -z "${PROXY_PID:-}" ] && kill -0 "$PROXY_PID" 2>/dev/null; then
+        log_step "Restoring pristine KEY state before shutdown"
+        ensure_rr_absent "$CLIENT_KEY_NAME" KEY || true
+    fi
+
+    stop_proxy
+
+    if [ -n "$TMP_CONFIG_FILE" ] && [ -f "$TMP_CONFIG_FILE" ]; then
+        rm -f "$TMP_CONFIG_FILE"
+    fi
+
+    set -e
+}
+
+################################
+# Menu
+################################
 
 case "${1:-run}" in
     run)

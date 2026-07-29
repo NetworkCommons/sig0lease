@@ -38,7 +38,7 @@ func TestParseLeaseRegistrationIncludesKeyLease(t *testing.T) {
 	}
 }
 
-func TestExtractUpdateRecordsRejectsMultipleKeys(t *testing.T) {
+func TestExtractUpdateRecordsAcceptsMultipleKeys(t *testing.T) {
 	msg := dns.NewMsg("test.dev.zenr.io.", dns.TypeSOA)
 	if msg == nil {
 		t.Fatalf("expected message")
@@ -49,9 +49,15 @@ func TestExtractUpdateRecordsRejectsMultipleKeys(t *testing.T) {
 		testKeyRR("test.dev.zenr.io.", "AAAATESTKEY222="),
 	)
 
-	_, _, err := extractUpdateRecords(msg, nil)
-	if err == nil {
-		t.Fatalf("expected multiple KEY rejection")
+	keyRRs, _, err := extractUpdateRecords(msg, nil)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(keyRRs) != 2 {
+		t.Fatalf("expected 2 KEY RRs, got %d", len(keyRRs))
+	}
+	if keyRRs[0].PublicKey[0] != 'A' || keyRRs[1].PublicKey[0] != 'A' {
+		t.Fatalf("expected valid KEY RRs")
 	}
 }
 

@@ -108,7 +108,7 @@ func cmdRegisterWithMode(proxyAddr string, args []string, tamper bool) {
 	additionalSpecs := args[argIndex:]
 	additionalRRs := make([]dns.RR, 0, len(additionalSpecs))
 	for _, spec := range additionalSpecs {
-		rr, err := dnsmsg.ParseAdditionalRRSpec(spec, keyname, leaseDuration)
+		rr, err := dnsmsg.ParseAdditionalRRSpec(spec)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "ERROR: Invalid rr-spec %q: %v\n", spec, err)
 			os.Exit(1)
@@ -130,8 +130,8 @@ func cmdRegisterWithMode(proxyAddr string, args []string, tamper bool) {
 	}
 	fmt.Printf("\n")
 
-	// Step 1: Load client key by keyname (same key used for payload and SIG(0) signing)
-	fmt.Printf("Step 1: Loading client key for key name (%s) from keystore (%s)\n", keyname, keystoreDir)
+	// Load client key by keyname used for SIG(0) signing
+	fmt.Printf("Loading client key for key name (%s) from keystore (%s)\n", keyname, keystoreDir)
 	clientKeyName, err := keyrec.FindKeyByZone(keystoreDir, keyname)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "ERROR: Could not find client key for key name %s: %v\n", keyname, err)
@@ -149,11 +149,11 @@ func cmdRegisterWithMode(proxyAddr string, args []string, tamper bool) {
 	fmt.Printf("    KeyTag: %d\n", clientKey.PublicKey.KeyTag())
 	fmt.Printf("    Name: %s\n", clientKey.PublicKey.Hdr.Name)
 
-	// Step 2/3: Build UPDATE payload using shared packet factory
-	fmt.Printf("\nStep 2: Building UPDATE message payload\n")
+	// Build UPDATE payload using shared packet factory
+	fmt.Printf("\nBuilding UPDATE message payload\n")
 
-	// Step 3: Build KEY RR for Authority section (UPDATE section in DNS UPDATE)
-	fmt.Printf("\nStep 3: Adding KEY RR to Authority section\n")
+	// Build KEY RR for Authority section (UPDATE section in DNS UPDATE)
+	fmt.Printf("\nAdding KEY RR to Authority section\n")
 	// Create a KEY RR with client key material
 	keyRR := new(dns.KEY)
 	keyRR.Hdr.Name = keyname
@@ -166,25 +166,24 @@ func cmdRegisterWithMode(proxyAddr string, args []string, tamper bool) {
 	fmt.Printf("  ✓ Added KEY RR: %s\n", keyRR.String())
 
 	if len(additionalRRs) > 0 {
-		fmt.Printf("\nStep 3b: Adding additional RR(s) to Authority section\n")
+		fmt.Printf("\nAdding additional RR(s) to Authority section\n")
 		for _, rr := range additionalRRs {
 			fmt.Printf("  ✓ Added RR: %s\n", rr.String())
 		}
 	}
-
 	msg, err := dnsmsg.NewRegistrationUpdate(zone, keyRR, additionalRRs, leaseDuration, keyLeaseDuration)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "ERROR: Failed to build registration update packet: %v\n", err)
 		os.Exit(1)
 	}
 
-	fmt.Printf("\nStep 4: Added UPDATE-LEASE EDNS option\n")
+	fmt.Printf("\nAdded UPDATE-LEASE EDNS option\n")
 	fmt.Printf("  ✓ Added UPDATE-LEASE EDNS option\n")
 	fmt.Printf("    LEASE: %d seconds\n", leaseDuration)
 	fmt.Printf("    KEY-LEASE: %d seconds\n", keyLeaseDuration)
 
-	// Step 5: Sign with SIG(0)
-	fmt.Printf("\nStep 5: Signing with SIG(0)\n")
+	// Sign with SIG(0)
+	fmt.Printf("\nSigning with SIG(0)\n")
 	fmt.Printf("  Message before signing:\n")
 	fmt.Printf("    Question: %d\n", len(msg.Question))
 	fmt.Printf("    Answer: %d\n", len(msg.Answer))
@@ -217,7 +216,7 @@ func cmdRegisterWithMode(proxyAddr string, args []string, tamper bool) {
 	fmt.Printf("    Algorithm: %d\n", clientKey.PublicKey.Algorithm)
 
 	if tamper {
-		fmt.Printf("\nStep 5b: Tampering signed payload\n")
+		fmt.Printf("\nTampering signed payload\n")
 		if err := flipOnePayloadBit(signedMsg); err != nil {
 			fmt.Fprintf(os.Stderr, "ERROR: Failed to tamper signed message: %v\n", err)
 			os.Exit(1)
@@ -225,8 +224,8 @@ func cmdRegisterWithMode(proxyAddr string, args []string, tamper bool) {
 		fmt.Printf("  ✓ Flipped one bit in payload KEY RDATA after signing\n")
 	}
 
-	// Step 6: Send to proxy
-	fmt.Printf("\nStep 6: Sending to proxy (%s)\n", proxyAddr)
+	// Send to proxy
+	fmt.Printf("\nSending to proxy (%s)\n", proxyAddr)
 
 	// Check message before packing
 	fmt.Printf("  Message structure before sending:\n")
@@ -248,8 +247,8 @@ func cmdRegisterWithMode(proxyAddr string, args []string, tamper bool) {
 	}
 	fmt.Printf("  ✓ Response received\n")
 
-	// Step 7: Display response
-	fmt.Printf("\nStep 7: Response from proxy\n")
+	// Display response
+	fmt.Printf("\nResponse from proxy\n")
 	fmt.Printf("  Status: %s (Rcode=%d)\n", dns.RcodeToString[resp.Rcode], resp.Rcode)
 	fmt.Printf("  Flags: AA=%v, RD=%v, RA=%v\n", resp.Authoritative, resp.RecursionDesired, resp.RecursionAvailable)
 
@@ -314,7 +313,7 @@ func cmdRefresh(proxyAddr string, args []string) {
 	fmt.Printf("Key-Lease: %d seconds\n", keyLeaseDuration)
 	fmt.Printf("Lease Variant: 8-byte\n\n")
 
-	fmt.Printf("Step 1: Loading client key for key name (%s) from keystore (%s)\n", keyname, keystoreDir)
+	fmt.Printf("Loading client key for key name (%s) from keystore (%s)\n", keyname, keystoreDir)
 	clientKeyName, err := keyrec.FindKeyByZone(keystoreDir, keyname)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "ERROR: Could not find client key for key name %s: %v\n", keyname, err)
@@ -327,7 +326,7 @@ func cmdRefresh(proxyAddr string, args []string) {
 		os.Exit(1)
 	}
 
-	fmt.Printf("Step 2: Creating UPDATE refresh message\n")
+	fmt.Printf("Creating UPDATE refresh message\n")
 
 	keyRR := new(dns.KEY)
 	keyRR.Hdr.Name = keyname
@@ -343,14 +342,14 @@ func cmdRefresh(proxyAddr string, args []string) {
 		os.Exit(1)
 	}
 
-	fmt.Printf("Step 3: Signing refresh request with SIG(0)\n")
+	fmt.Printf("Signing refresh request with SIG(0)\n")
 	signedMsg, err := sig0.SignMessage(msg, clientKey.PublicKey, clientKey.PrivateKey)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "ERROR: Failed to sign message: %v\n", err)
 		os.Exit(1)
 	}
 
-	fmt.Printf("Step 4: Sending to proxy (%s)\n", proxyAddr)
+	fmt.Printf("Sending to proxy (%s)\n", proxyAddr)
 	c := client.New(proxyAddr, "udp", 20*time.Second)
 	resp, err := c.Query(signedMsg)
 	if err != nil {
