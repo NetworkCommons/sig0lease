@@ -24,7 +24,7 @@
 </h4>
 
 
-sig0lease is a reference implementation of DNS leases (as described in RFC 9664) together with an implementation of the Service Registration Protocol (described in RFC 9665) a sig0lease proxy server handles lease management for DNS updates on behalf of authoritative DNS resolvers for lease registrations and renewals by sig0lease clients. TThe concept of a DNS lease can be thought of as similar to a DHCP lease only it is a lease for a DNS name rather than for an IP address). 
+sig0lease is an implementation of DNS leases (as described in RFC 9664) together with an implementation of the Service Registration Protocol (described in RFC 9665) a sig0lease proxy server handles lease management for DNS updates on behalf of authoritative DNS resolvers for lease registrations and renewals by sig0lease clients. The concept of a DNS lease can be thought of as similar to a DHCP lease except it is a lease for DNS names rather than for an IP address). 
 
 Similar to sig0namectl, a SIG(0) KEY Resource Record (RR) is used as a secure DNS update method. A client may apply for registration of a DNS KEY lease that may be periodically refreshed. If the agreed lease time expires without renewal, the KEY RR and all other RRs leased through it are removed from the DNS zone. If the lease is renewed within the lease expiration time, then the leases are refreshed. While the KEY is active within the zone, DNS update rights are granted on a first come, first served (FCFS) basis.
 
