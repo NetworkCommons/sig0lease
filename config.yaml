@@ -1,0 +1,83 @@
+# DNS Proxy Configuration Example
+#
+# This file demonstrates the configuration options for the DNS proxy.
+# The proxy routes DNS queries based on their opcode to processing modules,
+# and forwards all other opcodes to upstream resolvers.
+#
+# Protocol-Specific Routing:
+# - UPDATE queries WITH UPDATE-LEASE EDNS option (RFC 9664) are handled by the update handler
+# - UPDATE queries WITHOUT UPDATE-LEASE EDNS option are forwarded to the default upstream resolver
+# - Other opcodes are routed according to the configured processing rules or forwarded upstream
+
+server:
+  # Address to listen on (port 8053 by default - non-privileged)
+  # For standard DNS, use :53 but requires root privileges
+  address: ":8053"
+
+  # Networks to enable
+  networks:
+    - udp
+    - tcp
+
+upstreams:
+  # Generic upstream resolvers used for non-processed opcodes.
+  # UPDATE handler primarily resolves authoritative server from handlers.update.upstream_zone.
+  - address: "8.8.8.8:53"
+    protocol: "udp"
+    timeout: "5s"
+
+  # Secondary upstream resolver (used as fallback)
+  - address: "8.8.4.4:53"
+    protocol: "udp"
+    timeout: "5s"
+
+# Handler Configuration for SIG(0) Registration Requests
+# Proxy acts as intermediary between downstream client and upstream authoritative server
+handlers:
+  update:
+    # Upstream zone used to discover authoritative nameserver for UPDATE forwarding.
+    # Proxy resolves NS for this zone and sends UPDATE to that authoritative server.
+    upstream_zone: "dev.zenr.io."
+
+    # Keystore directory containing DNSSEC keys in sig0namectl format
+    # Keys must be named: Kzone.+015+keytag.key and Kzone.+015+keytag.private
+    keystore_dir: "./keystore/server"
+
+    # Optional Lease rewrite policy applied before forwarding UPDATE to upstream.
+    # KEY and non-KEY records are clamped separately.
+    # RFC 9464:
+    # Default values for upper limits of 24 hours and 7 days, respectively,
+    # are RECOMMENDED.
+    # Servers implementing Update Lease MUST have a default minimum lease duration.
+    # A minimum of 30 seconds for both the LEASE and KEY-LEASE durations is RECOMMENDED.
+    lease_policy:
+      min_key_lease_sec: 20
+      max_key_lease_sec: 30
+      min_rr_lease_sec: 10
+      max_rr_lease_sec: 20
+
+    # Whether to use 4-byte variant for lease requests (backward compatibility).
+    # Default is false: 8-byte variant is always used for ALL lease requests.
+    # When true, refresh requests use 4-byte variant (no KEY-LEASE).
+    # When false, all requests use 8-byte variant (KEY-LEASE=0 for refresh/no second RR).
+    prefer_4byte_variant: false
+
+    # Blacklisted RR types that are not allowed for registration.
+    # These types will be rejected with a format error if attempted.
+    # Entries are RR type names as defined by IANA (case-insensitive).
+    # Commonly blacklisted types: NULL (unknown types), NXNAME.
+    blacklisted_types:
+      - "NULL"
+      - "NXNAME"
+      - "CLA"
+      - "IPN"
+
+# Processing rules map opcodes to module names
+processing_rules:
+  # Route opcode 5 (UPDATE) to an update handler module
+  # UPDATE queries are used for dynamic DNS updates (RFC 2136)
+  - opcode: 5
+    module: "update_handler"
+
+# Forwarding for opcodes not listed in processing_rules uses the upstreams list above.
+
