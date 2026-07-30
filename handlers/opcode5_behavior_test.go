@@ -343,18 +343,19 @@ func TestKeyLeaseZeroDeleteKeyNoOtherRecords_Expires(t *testing.T) {
 	}
 }
 
-func TestRecordKey_SameRecordDifferentTTL_ProducesDifferentKeys(t *testing.T) {
-	// Same name+type+rdata but different TTLs are distinct records.
+func TestRecordKey_SameRecordDifferentTTL_ProducesSameKey(t *testing.T) {
+	// Per rfc2136 - 1.1 - Comparison Rules: TTL is excluded from RR comparison.
+	// Same name+type+rdata but different TTLs produce the same key (they are equal).
 	mx1 := &dns.MX{Hdr: dns.Header{Name: "mailtrap.io.", Class: dns.ClassINET, TTL: 60}, MX: rdata.MX{Preference: 5, Mx: "mail1.mailtrap.io."}}
 	mx2 := &dns.MX{Hdr: dns.Header{Name: "mailtrap.io.", Class: dns.ClassINET, TTL: 300}, MX: rdata.MX{Preference: 5, Mx: "mail1.mailtrap.io."}}
 
 	key1 := recordKey(mx1)
 	key2 := recordKey(mx2)
-	if key1 == key2 {
-		t.Fatalf("same MX record with different TTLs produced same key (expected different): %q vs %q", key1, key2)
+	if key1 != key2 {
+		t.Fatalf("same MX record with different TTLs produced different keys (expected same per rfc2136 - 1.1): %q vs %q", key1, key2)
 	}
-	if strings.Contains(key1, "60") == false {
-		t.Fatalf("record key should contain TTL, got: %q", key1)
+	if strings.Contains(key1, "60") == true || strings.Contains(key1, "300") == true {
+		t.Fatalf("record key should NOT contain TTL (excluded per rfc2136 - 1.1), got: %q", key1)
 	}
 }
 
@@ -435,9 +436,10 @@ func TestRecordKey_DistinguishesDifferentTypes(t *testing.T) {
 	}
 }
 
-func TestSetDataLease_SameRecordDifferentTTL_CreatesDistinctEntries(t *testing.T) {
+func TestSetDataLease_SameRecordDifferentTTL_SingleEntry(t *testing.T) {
 	// Register a record with TTL=60, then same record at TTL=120.
-	// TTL difference makes this a distinct leased record.
+	// Per rfc2136 - 1.1 - Comparison Rules: TTL is excluded from RR comparison.
+	// Same record with different TTLs overwrites the previous entry (single entry).
 	h := NewUpdateHandler()
 	ctx := context.Background()
 
@@ -456,14 +458,16 @@ func TestSetDataLease_SameRecordDifferentTTL_CreatesDistinctEntries(t *testing.T
 		t.Fatalf("expected 1 record after first registration, got %d", len(dataLease.Records))
 	}
 
-	// Second registration: same record, but TTL 120 (different from 60).
+	// Second registration: same record (name+type+rdata), but TTL 120.
+	// Per rfc2136 - 1.1 - Comparison Rules, TTL is excluded from comparison,
+	// so this overwrites the first entry rather than creating a new one.
 	txt2 := &dns.TXT{Hdr: dns.Header{Name: "test.dev.zenr.io.", Class: dns.ClassINET, TTL: 120}}
 	txt2.Txt = []string{"hello"}
 	h.setDataLease(key.Hdr.Name, []dns.RR{txt2}, 120, "dev.zenr.io.")
 
 	dataLease = h.getDataLease(key.Hdr.Name)
-	if len(dataLease.Records) != 2 {
-		t.Fatalf("expected 2 records (distinct TTLs = distinct keys), got %d", len(dataLease.Records))
+	if len(dataLease.Records) != 1 {
+		t.Fatalf("expected 1 record (RFC 2136: TTL excluded from comparison, overwrite), got %d", len(dataLease.Records))
 	}
 }
 

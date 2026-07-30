@@ -21,10 +21,12 @@ import (
 type LeaseRecord = leasepkg.Record
 
 // DataLeaseRecord tracks non-KEY RR lease state linked to a key registration.
-// Records are tracked individually by their full RDATA, so each record
-// can have its own lease duration and expiry time.
+// Records are tracked individually by their RFC 2136 key (rfc2136 - 1.1 -
+// Comparison Rules), so each record can have its own lease duration and
+// expiry time. The key excludes TTL and applies special rules for SOA,
+// CNAME, and WKS record types.
 type DataLeaseRecord struct {
-	Records       map[string]*dataRecordEntry // key = full RR presentation (includes TTL)
+	Records       map[string]*dataRecordEntry // key = RFC 2136 RR key (excludes TTL)
 	ExpiresAt     time.Time
 	UpstreamZone  string
 	LeaseDuration uint32
@@ -39,13 +41,43 @@ type dataRecordEntry struct {
 	Deleted       bool
 }
 
-// recordKey returns a unique key for a DNS RR using full presentation form,
-// including TTL. Records differing in any field are tracked as distinct.
+// recordKey returns an RFC 2136-compliant key for a DNS RR.
+// Per rfc2136 - 1.1 - Comparison Rules, two RRs are equal if their NAME,
+// CLASS, TYPE, RDLENGTH, and RDATA fields are equal. The TTL field is
+// explicitly excluded from the comparison.
+//
+// Special RR types (rfc2136 - 1.1 - Comparison Rules):
+//   SOA:  compare only NAME, CLASS, TYPE (only one SOA per zone)
+//   CNAME: compare only NAME, CLASS, TYPE (only one CNAME per name)
+//   WKS:  compare only NAME, CLASS, TYPE, ADDRESS, PROTOCOL (services mask excluded)
 func recordKey(rr dns.RR) string {
 	if rr == nil {
 		return ""
 	}
-	return rr.String()
+	hdr := rr.Header()
+	name := hdr.Name
+	class := hdr.Class
+	typ := dns.RRToType(rr)
+
+	switch typ {
+	case dns.TypeSOA:
+		// rfc2136 - 1.1 - Comparison Rules: SOA compare only NAME, CLASS and TYPE
+		return name + " " + fmt.Sprint(class) + " " + fmt.Sprint(typ)
+	case dns.TypeCNAME:
+		// rfc2136 - 1.1 - Comparison Rules: CNAME compare only NAME, CLASS, and TYPE
+		return name + " " + fmt.Sprint(class) + " " + fmt.Sprint(typ)
+		case uint16(4): // WKS type code (not exported by the dns library)
+			// rfc2136 - 1.1 - Comparison Rules: WKS compare only NAME, CLASS, TYPE, ADDRESS, and PROTOCOL
+			// (services mask excluded). The dns library does not provide support for WKS RRs
+			// (no dns.WK type, no TypeWKS constant), so we have no proper parser for the RDATA.
+			// We fall back to comparing the full data string, which may include the services mask;
+			// this is not fully RFC 2136 compliant for WKS, but there is no better option available.
+			return name + " " + fmt.Sprint(class) + " " + fmt.Sprint(typ) + " " + rr.Data().String()
+	default:
+		// rfc2136 - 1.1 - Comparison Rules: two RRs are equal if their NAME,
+		// CLASS, TYPE, RDLENGTH and RDATA fields are equal (TTL excluded).
+		return name + " " + fmt.Sprint(class) + " " + fmt.Sprint(typ) + " " + fmt.Sprint(rr.Data().Len()) + " " + rr.Data().String()
+	}
 }
 
 // LeasePolicy controls rewrite clamping for upstream forwarded RRs.
@@ -1577,11 +1609,61 @@ func isNameAtOrAbove(baseName, candidate string) bool {
 	return strings.HasSuffix(base, "."+c)
 }
 
+// rrEqual compares two DNS RRs for RFC 2136 equality.
+// Per rfc2136 - 1.1 - Comparison Rules: two RRs are considered equal if
+// their NAME, CLASS, TYPE, RDLENGTH, and RDATA fields are equal.
+// The TTL field is explicitly excluded from the comparison.
+//
+// Special RR types (rfc2136 - 1.1 - Comparison Rules):
+//   SOA:  compare only NAME, CLASS, TYPE (only one SOA per zone)
+//   CNAME: compare only NAME, CLASS, TYPE (only one CNAME per name)
+//   WKS:  compare only NAME, CLASS, TYPE, ADDRESS, PROTOCOL (services mask excluded)
 func rrEqual(a, b dns.RR) bool {
 	if a == nil || b == nil {
 		return false
 	}
-	return dns.Equal(a, b)
+	hdrA := a.Header()
+	hdrB := b.Header()
+
+	if hdrA == nil || hdrB == nil {
+		return false
+	}
+
+	// Common fields: NAME, CLASS, TYPE
+	if !strings.EqualFold(hdrA.Name, hdrB.Name) {
+		return false
+	}
+	if hdrA.Class != hdrB.Class {
+		return false
+	}
+	if dns.RRToType(a) != dns.RRToType(b) {
+		return false
+	}
+
+	typA := dns.RRToType(a)
+
+	// Special RR types per rfc2136 - 1.1 - Comparison Rules
+	switch typA {
+	case dns.TypeSOA:
+		// SOA: compare only NAME, CLASS and TYPE
+		return true
+	case dns.TypeCNAME:
+		// CNAME: compare only NAME, CLASS, and TYPE
+		return true
+		case uint16(4): // WKS type code (not exported by the dns library)
+			// rfc2136 - 1.1 - Comparison Rules: WKS compare only NAME, CLASS, TYPE, ADDRESS, and PROTOCOL
+			// (services mask excluded). The dns library does not provide support for WKS RRs
+			// (no dns.WK type, no TypeWKS constant), so we have no proper parser for the RDATA.
+			// We fall back to comparing the full data string, which may include the services mask;
+			// this is not fully RFC 2136 compliant for WKS, but there is no better option available.
+			return a.Data().String() == b.Data().String()
+	default:
+		// Other RR types: compare RDLENGTH and RDATA (TTL excluded)
+		if a.Data().Len() != b.Data().Len() {
+			return false
+		}
+		return a.Data().String() == b.Data().String()
+	}
 }
 
 func (h *UpdateHandler) queryAuthoritativeRRs(ctx context.Context, zoneHint string, fqdn string, rrType uint16) ([]dns.RR, error) {
