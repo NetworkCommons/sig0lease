@@ -47,9 +47,10 @@ type dataRecordEntry struct {
 // explicitly excluded from the comparison.
 //
 // Special RR types (rfc2136 - 1.1 - Comparison Rules):
-//   SOA:  compare only NAME, CLASS, TYPE (only one SOA per zone)
-//   CNAME: compare only NAME, CLASS, TYPE (only one CNAME per name)
-//   WKS:  compare only NAME, CLASS, TYPE, ADDRESS, PROTOCOL (services mask excluded)
+//
+//	SOA:  compare only NAME, CLASS, TYPE (only one SOA per zone)
+//	CNAME: compare only NAME, CLASS, TYPE (only one CNAME per name)
+//	WKS:  compare only NAME, CLASS, TYPE, ADDRESS, PROTOCOL (services mask excluded)
 func recordKey(rr dns.RR) string {
 	if rr == nil {
 		return ""
@@ -66,13 +67,13 @@ func recordKey(rr dns.RR) string {
 	case dns.TypeCNAME:
 		// rfc2136 - 1.1 - Comparison Rules: CNAME compare only NAME, CLASS, and TYPE
 		return name + " " + fmt.Sprint(class) + " " + fmt.Sprint(typ)
-		case uint16(4): // WKS type code (not exported by the dns library)
-			// rfc2136 - 1.1 - Comparison Rules: WKS compare only NAME, CLASS, TYPE, ADDRESS, and PROTOCOL
-			// (services mask excluded). The dns library does not provide support for WKS RRs
-			// (no dns.WK type, no TypeWKS constant), so we have no proper parser for the RDATA.
-			// We fall back to comparing the full data string, which may include the services mask;
-			// this is not fully RFC 2136 compliant for WKS, but there is no better option available.
-			return name + " " + fmt.Sprint(class) + " " + fmt.Sprint(typ) + " " + rr.Data().String()
+	case uint16(4): // WKS type code (not exported by the dns library)
+		// rfc2136 - 1.1 - Comparison Rules: WKS compare only NAME, CLASS, TYPE, ADDRESS, and PROTOCOL
+		// (services mask excluded). The dns library does not provide support for WKS RRs
+		// (no dns.WK type, no TypeWKS constant), so we have no proper parser for the RDATA.
+		// We fall back to comparing the full data string, which may include the services mask;
+		// this is not fully RFC 2136 compliant for WKS, but there is no better option available.
+		return name + " " + fmt.Sprint(class) + " " + fmt.Sprint(typ) + " " + rr.Data().String()
 	default:
 		// rfc2136 - 1.1 - Comparison Rules: two RRs are equal if their NAME,
 		// CLASS, TYPE, RDLENGTH and RDATA fields are equal (TTL excluded).
@@ -80,7 +81,7 @@ func recordKey(rr dns.RR) string {
 	}
 }
 
-// LeasePolicy controls rewrite clamping for upstream forwarded RRs.
+// LeasePolicy controls clamping for lease durations and forwarded RR TTLs.
 type LeasePolicy struct {
 	MinKeyLease uint32
 	MaxKeyLease uint32
@@ -89,10 +90,10 @@ type LeasePolicy struct {
 }
 
 // LeaseManager is the shared lease manager abstraction.
-type LeaseManager = leasepkg.Manager
+type LeaseManager = leasepkg.LeaseStore
 
 // InMemoryLeaseManager is a reusable in-memory lease manager implementation.
-type InMemoryLeaseManager = leasepkg.InMemoryManager
+type InMemoryLeaseManager = leasepkg.InMemoryLeaseStore
 
 // NewInMemoryLeaseManager creates a new in-memory lease manager.
 func NewInMemoryLeaseManager() *InMemoryLeaseManager {
@@ -425,6 +426,20 @@ func clampTTL(ttl, min, max uint32) uint32 {
 	return ttl
 }
 
+func (h *UpdateHandler) clampLeaseDurations(leaseDuration, keyLeaseDuration uint32) (uint32, uint32) {
+	if leaseDuration != 0 {
+		leaseDuration = clampTTL(leaseDuration, h.LeasePolicy.MinRRLease, h.LeasePolicy.MaxRRLease)
+	}
+	if keyLeaseDuration != 0 {
+		keyLeaseDuration = clampTTL(keyLeaseDuration, h.LeasePolicy.MinKeyLease, h.LeasePolicy.MaxKeyLease)
+	}
+	if leaseDuration != 0 && keyLeaseDuration != 0 && leaseDuration > keyLeaseDuration {
+		// Preserve LEASE <= KEY-LEASE invariant when policy clamps tighten durations.
+		leaseDuration = keyLeaseDuration
+	}
+	return leaseDuration, keyLeaseDuration
+}
+
 func (h *UpdateHandler) applyLeasePolicy(keyRR *dns.KEY, other []dns.RR) (*dns.KEY, []dns.RR) {
 	newKey := copyRR(keyRR).(*dns.KEY)
 	newKey.Hdr.TTL = clampTTL(newKey.Hdr.TTL, h.LeasePolicy.MinKeyLease, h.LeasePolicy.MaxKeyLease)
@@ -457,10 +472,32 @@ func (h *UpdateHandler) validateRefreshOwnership(clientKeyRR *dns.KEY) error {
 	return nil
 }
 
+func (h *UpdateHandler) registerKeyLease(ctx context.Context, signerName, keyName string, keyRR *dns.KEY, leaseDuration uint32, keyLeaseDuration uint32) error {
+	if hs, ok := h.leaseManager.(leasepkg.HierarchicalLeaseStore); ok {
+		parent := ""
+		signerCanon := canonicalName(signerName)
+		keyCanon := canonicalName(keyName)
+		if signerCanon != "" && keyCanon != "" && signerCanon != keyCanon {
+			parent = signerName
+		}
+		return hs.RegisterWithParent(ctx, parent, keyName, keyRR, leaseDuration, keyLeaseDuration, h.upstreamZone)
+	}
+
+	return h.leaseManager.Register(ctx, keyName, keyRR, leaseDuration, keyLeaseDuration, h.upstreamZone)
+}
+
 func (h *UpdateHandler) setDataLease(keyName string, records []dns.RR, leaseDuration uint32, upstreamZone string) {
+	if treeStore, ok := h.leaseManager.(leasepkg.LeaseTreeStore); ok {
+		if err := treeStore.UpsertNonKEYRecords(keyName, records, leaseDuration, upstreamZone); err != nil {
+			h.logger.Debugf("failed to store non-KEY records in lease tree for %s: %v", keyName, err)
+		}
+		return
+	}
+
 	h.dataLeasesMu.Lock()
 	defer h.dataLeasesMu.Unlock()
 
+	keyName = canonicalName(keyName)
 	rec, ok := h.dataLeases[keyName]
 	if !ok {
 		rec = &DataLeaseRecord{Records: make(map[string]*dataRecordEntry)}
@@ -498,9 +535,14 @@ func (h *UpdateHandler) setDataLease(keyName string, records []dns.RR, leaseDura
 }
 
 func (h *UpdateHandler) refreshDataLease(keyName string, leaseDuration uint32) error {
+	if treeStore, ok := h.leaseManager.(leasepkg.LeaseTreeStore); ok {
+		return treeStore.RefreshNonKEYRecords(keyName, leaseDuration)
+	}
+
 	h.dataLeasesMu.Lock()
 	defer h.dataLeasesMu.Unlock()
 
+	keyName = canonicalName(keyName)
 	rec, ok := h.dataLeases[keyName]
 	if !ok {
 		return fmt.Errorf("refresh rejected: lease does not exist")
@@ -518,8 +560,14 @@ func (h *UpdateHandler) refreshDataLease(keyName string, leaseDuration uint32) e
 }
 
 func (h *UpdateHandler) deleteDataLease(keyName string) {
+	if treeStore, ok := h.leaseManager.(leasepkg.LeaseTreeStore); ok {
+		treeStore.MarkNonKEYRecordsDeleted(keyName)
+		return
+	}
+
 	h.dataLeasesMu.Lock()
 	defer h.dataLeasesMu.Unlock()
+	keyName = canonicalName(keyName)
 	rec, ok := h.dataLeases[keyName]
 	if !ok {
 		return
@@ -530,9 +578,46 @@ func (h *UpdateHandler) deleteDataLease(keyName string) {
 	}
 }
 
+func (h *UpdateHandler) removeDataLease(keyName string) {
+	if treeStore, ok := h.leaseManager.(leasepkg.LeaseTreeStore); ok {
+		treeStore.RemoveNonKEYRecords(keyName)
+		return
+	}
+
+	h.dataLeasesMu.Lock()
+	defer h.dataLeasesMu.Unlock()
+	keyName = canonicalName(keyName)
+	delete(h.dataLeases, keyName)
+}
+
 func (h *UpdateHandler) getDataLease(keyName string) *DataLeaseRecord {
+	if treeStore, ok := h.leaseManager.(leasepkg.LeaseTreeStore); ok {
+		set := treeStore.GetNonKEYRecordSet(keyName)
+		if set == nil {
+			return nil
+		}
+		rec := &DataLeaseRecord{
+			Records:      make(map[string]*dataRecordEntry, len(set.Records)),
+			UpstreamZone: set.UpstreamZone,
+			Deleted:      set.Deleted,
+		}
+		for rrKey, node := range set.Records {
+			if node == nil {
+				continue
+			}
+			rec.Records[rrKey] = &dataRecordEntry{
+				RR:            copyRR(node.RR),
+				ExpiresAt:     node.ExpiresAt,
+				LeaseDuration: node.LeaseDuration,
+				Deleted:       node.Deleted,
+			}
+		}
+		return rec
+	}
+
 	h.dataLeasesMu.RLock()
 	defer h.dataLeasesMu.RUnlock()
+	keyName = canonicalName(keyName)
 	rec, ok := h.dataLeases[keyName]
 	if !ok {
 		return nil
@@ -551,6 +636,9 @@ func (h *UpdateHandler) hasActiveDataRecord(keyName string, rr dns.RR) bool {
 	if rr == nil {
 		return false
 	}
+	if treeStore, ok := h.leaseManager.(leasepkg.LeaseTreeStore); ok {
+		return treeStore.HasActiveNonKEYRecord(keyName, rr)
+	}
 	rec := h.getDataLease(keyName)
 	if rec == nil {
 		return false
@@ -567,8 +655,14 @@ func (h *UpdateHandler) hasActiveDataRecord(keyName string, rr dns.RR) bool {
 }
 
 func (h *UpdateHandler) markDataLeaseDeleted(keyName string) {
+	if treeStore, ok := h.leaseManager.(leasepkg.LeaseTreeStore); ok {
+		treeStore.MarkNonKEYRecordsDeleted(keyName)
+		return
+	}
+
 	h.dataLeasesMu.Lock()
 	defer h.dataLeasesMu.Unlock()
+	keyName = canonicalName(keyName)
 	if rec, ok := h.dataLeases[keyName]; ok {
 		rec.Deleted = true
 	}
@@ -956,6 +1050,7 @@ func (h *UpdateHandler) processExpiredLease(ctx context.Context, keyName string)
 
 	// Per-record expiry: expire each expired data record individually.
 	if dataLease != nil {
+		expiredAny := false
 		effectiveZone := dataLease.UpstreamZone
 		if dc, ok := h.upstreamCoordinator.(*DefaultUpstreamCoordinator); ok {
 			resolvedZone, err := dc.resolveAuthoritativeZone(ctx, dataLease.UpstreamZone)
@@ -966,6 +1061,7 @@ func (h *UpdateHandler) processExpiredLease(ctx context.Context, keyName string)
 
 		for key, entry := range dataLease.Records {
 			if !entry.Deleted && !now.Before(entry.ExpiresAt) {
+				expiredAny = true
 				if h.upstreamCoordinator != nil {
 					deleteMsg, err := h.constructUpstreamDeleteForRecords([]dns.RR{entry.RR}, effectiveZone)
 					if err != nil {
@@ -976,6 +1072,9 @@ func (h *UpdateHandler) processExpiredLease(ctx context.Context, keyName string)
 				}
 				entry.Deleted = true
 			}
+		}
+		if expiredAny {
+			h.markDataLeaseDeleted(keyName)
 		}
 	}
 
@@ -1068,6 +1167,14 @@ func (h *UpdateHandler) Handle(ctx context.Context, w dns.ResponseWriter, r *dns
 		return NewErrorResult(msg, fmt.Sprintf("lease parsing failed: %v", err), err)
 	}
 
+	originalLeaseDuration := leaseDuration
+	originalKeyLeaseDuration := keyLeaseDuration
+	leaseDuration, keyLeaseDuration = h.clampLeaseDurations(leaseDuration, keyLeaseDuration)
+	if leaseDuration != originalLeaseDuration || keyLeaseDuration != originalKeyLeaseDuration {
+		h.logger.Debugf("Lease policy clamped request durations: lease=%d->%d key-lease=%d->%d",
+			originalLeaseDuration, leaseDuration, originalKeyLeaseDuration, keyLeaseDuration)
+	}
+
 	h.logger.Debugf("Parsed lease duration: %d seconds key-lease=%d", leaseDuration, keyLeaseDuration)
 
 	clientKeyRRs, otherRecords, err := extractUpdateRecords(r, h.blacklistedTypes)
@@ -1095,8 +1202,13 @@ func (h *UpdateHandler) Handle(ctx context.Context, w dns.ResponseWriter, r *dns
 	existingLease := h.leaseManager.Lookup(clientKeyName)
 	isRefresh := existingLease != nil
 
+	var requestKey *dns.KEY
+	if len(clientKeyRRs) > 0 {
+		requestKey = clientKeyRRs[0]
+	}
+
 	// Validate SIG(0) using request KEY (if matching signer) and authoritative DNS.
-	sigRR, signerKey, err := h.extractAndValidateSig0(ctx, r, zone, leaseOwner, clientKeyRRs[0])
+	sigRR, signerKey, err := h.extractAndValidateSig0(ctx, r, zone, leaseOwner, requestKey)
 	if err != nil {
 		h.logger.Debugf("SIG(0) validation failed: %v", err)
 		msg := h.makeErrorResponse(r, dns.RcodeRefused, fmt.Sprintf("SIG(0) validation failed: %v", err))
@@ -1115,12 +1227,13 @@ func (h *UpdateHandler) Handle(ctx context.Context, w dns.ResponseWriter, r *dns
 		h.logger.Debugf("Extracted request KEY RR[%d]: %s", i, keyRR.String())
 	}
 
-	// KEY-LEASE!=0, LEASE!=0 requires KEY + at least one non-KEY RR.
+	// KEY-LEASE!=0, LEASE!=0 requires KEY RR. Non-KEY RRs are optional:
+	// missing non-KEY RRs means KEY-only refresh/registration.
 	if keyLeaseDuration != 0 && leaseDuration != 0 {
-		if len(clientKeyRRs) == 0 || len(otherRecords) == 0 {
+		if len(clientKeyRRs) == 0 {
 			msg := h.makeErrorResponse(r, dns.RcodeFormatError,
-				"KEY-LEASE!=0 and LEASE!=0 requires KEY RR and at least one non-KEY RR")
-			return NewErrorResult(msg, "invalid update matrix for register/refresh", fmt.Errorf("missing required KEY/non-KEY records"))
+				"KEY-LEASE!=0 and LEASE!=0 requires at least one KEY RR")
+			return NewErrorResult(msg, "invalid update matrix for register/refresh", fmt.Errorf("missing required KEY record"))
 		}
 	}
 
@@ -1130,14 +1243,16 @@ func (h *UpdateHandler) Handle(ctx context.Context, w dns.ResponseWriter, r *dns
 	var responseKeys []*dns.KEY
 	upstreamKeys := make([]*dns.KEY, 0)
 	var acceptedRecordsForUpstream []dns.RR
+	affectedKeys := make([]string, 0)
 
 	for _, keyRR := range clientKeyRRs {
 		keyName := keyRR.Hdr.Name
 
 		// KEY-LEASE != 0, LEASE == 0: KEY lease registration (Case 4).
 		if keyLeaseDuration != 0 && leaseDuration == 0 {
+			affectedKeys = append(affectedKeys, keyName)
 			notes := make([]string, 0)
-			if err := h.leaseManager.Register(ctx, keyName, keyRR, keyLeaseDuration, keyLeaseDuration, h.upstreamZone); err != nil {
+			if err := h.registerKeyLease(ctx, sigRR.SignerName, keyName, keyRR, keyLeaseDuration, keyLeaseDuration); err != nil {
 				msg := h.makeErrorResponse(r, dns.RcodeServerFailure, fmt.Sprintf("key registration failed for %s: %v", keyName, err))
 				return NewErrorResult(msg, fmt.Sprintf("key registration failed for %s: %v", keyName, err), err)
 			}
@@ -1159,6 +1274,7 @@ func (h *UpdateHandler) Handle(ctx context.Context, w dns.ResponseWriter, r *dns
 
 		// KEY-LEASE == 0, LEASE == 0: delete matrix (Case 3).
 		if keyLeaseDuration == 0 && leaseDuration == 0 {
+			affectedKeys = append(affectedKeys, keyName)
 			notes := make([]string, 0)
 			if h.leaseManager.Lookup(keyName) == nil {
 				notes = append(notes, fmt.Sprintf("KEY %s not found for delete", keyName))
@@ -1184,6 +1300,7 @@ func (h *UpdateHandler) Handle(ctx context.Context, w dns.ResponseWriter, r *dns
 
 		// KEY-LEASE == 0, LEASE != 0: data-only lease (Case 1 or 2).
 		if keyLeaseDuration == 0 && leaseDuration != 0 {
+			affectedKeys = append(affectedKeys, keyName)
 			// Case 2: no other RRs — error.
 			if len(otherRecords) == 0 {
 				msg := h.makeErrorResponse(r, dns.RcodeRefused,
@@ -1205,8 +1322,9 @@ func (h *UpdateHandler) Handle(ctx context.Context, w dns.ResponseWriter, r *dns
 
 			acceptedRecords, notes, err := h.filterDuplicateRegistrations(ctx, keyName, zone, otherRecords)
 			if err != nil {
-				msg := h.makeErrorResponse(r, dns.RcodeServerFailure, fmt.Sprintf("authoritative duplicate check failed: %v", err))
-				return NewErrorResult(msg, "authoritative duplicate check failed", err)
+				h.rollbackLeaseStateForUpdate(affectedKeys)
+				msg := h.makeErrorResponse(r, dns.RcodeRefused, fmt.Sprintf("duplicate registration rejected: %v", err))
+				return NewErrorResult(msg, "duplicate registration rejected", err)
 			}
 			if len(acceptedRecords) > 0 {
 				h.setDataLease(keyName, acceptedRecords, leaseDuration, h.upstreamZone)
@@ -1221,6 +1339,7 @@ func (h *UpdateHandler) Handle(ctx context.Context, w dns.ResponseWriter, r *dns
 		// KEY-LEASE != 0, LEASE != 0: normal registration (Case 1).
 		// This is the full registration path.
 		if isRefresh {
+			affectedKeys = append(affectedKeys, keyName)
 			// Normal refresh: validate ownership and refresh key/data lease.
 			if err := h.validateRefreshOwnership(keyRR); err != nil {
 				// Ownership check failed (key mismatch). Promote to full registration
@@ -1229,7 +1348,7 @@ func (h *UpdateHandler) Handle(ctx context.Context, w dns.ResponseWriter, r *dns
 				existingKey := h.leaseManager.Lookup(keyName)
 				if existingKey == nil {
 					// Key not at FQDN: promote to full registration (both key and data RRs).
-					if err := h.leaseManager.Register(ctx, keyName, keyRR, leaseDuration, keyLeaseDuration, h.upstreamZone); err != nil {
+					if err := h.registerKeyLease(ctx, sigRR.SignerName, keyName, keyRR, keyLeaseDuration, keyLeaseDuration); err != nil {
 						msg := h.makeErrorResponse(r, dns.RcodeServerFailure, fmt.Sprintf("lease registration failed for %s: %v", keyName, err))
 						return NewErrorResult(msg, fmt.Sprintf("lease registration failed for %s: %v", keyName, err), err)
 					}
@@ -1246,9 +1365,17 @@ func (h *UpdateHandler) Handle(ctx context.Context, w dns.ResponseWriter, r *dns
 				msg := h.makeErrorResponse(r, dns.RcodeRefused, err.Error())
 				return NewErrorResult(msg, err.Error(), err)
 			}
-			if err := h.refreshDataLease(keyName, leaseDuration); err != nil {
-				msg := h.makeErrorResponse(r, dns.RcodeRefused, err.Error())
-				return NewErrorResult(msg, err.Error(), err)
+			// Key refresh always extends key lease if ownership validated.
+			if err := h.registerKeyLease(ctx, sigRR.SignerName, keyName, keyRR, keyLeaseDuration, keyLeaseDuration); err != nil {
+				msg := h.makeErrorResponse(r, dns.RcodeServerFailure, fmt.Sprintf("lease registration failed for %s: %v", keyName, err))
+				return NewErrorResult(msg, fmt.Sprintf("lease registration failed for %s: %v", keyName, err), err)
+			}
+
+			if len(otherRecords) > 0 {
+				if err := h.refreshDataLease(keyName, leaseDuration); err != nil {
+					msg := h.makeErrorResponse(r, dns.RcodeRefused, err.Error())
+					return NewErrorResult(msg, err.Error(), err)
+				}
 			}
 			h.scheduleLeaseExpiry(keyName)
 
@@ -1260,29 +1387,33 @@ func (h *UpdateHandler) Handle(ctx context.Context, w dns.ResponseWriter, r *dns
 		}
 
 		// Normal path (not refresh): KEY-LEASE != 0 and LEASE != 0.
+		affectedKeys = append(affectedKeys, keyName)
 		partialNotes := make([]string, 0)
 		registerKey := true
 		if h.leaseManager.Lookup(keyName) == nil {
 			exists, err := h.authoritativeHasRR(ctx, zone, keyRR)
 			if err != nil {
+				h.rollbackLeaseStateForUpdate(affectedKeys)
 				msg := h.makeErrorResponse(r, dns.RcodeServerFailure, fmt.Sprintf("authoritative duplicate check failed: %v", err))
 				return NewErrorResult(msg, "authoritative duplicate check failed", err)
 			}
 			if exists {
-				registerKey = false
-				partialNotes = append(partialNotes, fmt.Sprintf("skipped duplicate registration for KEY %s", keyRR.Hdr.Name))
+				h.rollbackLeaseStateForUpdate(affectedKeys)
+				msg := h.makeErrorResponse(r, dns.RcodeRefused, fmt.Sprintf("duplicate registration rejected: authoritative RR already exists for %s", keyRR.String()))
+				return NewErrorResult(msg, "duplicate registration rejected", fmt.Errorf("authoritative RR already exists for %s", keyRR.String()))
 			}
 		}
 
 		acceptedRecords, notes, err := h.filterDuplicateRegistrations(ctx, keyName, zone, otherRecords)
 		if err != nil {
-			msg := h.makeErrorResponse(r, dns.RcodeServerFailure, fmt.Sprintf("authoritative duplicate check failed: %v", err))
-			return NewErrorResult(msg, "authoritative duplicate check failed", err)
+			h.rollbackLeaseStateForUpdate(affectedKeys)
+			msg := h.makeErrorResponse(r, dns.RcodeRefused, fmt.Sprintf("duplicate registration rejected: %v", err))
+			return NewErrorResult(msg, "duplicate registration rejected", err)
 		}
 		partialNotes = append(partialNotes, notes...)
 
 		if registerKey {
-			if err := h.leaseManager.Register(ctx, keyName, keyRR, leaseDuration, keyLeaseDuration, h.upstreamZone); err != nil {
+			if err := h.registerKeyLease(ctx, sigRR.SignerName, keyName, keyRR, keyLeaseDuration, keyLeaseDuration); err != nil {
 				h.logger.Debugf("Failed to register lease for %s: %v", keyName, err)
 				msg := h.makeErrorResponse(r, dns.RcodeServerFailure, fmt.Sprintf("lease registration failed for %s: %v", keyName, err))
 				return NewErrorResult(msg, fmt.Sprintf("lease registration failed for %s: %v", keyName, err), err)
@@ -1330,9 +1461,7 @@ func (h *UpdateHandler) Handle(ctx context.Context, w dns.ResponseWriter, r *dns
 			if err != nil {
 				h.logger.Debugf("Failed to resolve effective upstream zone from %s: %v", h.upstreamZone, err)
 				// Rollback: delete all registered leases.
-				for _, keyRR := range upstreamKeys {
-					_ = h.leaseManager.Delete(keyRR.Hdr.Name)
-				}
+				h.rollbackLeaseStateForUpdate(affectedKeys)
 				msg := h.makeErrorResponse(r, dns.RcodeServerFailure, fmt.Sprintf("upstream zone resolution failed: %v", err))
 				return NewErrorResult(msg, fmt.Sprintf("upstream zone resolution failed: %v", err), err)
 			}
@@ -1344,9 +1473,7 @@ func (h *UpdateHandler) Handle(ctx context.Context, w dns.ResponseWriter, r *dns
 		if err != nil {
 			h.logger.Debugf("Failed to construct upstream UPDATE: %v", err)
 			// Rollback: delete all registered leases.
-			for _, keyRR := range upstreamKeys {
-				_ = h.leaseManager.Delete(keyRR.Hdr.Name)
-			}
+			h.rollbackLeaseStateForUpdate(affectedKeys)
 			msg := h.makeErrorResponse(r, dns.RcodeServerFailure, fmt.Sprintf("upstream construction failed: %v", err))
 			return NewErrorResult(msg, fmt.Sprintf("upstream construction failed: %v", err), err)
 		}
@@ -1365,9 +1492,7 @@ func (h *UpdateHandler) Handle(ctx context.Context, w dns.ResponseWriter, r *dns
 
 		// Send UPDATE to upstream and fail-closed if upstream does not accept it.
 		if h.upstreamCoordinator == nil {
-			for _, keyRR := range upstreamKeys {
-				_ = h.leaseManager.Delete(keyRR.Hdr.Name)
-			}
+			h.rollbackLeaseStateForUpdate(affectedKeys)
 			msg := h.makeErrorResponse(r, dns.RcodeServerFailure, "upstream coordinator not configured")
 			return NewErrorResult(msg, "upstream coordinator not configured", fmt.Errorf("upstream coordinator is nil"))
 		}
@@ -1379,18 +1504,14 @@ func (h *UpdateHandler) Handle(ctx context.Context, w dns.ResponseWriter, r *dns
 			h.logger.Debugf("Upstream UPDATE transport/processing error for zone=%s keys=%d: %v",
 				h.upstreamZone, len(upstreamKeys), err)
 			// Rollback: delete all registered leases.
-			for _, keyRR := range upstreamKeys {
-				_ = h.leaseManager.Delete(keyRR.Hdr.Name)
-			}
+			h.rollbackLeaseStateForUpdate(affectedKeys)
 			msg := h.makeErrorResponse(r, dns.RcodeServerFailure, fmt.Sprintf("upstream update failed: %v", err))
 			return NewErrorResult(msg, fmt.Sprintf("upstream update failed: %v", err), err)
 		}
 		if upstreamResp == nil {
 			h.logger.Debugf("Upstream UPDATE returned nil response for zone=%s keys=%d",
 				h.upstreamZone, len(upstreamKeys))
-			for _, keyRR := range upstreamKeys {
-				_ = h.leaseManager.Delete(keyRR.Hdr.Name)
-			}
+			h.rollbackLeaseStateForUpdate(affectedKeys)
 			msg := h.makeErrorResponse(r, dns.RcodeServerFailure, "upstream update returned nil response")
 			return NewErrorResult(msg, "upstream update returned nil response", fmt.Errorf("nil upstream response"))
 		}
@@ -1400,9 +1521,7 @@ func (h *UpdateHandler) Handle(ctx context.Context, w dns.ResponseWriter, r *dns
 			len(upstreamResp.Answer), len(upstreamResp.Ns), len(upstreamResp.Extra))
 		if upstreamResp.Rcode != dns.RcodeSuccess {
 			// Rollback: delete all registered leases.
-			for _, keyRR := range upstreamKeys {
-				_ = h.leaseManager.Delete(keyRR.Hdr.Name)
-			}
+			h.rollbackLeaseStateForUpdate(affectedKeys)
 			msg := h.makeErrorResponse(r, dns.RcodeServerFailure,
 				fmt.Sprintf("upstream rejected update: rcode=%d (%s)",
 					upstreamResp.Rcode, dns.RcodeToString[upstreamResp.Rcode]))
@@ -1615,9 +1734,10 @@ func isNameAtOrAbove(baseName, candidate string) bool {
 // The TTL field is explicitly excluded from the comparison.
 //
 // Special RR types (rfc2136 - 1.1 - Comparison Rules):
-//   SOA:  compare only NAME, CLASS, TYPE (only one SOA per zone)
-//   CNAME: compare only NAME, CLASS, TYPE (only one CNAME per name)
-//   WKS:  compare only NAME, CLASS, TYPE, ADDRESS, PROTOCOL (services mask excluded)
+//
+//	SOA:  compare only NAME, CLASS, TYPE (only one SOA per zone)
+//	CNAME: compare only NAME, CLASS, TYPE (only one CNAME per name)
+//	WKS:  compare only NAME, CLASS, TYPE, ADDRESS, PROTOCOL (services mask excluded)
 func rrEqual(a, b dns.RR) bool {
 	if a == nil || b == nil {
 		return false
@@ -1650,13 +1770,13 @@ func rrEqual(a, b dns.RR) bool {
 	case dns.TypeCNAME:
 		// CNAME: compare only NAME, CLASS, and TYPE
 		return true
-		case uint16(4): // WKS type code (not exported by the dns library)
-			// rfc2136 - 1.1 - Comparison Rules: WKS compare only NAME, CLASS, TYPE, ADDRESS, and PROTOCOL
-			// (services mask excluded). The dns library does not provide support for WKS RRs
-			// (no dns.WK type, no TypeWKS constant), so we have no proper parser for the RDATA.
-			// We fall back to comparing the full data string, which may include the services mask;
-			// this is not fully RFC 2136 compliant for WKS, but there is no better option available.
-			return a.Data().String() == b.Data().String()
+	case uint16(4): // WKS type code (not exported by the dns library)
+		// rfc2136 - 1.1 - Comparison Rules: WKS compare only NAME, CLASS, TYPE, ADDRESS, and PROTOCOL
+		// (services mask excluded). The dns library does not provide support for WKS RRs
+		// (no dns.WK type, no TypeWKS constant), so we have no proper parser for the RDATA.
+		// We fall back to comparing the full data string, which may include the services mask;
+		// this is not fully RFC 2136 compliant for WKS, but there is no better option available.
+		return a.Data().String() == b.Data().String()
 	default:
 		// Other RR types: compare RDLENGTH and RDATA (TTL excluded)
 		if a.Data().Len() != b.Data().Len() {
@@ -1748,19 +1868,39 @@ func (h *UpdateHandler) filterDuplicateRegistrations(ctx context.Context, keyNam
 			continue
 		}
 
-		// New registration attempt for this RR: reject per-record if already present authoritatively.
+		// New registration attempt for this RR: fail the whole request if
+		// the authoritative zone already contains an identical RR.
 		exists, err := h.authoritativeHasRR(ctx, zoneHint, rr)
 		if err != nil {
 			return nil, nil, err
 		}
 		if exists {
-			notes = append(notes, fmt.Sprintf("skipped duplicate registration for %s", rr.String()))
-			continue
+			return nil, nil, fmt.Errorf("duplicate registration rejected: authoritative RR already exists for %s", rr.String())
 		}
 		accepted = append(accepted, rr)
 	}
 
 	return accepted, notes, nil
+}
+
+func (h *UpdateHandler) rollbackLeaseStateForUpdate(keyNames []string) {
+	seen := make(map[string]struct{}, len(keyNames))
+	for _, keyName := range keyNames {
+		name := canonicalName(keyName)
+		if name == "" {
+			continue
+		}
+		if _, ok := seen[name]; ok {
+			continue
+		}
+		seen[name] = struct{}{}
+
+		if err := h.leaseManager.Delete(name); err != nil {
+			h.logger.Debugf("rollback: failed to delete key lease for %s: %v", name, err)
+		}
+		h.removeDataLease(name)
+		h.clearLeaseTimer(name)
+	}
 }
 
 // extractAndValidateSig0 extracts and validates SIG(0) from the message.
@@ -1974,7 +2114,7 @@ func toUint32(v any) (uint32, bool) {
 //   - "upstream_coordinator": Custom UpstreamCoordinator implementation [OPTIONAL]
 //   - "lease_manager": Custom LeaseManager implementation [OPTIONAL, defaults to InMemoryLeaseManager]
 //   - "persistence_hook": Persistence function for leases [OPTIONAL]
-//   - "lease_policy": Rewrite TTL bounds applied before upstream forwarding [OPTIONAL]
+//   - "lease_policy": Bounds applied to local lease durations and forwarded RR TTLs [OPTIONAL]
 //   - "key_retrieval_mode": How to retrieve KEY RR when not in request: "lease_store_only",
 //     "dns_server_only", or "lease_store_with_dns_fallback" [OPTIONAL, defaults to lease_store_with_dns_fallback]
 //   - "prefer_4byte_variant": Enable 4-byte variant for backward compatibility [OPTIONAL, defaults to false]
@@ -2019,7 +2159,7 @@ func (h *UpdateHandler) Setup(cfg map[string]any) error {
 		h.logger.Debugf("Persistence hook configured for leases")
 	}
 
-	// Optional: TTL rewrite policy hook
+	// Optional: Lease/TTL policy hook
 	if raw, ok := cfg["lease_policy"]; ok {
 		policy, ok := raw.(map[string]any)
 		if !ok {
@@ -2045,7 +2185,7 @@ func (h *UpdateHandler) Setup(cfg map[string]any) error {
 			return fmt.Errorf("lease_policy min_rr_lease_sec cannot be greater than max_rr_lease_sec")
 		}
 
-		h.logger.Debugf("TTL policy configured: key[min=%d,max=%d] rr[min=%d,max=%d]",
+		h.logger.Debugf("Lease policy configured: key[min=%d,max=%d] rr[min=%d,max=%d]",
 			h.LeasePolicy.MinKeyLease, h.LeasePolicy.MaxKeyLease, h.LeasePolicy.MinRRLease, h.LeasePolicy.MaxRRLease)
 	}
 

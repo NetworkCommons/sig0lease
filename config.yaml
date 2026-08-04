@@ -51,10 +51,10 @@ handlers:
     # Servers implementing Update Lease MUST have a default minimum lease duration.
     # A minimum of 30 seconds for both the LEASE and KEY-LEASE durations is RECOMMENDED.
     lease_policy:
-      min_key_lease_sec: 20
-      max_key_lease_sec: 30
-      min_rr_lease_sec: 10
-      max_rr_lease_sec: 20
+      min_key_lease_sec: 30
+      max_key_lease_sec: 1800
+      min_rr_lease_sec: 30
+      max_rr_lease_sec: 900
 
     # Whether to use 4-byte variant for lease requests (backward compatibility).
     # Default is false: 8-byte variant is always used for ALL lease requests.

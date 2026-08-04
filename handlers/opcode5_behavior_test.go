@@ -113,6 +113,55 @@ func TestApplyLeasePolicyClampsKeyAndOtherRecords(t *testing.T) {
 	}
 }
 
+func TestClampLeaseDurationsAppliesBoundsAndKeepsOrder(t *testing.T) {
+	h := NewUpdateHandler()
+	h.LeasePolicy = LeasePolicy{
+		MinKeyLease: 20,
+		MaxKeyLease: 30,
+		MinRRLease:  10,
+		MaxRRLease:  20,
+	}
+
+	lease, keyLease := h.clampLeaseDurations(25, 100)
+	if keyLease != 30 {
+		t.Fatalf("expected key-lease clamped to 30, got %d", keyLease)
+	}
+	if lease != 20 {
+		t.Fatalf("expected lease clamped to 20, got %d", lease)
+	}
+
+	h.LeasePolicy = LeasePolicy{
+		MinKeyLease: 20,
+		MaxKeyLease: 25,
+		MinRRLease:  10,
+		MaxRRLease:  30,
+	}
+	lease, keyLease = h.clampLeaseDurations(29, 29)
+	if lease != 25 || keyLease != 25 {
+		t.Fatalf("expected lease<=key-lease invariant after clamp, got lease=%d key-lease=%d", lease, keyLease)
+	}
+}
+
+func TestClampLeaseDurationsPreservesZeroSemantics(t *testing.T) {
+	h := NewUpdateHandler()
+	h.LeasePolicy = LeasePolicy{
+		MinKeyLease: 20,
+		MaxKeyLease: 30,
+		MinRRLease:  10,
+		MaxRRLease:  20,
+	}
+
+	lease, keyLease := h.clampLeaseDurations(0, 0)
+	if lease != 0 || keyLease != 0 {
+		t.Fatalf("expected zero delete semantics preserved, got lease=%d key-lease=%d", lease, keyLease)
+	}
+
+	lease, keyLease = h.clampLeaseDurations(0, 99)
+	if lease != 0 || keyLease != 30 {
+		t.Fatalf("expected key-only lease semantics preserved with clamped key-lease, got lease=%d key-lease=%d", lease, keyLease)
+	}
+}
+
 func TestDataLeaseExpiresBeforeKeyLease(t *testing.T) {
 	h := NewUpdateHandler()
 	ctx := context.Background()
@@ -394,7 +443,7 @@ func TestSetDataLease_StoresMXRecordsWithDifferentPriority(t *testing.T) {
 	}
 }
 
-func TestFilterDuplicateRegistrations_SkipsOnlyDuplicateRecords(t *testing.T) {
+func TestFilterDuplicateRegistrations_RejectsDuplicateRecord(t *testing.T) {
 	h := NewUpdateHandler()
 	existing := &dns.TXT{Hdr: dns.Header{Name: "test.dev.zenr.io.", Class: dns.ClassINET, TTL: 60}}
 	existing.TXT.Txt = []string{"existing"}
@@ -409,17 +458,59 @@ func TestFilterDuplicateRegistrations_SkipsOnlyDuplicateRecords(t *testing.T) {
 	}
 
 	accepted, notes, err := h.filterDuplicateRegistrations(context.Background(), "test.dev.zenr.io.", "test.dev.zenr.io.", []dns.RR{existing, newRec})
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
+	if err == nil {
+		t.Fatal("expected duplicate registration to be rejected")
 	}
-	if len(accepted) != 1 {
-		t.Fatalf("expected one accepted record, got %d", len(accepted))
+	if len(accepted) != 0 {
+		t.Fatalf("expected no accepted records on duplicate rejection, got %d", len(accepted))
 	}
-	if !rrEqual(accepted[0], newRec) {
-		t.Fatalf("expected non-duplicate record to be accepted")
+	if len(notes) != 0 {
+		t.Fatalf("expected no duplicate notes on rejection, got %d", len(notes))
 	}
-	if len(notes) != 1 {
-		t.Fatalf("expected one duplicate note, got %d", len(notes))
+}
+
+func TestFilterDuplicateRegistrations_RejectsAuthoritativeDuplicateRecord(t *testing.T) {
+	h := NewUpdateHandler()
+	record := &dns.TXT{Hdr: dns.Header{Name: "test.dev.zenr.io.", Class: dns.ClassINET, TTL: 60}}
+	record.TXT.Txt = []string{"existing"}
+
+	h.authoritativeLookup = func(ctx context.Context, zoneHint, fqdn string, rrType uint16) ([]dns.RR, error) {
+		if rrType != dns.TypeTXT {
+			return nil, nil
+		}
+		return []dns.RR{record}, nil
+	}
+
+	accepted, notes, err := h.filterDuplicateRegistrations(context.Background(), "test.dev.zenr.io.", "test.dev.zenr.io.", []dns.RR{record})
+	if err == nil {
+		t.Fatal("expected duplicate registration to be rejected")
+	}
+	if len(accepted) != 0 {
+		t.Fatalf("expected no accepted records for duplicate, got %d", len(accepted))
+	}
+	if len(notes) != 0 {
+		t.Fatalf("expected no duplicate notes on rejection, got %d", len(notes))
+	}
+}
+
+func TestRollbackLeaseStateForUpdateRemovesKeyAndDataEntries(t *testing.T) {
+	h := NewUpdateHandler()
+	ctx := context.Background()
+	key := testKeyRR("test.dev.zenr.io.", "AAAATESTKEY101=")
+	if err := h.leaseManager.Register(ctx, key.Hdr.Name, key, 120, 120, "dev.zenr.io."); err != nil {
+		t.Fatalf("register key lease: %v", err)
+	}
+	data := &dns.TXT{Hdr: dns.Header{Name: key.Hdr.Name, Class: dns.ClassINET, TTL: 60}}
+	data.TXT.Txt = []string{"payload"}
+	h.setDataLease(key.Hdr.Name, []dns.RR{data}, 120, "dev.zenr.io.")
+
+	h.rollbackLeaseStateForUpdate([]string{key.Hdr.Name})
+
+	if h.leaseManager.Lookup(key.Hdr.Name) != nil {
+		t.Fatal("expected key lease to be removed")
+	}
+	if got := h.getDataLease(key.Hdr.Name); got != nil {
+		t.Fatalf("expected data lease to be removed, got %+v", got)
 	}
 }
 

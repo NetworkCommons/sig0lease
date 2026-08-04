@@ -41,6 +41,9 @@ KEY_LEASE_SECONDS="${KEY_LEASE_SECONDS:-30}"
 MIN_KEY_LEASE_SECONDS="${MIN_KEY_LEASE_SECONDS:-30}"
 # Case 2 validates refresh behavior under split-lease policy: keep KEY alive longer.
 REFRESH_CASE_KEY_LEASE_SECONDS="${REFRESH_CASE_KEY_LEASE_SECONDS:-3600}"
+OVERLAP_RR_LEASE_SECONDS="${OVERLAP_RR_LEASE_SECONDS:-30}"
+OVERLAP_KEY_LEASE_SECONDS="${OVERLAP_KEY_LEASE_SECONDS:-120}"
+OVERLAP_DELAY_SECONDS="${OVERLAP_DELAY_SECONDS:-10}"
 
 # Optional: limit matrix run to selected RR types, e.g. RR_TYPES="KEY TXT"
 # Supported types: KEY TXT A AAAA NULL NXNAME WALLET CLA IPN
@@ -77,6 +80,15 @@ wait_until_epoch() {
     local lease_seconds="$2"
     local grace_seconds="$3"
     local target_epoch=$((lease_start_epoch + lease_seconds + grace_seconds))
+    local now
+    now=$(date +%s)
+    if [ "$now" -lt "$target_epoch" ]; then
+        sleep $((target_epoch - now))
+    fi
+}
+
+wait_until_absolute_epoch() {
+    local target_epoch="$1"
     local now
     now=$(date +%s)
     if [ "$now" -lt "$target_epoch" ]; then
@@ -217,6 +229,15 @@ rr_is_present() {
     local answer
     answer=$(query_rr_at_authoritative "$name" "$rr_type" | tail -n 1 || true)
     [ -n "$answer" ]
+}
+
+rr_output_contains() {
+    local name="$1"
+    local rr_type="$2"
+    local needle="$3"
+    local out
+    out=$(query_rr_at_authoritative "$name" "$rr_type" | tail -n +1 || true)
+    echo "$out" | grep -Fq "$needle"
 }
 
 wait_for_rr_state() {
@@ -421,25 +442,35 @@ test_case_register_expire_remove() {
     log_step "Waiting until lease expiry boundary"
     wait_until_epoch "$lease_start" "$lease" 3
 
-    log_step "Attempting refresh after expiry (must succeed for KEY)"
-    if run_client "$PROXY_URL" refresh "$DOWNSTREAM_ZONE" "$CLIENT_KEY_NAME" "$REFRESH_SECONDS"; then
-        log_error "Refresh succeeded after expiry, expected failure"
-        return 1
-    fi
+    # KEY should be gone before we exercise post-expiry behavior.
     wait_for_rr_state "$DOWNSTREAM_ZONE" KEY absent
     proxy_consistent_with_authoritative "$DOWNSTREAM_ZONE" KEY absent
-    if [ "$rr_type" != "KEY" ]; then
+
+    if [ "$rr_type" = "KEY" ]; then
+        log_step "Attempting refresh after expiry (KEY path: expected to re-register)"
+        run_client "$PROXY_URL" refresh "$DOWNSTREAM_ZONE" "$CLIENT_KEY_NAME" "$REFRESH_SECONDS"
+        wait_for_rr_state "$DOWNSTREAM_ZONE" KEY present
+        proxy_consistent_with_authoritative "$DOWNSTREAM_ZONE" KEY present
+        log_success "Expired KEY refresh succeeded via re-registration semantics"
+    else
+        log_step "Attempting refresh after expiry (non-KEY path: expected failure)"
+        if run_client "$PROXY_URL" refresh "$DOWNSTREAM_ZONE" "$CLIENT_KEY_NAME" "$REFRESH_SECONDS"; then
+            log_error "Refresh succeeded after expiry, expected failure"
+            return 1
+        fi
+        wait_for_rr_state "$DOWNSTREAM_ZONE" KEY absent
+        proxy_consistent_with_authoritative "$DOWNSTREAM_ZONE" KEY absent
         log_step "Post-expiry note: non-key RR ($rr_type) state is informational only"
         query_rr_at_authoritative "$DOWNSTREAM_ZONE" "$rr_type" >/dev/null || true
+        assert_proxy_log_contains "refresh rejected: lease does not exist"
     fi
 
-    assert_proxy_log_contains "refresh rejected: lease does not exist"
     expected_min=$((lease_start + lease + 3 - case_start))
     if [ "$expected_min" -lt 0 ]; then
         expected_min=0
     fi
     log_case_timing "case1-${rr_type}" "$case_start" "$expected_min"
-    log_success "Expired lease no longer refreshable for $rr_type"
+    log_success "Case 1 post-expiry behavior validated for $rr_type"
 }
 
 test_case_register_refresh_not_prematurely_removed() {
@@ -460,7 +491,7 @@ test_case_register_refresh_not_prematurely_removed() {
     query_lease_dump "info"
 
     log_step "Waiting to near-expiry checkpoint then refreshing"
-    wait_until_epoch $((lease_start + 20))
+    wait_until_absolute_epoch $((lease_start + 20))
     refresh_start=$(date +%s)
     run_client "$PROXY_URL" refresh "$DOWNSTREAM_ZONE" "$CLIENT_KEY_NAME" "$REFRESH_SECONDS"
     wait_for_rr_state "$DOWNSTREAM_ZONE" KEY present
@@ -494,6 +525,92 @@ test_case_register_refresh_not_prematurely_removed() {
     fi
     log_case_timing "case2-${rr_type}" "$case_start" "$expected_min"
     log_success "Lease behavior validated after renewal for $rr_type"
+}
+
+test_case_split_lease_nonkey_expires_key_persists() {
+    local rr_type="$1"
+    if [ "$rr_type" = "KEY" ]; then
+        return 0
+    fi
+
+    log_section "CASE 2B [$rr_type]: LEASE < KEY-LEASE Deletes Non-KEY Only"
+
+    local case_start lease_start expected_min
+    case_start=$(date +%s)
+    lease_start=$(date +%s)
+
+    log_step "Registering split lease for $rr_type (LEASE=$LEASE_SECONDS, KEY-LEASE=$REFRESH_CASE_KEY_LEASE_SECONDS)"
+    register_with_rr_type "$rr_type" "$LEASE_SECONDS" "$REFRESH_CASE_KEY_LEASE_SECONDS"
+    wait_for_rr_state "$DOWNSTREAM_ZONE" KEY present
+    wait_for_rr_state "$DOWNSTREAM_ZONE" "$rr_type" present
+
+    log_step "Waiting past LEASE boundary and verifying only non-KEY records expire"
+    wait_until_epoch "$lease_start" "$LEASE_SECONDS" 5
+    wait_for_rr_state "$DOWNSTREAM_ZONE" KEY present
+    wait_for_rr_state "$DOWNSTREAM_ZONE" "$rr_type" absent
+
+    expected_min=$((lease_start + LEASE_SECONDS + 5 - case_start))
+    if [ "$expected_min" -lt 0 ]; then
+        expected_min=0
+    fi
+    log_case_timing "case2b-${rr_type}" "$case_start" "$expected_min"
+    log_success "Split lease behavior correct: non-KEY expired while KEY remained active for $rr_type"
+}
+
+test_case_overlapping_registrations_issue17() {
+    log_section "CASE 4 [ISSUE-17]: Overlapping Registrations Must Not Leave Permanent RR"
+
+    local case_start first_start second_start expected_min
+    local ts1 ts2
+    ts1=$(date +%s)
+    ts2=$((ts1 + 1))
+    case_start=$ts1
+
+    local rr1_a rr1_txt rr2_a rr2_txt
+    rr1_a="${DOWNSTREAM_ZONE} ${OVERLAP_RR_LEASE_SECONDS} IN A 192.0.2.99"
+    rr1_txt="${DOWNSTREAM_ZONE} ${OVERLAP_RR_LEASE_SECONDS} IN TXT \"issue17-first-${ts1}\""
+    rr2_a="${DOWNSTREAM_ZONE} ${OVERLAP_RR_LEASE_SECONDS} IN A 192.0.2.100"
+    rr2_txt="${DOWNSTREAM_ZONE} ${OVERLAP_RR_LEASE_SECONDS} IN TXT \"issue17-second-${ts2}\""
+
+    log_step "First registration (A+TXT set #1)"
+    first_start=$(date +%s)
+    run_client "$PROXY_URL" register "$DOWNSTREAM_ZONE" "$CLIENT_KEY_NAME" "$OVERLAP_RR_LEASE_SECONDS" "$OVERLAP_KEY_LEASE_SECONDS" "$rr1_a" "$rr1_txt"
+    wait_for_rr_state "$DOWNSTREAM_ZONE" KEY present
+    wait_for_rr_state "$DOWNSTREAM_ZONE" A present
+    wait_for_rr_state "$DOWNSTREAM_ZONE" TXT present
+
+    log_step "Waiting ${OVERLAP_DELAY_SECONDS}s before overlapping registration"
+    sleep "$OVERLAP_DELAY_SECONDS"
+
+    log_step "Second overlapping registration (A+TXT set #2)"
+    second_start=$(date +%s)
+    run_client "$PROXY_URL" register "$DOWNSTREAM_ZONE" "$CLIENT_KEY_NAME" "$OVERLAP_RR_LEASE_SECONDS" "$OVERLAP_KEY_LEASE_SECONDS" "$rr2_a" "$rr2_txt"
+    wait_for_rr_state "$DOWNSTREAM_ZONE" KEY present
+    wait_for_rr_state "$DOWNSTREAM_ZONE" A present
+    wait_for_rr_state "$DOWNSTREAM_ZONE" TXT present
+
+    if ! rr_output_contains "$DOWNSTREAM_ZONE" A "192.0.2.100"; then
+        log_error "Expected second A record to be visible after overlapping registration"
+        return 1
+    fi
+    if ! rr_output_contains "$DOWNSTREAM_ZONE" TXT "issue17-second-${ts2}"; then
+        log_error "Expected second TXT record to be visible after overlapping registration"
+        return 1
+    fi
+
+    log_step "Waiting for RR lease expiry to verify old and new non-KEY leases are both cleaned"
+    wait_until_epoch "$second_start" "$OVERLAP_RR_LEASE_SECONDS" 8
+
+    wait_for_rr_state "$DOWNSTREAM_ZONE" A absent
+    wait_for_rr_state "$DOWNSTREAM_ZONE" TXT absent
+    wait_for_rr_state "$DOWNSTREAM_ZONE" KEY present
+
+    expected_min=$((second_start + OVERLAP_RR_LEASE_SECONDS + 8 - case_start))
+    if [ "$expected_min" -lt 0 ]; then
+        expected_min=0
+    fi
+    log_case_timing "case4-issue17-overlap" "$case_start" "$expected_min"
+    log_success "Issue #17 regression check passed: overlapping RR sets were not forgotten/permanent"
 }
 
 test_case_unauthorized_refresh_rejected_then_expires() {
@@ -593,10 +710,15 @@ run_all_tests() {
             test_case_register_expire_remove "$rr_type"
             ensure_rr_absent "$CLIENT_KEY_NAME" KEY
             test_case_register_refresh_not_prematurely_removed "$rr_type"
+            ensure_rr_absent "$CLIENT_KEY_NAME" KEY
+            test_case_split_lease_nonkey_expires_key_persists "$rr_type"
             ensure_rr_absent "$DOWNSTREAM_ZONE" "$rr_type"
             test_case_unauthorized_refresh_rejected_then_expires "$rr_type"
         fi
     done
+
+    ensure_rr_absent "$CLIENT_KEY_NAME" KEY
+    test_case_overlapping_registrations_issue17
 
     log_section "TEST RESULTS"
     echo -e "${GREEN}All integration tests completed successfully!${NC}"
@@ -604,7 +726,9 @@ run_all_tests() {
     echo "Summary of what was tested:"
     echo "  [OK] Register -> expire -> removed (KEY/TXT/A/AAAA)"
     echo "  [OK] Register -> refresh -> split lease behavior (KEY/TXT/A/AAAA)"
+    echo "  [OK] LEASE < KEY-LEASE -> non-KEY records expire while KEY remains"
     echo "  [OK] Unauthorized refresh rejected, lease still expires (KEY/TXT/A/AAAA)"
+    echo "  [OK] Issue #17: overlapping registrations do not leave permanent stale RR"
     echo "  [OK] Proxy consistency checks use refresh path"
     echo ""
     echo "Proxy process was exercised at $PROXY_URL"
