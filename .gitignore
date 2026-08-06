@@ -3,3 +3,5 @@ keystore/client
 keystore/server
 *.tar.gz
 .pi
+coverage.out
+*.old

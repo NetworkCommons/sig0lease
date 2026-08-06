@@ -55,11 +55,6 @@ func TestValidate(t *testing.T) {
 		{"KeyLease = 0 sentinel (no additional RRs)", func() *LeaseOption {
 			return &LeaseOption{Lease: 7200, KeyLease: uintPtr(0)}
 		}(), false},
-		{"LEASE < MIN", Encode4Byte(29), true},
-		{"KeyLease < MIN (non-zero)", func() *LeaseOption {
-			opt := Encode8Byte(7200, 29)
-			return opt
-		}(), true},
 		{"LEASE > KeyLease", func() *LeaseOption {
 			opt := Encode8Byte(1209600, 7200)
 			return opt

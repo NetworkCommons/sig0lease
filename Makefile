@@ -78,12 +78,12 @@ lint:
 
 # Run fast unit tests that do not require live integration environment.
 test-unit: fmt vet
-	go test ./handlers ./pkg/lease ./pkg/keyrec ./pkg/srp/server ./pkg/srp/instruction ./pkg/srp/client -v
+	go test ./handlers ./pkg/dnsmsg/ ./pkg/keyrec ./pkg/lease 
 
 # Run keystore-dependent unit tests.
 # Requires CLIENT_KEYSTORE_DIR for the client key, ex. CLIENT_KEYSTORE_DIR=${PWD}/keystore/client make test-unit-keystore
 test-unit-keystore: fmt vet
-	CLIENT_KEYSTORE_DIR=$(CLIENT_KEYSTORE_DIR) go test ./tests/ ./pkg/sig0 -v
+	CLIENT_KEYSTORE_DIR=$(CLIENT_KEYSTORE_DIR) go test ./pkg/sig0
 
 # Run the complete test matrix.
 # Requires CLIENT_KEYSTORE_DIR for the client key, ex. CLIENT_KEYSTORE_DIR=${PWD}/keystore/client make test-full
@@ -132,7 +132,7 @@ run-server: build
 	./$(BUILD_DIR)/$(BINARY_NAME) ./config.yaml
 
 # Run client (requires proxy addr and command)
-# Usage: make run-client ADDR=127.0.0.1:8053 CMD="register test.dev.zenr.io. client.test.dev.zenr.io."
+# Usage: CLIENT_KEYSTORE_DIR=${PWD}/keystore/client make run-client ADDR=127.0.0.1:8053 CMD="register test.dev.zenr.io. client.test.dev.zenr.io."
 run-client: build-client
-	CLIENT_KEYSTORE_DIR=$(CLIENT_KEYSTORE_DIR) ./$(BUILD_DIR)/$(CLIENT_NAME) $(ADDR) $(CMD)
+	CLIENT_KEYSTORE_DIR=$(CLIENT_KEYSTORE_DIR) ./$(BUILD_DIR)/$(CLIENT_NAME) $(ADDR) $(CMD) $(DATA)
 

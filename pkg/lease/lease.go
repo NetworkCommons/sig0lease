@@ -13,22 +13,11 @@ const (
 	// OPTION_CODE is the EDNS(0) option code for Update Lease
 	OPTION_CODE = 2
 
-	// MIN_LEASE is the minimum valid lease value per RFC 9664 §8
-	MIN_LEASE = 30
-
 	// MAX_LEASE is the maximum lease value (2^32-1)
 	MAX_LEASE = 0xFFFFFFFF
 
-	// MIN_KEY_LEASE is the minimum valid key-lease value
-	MIN_KEY_LEASE = 30
-
 	// MAX_KEY_LEASE is the maximum key-lease value
 	MAX_KEY_LEASE = 0xFFFFFFFF
-
-	// defaultKeyLease is used for registration requests when no KEY RR
-	// is registered (no second lease value needed). The 8-byte variant
-	// is always used, with this value serving as the KEY-LEASE placeholder.
-	defaultKeyLease = 0
 )
 
 // LeaseOption represents the Update Lease EDNS(0) option.
@@ -49,23 +38,10 @@ func Encode8Byte(lease, keyLease uint32) *LeaseOption {
 	return &LeaseOption{Lease: lease, KeyLease: &keyLease}
 }
 
-// Validate checks that the lease values are valid per RFC 9664/9665.
+// Validate checks that the lease values are valid.
 func (lo *LeaseOption) Validate() error {
-	if lo.Lease != 0 && lo.Lease < MIN_LEASE {
-		return fmt.Errorf("LEASE %d is below minimum %d", lo.Lease, MIN_LEASE)
-	}
-	if lo.KeyLease != nil {
-		// KEY-LEASE = 0 is a special sentinel meaning "no additional RRs registered"
-		// (used for 8-byte variant when only LEASE is needed). This bypasses MIN_KEY_LEASE
-		// and the LEASE > KeyLease check.
-		if *lo.KeyLease != 0 {
-			if *lo.KeyLease < MIN_KEY_LEASE {
-				return fmt.Errorf("KEY-LEASE %d is below minimum %d", *lo.KeyLease, MIN_KEY_LEASE)
-			}
-			if lo.Lease != 0 && lo.Lease > *lo.KeyLease {
-				return fmt.Errorf("LEASE %d exceeds KEY-LEASE %d", lo.Lease, *lo.KeyLease)
-			}
-		}
+	if lo.KeyLease != nil && *lo.KeyLease != 0 && lo.Lease != 0 && lo.Lease > *lo.KeyLease {
+		return fmt.Errorf("LEASE %d exceeds KEY-LEASE %d", lo.Lease, *lo.KeyLease)
 	}
 	return nil
 }
@@ -80,7 +56,8 @@ func (lo *LeaseOption) Encode(opt *dns.OPT) error {
 
 	// Always use 8-byte variant: LEASE + KEY-LEASE
 	// If KeyLease is nil (no KEY-LEASE provided), use defaultKeyLease (0)
-	keyLease := uint32(defaultKeyLease)
+	keyLease := uint32(0)
+
 	if lo.KeyLease != nil {
 		keyLease = *lo.KeyLease
 	}

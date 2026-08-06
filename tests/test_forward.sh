@@ -10,7 +10,6 @@ source "$SCRIPT_DIR/utils.sh"
 cd "$(dirname "$0")/." || exit 1
 
 DOWNSTREAM_ZONE="test.dev.zenr.io."
-CLIENT_KEY_NAME="test.dev.zenr.io."
 
 log_section "DNS Proxy forward functionality test"
 

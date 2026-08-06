@@ -12,6 +12,7 @@ import (
 	"codeberg.org/miekg/dns"
 	"codeberg.org/miekg/dns/rdata"
 	"github.com/NetworkCommons/sig0lease/logging"
+	"github.com/NetworkCommons/sig0lease/pkg/keyrec"
 	"github.com/NetworkCommons/sig0lease/pkg/lease"
 )
 
@@ -110,6 +111,49 @@ func TestApplyLeasePolicyClampsKeyAndOtherRecords(t *testing.T) {
 	}
 	if rr[0].Header().TTL != 60 {
 		t.Fatalf("expected rr ttl clamped to max, got %d", rr[0].Header().TTL)
+	}
+}
+
+func TestConstructUpstreamUpdateIncludesDataOnlyRecordsOnce(t *testing.T) {
+	keystoreDir, err := createTestKeystore(t)
+	if err != nil {
+		t.Fatalf("setup test keystore: %v", err)
+	}
+	loaded, err := keyrec.LoadKeyFromFile(keystoreDir, "Kdev.zenr.io.+015+35317")
+	if err != nil {
+		t.Fatalf("load key: %v", err)
+	}
+
+	h := newTestHandler()
+
+	key1 := loaded.PublicKey.Clone().(*dns.KEY)
+	key2 := loaded.PublicKey.Clone().(*dns.KEY)
+	txt := &dns.TXT{Hdr: dns.Header{Name: "test.dev.zenr.io.", Class: dns.ClassINET, TTL: 120}}
+	txt.TXT.Txt = []string{"payload"}
+
+	msg, err := h.constructUpstreamUpdate([]*dns.KEY{key1, key2}, []dns.RR{txt}, loaded, "dev.zenr.io.")
+	if err != nil {
+		t.Fatalf("construct upstream update: %v", err)
+	}
+	if len(msg.Ns) != 3 {
+		t.Fatalf("expected 3 upstream records (2 KEY + 1 TXT), got %d", len(msg.Ns))
+	}
+	txtCount := 0
+	for _, rr := range msg.Ns {
+		if _, ok := rr.(*dns.TXT); ok {
+			txtCount++
+		}
+	}
+	if txtCount != 1 {
+		t.Fatalf("expected TXT record to appear once, got %d", txtCount)
+	}
+
+	dataOnlyMsg, err := h.constructUpstreamUpdate(nil, []dns.RR{txt}, loaded, "dev.zenr.io.")
+	if err != nil {
+		t.Fatalf("construct upstream update for data-only request: %v", err)
+	}
+	if len(dataOnlyMsg.Ns) != 1 {
+		t.Fatalf("expected 1 upstream record for data-only request, got %d", len(dataOnlyMsg.Ns))
 	}
 }
 
@@ -576,7 +620,7 @@ func TestExtractUpdateRecordsRejectsBlacklistedTypes(t *testing.T) {
 
 	// Create a blacklist containing NULL (type 10).
 	blacklist := map[uint16]struct{}{
-		dns.TypeNULL: struct{}{},
+		dns.TypeNULL: {},
 	}
 
 	_, _, err := extractUpdateRecords(msg, blacklist)
@@ -603,8 +647,8 @@ func TestExtractUpdateRecordsAllowsNonBlacklistedTypes(t *testing.T) {
 
 	// Create a blacklist that does NOT contain MX (type 15).
 	blacklist := map[uint16]struct{}{
-		dns.TypeNULL:   struct{}{},
-		dns.TypeNXNAME: struct{}{},
+		dns.TypeNULL:   {},
+		dns.TypeNXNAME: {},
 	}
 
 	keyRR, other, err := extractUpdateRecords(msg, blacklist)
@@ -638,7 +682,7 @@ func TestExtractUpdateRecordsBlacklistedTypeWithKeyRR(t *testing.T) {
 
 	// Create a blacklist containing NXNAME (type 67).
 	blacklist := map[uint16]struct{}{
-		dns.TypeNXNAME: struct{}{},
+		dns.TypeNXNAME: {},
 	}
 
 	_, _, err := extractUpdateRecords(msg, blacklist)

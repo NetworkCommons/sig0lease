@@ -8,60 +8,32 @@ import (
 	"github.com/NetworkCommons/sig0lease/pkg/lease"
 )
 
-// NewRegistrationUpdate builds a DNS UPDATE registration message with
-// one KEY RR, optional additional RRs, and an 8-byte UPDATE-LEASE option.
-func NewRegistrationUpdate(zone string, keyRR *dns.KEY, additional []dns.RR, leaseDuration, keyLeaseDuration uint32) (*dns.Msg, error) {
+// NewLeaseUpdate builds a DNS UPDATE registration message with
+// one optional KEY RR, optional additional RRs, and an 8-byte UPDATE-LEASE option.
+func NewLeaseUpdate(zone string, keyRRs []*dns.KEY, additional []dns.RR, leaseDuration, keyLeaseDuration uint32) (*dns.Msg, error) {
 	if strings.TrimSpace(zone) == "" {
 		return nil, fmt.Errorf("zone cannot be empty")
 	}
-	if keyRR == nil {
-		return nil, fmt.Errorf("key RR cannot be nil")
-	}
-
 	msg := dns.NewMsg(zone, dns.TypeSOA)
 	if msg == nil {
 		return nil, fmt.Errorf("failed to create DNS message")
 	}
 	msg.Opcode = dns.OpcodeUpdate
-	msg.Ns = append(msg.Ns, keyRR)
+
+	if len(keyRRs) > 0 {
+		for _, keyRR := range keyRRs {
+			msg.Ns = append(msg.Ns, keyRR)
+		}
+	} else {
+		if keyLeaseDuration != 0 {
+			return nil, fmt.Errorf("keyRRs not present but keyLeaseDuration != 0")
+		}
+	}
+
 	msg.Ns = append(msg.Ns, additional...)
 
 	leaseOpt := lease.Encode8Byte(leaseDuration, keyLeaseDuration)
-	if err := leaseOpt.Validate(); err != nil {
-		return nil, err
-	}
-	opt := &dns.OPT{Hdr: dns.Header{Name: "."}}
-	opt.SetUDPSize(uint16(dns.DefaultMsgSize))
-	if err := leaseOpt.Encode(opt); err != nil {
-		return nil, fmt.Errorf("failed to encode lease option: %w", err)
-	}
-	msg.Extra = append(msg.Extra, opt)
-	return msg, nil
-}
 
-// NewRefreshUpdate builds a DNS UPDATE refresh message with one KEY RR and
-// a lease option. By default callers should use 8-byte variant; 4-byte is for compatibility testing.
-func NewRefreshUpdate(zone string, keyRR *dns.KEY, leaseDuration, keyLeaseDuration uint32, use4Byte bool) (*dns.Msg, error) {
-	if strings.TrimSpace(zone) == "" {
-		return nil, fmt.Errorf("zone cannot be empty")
-	}
-	if keyRR == nil {
-		return nil, fmt.Errorf("key RR cannot be nil")
-	}
-
-	msg := dns.NewMsg(zone, dns.TypeSOA)
-	if msg == nil {
-		return nil, fmt.Errorf("failed to create DNS message")
-	}
-	msg.Opcode = dns.OpcodeUpdate
-	msg.Ns = append(msg.Ns, keyRR)
-
-	var leaseOpt *lease.LeaseOption
-	if use4Byte {
-		leaseOpt = lease.Encode4Byte(leaseDuration)
-	} else {
-		leaseOpt = lease.Encode8Byte(leaseDuration, keyLeaseDuration)
-	}
 	if err := leaseOpt.Validate(); err != nil {
 		return nil, err
 	}
@@ -103,31 +75,5 @@ func ParseAdditionalRRSpec(spec string) (dns.RR, error) {
 // This is used for data-only operations where the client's key is resolved
 // from the lease store or DNS server on the proxy side.
 func NewDataOnlyUpdate(zone string, additional []dns.RR, leaseDuration uint32) (*dns.Msg, error) {
-	if strings.TrimSpace(zone) == "" {
-		return nil, fmt.Errorf("zone cannot be empty")
-	}
-	// Additional RRs are optional — a refresh with KEY-LEASE == 0 may not
-	// include any data RRs; the proxy resolves them from the lease store.
-
-	msg := dns.NewMsg(zone, dns.TypeSOA)
-	if msg == nil {
-		return nil, fmt.Errorf("failed to create DNS message")
-	}
-	msg.Opcode = dns.OpcodeUpdate
-
-	// Only data RRs in the authority section — no KEY RR.
-	msg.Ns = append(msg.Ns, additional...)
-
-	// 8-byte UPDATE-LEASE with KEY-LEASE = 0 (no KEY RRs being registered).
-	leaseOpt := lease.Encode8Byte(leaseDuration, 0)
-	if err := leaseOpt.Validate(); err != nil {
-		return nil, err
-	}
-	opt := &dns.OPT{Hdr: dns.Header{Name: "."}}
-	opt.SetUDPSize(uint16(dns.DefaultMsgSize))
-	if err := leaseOpt.Encode(opt); err != nil {
-		return nil, fmt.Errorf("failed to encode lease option: %w", err)
-	}
-	msg.Extra = append(msg.Extra, opt)
-	return msg, nil
+	return NewLeaseUpdate(zone, nil, additional, leaseDuration, 0)
 }

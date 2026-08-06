@@ -98,13 +98,13 @@ func main() {
 				}
 
 				fmt.Print(h.DumpLeasesLevel(dumpLevel))
+				if dumpLevel == "debug" {
+					fmt.Println("=== Lease Store Dump ===")
+				} else {
+					fmt.Println("=== Lease Store Summary ===")
+				}
 				return
 			}
-		}
-		if dumpLevel == "debug" {
-			fmt.Println("=== Lease Store Dump ===")
-		} else {
-			fmt.Println("=== Lease Store Summary ===")
 		}
 		fmt.Println("(no update_handler configured)")
 		return

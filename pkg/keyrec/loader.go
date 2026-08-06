@@ -26,11 +26,11 @@ type LoadedKey struct {
 	PrivateKey crypto.PrivateKey
 }
 
-// LoadKeyFromFiles loads a DNSSEC key from keystore files.
+// LoadKeyFromFile loads a DNSSEC key from keystore files.
 // Provenance: Adapted from sig0namectl's LoadKeyFile() approach
 // Expects files: <keystoreDir>/<keyName>.key and <keystoreDir>/<keyName>.private
-// Uses codeberg.org/miekg/dns v0.6.82 API (not the old miekg/dns API)
-func LoadKeyFromFiles(keystoreDir, keyName string) (*LoadedKey, error) {
+// Uses codeberg.org/miekg/dns v0.6.82 API
+func LoadKeyFromFile(keystoreDir, keyName string) (*LoadedKey, error) {
 	pubKeyPath := filepath.Join(keystoreDir, keyName+".key")
 	privKeyPath := filepath.Join(keystoreDir, keyName+".private")
 
@@ -104,19 +104,21 @@ func ListKeysInDirectory(keystoreDir string) ([]string, error) {
 	return keyNames, nil
 }
 
-// FindKeyByZone searches for a key by zone name in the keystore.
-// Returns the key name or error if not found.
-// Prefers ED25519 (algorithm 15) over other algorithms.
+// FindKeysByZone searches for keys by zone name in the keystore.
+// Returns the key names. possibly none.
+// First searches ED25519 (algorithm 15) and then other algorithms.
 // Provenance: Inspired by sig0namectl's LoadOrGenerateKey()
-func FindKeyByZone(keystoreDir, zoneName string) (string, error) {
+func FindKeysByZone(keystoreDir, zoneName string) ([]string, error) {
 	if !strings.HasSuffix(zoneName, ".") {
 		zoneName += "."
 	}
 
 	keys, err := ListKeysInDirectory(keystoreDir)
 	if err != nil {
-		return "", err
+		return nil, err
 	}
+
+	keyNamesSet := make(map[string]struct{}, 10)
 
 	// Key filenames are in format: Kzone.+algorithm+keytag
 	// Look for a key that starts with this zone name
@@ -125,24 +127,62 @@ func FindKeyByZone(keystoreDir, zoneName string) (string, error) {
 	// First pass: look for ED25519 (algorithm 15)
 	for _, keyName := range keys {
 		if strings.HasPrefix(keyName, prefix) && strings.Contains(keyName, "+015+") {
-			return keyName, nil
+			if _, exists := keyNamesSet[keyName]; !exists {
+				keyNamesSet[keyName] = struct{}{}
+			}
 		}
 	}
 
 	// Second pass: return any other algorithm if ED25519 not found
 	for _, keyName := range keys {
 		if strings.HasPrefix(keyName, prefix) {
-			return keyName, nil
+			if _, exists := keyNamesSet[keyName]; !exists {
+				keyNamesSet[keyName] = struct{}{}
+			}
+		}
+	}
+	// Pre-allocate slice with the exact size of the map
+	keyNames := make([]string, 0, len(keyNamesSet))
+
+	for key := range keyNamesSet {
+		keyNames = append(keyNames, key)
+	}
+	if len(keyNames) == 0 {
+		fmt.Printf("no key found for zone %s in keystore %s", zoneName, keystoreDir)
+	}
+	fmt.Printf("zone %s keys %v", zoneName, keyNames)
+	return keyNames, nil
+
+}
+
+// KeyExists searches for a key by filename without .key in the keystore.
+// Returns the key name or error if none found.
+func KeyExists(keystoreDir, keyName string) error {
+
+	keyFiles, err := ListKeysInDirectory(keystoreDir)
+	if err != nil {
+		return err
+	}
+
+	// look for public keys
+	for _, keyFile := range keyFiles {
+		if keyName == keyFile {
+			return nil
 		}
 	}
 
-	return "", fmt.Errorf("no key found for zone %s in keystore %s", zoneName, keystoreDir)
+	return fmt.Errorf("no key file found for key %s in keystore %s", keyName, keystoreDir)
 }
 
-// KeyName returns the formatted key filename for this record (without extensions)
-func (lk *LoadedKey) KeyName() string {
+// KeyFileName returns the formatted key filename for this record (without extensions)
+func (lk *LoadedKey) KeyFileName() string {
 	zone := lk.PublicKey.Hdr.Name
 	return fmt.Sprintf("K%s+%03d+%d", zone, lk.PublicKey.Algorithm, lk.PublicKey.KeyTag())
+}
+
+// KeyName returns the key name
+func (lk *LoadedKey) KeyName() string {
+	return lk.PublicKey.Hdr.Name
 }
 
 // Algorithm returns the DNSSEC algorithm number
@@ -167,4 +207,22 @@ func (lk *LoadedKey) KeyTag() uint16 {
 func (lk *LoadedKey) String() string {
 	return fmt.Sprintf("LoadedKey{Name:%s, Zone:%s, Algorithm:%s, KeyTag:%d}",
 		lk.Name, lk.PublicKey.Hdr.Name, lk.AlgorithmName(), lk.KeyTag())
+}
+
+// Print key info
+func (lk *LoadedKey) Print() {
+	fmt.Printf("Name  %s\n", lk.Name)
+	fmt.Printf("    Zone: %s\n", lk.PublicKey.Hdr.Name)
+	fmt.Printf("    Algorithm: %d (15=ED25519)\n", lk.PublicKey.Algorithm)
+	fmt.Printf("    KeyTag: %d\n", lk.PublicKey.KeyTag())
+	fmt.Printf("    Flags: %d\n", lk.PublicKey.Flags)
+
+	// Check for private key
+	if lk.PrivateKey != nil {
+		fmt.Printf("    Private key: ✓ Available\n")
+	} else {
+		fmt.Printf("    Private key: ✗ Not available\n")
+	}
+	fmt.Printf("\n")
+
 }

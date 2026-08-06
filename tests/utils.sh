@@ -51,6 +51,26 @@ log_info() {
     echo -e "  [INFO] $1"
 }
 
+yaml_get_lease_time() {
+    local key="$1"
+
+    local value=""
+
+    if command -v yq >/dev/null 2>&1; then
+        value="$(yq -r ".handlers.update.lease_policy.${key} // \"\"" "$CONFIG_FILE" 2>/dev/null || true)"
+    else
+        echo "please install jq!"
+        exit 1
+    fi
+
+    if [[ "$value" =~ ^[0-9]+$ ]]; then
+        echo "$value"
+    else
+        echo "Invalid value for ${key}: $value"
+        exit 1
+    fi
+}
+
 start_proxy() {
     log_section "START: Proxy Process"
 

@@ -25,6 +25,7 @@ func decodeLeaseFromERFC(erfc *dns.ERFC3597) (uint32, bool) {
 // EffectiveLeaseDuration returns the lease duration that should be used by the
 // client for expiry calculations. If the server response contains an
 // UPDATE-LEASE option, that LEASE value is authoritative. Otherwise requested is used.
+// FIXME: There are two lease times to read from the server
 func EffectiveLeaseDuration(resp *dns.Msg, requested uint32) uint32 {
 	if resp == nil {
 		return requested

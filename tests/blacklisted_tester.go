@@ -64,14 +64,14 @@ func main() {
 		os.Exit(1)
 	}
 
-	clientKeyName, err := keyrec.FindKeyByZone(keystoreDir, rrOwner)
+	err := keyrec.KeyExists(keystoreDir, rrOwner)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "ERROR: Could not find client key for key name %s: %v\n", rrOwner, err)
 		os.Exit(1)
 	}
-	fmt.Printf("  Found client key: %s\n", clientKeyName)
+	fmt.Printf("  Found client key: %s\n", rrOwner)
 
-	clientKey, err := keyrec.LoadKeyFromFiles(keystoreDir, clientKeyName)
+	clientKey, err := keyrec.LoadKeyFromFile(keystoreDir, rrOwner)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "ERROR: Failed to load client key: %v\n", err)
 		os.Exit(1)
@@ -125,7 +125,7 @@ func main() {
 
 	// Step 4: Build registration UPDATE message
 	fmt.Printf("\nStep 3: Building UPDATE message payload\n")
-	msg, err := dnsmsg.NewRegistrationUpdate(zone, keyRR, []dns.RR{additionalRR}, leaseDuration, keyLeaseSec)
+	msg, err := dnsmsg.NewLeaseUpdate(zone, []*dns.KEY{keyRR}, []dns.RR{additionalRR}, leaseDuration, keyLeaseSec)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "ERROR: Failed to build registration update packet: %v\n", err)
 		os.Exit(1)

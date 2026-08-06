@@ -1,7 +1,6 @@
 package sig0
 
 import (
-	"os"
 	"testing"
 	"time"
 
@@ -9,31 +8,18 @@ import (
 	"github.com/NetworkCommons/sig0lease/pkg/keyrec"
 )
 
-// getKeystoreDir retrieves the keystore directory from environment or config.
-// Returns error if not defined - keystore path must be explicitly configured.
-func getKeystoreDir(t *testing.T) string {
-	// Priority 1: Environment variable
-	if dir := os.Getenv("CLIENT_KEYSTORE_DIR"); dir != "" {
-		return dir
-	}
-
-	// Keystore path must be configured
-	t.Fatalf("CLIENT_KEYSTORE_DIR environment variable")
-	return ""
-}
-
 func TestSignerWithRealKey(t *testing.T) {
 	// Use test keys from sig0namectl keystore
 	keystoreDir := getKeystoreDir(t)
 
 	// Find the key for test.dev.zenr.io
-	keyName, err := keyrec.FindKeyByZone(keystoreDir, "test.dev.zenr.io")
+	err := keyrec.KeyExists(keystoreDir, keyName)
 	if err != nil {
 		t.Skipf("Could not find test key: %v", err)
 	}
 
 	// Load a test key
-	loadedKey, err := keyrec.LoadKeyFromFiles(keystoreDir, keyName)
+	loadedKey, err := keyrec.LoadKeyFromFile(keystoreDir, keyName)
 	if err != nil {
 		t.Skipf("Could not load test key: %v", err)
 	}
@@ -117,13 +103,13 @@ func TestVerifySignature(t *testing.T) {
 	keystoreDir := getKeystoreDir(t)
 
 	// Find the key for test.dev.zenr.io
-	keyName, err := keyrec.FindKeyByZone(keystoreDir, "test.dev.zenr.io")
+	err := keyrec.KeyExists(keystoreDir, keyName)
 	if err != nil {
 		t.Skipf("Could not find test key: %v", err)
 	}
 
 	// Load a test key
-	loadedKey, err := keyrec.LoadKeyFromFiles(keystoreDir, keyName)
+	loadedKey, err := keyrec.LoadKeyFromFile(keystoreDir, keyName)
 	if err != nil {
 		t.Skipf("Could not load test key: %v", err)
 	}
@@ -164,13 +150,13 @@ func TestLoadKeyFromFiles(t *testing.T) {
 	keystoreDir := getKeystoreDir(t)
 
 	// Find the key for test.dev.zenr.io
-	keyName, err := keyrec.FindKeyByZone(keystoreDir, "test.dev.zenr.io")
+	err := keyrec.KeyExists(keystoreDir, keyName)
 	if err != nil {
 		t.Skipf("Could not find test key: %v", err)
 	}
 
 	// Test finding test.dev.zenr.io key
-	loadedKey, err := keyrec.LoadKeyFromFiles(keystoreDir, keyName)
+	loadedKey, err := keyrec.LoadKeyFromFile(keystoreDir, keyName)
 	if err != nil {
 		t.Skipf("Could not load test key: %v", err)
 	}

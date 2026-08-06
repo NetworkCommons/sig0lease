@@ -101,8 +101,8 @@ func TestNewDataOnlyUpdateShortLease(t *testing.T) {
 	txt.TXT.Txt = []string{"hello"}
 
 	_, err := NewDataOnlyUpdate("dev.zenr.io.", []dns.RR{txt}, 10)
-	if err == nil {
-		t.Fatalf("expected error for lease < 30 seconds")
+	if err != nil {
+		t.Fatalf("expected no errors for lease < 30 seconds")
 	}
 }
 

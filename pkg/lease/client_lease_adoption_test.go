@@ -1,4 +1,4 @@
-package main
+package lease
 
 import (
 	"testing"
@@ -6,7 +6,6 @@ import (
 
 	"codeberg.org/miekg/dns"
 	"github.com/NetworkCommons/sig0lease/client"
-	leasepkg "github.com/NetworkCommons/sig0lease/pkg/lease"
 )
 
 func TestClientUsesServerGrantedLeaseForExpiry(t *testing.T) {
@@ -15,7 +14,7 @@ func TestClientUsesServerGrantedLeaseForExpiry(t *testing.T) {
 
 	resp := &dns.Msg{}
 	opt := &dns.OPT{Hdr: dns.Header{Name: "."}}
-	leaseOpt := leasepkg.Encode8Byte(granted, granted)
+	leaseOpt := Encode8Byte(granted, granted)
 	if err := leaseOpt.Encode(opt); err != nil {
 		t.Fatalf("encode lease option: %v", err)
 	}
