@@ -5,6 +5,7 @@ import (
 	"fmt"
 
 	"codeberg.org/miekg/dns"
+	leasepkg "github.com/NetworkCommons/sig0lease/pkg/lease"
 )
 
 func (h *UpdateHandler) Handle(ctx context.Context, w dns.ResponseWriter, r *dns.Msg) *HandlerResult {
@@ -53,7 +54,7 @@ func (h *UpdateHandler) Handle(ctx context.Context, w dns.ResponseWriter, r *dns
 
 	h.logger.Debugf("Parsed lease duration: %d seconds key-lease=%d", leaseDuration, keyLeaseDuration)
 
-	clientKeyRRs, otherRecords, err := extractUpdateRecords(r, h.blacklistedTypes)
+	updateKeyRRs, updateOtherRRs, err := extractUpdateRecords(r, h.blacklistedTypes)
 	if err != nil {
 		h.logger.Debugf("Invalid update records: %v", err)
 		msg := h.makeErrorResponse(r, dns.RcodeFormatError, err.Error())
@@ -67,34 +68,35 @@ func (h *UpdateHandler) Handle(ctx context.Context, w dns.ResponseWriter, r *dns
 		return NewErrorResult(msg, err.Error(), err)
 	}
 
-	// Determine leaseOwner from the first KEY RR, or from the first non-KEY RR if no KEY RRs present.
-	leaseOwner := ""
-	if len(clientKeyRRs) > 0 {
-		leaseOwner = clientKeyRRs[0].Hdr.Name
-	} else if len(otherRecords) > 0 && otherRecords[0] != nil && otherRecords[0].Header() != nil {
-		leaseOwner = otherRecords[0].Header().Name
-	}
-	if leaseOwner == "" {
-		msg := h.makeErrorResponse(r, dns.RcodeFormatError, "request must include at least one KEY or non-KEY RR")
-		return NewErrorResult(msg, "no updatable records in request", fmt.Errorf("empty update section"))
+	sigRR, err := extractSig0(r)
+	if err != nil {
+		msg := h.makeErrorResponse(r, dns.RcodeRefused, err.Error())
+		return NewErrorResult(msg, err.Error(), err)
 	}
 
-	// Validate SIG(0) using signer KEY candidates in this order:
-	// 1) request (Additional + Update), 2) lease store, 3) authoritative DNS.
-	sigRR, signerKey, err := h.extractAndValidateSig0(ctx, r, zone, leaseOwner, additionalSigningKeys, clientKeyRRs)
+	signerKey, err := h.resolveSignerKeyForOwnership(sigRR, additionalSigningKeys, updateKeyRRs)
+	if err != nil {
+		msg := h.makeErrorResponse(r, dns.RcodeRefused, err.Error())
+		return NewErrorResult(msg, err.Error(), err)
+	}
+
+	// Ownership must come from the signer KEY.
+	// The provided signer KEY is the ownership key, so verification should use it first.
+	sigRR, signerKey, err = h.extractAndValidateSig0(ctx, r, zone, signerKey, additionalSigningKeys, updateKeyRRs)
 	if err != nil {
 		h.logger.Debugf("SIG(0) validation failed: %v", err)
 		msg := h.makeErrorResponse(r, dns.RcodeRefused, fmt.Sprintf("SIG(0) validation failed: %v", err))
 		return NewErrorResult(msg, fmt.Sprintf("SIG(0) validation failed: %v", err), err)
 	}
 
-	if err := h.validateSignerHierarchyForUpdateRecords(sigRR.SignerName, clientKeyRRs, otherRecords); err != nil {
+	if err := h.validateSignerHierarchyForUpdateRecords(sigRR.SignerName, updateKeyRRs, updateOtherRRs); err != nil {
 		h.logger.Debugf("Update hierarchy validation failed: %v", err)
 		msg := h.makeErrorResponse(r, dns.RcodeRefused, fmt.Sprintf("hierarchy validation failed: %v", err))
 		return NewErrorResult(msg, fmt.Sprintf("hierarchy validation failed: %v", err), err)
 	}
 
-	otherRecordsByKeyOwner, err := groupOtherRecordsByTargetKey(clientKeyRRs, otherRecords)
+	signerID := keyIDFromSIG(sigRR)
+	updateOtherRRsByKeyOwner, err := groupOtherRecordsByTargetKey(signerID, updateKeyRRs, updateOtherRRs, false)
 	if err != nil {
 		h.logger.Debugf("Failed to map non-KEY records to KEY owners: %v", err)
 		msg := h.makeErrorResponse(r, dns.RcodeRefused, fmt.Sprintf("invalid mixed-owner update: %v", err))
@@ -109,14 +111,14 @@ func (h *UpdateHandler) Handle(ctx context.Context, w dns.ResponseWriter, r *dns
 	h.logger.Debugf("Resolved signer KEY: %s", signerKey.Hdr.Name)
 
 	// Log all extracted request KEY RRs.
-	for i, keyRR := range clientKeyRRs {
+	for i, keyRR := range updateKeyRRs {
 		h.logger.Debugf("Extracted request KEY RR[%d]: %s", i, keyRR.String())
 	}
 
 	// KEY-LEASE!=0, LEASE!=0 requires KEY RR. Non-KEY RRs are optional:
 	// missing non-KEY RRs means KEY-only refresh/registration.
 	if keyLeaseDuration != 0 && leaseDuration != 0 {
-		if len(clientKeyRRs) == 0 {
+		if len(updateKeyRRs) == 0 {
 			msg := h.makeErrorResponse(r, dns.RcodeFormatError,
 				"KEY-LEASE!=0 and LEASE!=0 requires at least one KEY RR")
 			return NewErrorResult(msg, "invalid update matrix for register/refresh", fmt.Errorf("missing required KEY record"))
@@ -135,35 +137,35 @@ func (h *UpdateHandler) Handle(ctx context.Context, w dns.ResponseWriter, r *dns
 	}
 	pendingMutations := make([]pendingLeaseMutation, 0)
 
-	for _, keyRR := range clientKeyRRs {
+	for _, keyRR := range updateKeyRRs {
 		keyName := keyRR.Hdr.Name
-		scopedOtherRecords := otherRecordsByKeyOwner[canonicalName(keyName)]
-		keyIsRefresh := h.leaseManager.Lookup(keyName) != nil
+		scopedOtherRecords := updateOtherRRsByKeyOwner[keyIDFromKEY(keyRR)]
+		keyIsRefresh := h.leaseManager.LookupByKEY(keyRR) != nil
 
 		// KEY-LEASE != 0, LEASE == 0: KEY lease registration (Case 4).
 		if keyLeaseDuration != 0 && leaseDuration == 0 {
 			notes := make([]string, 0)
 			if len(scopedOtherRecords) > 0 {
 				for _, rr := range scopedOtherRecords {
-					if !h.hasActiveDataRecord(keyName, rr) {
+					if !h.hasActiveDataRecord(leasepkg.NodeKey(keyRR), rr) {
 						notes = append(notes, fmt.Sprintf("record not found for delete: %s", rr.String()))
 					}
 				}
 			}
 
-			pendingKeyName := keyName
 			pendingKeyRR := keyRR
+			pendingKeyName := keyName
 			pendingRecords := scopedOtherRecords
 			pendingMutations = append(pendingMutations, pendingLeaseMutation{
 				keyName: pendingKeyName,
 				apply: func() error {
-					if err := h.registerKeyLease(ctx, sigRR.SignerName, pendingKeyName, pendingKeyRR, keyLeaseDuration, keyLeaseDuration); err != nil {
+					if err := h.registerKeyLease(ctx, keyIDFromSIG(sigRR), pendingKeyRR, keyLeaseDuration, keyLeaseDuration); err != nil {
 						return err
 					}
 					if len(pendingRecords) > 0 {
-						h.deleteDataLease(pendingKeyName)
+						h.deleteDataLease(leasepkg.NodeKey(pendingKeyRR))
 					}
-					h.scheduleLeaseExpiry(pendingKeyName)
+					h.scheduleLeaseExpiry(leasepkg.NodeKey(pendingKeyRR))
 					return nil
 				},
 			})
@@ -177,21 +179,21 @@ func (h *UpdateHandler) Handle(ctx context.Context, w dns.ResponseWriter, r *dns
 		// KEY-LEASE == 0, LEASE == 0: delete matrix (Case 3).
 		if keyLeaseDuration == 0 && leaseDuration == 0 {
 			notes := make([]string, 0)
-			if h.leaseManager.Lookup(keyName) == nil {
+			if h.leaseManager.LookupByKEY(keyRR) == nil {
 				notes = append(notes, fmt.Sprintf("KEY %s not found for delete", keyName))
 			}
-			if err := h.leaseManager.Delete(keyName); err != nil {
+			if err := h.leaseManager.Delete(leasepkg.NodeKey(keyRR)); err != nil {
 				h.logger.Debugf("Failed to delete key lease for %s: %v", keyName, err)
 			}
-			h.clearLeaseTimer(keyName)
+			h.clearLeaseTimer(leasepkg.NodeKey(keyRR))
 
 			if len(scopedOtherRecords) > 0 {
 				for _, rr := range scopedOtherRecords {
-					if !h.hasActiveDataRecord(keyName, rr) {
+					if !h.hasActiveDataRecord(leasepkg.NodeKey(keyRR), rr) {
 						notes = append(notes, fmt.Sprintf("record not found for delete: %s", rr.String()))
 					}
 				}
-				h.deleteDataLease(keyName)
+				h.deleteDataLease(leasepkg.NodeKey(keyRR))
 			}
 			h.logger.Debugf("Deleted key for %s (KEY-LEASE=0, LEASE=0)", keyName)
 
@@ -220,15 +222,15 @@ func (h *UpdateHandler) Handle(ctx context.Context, w dns.ResponseWriter, r *dns
 				return NewErrorResult(msg, "key missing for KEY-LEASE=0 data update", fmt.Errorf("missing existing key at FQDN"))
 			}
 
-			acceptedRecords, notes, err := h.filterDuplicateRegistrations(ctx, keyName, zone, scopedOtherRecords)
+			acceptedRecords, notes, err := h.filterDuplicateRegistrations(ctx, leasepkg.NodeKey(keyRR), zone, scopedOtherRecords)
 			if err != nil {
 				msg := h.makeErrorResponse(r, dns.RcodeRefused, fmt.Sprintf("duplicate registration rejected: %v", err))
 				return NewErrorResult(msg, "duplicate registration rejected", err)
 			}
 			if len(acceptedRecords) > 0 {
-				h.setDataLease(keyName, acceptedRecords, leaseDuration, h.upstreamZone)
+				h.setDataLease(leasepkg.NodeKey(keyRR), acceptedRecords, leaseDuration, h.upstreamZone)
 			}
-			h.scheduleLeaseExpiry(keyName)
+			h.scheduleLeaseExpiry(leasepkg.NodeKey(keyRR))
 
 			allNotes = append(allNotes, notes...)
 			// For data-only leases, we don't add a KEY to the response.
@@ -243,20 +245,20 @@ func (h *UpdateHandler) Handle(ctx context.Context, w dns.ResponseWriter, r *dns
 				// Ownership check failed (key mismatch). Promote to full registration
 				// if the key does not exist at the FQDN — the client is re-registering
 				// (they have valid lease-times from before and lost the key at the DNS).
-				existingKey := h.leaseManager.Lookup(keyName)
+				existingKey := h.leaseManager.LookupByKEY(keyRR)
 				if existingKey == nil {
 					// Key not at FQDN: promote to full registration (both key and data RRs).
-					pendingKeyName := keyName
 					pendingKeyRR := keyRR
+					pendingKeyName := keyName
 					pendingRecords := scopedOtherRecords
 					pendingMutations = append(pendingMutations, pendingLeaseMutation{
 						keyName: pendingKeyName,
 						apply: func() error {
-							if err := h.registerKeyLease(ctx, sigRR.SignerName, pendingKeyName, pendingKeyRR, keyLeaseDuration, keyLeaseDuration); err != nil {
+							if err := h.registerKeyLease(ctx, keyIDFromSIG(sigRR), pendingKeyRR, keyLeaseDuration, keyLeaseDuration); err != nil {
 								return err
 							}
-							h.setDataLease(pendingKeyName, pendingRecords, leaseDuration, h.upstreamZone)
-							h.scheduleLeaseExpiry(pendingKeyName)
+							h.setDataLease(leasepkg.NodeKey(pendingKeyRR), pendingRecords, leaseDuration, h.upstreamZone)
+							h.scheduleLeaseExpiry(leasepkg.NodeKey(pendingKeyRR))
 							h.logger.Debugf("Lease re-registered for %s (KEY-LEASE != 0, key not at FQDN, promoted from refresh)", pendingKeyName)
 							return nil
 						},
@@ -272,18 +274,18 @@ func (h *UpdateHandler) Handle(ctx context.Context, w dns.ResponseWriter, r *dns
 				return NewErrorResult(msg, err.Error(), err)
 			}
 			// Key refresh always extends key lease if ownership validated.
-			if err := h.registerKeyLease(ctx, sigRR.SignerName, keyName, keyRR, keyLeaseDuration, keyLeaseDuration); err != nil {
+			if err := h.registerKeyLease(ctx, keyIDFromSIG(sigRR), keyRR, keyLeaseDuration, keyLeaseDuration); err != nil {
 				msg := h.makeErrorResponse(r, dns.RcodeServerFailure, fmt.Sprintf("lease registration failed for %s: %v", keyName, err))
 				return NewErrorResult(msg, fmt.Sprintf("lease registration failed for %s: %v", keyName, err), err)
 			}
 
 			if len(scopedOtherRecords) > 0 {
-				if err := h.refreshDataLease(keyName, leaseDuration); err != nil {
+				if err := h.refreshDataLease(leasepkg.NodeKey(keyRR), leaseDuration); err != nil {
 					msg := h.makeErrorResponse(r, dns.RcodeRefused, err.Error())
 					return NewErrorResult(msg, err.Error(), err)
 				}
 			}
-			h.scheduleLeaseExpiry(keyName)
+			h.scheduleLeaseExpiry(leasepkg.NodeKey(keyRR))
 
 			h.logger.Debugf("Lease refreshed for %s (data lease=%d seconds)", keyName, leaseDuration)
 
@@ -295,7 +297,7 @@ func (h *UpdateHandler) Handle(ctx context.Context, w dns.ResponseWriter, r *dns
 		// Normal path (not refresh): KEY-LEASE != 0 and LEASE != 0.
 		partialNotes := make([]string, 0)
 		registerKey := true
-		if h.leaseManager.Lookup(keyName) == nil {
+		if h.leaseManager.LookupByKEY(keyRR) == nil {
 			exists, err := h.authoritativeHasRR(ctx, zone, keyRR)
 			if err != nil {
 				msg := h.makeErrorResponse(r, dns.RcodeServerFailure, fmt.Sprintf("authoritative duplicate check failed: %v", err))
@@ -307,7 +309,7 @@ func (h *UpdateHandler) Handle(ctx context.Context, w dns.ResponseWriter, r *dns
 			}
 		}
 
-		acceptedRecords, notes, err := h.filterDuplicateRegistrations(ctx, keyName, zone, scopedOtherRecords)
+		acceptedRecords, notes, err := h.filterDuplicateRegistrations(ctx, leasepkg.NodeKey(keyRR), zone, scopedOtherRecords)
 		if err != nil {
 			msg := h.makeErrorResponse(r, dns.RcodeRefused, fmt.Sprintf("duplicate registration rejected: %v", err))
 			return NewErrorResult(msg, "duplicate registration rejected", err)
@@ -315,19 +317,19 @@ func (h *UpdateHandler) Handle(ctx context.Context, w dns.ResponseWriter, r *dns
 		partialNotes = append(partialNotes, notes...)
 
 		if registerKey {
-			pendingKeyName := keyName
 			pendingKeyRR := keyRR
+			pendingKeyName := keyName
 			pendingRecords := acceptedRecords
 			pendingMutations = append(pendingMutations, pendingLeaseMutation{
 				keyName: pendingKeyName,
 				apply: func() error {
-					if err := h.registerKeyLease(ctx, sigRR.SignerName, pendingKeyName, pendingKeyRR, keyLeaseDuration, keyLeaseDuration); err != nil {
+					if err := h.registerKeyLease(ctx, keyIDFromSIG(sigRR), pendingKeyRR, keyLeaseDuration, keyLeaseDuration); err != nil {
 						return err
 					}
 					if len(pendingRecords) > 0 {
-						h.setDataLease(pendingKeyName, pendingRecords, leaseDuration, h.upstreamZone)
+						h.setDataLease(leasepkg.NodeKey(pendingKeyRR), pendingRecords, leaseDuration, h.upstreamZone)
 					}
-					h.scheduleLeaseExpiry(pendingKeyName)
+					h.scheduleLeaseExpiry(leasepkg.NodeKey(pendingKeyRR))
 					return nil
 				},
 			})

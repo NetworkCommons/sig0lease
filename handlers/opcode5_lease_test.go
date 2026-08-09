@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"codeberg.org/miekg/dns"
+	lease "github.com/NetworkCommons/sig0lease/pkg/lease"
 )
 
 func testKeyRR(name, pub string) *dns.KEY {
@@ -30,19 +31,19 @@ func TestLeaseExpiresAndRemoved(t *testing.T) {
 	ctx := context.Background()
 	key := testKeyRR("test.dev.zenr.io.", "AAAATESTKEY111=")
 
-	if err := h.leaseManager.Register(ctx, key.Hdr.Name, key, 1, 1, "dev.zenr.io."); err != nil {
+	if err := h.leaseManager.Register(ctx, key, 1, 1, "dev.zenr.io."); err != nil {
 		t.Fatalf("register lease: %v", err)
 	}
-	h.scheduleLeaseExpiry(key.Hdr.Name)
-	defer h.clearLeaseTimer(key.Hdr.Name)
+	h.scheduleLeaseExpiry(lease.NodeKey(key))
+	defer h.clearLeaseTimer(lease.NodeKey(key))
 
-	if h.leaseManager.Lookup(key.Hdr.Name) == nil {
+	if h.leaseManager.LookupByKEY(key) == nil {
 		t.Fatalf("expected active lease immediately after registration")
 	}
 
 	time.Sleep(1500 * time.Millisecond)
 
-	if got := h.leaseManager.Lookup(key.Hdr.Name); got != nil {
+	if got := h.leaseManager.LookupByKEY(key); got != nil {
 		t.Fatalf("expected lease removed after expiry")
 	}
 }
@@ -52,26 +53,26 @@ func TestLeaseRenewedAndNotRemovedPrematurely(t *testing.T) {
 	ctx := context.Background()
 	key := testKeyRR("test.dev.zenr.io.", "AAAATESTKEY222=")
 
-	if err := h.leaseManager.Register(ctx, key.Hdr.Name, key, 1, 1, "dev.zenr.io."); err != nil {
+	if err := h.leaseManager.Register(ctx, key, 1, 1, "dev.zenr.io."); err != nil {
 		t.Fatalf("register lease: %v", err)
 	}
-	h.scheduleLeaseExpiry(key.Hdr.Name)
-	defer h.clearLeaseTimer(key.Hdr.Name)
+	h.scheduleLeaseExpiry(lease.NodeKey(key))
+	defer h.clearLeaseTimer(lease.NodeKey(key))
 
 	time.Sleep(500 * time.Millisecond)
 
-	if err := h.leaseManager.Register(ctx, key.Hdr.Name, key, 2, 2, "dev.zenr.io."); err != nil {
+	if err := h.leaseManager.Register(ctx, key, 2, 2, "dev.zenr.io."); err != nil {
 		t.Fatalf("refresh lease: %v", err)
 	}
-	h.scheduleLeaseExpiry(key.Hdr.Name)
+	h.scheduleLeaseExpiry(lease.NodeKey(key))
 
 	time.Sleep(800 * time.Millisecond)
-	if h.leaseManager.Lookup(key.Hdr.Name) == nil {
+	if h.leaseManager.LookupByKEY(key) == nil {
 		t.Fatalf("expected lease to remain active after renewal")
 	}
 
 	time.Sleep(1700 * time.Millisecond)
-	if got := h.leaseManager.Lookup(key.Hdr.Name); got != nil {
+	if got := h.leaseManager.LookupByKEY(key); got != nil {
 		t.Fatalf("expected renewed lease to be removed after extended expiry")
 	}
 }
@@ -82,22 +83,22 @@ func TestRefreshRejectedForDifferentKeyAndExpires(t *testing.T) {
 	leaseKey := testKeyRR("test.dev.zenr.io.", "AAAATESTKEY333=")
 	otherKeySameName := testKeyRR("test.dev.zenr.io.", "BBBBOTHERKEY999=")
 
-	if err := h.leaseManager.Register(ctx, leaseKey.Hdr.Name, leaseKey, 1, 1, "dev.zenr.io."); err != nil {
+	if err := h.leaseManager.Register(ctx, leaseKey, 1, 1, "dev.zenr.io."); err != nil {
 		t.Fatalf("register lease: %v", err)
 	}
-	h.scheduleLeaseExpiry(leaseKey.Hdr.Name)
-	defer h.clearLeaseTimer(leaseKey.Hdr.Name)
+	h.scheduleLeaseExpiry(lease.NodeKey(leaseKey))
+	defer h.clearLeaseTimer(lease.NodeKey(leaseKey))
 
 	if err := h.validateRefreshOwnership(otherKeySameName); err == nil {
 		t.Fatalf("expected refresh ownership validation to reject mismatched key")
 	}
 
-	if h.leaseManager.Lookup(leaseKey.Hdr.Name) == nil {
+	if h.leaseManager.LookupByKEY(leaseKey) == nil {
 		t.Fatalf("expected original lease to remain active after rejected refresh")
 	}
 
 	time.Sleep(1500 * time.Millisecond)
-	if got := h.leaseManager.Lookup(leaseKey.Hdr.Name); got != nil {
+	if got := h.leaseManager.LookupByKEY(leaseKey); got != nil {
 		t.Fatalf("expected lease removed after expiry even after rejected refresh")
 	}
 }

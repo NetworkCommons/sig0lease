@@ -76,10 +76,18 @@ func (r *Record) TimeRemaining() time.Duration {
 
 // LeaseStore manages lifecycle of client leases. Implementations must be thread-safe.
 type LeaseStore interface {
-	Register(ctx context.Context, keyName string, keyRR *dns.KEY, leaseDuration uint32, keyLeaseDuration uint32, upstreamZone string) error
-	Lookup(keyName string) *Record
-	Get(keyName string) *Record
-	Delete(keyName string) error
+	// Register creates or updates a KEY lease. The node identity is derived from keyRR.
+	Register(ctx context.Context, keyRR *dns.KEY, leaseDuration uint32, keyLeaseDuration uint32, upstreamZone string) error
+	// FindByName returns all non-expired records at the given DNS name.
+	FindByName(dnsName string) []*Record
+	// LookupByKEY returns the non-expired record matching k's exact identity (name+algo+tag).
+	LookupByKEY(k *dns.KEY) *Record
+	// LookupBySIG returns the non-expired record matching the SIG(0) signer identity.
+	LookupBySIG(signerName string, algorithm uint8, keyTag uint16) *Record
+	// Get returns the record for nodeKey (composite key), including expired records.
+	Get(nodeKey string) *Record
+	// Delete removes the subtree rooted at the composite nodeKey.
+	Delete(nodeKey string) error
 	ListExpiring(within time.Duration) []*Record
 	ListAll() []*Record
 	SetPersistenceHook(hook func(ctx context.Context, op string, record *Record) error)
@@ -89,9 +97,11 @@ type LeaseStore interface {
 // on top of LeaseStore.
 type HierarchicalLeaseStore interface {
 	LeaseStore
-	RegisterWithParent(ctx context.Context, parentKeyName string, keyName string, keyRR *dns.KEY, leaseDuration uint32, keyLeaseDuration uint32, upstreamZone string) error
-	DeleteSubtree(keyName string) error
-	ChildrenOf(keyName string) []string
+	RegisterWithParent(ctx context.Context, parentNodeKey string, keyRR *dns.KEY, leaseDuration uint32, keyLeaseDuration uint32, upstreamZone string) error
+	DeleteSubtree(nodeKey string) error
+	ChildrenOf(nodeKey string) []string
+	// ListSubtreeKeys returns composite node keys of all descendants, deepest first.
+	ListSubtreeKeys(nodeKey string) []string
 	ExportSnapshot() (*LeaseTreeSnapshot, error)
 	ImportSnapshot(snapshot *LeaseTreeSnapshot) error
 	SaveSnapshot(path string) error
@@ -101,12 +111,12 @@ type HierarchicalLeaseStore interface {
 // LeaseTreeStore extends tree operations with non-KEY node storage.
 type LeaseTreeStore interface {
 	HierarchicalLeaseStore
-	UpsertNonKEYRecords(ownerKeyName string, records []dns.RR, leaseDuration uint32, upstreamZone string) error
-	RefreshNonKEYRecords(ownerKeyName string, leaseDuration uint32) error
-	MarkNonKEYRecordsDeleted(ownerKeyName string)
-	RemoveNonKEYRecords(ownerKeyName string)
-	GetNonKEYRecordSet(ownerKeyName string) *NonKEYRecordSet
-	HasActiveNonKEYRecord(ownerKeyName string, rr dns.RR) bool
+	UpsertNonKEYRecords(ownerNodeKey string, records []dns.RR, leaseDuration uint32, upstreamZone string) error
+	RefreshNonKEYRecords(ownerNodeKey string, leaseDuration uint32) error
+	MarkNonKEYRecordsDeleted(ownerNodeKey string)
+	RemoveNonKEYRecords(ownerNodeKey string)
+	GetNonKEYRecordSet(ownerNodeKey string) *NonKEYRecordSet
+	HasActiveNonKEYRecord(ownerNodeKey string, rr dns.RR) bool
 }
 
 // LeaseTreeSnapshot is a storage-neutral representation of the lease tree.
@@ -154,10 +164,11 @@ type NonKEYNodeSnapshot struct {
 // InMemoryLeaseStore is an in-memory lease manager implementation.
 type InMemoryLeaseStore struct {
 	mu              sync.RWMutex
-	leases          map[string]*Record
-	children        map[string]map[string]struct{}
+	leases          map[string]*Record             // composite NodeKey → Record
+	nameIdx         map[string][]string            // DNS name → []NodeKey (secondary index)
+	children        map[string]map[string]struct{} // NodeKey → set of child NodeKeys
 	rootsByZone     map[string]map[string]struct{}
-	nonKeySets      map[string]*NonKEYRecordSet
+	nonKeySets      map[string]*NonKEYRecordSet // NodeKey → NonKEYRecordSet
 	persistenceHook func(ctx context.Context, op string, record *Record) error
 	cleanupTicker   *time.Ticker
 	cleanupDone     chan struct{}
@@ -167,6 +178,7 @@ type InMemoryLeaseStore struct {
 func NewInMemoryManager() *InMemoryLeaseStore {
 	m := &InMemoryLeaseStore{
 		leases:      make(map[string]*Record),
+		nameIdx:     make(map[string][]string),
 		children:    make(map[string]map[string]struct{}),
 		rootsByZone: make(map[string]map[string]struct{}),
 		nonKeySets:  make(map[string]*NonKEYRecordSet),
@@ -186,29 +198,30 @@ func NewInMemoryManager() *InMemoryLeaseStore {
 	return m
 }
 
-// Register creates or updates a KEY lease.
-func (m *InMemoryLeaseStore) Register(ctx context.Context, keyName string, keyRR *dns.KEY, leaseDuration uint32, keyLeaseDuration uint32, upstreamZone string) error {
-	return m.RegisterWithParent(ctx, "", keyName, keyRR, leaseDuration, keyLeaseDuration, upstreamZone)
+// Register creates or updates a KEY lease. Node identity is derived from keyRR.
+func (m *InMemoryLeaseStore) Register(ctx context.Context, keyRR *dns.KEY, leaseDuration uint32, keyLeaseDuration uint32, upstreamZone string) error {
+	return m.RegisterWithParent(ctx, "", keyRR, leaseDuration, keyLeaseDuration, upstreamZone)
 }
 
-// RegisterWithParent creates or updates a KEY lease with an optional parent key.
-func (m *InMemoryLeaseStore) RegisterWithParent(ctx context.Context, parentKeyName string, keyName string, keyRR *dns.KEY, leaseDuration uint32, keyLeaseDuration uint32, upstreamZone string) error {
+// RegisterWithParent creates or updates a KEY lease with an optional parent composite node key.
+func (m *InMemoryLeaseStore) RegisterWithParent(ctx context.Context, parentNodeKey string, keyRR *dns.KEY, leaseDuration uint32, keyLeaseDuration uint32, upstreamZone string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	keyName = normalizeName(keyName)
-	if keyName == "" {
-		return fmt.Errorf("key name is empty")
-	}
 	if keyRR == nil {
 		return fmt.Errorf("key rr is nil")
 	}
-
-	parentKeyName = normalizeName(parentKeyName)
-	upstreamZone = normalizeZone(upstreamZone)
-	if parentKeyName == keyName {
-		parentKeyName = ""
+	dnsName := normalizeName(keyRR.Hdr.Name)
+	if dnsName == "" {
+		return fmt.Errorf("key name is empty")
 	}
+	nodeKey := NodeKey(keyRR)
+
+	parentNodeKey = normalizeName(parentNodeKey)
+	if parentNodeKey == nodeKey {
+		parentNodeKey = ""
+	}
+	upstreamZone = normalizeZone(upstreamZone)
 
 	now := time.Now()
 	record := &Record{
@@ -218,19 +231,21 @@ func (m *InMemoryLeaseStore) RegisterWithParent(ctx context.Context, parentKeyNa
 			ExpiresAt:     now.Add(time.Duration(leaseDuration) * time.Second),
 			LeaseDuration: leaseDuration,
 			RegisteredAt:  now,
-			ParentKeyName: parentKeyName,
+			ParentKeyName: parentNodeKey,
 		},
-		KeyName:          keyName,
+		KeyName:          dnsName,
 		KeyRR:            keyRR,
 		KeyLeaseDuration: keyLeaseDuration,
 		UpstreamZone:     upstreamZone,
 	}
 
-	if existing, ok := m.leases[keyName]; ok {
-		m.detachNodeLocked(existing.KeyName, existing.ParentKeyName, existing.UpstreamZone)
+	if existing, ok := m.leases[nodeKey]; ok {
+		m.detachNodeLocked(nodeKey, existing.ParentKeyName, existing.UpstreamZone)
+	} else {
+		m.nameIdx[dnsName] = append(m.nameIdx[dnsName], nodeKey)
 	}
-	m.leases[keyName] = record
-	m.attachNodeLocked(keyName, parentKeyName, upstreamZone)
+	m.leases[nodeKey] = record
+	m.attachNodeLocked(nodeKey, parentNodeKey, upstreamZone)
 
 	if m.persistenceHook != nil {
 		_ = m.persistenceHook(ctx, "register", cloneRecord(record))
@@ -238,52 +253,76 @@ func (m *InMemoryLeaseStore) RegisterWithParent(ctx context.Context, parentKeyNa
 	return nil
 }
 
-func (m *InMemoryLeaseStore) Lookup(keyName string) *Record {
+func (m *InMemoryLeaseStore) FindByName(dnsName string) []*Record {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 
-	keyName = normalizeName(keyName)
-	record, exists := m.leases[keyName]
-	if !exists || record.IsExpired() {
-		return nil
+	dnsName = normalizeName(dnsName)
+	var out []*Record
+	for _, nodeKey := range m.nameIdx[dnsName] {
+		if rec := m.leases[nodeKey]; rec != nil && !rec.IsExpired() {
+			out = append(out, cloneRecord(rec))
+		}
 	}
-	return cloneRecord(record)
+	return out
 }
 
-func (m *InMemoryLeaseStore) Get(keyName string) *Record {
+func (m *InMemoryLeaseStore) LookupByKEY(k *dns.KEY) *Record {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 
-	keyName = normalizeName(keyName)
-	record := m.leases[keyName]
-	if record == nil {
+	rec := m.leases[NodeKey(k)]
+	if rec == nil || rec.IsExpired() {
 		return nil
 	}
-	return cloneRecord(record)
+	return cloneRecord(rec)
 }
 
-func (m *InMemoryLeaseStore) Delete(keyName string) error {
-	return m.DeleteSubtree(keyName)
-}
+func (m *InMemoryLeaseStore) LookupBySIG(signerName string, algorithm uint8, keyTag uint16) *Record {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
 
-func (m *InMemoryLeaseStore) DeleteSubtree(keyName string) error {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-
-	keyName = normalizeName(keyName)
-	if keyName == "" {
-		return fmt.Errorf("key name is empty")
+	rec := m.leases[NodeKeyFromSIG(signerName, algorithm, keyTag)]
+	if rec == nil || rec.IsExpired() {
+		return nil
 	}
-	m.deleteSubtreeLocked(context.Background(), keyName)
+	return cloneRecord(rec)
+}
+
+// Get returns the record for the exact composite nodeKey, including expired records.
+func (m *InMemoryLeaseStore) Get(nodeKey string) *Record {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	if rec, ok := m.leases[normalizeName(nodeKey)]; ok {
+		return cloneRecord(rec)
+	}
 	return nil
 }
 
-func (m *InMemoryLeaseStore) ChildrenOf(keyName string) []string {
+func (m *InMemoryLeaseStore) Delete(nodeKey string) error {
+	return m.DeleteSubtree(nodeKey)
+}
+
+// DeleteSubtree removes the subtree rooted at the exact composite nodeKey.
+func (m *InMemoryLeaseStore) DeleteSubtree(nodeKey string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	nk := normalizeName(nodeKey)
+	if nk == "" {
+		return fmt.Errorf("node key is empty")
+	}
+	m.deleteSubtreeLocked(context.Background(), nk)
+	return nil
+}
+
+// ChildrenOf returns the composite node keys of direct children of the exact composite nodeKey.
+func (m *InMemoryLeaseStore) ChildrenOf(nodeKey string) []string {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 
-	keyName = normalizeName(keyName)
-	set := m.children[keyName]
+	set := m.children[normalizeName(nodeKey)]
 	if len(set) == 0 {
 		return nil
 	}
@@ -293,6 +332,31 @@ func (m *InMemoryLeaseStore) ChildrenOf(keyName string) []string {
 	}
 	sort.Strings(children)
 	return children
+}
+
+// ListSubtreeKeys returns composite node keys of all descendants of nodeKey, deepest first.
+func (m *InMemoryLeaseStore) ListSubtreeKeys(nodeKey string) []string {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	nk := normalizeName(nodeKey)
+
+	all := make([]string, 0)
+	stack := []string{nk}
+	visited := map[string]bool{nk: true}
+	for len(stack) > 0 {
+		cur := stack[len(stack)-1]
+		stack = stack[:len(stack)-1]
+		for child := range m.children[cur] {
+			if !visited[child] {
+				visited[child] = true
+				all = append(all, child)
+				stack = append(stack, child)
+			}
+		}
+	}
+	sort.Slice(all, func(i, j int) bool { return len(all[i]) > len(all[j]) })
+	return all
 }
 
 func (m *InMemoryLeaseStore) ListExpiring(within time.Duration) []*Record {
@@ -326,19 +390,19 @@ func (m *InMemoryLeaseStore) SetPersistenceHook(hook func(ctx context.Context, o
 	m.persistenceHook = hook
 }
 
-func (m *InMemoryLeaseStore) UpsertNonKEYRecords(ownerKeyName string, records []dns.RR, leaseDuration uint32, upstreamZone string) error {
+func (m *InMemoryLeaseStore) UpsertNonKEYRecords(ownerNodeKey string, records []dns.RR, leaseDuration uint32, upstreamZone string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	ownerKeyName = normalizeName(ownerKeyName)
-	if ownerKeyName == "" {
+	ownerNodeKey = normalizeName(ownerNodeKey)
+	if ownerNodeKey == "" {
 		return fmt.Errorf("owner key name is empty")
 	}
-	if _, ok := m.leases[ownerKeyName]; !ok {
-		return fmt.Errorf("owner key %s not found", ownerKeyName)
+	if _, ok := m.leases[ownerNodeKey]; !ok {
+		return fmt.Errorf("owner key %s not found", ownerNodeKey)
 	}
 
-	set := m.ensureNonKeySetLocked(ownerKeyName)
+	set := m.ensureNonKeySetLocked(ownerNodeKey)
 	now := time.Now()
 	for _, rr := range records {
 		if rr == nil || rr.Header() == nil {
@@ -354,9 +418,9 @@ func (m *InMemoryLeaseStore) UpsertNonKEYRecords(ownerKeyName string, records []
 				BaseRecord: BaseRecord{
 					NodeKind:      NodeKindNonKEY,
 					RRType:        dns.RRToType(rr),
-					ParentKeyName: ownerKeyName,
+					ParentKeyName: ownerNodeKey,
 				},
-				OwnerKeyName: ownerKeyName,
+				OwnerKeyName: ownerNodeKey,
 				RRKey:        rrKey,
 			}
 			set.Records[rrKey] = entry
@@ -374,12 +438,12 @@ func (m *InMemoryLeaseStore) UpsertNonKEYRecords(ownerKeyName string, records []
 	return nil
 }
 
-func (m *InMemoryLeaseStore) RefreshNonKEYRecords(ownerKeyName string, leaseDuration uint32) error {
+func (m *InMemoryLeaseStore) RefreshNonKEYRecords(ownerNodeKey string, leaseDuration uint32) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	ownerKeyName = normalizeName(ownerKeyName)
-	set := m.nonKeySets[ownerKeyName]
+	ownerNodeKey = normalizeName(ownerNodeKey)
+	set := m.nonKeySets[ownerNodeKey]
 	if set == nil {
 		return fmt.Errorf("refresh rejected: lease does not exist")
 	}
@@ -396,12 +460,12 @@ func (m *InMemoryLeaseStore) RefreshNonKEYRecords(ownerKeyName string, leaseDura
 	return nil
 }
 
-func (m *InMemoryLeaseStore) MarkNonKEYRecordsDeleted(ownerKeyName string) {
+func (m *InMemoryLeaseStore) MarkNonKEYRecordsDeleted(ownerNodeKey string) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	ownerKeyName = normalizeName(ownerKeyName)
-	set := m.nonKeySets[ownerKeyName]
+	ownerNodeKey = normalizeName(ownerNodeKey)
+	set := m.nonKeySets[ownerNodeKey]
 	if set == nil {
 		return
 	}
@@ -411,31 +475,28 @@ func (m *InMemoryLeaseStore) MarkNonKEYRecordsDeleted(ownerKeyName string) {
 	set.Deleted = true
 }
 
-func (m *InMemoryLeaseStore) RemoveNonKEYRecords(ownerKeyName string) {
+func (m *InMemoryLeaseStore) RemoveNonKEYRecords(ownerNodeKey string) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	ownerKeyName = normalizeName(ownerKeyName)
-	delete(m.nonKeySets, ownerKeyName)
+	delete(m.nonKeySets, normalizeName(ownerNodeKey))
 }
 
-func (m *InMemoryLeaseStore) GetNonKEYRecordSet(ownerKeyName string) *NonKEYRecordSet {
+func (m *InMemoryLeaseStore) GetNonKEYRecordSet(ownerNodeKey string) *NonKEYRecordSet {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 
-	ownerKeyName = normalizeName(ownerKeyName)
-	set := m.nonKeySets[ownerKeyName]
+	set := m.nonKeySets[normalizeName(ownerNodeKey)]
 	if set == nil {
 		return nil
 	}
 	return cloneNonKeySet(set)
 }
 
-func (m *InMemoryLeaseStore) HasActiveNonKEYRecord(ownerKeyName string, rr dns.RR) bool {
+func (m *InMemoryLeaseStore) HasActiveNonKEYRecord(ownerNodeKey string, rr dns.RR) bool {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 
-	ownerKeyName = normalizeName(ownerKeyName)
-	set := m.nonKeySets[ownerKeyName]
+	set := m.nonKeySets[normalizeName(ownerNodeKey)]
 	if set == nil {
 		return false
 	}
@@ -473,15 +534,15 @@ func (m *InMemoryLeaseStore) ExportSnapshot() (*LeaseTreeSnapshot, error) {
 		sort.Strings(childKeys)
 
 		keyNodes = append(keyNodes, LeaseNodeSnapshot{
-			KeyName:          rec.KeyName,
+			KeyName:          key, // composite NodeKey
 			RRType:           rec.RRType,
-			ParentKeyName:    rec.ParentKeyName,
+			ParentKeyName:    rec.ParentKeyName, // composite NodeKey of parent
 			UpstreamZone:     rec.UpstreamZone,
 			LeaseDuration:    rec.LeaseDuration,
 			KeyLeaseDuration: rec.KeyLeaseDuration,
 			RegisteredAt:     rec.RegisteredAt,
 			ExpiresAt:        rec.ExpiresAt,
-			RRName:           rec.KeyRR.Hdr.Name,
+			RRName:           rec.KeyRR.Hdr.Name, // DNS owner name
 			RRClass:          rec.KeyRR.Hdr.Class,
 			RRTTL:            rec.KeyRR.Hdr.TTL,
 			KeyFlags:         rec.KeyRR.Flags,
@@ -547,12 +608,8 @@ func (m *InMemoryLeaseStore) ImportSnapshot(snapshot *LeaseTreeSnapshot) error {
 	newNonKeySets := make(map[string]*NonKEYRecordSet)
 
 	for _, node := range snapshot.KeyNodes {
-		keyName := normalizeName(node.KeyName)
-		if keyName == "" {
-			return fmt.Errorf("snapshot key node has empty key name")
-		}
 		if strings.TrimSpace(node.KeyData) == "" {
-			return fmt.Errorf("snapshot key data is empty for %s", keyName)
+			return fmt.Errorf("snapshot key data is empty for %s", node.KeyName)
 		}
 
 		keyRR := &dns.KEY{DNSKEY: dns.DNSKEY{Hdr: dns.Header{Name: node.RRName, Class: node.RRClass, TTL: node.RRTTL}}}
@@ -560,6 +617,15 @@ func (m *InMemoryLeaseStore) ImportSnapshot(snapshot *LeaseTreeSnapshot) error {
 		keyRR.Protocol = node.KeyProtocol
 		keyRR.Algorithm = node.KeyAlgorithm
 		keyRR.PublicKey = node.KeyData
+
+		// Accept both composite key format and legacy DNS-name format.
+		keyName := normalizeName(node.KeyName)
+		if !strings.Contains(keyName, ".+") {
+			keyName = NodeKey(keyRR)
+		}
+		if keyName == "" {
+			return fmt.Errorf("snapshot key node has empty key name")
+		}
 
 		rrType := node.RRType
 		if rrType == 0 {
@@ -569,6 +635,15 @@ func (m *InMemoryLeaseStore) ImportSnapshot(snapshot *LeaseTreeSnapshot) error {
 			}
 		}
 
+		parentKey := normalizeName(node.ParentKeyName)
+		// Normalise legacy parent format to composite key if possible.
+		if parentKey != "" && !strings.Contains(parentKey, ".+") {
+			// Cannot recompute parent composite key without its KEY RR data here;
+			// keep the plain name and the tree link will be rebuilt from ChildKeys.
+			_ = parentKey
+			parentKey = normalizeName(node.ParentKeyName)
+		}
+
 		rec := &Record{
 			BaseRecord: BaseRecord{
 				NodeKind:      NodeKindKEY,
@@ -576,9 +651,9 @@ func (m *InMemoryLeaseStore) ImportSnapshot(snapshot *LeaseTreeSnapshot) error {
 				ExpiresAt:     node.ExpiresAt,
 				LeaseDuration: node.LeaseDuration,
 				RegisteredAt:  node.RegisteredAt,
-				ParentKeyName: normalizeName(node.ParentKeyName),
+				ParentKeyName: parentKey,
 			},
-			KeyName:          keyName,
+			KeyName:          normalizeName(node.RRName),
 			KeyRR:            keyRR,
 			KeyLeaseDuration: node.KeyLeaseDuration,
 			UpstreamZone:     normalizeZone(node.UpstreamZone),
@@ -589,12 +664,15 @@ func (m *InMemoryLeaseStore) ImportSnapshot(snapshot *LeaseTreeSnapshot) error {
 		newLeases[keyName] = rec
 	}
 
-	for keyName, rec := range newLeases {
+	newNameIdx := make(map[string][]string, len(newLeases))
+	for nodeKey, rec := range newLeases {
+		dnsName := normalizeName(rec.KeyName)
+		newNameIdx[dnsName] = append(newNameIdx[dnsName], nodeKey)
 		if rec.ParentKeyName != "" {
 			if _, ok := newChildren[rec.ParentKeyName]; !ok {
 				newChildren[rec.ParentKeyName] = make(map[string]struct{})
 			}
-			newChildren[rec.ParentKeyName][keyName] = struct{}{}
+			newChildren[rec.ParentKeyName][nodeKey] = struct{}{}
 			continue
 		}
 		if rec.UpstreamZone == "" {
@@ -603,7 +681,7 @@ func (m *InMemoryLeaseStore) ImportSnapshot(snapshot *LeaseTreeSnapshot) error {
 		if _, ok := newRootsByZone[rec.UpstreamZone]; !ok {
 			newRootsByZone[rec.UpstreamZone] = make(map[string]struct{})
 		}
-		newRootsByZone[rec.UpstreamZone][keyName] = struct{}{}
+		newRootsByZone[rec.UpstreamZone][nodeKey] = struct{}{}
 	}
 
 	for _, node := range snapshot.NonKEYNodes {
@@ -654,6 +732,7 @@ func (m *InMemoryLeaseStore) ImportSnapshot(snapshot *LeaseTreeSnapshot) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.leases = newLeases
+	m.nameIdx = newNameIdx
 	m.children = newChildren
 	m.rootsByZone = newRootsByZone
 	m.nonKeySets = newNonKeySets
@@ -692,13 +771,13 @@ func (m *InMemoryLeaseStore) cleanupExpired() {
 	defer m.mu.Unlock()
 
 	expiredRoots := make([]string, 0)
-	for keyName, record := range m.leases {
+	for nodeKey, record := range m.leases {
 		if record.IsExpired() {
-			expiredRoots = append(expiredRoots, keyName)
+			expiredRoots = append(expiredRoots, nodeKey)
 		}
 	}
-	for _, keyName := range expiredRoots {
-		m.deleteSubtreeLocked(context.Background(), keyName)
+	for _, nodeKey := range expiredRoots {
+		m.deleteSubtreeLocked(context.Background(), nodeKey)
 	}
 
 	for owner, set := range m.nonKeySets {
@@ -731,6 +810,25 @@ func (m *InMemoryLeaseStore) Stop() {
 
 func normalizeName(name string) string {
 	return strings.TrimSuffix(strings.ToLower(strings.TrimSpace(name)), ".")
+}
+
+// NodeKey returns the canonical composite lease-store key for a KEY RR.
+// Format: dnsname.+algo+keytag (same convention as BIND key files).
+func NodeKey(k *dns.KEY) string {
+	return fmt.Sprintf("%s.+%03d+%05d", normalizeName(k.Hdr.Name), k.Algorithm, k.KeyTag())
+}
+
+// NodeKeyFromSIG computes the composite lease-store key from SIG(0) signer fields.
+func NodeKeyFromSIG(signerName string, algorithm uint8, keyTag uint16) string {
+	return fmt.Sprintf("%s.+%03d+%05d", normalizeName(signerName), algorithm, keyTag)
+}
+
+// dnsNameFromNodeKey extracts the DNS name portion of a composite node key.
+func dnsNameFromNodeKey(nodeKey string) string {
+	if i := strings.LastIndex(nodeKey, ".+"); i > 0 {
+		return nodeKey[:i]
+	}
+	return nodeKey
 }
 
 func normalizeZone(zone string) string {
@@ -802,12 +900,12 @@ func rrNodeKey(rr dns.RR) string {
 	}
 }
 
-func (m *InMemoryLeaseStore) attachNodeLocked(keyName, parentKeyName, zone string) {
-	if parentKeyName != "" {
-		if _, ok := m.children[parentKeyName]; !ok {
-			m.children[parentKeyName] = make(map[string]struct{})
+func (m *InMemoryLeaseStore) attachNodeLocked(nodeKey, parentNodeKey, zone string) {
+	if parentNodeKey != "" {
+		if _, ok := m.children[parentNodeKey]; !ok {
+			m.children[parentNodeKey] = make(map[string]struct{})
 		}
-		m.children[parentKeyName][keyName] = struct{}{}
+		m.children[parentNodeKey][nodeKey] = struct{}{}
 		return
 	}
 	if zone == "" {
@@ -816,15 +914,15 @@ func (m *InMemoryLeaseStore) attachNodeLocked(keyName, parentKeyName, zone strin
 	if _, ok := m.rootsByZone[zone]; !ok {
 		m.rootsByZone[zone] = make(map[string]struct{})
 	}
-	m.rootsByZone[zone][keyName] = struct{}{}
+	m.rootsByZone[zone][nodeKey] = struct{}{}
 }
 
-func (m *InMemoryLeaseStore) detachNodeLocked(keyName, parentKeyName, zone string) {
-	if parentKeyName != "" {
-		if kids, ok := m.children[parentKeyName]; ok {
-			delete(kids, keyName)
+func (m *InMemoryLeaseStore) detachNodeLocked(nodeKey, parentNodeKey, zone string) {
+	if parentNodeKey != "" {
+		if kids, ok := m.children[parentNodeKey]; ok {
+			delete(kids, nodeKey)
 			if len(kids) == 0 {
-				delete(m.children, parentKeyName)
+				delete(m.children, parentNodeKey)
 			}
 		}
 		return
@@ -833,7 +931,7 @@ func (m *InMemoryLeaseStore) detachNodeLocked(keyName, parentKeyName, zone strin
 		return
 	}
 	if roots, ok := m.rootsByZone[zone]; ok {
-		delete(roots, keyName)
+		delete(roots, nodeKey)
 		if len(roots) == 0 {
 			delete(m.rootsByZone, zone)
 		}
@@ -871,6 +969,21 @@ func (m *InMemoryLeaseStore) deleteSubtreeLocked(ctx context.Context, rootKey st
 				_ = m.persistenceHook(ctx, "delete", cloneRecord(rec))
 			}
 			delete(m.leases, key)
+			// Remove from nameIdx
+			dnsName := dnsNameFromNodeKey(key)
+			if existing := m.nameIdx[dnsName]; len(existing) > 0 {
+				updated := existing[:0]
+				for _, nk := range existing {
+					if nk != key {
+						updated = append(updated, nk)
+					}
+				}
+				if len(updated) == 0 {
+					delete(m.nameIdx, dnsName)
+				} else {
+					m.nameIdx[dnsName] = updated
+				}
+			}
 		}
 		delete(m.children, key)
 		if set := m.nonKeySets[key]; set != nil {

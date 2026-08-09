@@ -5,10 +5,11 @@ import (
 	"context"
 	"fmt"
 	"net"
-	"os"
 	"os/signal"
 	"syscall"
 	"time"
+
+	"golang.org/x/sync/errgroup"
 
 	"codeberg.org/miekg/dns"
 	"github.com/NetworkCommons/sig0lease/config"
@@ -74,62 +75,51 @@ func (s *Server) GetResolver() *forward.Resolver {
 func (s *Server) Serve() error {
 	s.logger.Infof("DNS Proxy starting on %s", s.cfg.Server.Address)
 
-	// Create a custom handler that routes based on opcode
+	// Create a custom handler that passes the per-query context to handleRequest
 	router := dns.HandlerFunc(func(ctx context.Context, w dns.ResponseWriter, r *dns.Msg) {
-		s.handleRequest(w, r)
+		s.handleRequest(ctx, w, r)
 	})
 
-	// Start listeners for each configured network
-	errCh := make(chan error, len(s.cfg.Server.Networks))
+	// Set up OS signal interception that automatically cancels ctx on SIGINT/SIGTERM
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
 
+	// Create an errgroup bound to the signal context
+	g, ctx := errgroup.WithContext(ctx)
+
+	// Launch each network listener in the errgroup
 	for _, network := range s.cfg.Server.Networks {
-		go func(net string) {
-			var err error
+		net := network // Local copy for closure safety
+		g.Go(func() error {
 			switch net {
 			case "udp":
-				err = s.serveUDP(router)
+				return s.serveUDP(ctx, router)
 			case "tcp":
-				err = s.serveTCP(router)
+				return s.serveTCP(ctx, router)
 			default:
-				err = fmt.Errorf("unsupported network: %s", net)
+				return fmt.Errorf("unsupported network: %s", net)
 			}
-			if err != nil {
-				errCh <- fmt.Errorf("%s listener error: %w", net, err)
-			}
-		}(network)
+		})
 	}
 
-	// Collect any startup errors
-	for i := 0; i < len(s.cfg.Server.Networks); i++ {
-		select {
-		case err := <-errCh:
-			s.logger.Errorf("Listener failed: %v", err)
-			s.shutdown()
-			return err
-		default:
-			// No error yet, continue
-		}
-	}
+	s.logger.Infof("DNS Proxy ready to accept queries on %v", s.cfg.Server.Networks)
 
-	// Wait for shutdown signal
-	sigCh := make(chan os.Signal, 1)
-	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
-
-	s.logger.Infof("DNS Proxy ready to accept queries")
-
-	select {
-	case sig := <-sigCh:
-		s.logger.Infof("Received signal %v, shutting down...", sig)
-	case err := <-errCh:
+	// g.Wait() blocks until:
+	// 1. Any listener returns an error (e.g. port bind failure or runtime crash)
+	// 2. An OS signal is received (causing ctx cancellation and listener exit)
+	if err := g.Wait(); err != nil && ctx.Err() == nil {
+		s.logger.Errorf("Listener failed: %v", err)
+		s.shutdown()
 		return err
 	}
 
+	s.logger.Infof("DNS Proxy shut down gracefully")
 	s.shutdown()
 	return nil
 }
 
 // serveUDP starts a custom UDP listener that preserves EDNS options
-func (s *Server) serveUDP(handler dns.HandlerFunc) error {
+func (s *Server) serveUDP(ctx context.Context, handler dns.HandlerFunc) error {
 	addr := s.cfg.Server.Address
 
 	// Handle port-only syntax - explicitly use localhost for IPv4
@@ -149,6 +139,12 @@ func (s *Server) serveUDP(handler dns.HandlerFunc) error {
 	}
 	defer conn.Close()
 
+	// Goroutine to force unblock ReadFromUDP when ctx is canceled
+	go func() {
+		<-ctx.Done()
+		conn.Close() // Closing conn forces ReadFromUDP to unblock with an error
+	}()
+
 	// Set buffer sizes
 	conn.SetReadBuffer(65536)
 	conn.SetWriteBuffer(65536)
@@ -160,8 +156,22 @@ func (s *Server) serveUDP(handler dns.HandlerFunc) error {
 		buf := make([]byte, 4096)
 		n, remoteAddr, err := conn.ReadFromUDP(buf)
 		if err != nil {
-			s.logger.Errorf("UDP read error: %v", err)
-			continue
+			// Check if error happened because ctx was canceled (graceful exit)
+			select {
+			case <-ctx.Done():
+				s.logger.Infof("UDP listener shutting down cleanly")
+				return nil
+			default:
+				s.logger.Errorf("UDP read error: %v", err)
+				continue
+			}
+		}
+
+		// Prevent processing new packets if shutdown signal arrived mid-read
+		select {
+		case <-ctx.Done():
+			return nil
+		default:
 		}
 
 		s.logger.Infof("UDP: Received %d bytes from %s", n, remoteAddr.String())
@@ -198,7 +208,7 @@ func (s *Server) serveUDP(handler dns.HandlerFunc) error {
 		}
 
 		// Call the handler with context
-		go handler(context.Background(), w, msg)
+		go handler(ctx, w, msg)
 	}
 }
 
@@ -285,7 +295,7 @@ func (w *udpResponseWriter) Session() *dns.Session {
 }
 
 // serveTCP starts a TCP listener.
-func (s *Server) serveTCP(handler dns.HandlerFunc) error {
+func (s *Server) serveTCP(ctx context.Context, handler dns.HandlerFunc) error {
 	addr := s.cfg.Server.Address
 
 	// Handle port-only syntax
@@ -300,12 +310,28 @@ func (s *Server) serveTCP(handler dns.HandlerFunc) error {
 		Handler:   handler,
 		TLSConfig: nil,
 	}
+	// Monitor context cancellation in the background
+	go func() {
+		<-ctx.Done()
+		s.logger.Infof("TCP listener shutting down...")
 
-	return srv.ListenAndServe()
+		srv.Shutdown(ctx)
+	}()
+
+	err := srv.ListenAndServe()
+
+	// Check if ListenAndServe returned an error due to server shutdown
+	select {
+	case <-ctx.Done():
+		s.logger.Infof("TCP listener shut down cleanly")
+		return nil
+	default:
+		return err
+	}
 }
 
 // handleRequest is the main request handler that routes based on opcode.
-func (s *Server) handleRequest(w dns.ResponseWriter, r *dns.Msg) {
+func (s *Server) handleRequest(ctx context.Context, w dns.ResponseWriter, r *dns.Msg) {
 	s.logger.Infof("handleRequest: Received DNS message from %s", w.RemoteAddr().String())
 	if len(r.Question) > 0 {
 		q := r.Question[0]
@@ -313,7 +339,7 @@ func (s *Server) handleRequest(w dns.ResponseWriter, r *dns.Msg) {
 			r.ID, r.Opcode, q.Header().Name, dns.TypeToString[dns.RRToType(q)])
 	}
 
-	resp := s.router.Route(context.Background(), w, r)
+	resp := s.router.Route(ctx, w, r)
 
 	if resp != nil {
 		s.logger.Infof("handleRequest: Response has Data len=%d, Rcode=%d", len(resp.Data), resp.Rcode)

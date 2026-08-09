@@ -74,6 +74,34 @@ yaml_get_lease_time() {
 start_proxy() {
     log_section "START: Proxy Process"
 
+    # Check if a proxy/service is ALREADY listening on PROXY_PORT
+    local is_port_in_use=false
+
+    PORT_HEX=$(printf '%04X' "$PROXY_PORT")
+
+    if [ "${OS}" = "darwin" ]; then
+        if lsof -nP -iTCP:"${PROXY_PORT}" -sTCP:LISTEN >/dev/null 2>&1 || \
+           lsof -nP -iUDP:"${PROXY_PORT}" >/dev/null 2>&1; then
+            is_port_in_use=true
+        fi
+    elif command -v ss >/dev/null 2>&1; then
+        if ss -tuln 2>/dev/null | grep -qE ":${PROXY_PORT}\\b"; then
+            is_port_in_use=true
+        fi
+    elif [ -f /proc/net/tcp ] || [ -f /proc/net/udp ]; then
+        if grep ":${PORT_HEX} " /proc/net/tcp 2>/dev/null | grep -q " 0A " || \
+           grep ":${PORT_HEX} " /proc/net/udp 2>/dev/null | grep -q " 07 "; then
+            is_port_in_use=true
+        fi
+    fi
+
+    # If already running, reuse it and skip startup
+    if [ "$is_port_in_use" = true ]; then
+        log_success "Reusing proxy already listening on ${PROXY_ADDR}:${PROXY_PORT}"
+        REUSED_PROXY=true # Optional flag for cleanup scripts to avoid killing pre-existing proxies
+        return 0
+    fi
+    
     if ! [ -x "$PROXY_BIN" ]; then
         log_error "Proxy binary not found or not executable: $PROXY_BIN"
         exit 1
@@ -103,7 +131,7 @@ start_proxy() {
     fi
     # Verify our proxy PID owns at least one listener on the target port.
     is_listening=true
-    PORT_HEX=$(printf '%04X' "$PROXY_PORT")
+
     if [ "${OS}" = "darwin" ]
     then
         if ! lsof -nP -a -p "$PROXY_PID" -iTCP:"${PROXY_PORT}" -sTCP:LISTEN >/dev/null 2>&1 && \

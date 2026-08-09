@@ -150,7 +150,7 @@ func TestExtractAndValidateSig0_UsesAuthoritativeSignerKey(t *testing.T) {
 	}
 
 	signed := buildSignedUpdateForTest(t, loaded, "test.dev.zenr.io.")
-	sig, resolved, err := h.extractAndValidateSig0(context.Background(), signed, "test.dev.zenr.io.", "test.dev.zenr.io.", nil, nil)
+	sig, resolved, err := h.extractAndValidateSig0(context.Background(), signed, "test.dev.zenr.io.", nil, nil, nil)
 	if err != nil {
 		t.Fatalf("expected validation success: %v", err)
 	}
@@ -189,7 +189,7 @@ func TestExtractAndValidateSig0_RejectsSignerOutsideLeaseHierarchy(t *testing.T)
 	}
 
 	signed := buildSignedUpdateForTest(t, outsideLoaded, "test.dev.zenr.io.")
-	_, _, err = h.extractAndValidateSig0(context.Background(), signed, "test.dev.zenr.io.", "test.dev.zenr.io.", nil, nil)
+	_, _, err = h.extractAndValidateSig0(context.Background(), signed, "test.dev.zenr.io.", nil, nil, nil)
 	if err == nil {
 		t.Fatalf("expected hierarchy validation failure")
 	}
@@ -206,7 +206,7 @@ func TestExtractAndValidateSig0_DNSFailureFallsBackToLeaseStore(t *testing.T) {
 	}
 
 	h := newTestHandler()
-	if err := h.leaseManager.Register(context.Background(), loaded.PublicKey.Hdr.Name, loaded.PublicKey, 120, 120, "dev.zenr.io."); err != nil {
+	if err := h.leaseManager.Register(context.Background(), loaded.PublicKey, 120, 120, "dev.zenr.io."); err != nil {
 		t.Fatalf("register lease key: %v", err)
 	}
 	h.authoritativeLookup = func(ctx context.Context, zoneHint, fqdn string, rrType uint16) ([]dns.RR, error) {
@@ -214,7 +214,7 @@ func TestExtractAndValidateSig0_DNSFailureFallsBackToLeaseStore(t *testing.T) {
 	}
 
 	signed := buildSignedUpdateForTest(t, loaded, "test.dev.zenr.io.")
-	_, resolved, err := h.extractAndValidateSig0(context.Background(), signed, "test.dev.zenr.io.", "test.dev.zenr.io.", nil, nil)
+	_, resolved, err := h.extractAndValidateSig0(context.Background(), signed, "test.dev.zenr.io.", nil, nil, nil)
 	if err != nil {
 		t.Fatalf("expected lease-store fallback success when authoritative lookup fails: %v", err)
 	}
@@ -234,7 +234,7 @@ func TestExtractAndValidateSig0_DNSNoKeyFallsBackToLeaseStore(t *testing.T) {
 	}
 
 	h := newTestHandler()
-	if err := h.leaseManager.Register(context.Background(), loaded.PublicKey.Hdr.Name, loaded.PublicKey, 120, 120, "dev.zenr.io."); err != nil {
+	if err := h.leaseManager.Register(context.Background(), loaded.PublicKey, 120, 120, "dev.zenr.io."); err != nil {
 		t.Fatalf("register lease key: %v", err)
 	}
 	h.authoritativeLookup = func(ctx context.Context, zoneHint, fqdn string, rrType uint16) ([]dns.RR, error) {
@@ -242,7 +242,7 @@ func TestExtractAndValidateSig0_DNSNoKeyFallsBackToLeaseStore(t *testing.T) {
 	}
 
 	signed := buildSignedUpdateForTest(t, loaded, "test.dev.zenr.io.")
-	_, resolved, err := h.extractAndValidateSig0(context.Background(), signed, "test.dev.zenr.io.", "test.dev.zenr.io.", nil, nil)
+	_, resolved, err := h.extractAndValidateSig0(context.Background(), signed, "test.dev.zenr.io.", nil, nil, nil)
 	if err != nil {
 		t.Fatalf("expected lease-store fallback success when authoritative DNS has no signer key: %v", err)
 	}
@@ -271,7 +271,7 @@ func TestExtractAndValidateSig0_RequestKeyWorksWhenDnsAndLeaseStoreDontHaveSigne
 	signed := buildSignedUpdateWithSignerKeyInUpdateForTest(t, loaded, "test.dev.zenr.io.")
 	requestKey := loaded.PublicKey.Clone().(*dns.KEY)
 
-	_, resolved, err := h.extractAndValidateSig0(context.Background(), signed, "test.dev.zenr.io.", "test.dev.zenr.io.", nil, []*dns.KEY{requestKey})
+	_, resolved, err := h.extractAndValidateSig0(context.Background(), signed, "test.dev.zenr.io.", nil, []*dns.KEY{requestKey}, nil)
 	if err != nil {
 		t.Fatalf("expected validation success using request KEY only: %v", err)
 	}
@@ -299,7 +299,7 @@ func TestExtractAndValidateSig0_AdditionalSigningKeyWorksWithoutAuthoritativeMat
 	signed := buildSignedUpdateWithSignerKeyInAdditionalForTest(t, loaded, "test.dev.zenr.io.")
 	requestKey := loaded.PublicKey.Clone().(*dns.KEY)
 
-	_, resolved, err := h.extractAndValidateSig0(context.Background(), signed, "test.dev.zenr.io.", "test.dev.zenr.io.", []*dns.KEY{requestKey}, nil)
+	_, resolved, err := h.extractAndValidateSig0(context.Background(), signed, "test.dev.zenr.io.", nil, []*dns.KEY{requestKey}, nil)
 	if err != nil {
 		t.Fatalf("expected validation success using Additional-section signing KEY: %v", err)
 	}
@@ -338,7 +338,7 @@ func TestHandle_DoesNotPersistLeaseWhenUpstreamRejectsUpdate(t *testing.T) {
 
 	leaseOwner := "test.dev.zenr.io."
 	req := buildSignedLeaseRegistrationForHandleTest(t, loaded, leaseOwner, 120, 120)
-	if got := h.leaseManager.Lookup(leaseOwner); got != nil {
+	if got := h.leaseManager.FindByName(leaseOwner); len(got) != 0 {
 		t.Fatalf("expected empty lease store before request, got %+v", got)
 	}
 
@@ -352,7 +352,7 @@ func TestHandle_DoesNotPersistLeaseWhenUpstreamRejectsUpdate(t *testing.T) {
 	if res.Message.Rcode != dns.RcodeServerFailure {
 		t.Fatalf("expected SERVFAIL when upstream rejects update, got rcode=%d", res.Message.Rcode)
 	}
-	if got := h.leaseManager.Lookup(leaseOwner); got != nil {
+	if got := h.leaseManager.FindByName(leaseOwner); len(got) != 0 {
 		t.Fatalf("expected lease store unchanged when upstream update fails, got %+v", got)
 	}
 }
@@ -373,15 +373,15 @@ func TestValidateSignerHierarchyForUpdateRecords_AllowsSignerSelfKeyAndChildren(
 	}
 }
 
-func TestValidateSignerHierarchyForUpdateRecords_RejectsNonKeyAtSignerName(t *testing.T) {
+func TestValidateSignerHierarchyForUpdateRecords_AcceptNonKeyAtSignerName(t *testing.T) {
 	h := newTestHandler()
 	signer := "dev.zenr.io."
 	txt := &dns.TXT{Hdr: dns.Header{Name: "dev.zenr.io.", Class: dns.ClassINET, TTL: 60}}
 	txt.TXT.Txt = []string{"not-allowed"}
 
 	err := h.validateSignerHierarchyForUpdateRecords(signer, nil, []dns.RR{txt})
-	if err == nil {
-		t.Fatalf("expected hierarchy validation failure for non-KEY signer owner")
+	if err != nil {
+		t.Fatalf("expected hierarchy validation for non-KEY at same level as signer owner")
 	}
 }
 
@@ -395,7 +395,9 @@ func TestValidateSignerHierarchyForUpdateRecords_RejectsKeyOutsideSignerSubtree(
 	}
 }
 
-func TestGroupOtherRecordsByTargetKey_MultiKeyAssignsToMostSpecificOwner(t *testing.T) {
+func TestGroupOtherRecordsByTargetKey_DefaultAssignsAllToSigner(t *testing.T) {
+	signer := testKeyRR("dev.zenr.io.", "AAAASIGNER=")
+	signerID := keyIDFromKEY(signer)
 	keys := []*dns.KEY{
 		testKeyRR("a.dev.zenr.io.", "AAAAA="),
 		testKeyRR("b.dev.zenr.io.", "AAAAB="),
@@ -406,19 +408,43 @@ func TestGroupOtherRecordsByTargetKey_MultiKeyAssignsToMostSpecificOwner(t *test
 	txtB := &dns.TXT{Hdr: dns.Header{Name: "x.b.dev.zenr.io.", Class: dns.ClassINET, TTL: 60}}
 	txtB.TXT.Txt = []string{"b"}
 
-	grouped, err := groupOtherRecordsByTargetKey(keys, []dns.RR{txtA, txtB})
+	grouped, err := groupOtherRecordsByTargetKey(signerID, keys, []dns.RR{txtA, txtB}, false)
 	if err != nil {
 		t.Fatalf("expected grouping success, got error: %v", err)
 	}
-	if len(grouped[canonicalName("a.dev.zenr.io.")]) != 1 {
+	if len(grouped[signerID]) != 2 {
+		t.Fatalf("expected both RRs assigned to signer, got %d", len(grouped[signerID]))
+	}
+}
+
+func TestGroupOtherRecordsByTargetKey_HierarchyAssignsToMostSpecificOwner(t *testing.T) {
+	signer := testKeyRR("dev.zenr.io.", "AAAASIGNER=")
+	signerID := keyIDFromKEY(signer)
+	keys := []*dns.KEY{
+		testKeyRR("a.dev.zenr.io.", "AAAAA="),
+		testKeyRR("b.dev.zenr.io.", "AAAAB="),
+	}
+
+	txtA := &dns.TXT{Hdr: dns.Header{Name: "x.a.dev.zenr.io.", Class: dns.ClassINET, TTL: 60}}
+	txtA.TXT.Txt = []string{"a"}
+	txtB := &dns.TXT{Hdr: dns.Header{Name: "x.b.dev.zenr.io.", Class: dns.ClassINET, TTL: 60}}
+	txtB.TXT.Txt = []string{"b"}
+
+	grouped, err := groupOtherRecordsByTargetKey(signerID, keys, []dns.RR{txtA, txtB}, true)
+	if err != nil {
+		t.Fatalf("expected grouping success, got error: %v", err)
+	}
+	if len(grouped[keyIDFromKEY(keys[0])]) != 1 {
 		t.Fatalf("expected one RR mapped to a.dev.zenr.io")
 	}
-	if len(grouped[canonicalName("b.dev.zenr.io.")]) != 1 {
+	if len(grouped[keyIDFromKEY(keys[1])]) != 1 {
 		t.Fatalf("expected one RR mapped to b.dev.zenr.io")
 	}
 }
 
-func TestGroupOtherRecordsByTargetKey_MultiKeyRejectsUnmappedOwner(t *testing.T) {
+func TestGroupOtherRecordsByTargetKey_HierarchyRejectsUnmappedOwner(t *testing.T) {
+	signer := testKeyRR("dev.zenr.io.", "AAAASIGNER=")
+	signerID := keyIDFromKEY(signer)
 	keys := []*dns.KEY{
 		testKeyRR("a.dev.zenr.io.", "AAAAA="),
 		testKeyRR("b.dev.zenr.io.", "AAAAB="),
@@ -427,8 +453,8 @@ func TestGroupOtherRecordsByTargetKey_MultiKeyRejectsUnmappedOwner(t *testing.T)
 	txt := &dns.TXT{Hdr: dns.Header{Name: "x.c.dev.zenr.io.", Class: dns.ClassINET, TTL: 60}}
 	txt.TXT.Txt = []string{"c"}
 
-	_, err := groupOtherRecordsByTargetKey(keys, []dns.RR{txt})
+	_, err := groupOtherRecordsByTargetKey(signerID, keys, []dns.RR{txt}, true)
 	if err == nil {
-		t.Fatalf("expected grouping failure for unmapped owner in multi-KEY update")
+		t.Fatalf("expected grouping failure for unmapped owner in hierarchy mode")
 	}
 }

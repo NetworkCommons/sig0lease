@@ -129,31 +129,56 @@ func extractAdditionalSigningKeys(msg *dns.Msg) ([]*dns.KEY, error) {
 	return keys, nil
 }
 
+func extractSig0(msg *dns.Msg) (*dns.SIG, error) {
+	var sigRR *dns.SIG
+
+	// Look for SIG in Pseudo section first (RFC 2535 SIG(0))
+	for _, rr := range msg.Pseudo {
+		if sig, ok := rr.(*dns.SIG); ok && sigRR == nil {
+			sigRR = sig
+		}
+	}
+
+	// If not found in Pseudo, look in Extra (shouldn't be there but check anyway)
+	if sigRR == nil {
+		for _, rr := range msg.Extra {
+			if sig, ok := rr.(*dns.SIG); ok && sigRR == nil {
+				sigRR = sig
+			}
+		}
+	}
+
+	if sigRR == nil {
+		return nil, fmt.Errorf("no SIG(0) in message")
+	}
+
+	return sigRR, nil
+}
+
 func canonicalName(name string) string {
 	return strings.TrimSuffix(strings.ToLower(strings.TrimSpace(name)), ".")
 }
 
-func isNameAtOrAbove(baseName, candidate string) bool {
+// Check that candidate is above or at basename, and if mustBeAbove is true
+// it must be strictly above
+func isNameAtOrAbove(baseName, candidate string, mustBeAbove bool) bool {
 	base := canonicalName(baseName)
 	c := canonicalName(candidate)
 	if base == "" || c == "" {
 		return false
 	}
 	if c == base {
-		return true
+		if mustBeAbove {
+			return false
+		} else {
+			return true
+		}
+
 	}
 	return strings.HasSuffix(base, "."+c)
 }
 
-func isStrictChildName(name, parent string) bool {
-	n := canonicalName(name)
-	p := canonicalName(parent)
-	if n == "" || p == "" || n == p {
-		return false
-	}
-	return strings.HasSuffix(n, "."+p)
-}
-
+// Verify that each RR in the Update section is at or below
 func (h *UpdateHandler) validateSignerHierarchyForUpdateRecords(signerName string, keyRRs []*dns.KEY, otherRecords []dns.RR) error {
 	signerCanon := canonicalName(signerName)
 	if signerCanon == "" {
@@ -170,7 +195,7 @@ func (h *UpdateHandler) validateSignerHierarchyForUpdateRecords(signerName strin
 			// Exception: signer self-KEY update is allowed.
 			continue
 		}
-		if !isStrictChildName(keyOwnerCanon, signerCanon) {
+		if !isNameAtOrAbove(keyOwnerCanon, signerCanon, false) {
 			return fmt.Errorf("KEY RR owner %q is outside signer subtree %q", keyOwner, signerName)
 		}
 	}
@@ -181,7 +206,7 @@ func (h *UpdateHandler) validateSignerHierarchyForUpdateRecords(signerName strin
 		}
 		owner := rr.Header().Name
 		ownerCanon := canonicalName(owner)
-		if !isStrictChildName(ownerCanon, signerCanon) {
+		if !isNameAtOrAbove(ownerCanon, signerCanon, false) {
 			return fmt.Errorf("non-KEY RR owner %q is outside signer subtree %q", owner, signerName)
 		}
 	}
@@ -189,15 +214,42 @@ func (h *UpdateHandler) validateSignerHierarchyForUpdateRecords(signerName strin
 	return nil
 }
 
-func groupOtherRecordsByTargetKey(keyRRs []*dns.KEY, otherRecords []dns.RR) (map[string][]dns.RR, error) {
-	grouped := make(map[string][]dns.RR)
-	if len(otherRecords) == 0 {
+// keyID uniquely identifies a KEY by canonical owner name, algorithm, and key tag.
+// Two keys with the same name but different algorithm or tag are separate identities.
+type keyID struct {
+	Name      string // canonical (lower-case, no trailing dot)
+	Algorithm uint8
+	KeyTag    uint16
+}
+
+func keyIDFromKEY(k *dns.KEY) keyID {
+	return keyID{Name: canonicalName(k.Hdr.Name), Algorithm: k.Algorithm, KeyTag: k.KeyTag()}
+}
+
+func keyIDFromSIG(sig *dns.SIG) keyID {
+	return keyID{Name: canonicalName(sig.SignerName), Algorithm: sig.Algorithm, KeyTag: sig.KeyTag}
+}
+
+// groupOtherRecordsByTargetKey assigns non-KEY RRs to their owning key identity.
+// By default (useHierarchy=false) all non-KEY RRs are owned by the signing key.
+// When useHierarchy is true, ownership is inferred by DNS name hierarchy: each
+// non-KEY RR is assigned to the KEY whose owner name is its longest ancestor;
+// the signer breaks ties among keys at equal depth.
+func groupOtherRecordsByTargetKey(signerID keyID, updateKeyRRs []*dns.KEY, updateOtherRRs []dns.RR, useHierarchy bool) (map[keyID][]dns.RR, error) {
+	grouped := make(map[keyID][]dns.RR)
+	if len(updateOtherRRs) == 0 {
 		return grouped, nil
 	}
 
-	if len(keyRRs) == 0 {
-		owner := canonicalName(otherRecords[0].Header().Name)
-		for _, rr := range otherRecords {
+	if !useHierarchy {
+		grouped[signerID] = append(grouped[signerID], updateOtherRRs...)
+		return grouped, nil
+	}
+
+	// Hierarchy mode: assign by closest ancestor KEY name.
+	if len(updateKeyRRs) == 0 {
+		owner := canonicalName(updateOtherRRs[0].Header().Name)
+		for _, rr := range updateOtherRRs {
 			if rr == nil || rr.Header() == nil {
 				return nil, fmt.Errorf("invalid non-KEY RR in update section")
 			}
@@ -205,57 +257,63 @@ func groupOtherRecordsByTargetKey(keyRRs []*dns.KEY, otherRecords []dns.RR) (map
 			if rrOwner != owner {
 				return nil, fmt.Errorf("mixed non-KEY owner names are not allowed without KEY RRs in update section")
 			}
-			grouped[owner] = append(grouped[owner], rr)
+			grouped[signerID] = append(grouped[signerID], rr)
 		}
 		return grouped, nil
 	}
 
-	if len(keyRRs) == 1 {
-		keyOwner := canonicalName(keyRRs[0].Hdr.Name)
-		grouped[keyOwner] = append(grouped[keyOwner], otherRecords...)
+	if len(updateKeyRRs) == 1 {
+		kid := keyIDFromKEY(updateKeyRRs[0])
+		grouped[kid] = append(grouped[kid], updateOtherRRs...)
 		return grouped, nil
 	}
 
-	keyOwners := make([]string, 0, len(keyRRs))
-	for _, keyRR := range keyRRs {
+	keyIDs := make([]keyID, 0, len(updateKeyRRs))
+	for _, keyRR := range updateKeyRRs {
 		if keyRR == nil || keyRR.Hdr.Name == "" {
 			return nil, fmt.Errorf("invalid KEY RR owner name in update section")
 		}
-		keyOwners = append(keyOwners, canonicalName(keyRR.Hdr.Name))
+		keyIDs = append(keyIDs, keyIDFromKEY(keyRR))
 	}
 
-	for _, rr := range otherRecords {
+	for _, rr := range updateOtherRRs {
 		if rr == nil || rr.Header() == nil {
 			return nil, fmt.Errorf("invalid non-KEY RR in update section")
 		}
 		rrOwner := canonicalName(rr.Header().Name)
-		bestOwner := ""
+		var best keyID
 		bestLen := -1
 		ambiguous := false
 
-		for _, keyOwner := range keyOwners {
-			if rrOwner != keyOwner && !isNameAtOrAbove(rrOwner, keyOwner) {
+		for _, kid := range keyIDs {
+			if !isNameAtOrAbove(rrOwner, kid.Name, false) {
 				continue
 			}
-			if len(keyOwner) > bestLen {
-				bestOwner = keyOwner
-				bestLen = len(keyOwner)
+			if len(kid.Name) > bestLen {
+				best = kid
+				bestLen = len(kid.Name)
 				ambiguous = false
 				continue
 			}
-			if len(keyOwner) == bestLen && keyOwner != bestOwner {
-				ambiguous = true
+			if len(kid.Name) == bestLen {
+				// Same name length: signer breaks the tie; otherwise ambiguous.
+				if kid == signerID {
+					best = kid
+					ambiguous = false
+				} else if best != signerID {
+					ambiguous = true
+				}
 			}
 		}
 
-		if bestOwner == "" {
+		if bestLen == -1 {
 			return nil, fmt.Errorf("non-KEY RR owner %q does not map to any KEY owner in multi-KEY update", rr.Header().Name)
 		}
 		if ambiguous {
 			return nil, fmt.Errorf("non-KEY RR owner %q maps ambiguously to multiple KEY owners", rr.Header().Name)
 		}
 
-		grouped[bestOwner] = append(grouped[bestOwner], rr)
+		grouped[best] = append(grouped[best], rr)
 	}
 
 	return grouped, nil
@@ -416,62 +474,84 @@ func (h *UpdateHandler) filterDuplicateRegistrations(ctx context.Context, keyNam
 	return accepted, notes, nil
 }
 
-func (h *UpdateHandler) rollbackLeaseStateForUpdate(keyNames []string) {
-	seen := make(map[string]struct{}, len(keyNames))
-	for _, keyName := range keyNames {
-		name := canonicalName(keyName)
-		if name == "" {
+func (h *UpdateHandler) rollbackLeaseStateForUpdate(nodeKeys []string) {
+	seen := make(map[string]struct{}, len(nodeKeys))
+	for _, nodeKey := range nodeKeys {
+		nk := canonicalName(nodeKey)
+		if nk == "" {
 			continue
 		}
-		if _, ok := seen[name]; ok {
+		if _, ok := seen[nk]; ok {
 			continue
 		}
-		seen[name] = struct{}{}
+		seen[nk] = struct{}{}
 
-		if err := h.leaseManager.Delete(name); err != nil {
-			h.logger.Debugf("rollback: failed to delete key lease for %s: %v", name, err)
+		if err := h.leaseManager.Delete(nk); err != nil {
+			h.logger.Debugf("rollback: failed to delete key lease for %s: %v", nk, err)
 		}
-		h.removeDataLease(name)
-		h.clearLeaseTimer(name)
+		h.removeDataLease(nk)
+		h.clearLeaseTimer(nk)
 	}
+}
+
+func (h *UpdateHandler) resolveSignerKeyForOwnership(sigRR *dns.SIG, additionalSigningKeys, updateKeys []*dns.KEY) (*dns.KEY, error) {
+	signerCanon := canonicalName(sigRR.SignerName)
+	if signerCanon == "" {
+		return nil, fmt.Errorf("SIG(0) signer name is empty")
+	}
+
+	matchesSigner := func(key *dns.KEY) bool {
+		return key != nil && strings.EqualFold(canonicalName(key.Hdr.Name), signerCanon) && key.KeyTag() == sigRR.KeyTag && key.Algorithm == sigRR.Algorithm
+	}
+
+	for _, key := range additionalSigningKeys {
+		if matchesSigner(key) {
+			return key, nil
+		}
+	}
+	for _, key := range updateKeys {
+		if matchesSigner(key) {
+			return key, nil
+		}
+	}
+
+	leaseRecord := h.leaseManager.LookupBySIG(sigRR.SignerName, sigRR.Algorithm, sigRR.KeyTag)
+	if leaseRecord != nil && leaseRecord.KeyRR != nil && matchesSigner(leaseRecord.KeyRR) {
+		return leaseRecord.KeyRR, nil
+	}
+
+	return nil, fmt.Errorf("signing KEY %q must be present in the request or lease store", sigRR.SignerName)
 }
 
 // extractAndValidateSig0 extracts and validates SIG(0) from the message.
 // KEY RRs in Additional are interpreted as signing-key material.
 // KEY RRs in Update are interpreted as update targets, but may still be used as
 // verification candidates when they match the signer identity.
-func (h *UpdateHandler) extractAndValidateSig0(ctx context.Context, msg *dns.Msg, downstreamZone string, leaseOwner string, additionalSigningKeys []*dns.KEY, updateKeys []*dns.KEY) (*dns.SIG, *dns.KEY, error) {
-	var sigRR *dns.SIG
-	leaseOwnerCanon := canonicalName(leaseOwner)
-	if leaseOwnerCanon == "" {
-		return nil, nil, fmt.Errorf("empty lease owner")
+func (h *UpdateHandler) extractAndValidateSig0(ctx context.Context, msg *dns.Msg, downstreamZone string, signerKeyHint *dns.KEY, additionalSigningKeys []*dns.KEY, updateKeys []*dns.KEY) (*dns.SIG, *dns.KEY, error) {
+	sigRR, err := extractSig0(msg)
+	if err != nil {
+		return nil, nil, err
 	}
-
-	// Look for SIG in Pseudo section first (RFC 2535 SIG(0))
-	for _, rr := range msg.Pseudo {
-		if sig, ok := rr.(*dns.SIG); ok && sigRR == nil {
-			sigRR = sig
-		}
-	}
-
-	// If not found in Pseudo, look in Extra (shouldn't be there but check anyway)
-	if sigRR == nil {
-		for _, rr := range msg.Extra {
-			if sig, ok := rr.(*dns.SIG); ok && sigRR == nil {
-				sigRR = sig
-			}
-		}
-	}
-
-	if sigRR == nil {
-		return nil, nil, fmt.Errorf("no SIG(0) in message")
+	downstreamZoneCanon := canonicalName(downstreamZone)
+	if downstreamZoneCanon == "" {
+		return nil, nil, fmt.Errorf("empty downstream zone")
 	}
 	signerCanon := canonicalName(sigRR.SignerName)
 	if signerCanon == "" {
 		return nil, nil, fmt.Errorf("SIG(0) signer name is empty")
 	}
-	if !isNameAtOrAbove(leaseOwnerCanon, signerCanon) {
-		return nil, nil, fmt.Errorf("SIG(0) signer %q is outside allowed hierarchy for lease owner %q", sigRR.SignerName, leaseOwner)
+	if !isNameAtOrAbove(downstreamZoneCanon, signerCanon, false) {
+		return nil, nil, fmt.Errorf("SIG(0) signer %q is outside allowed hierarchy for downstream zone %q", sigRR.SignerName, downstreamZone)
+	}
+	if signerKeyHint != nil {
+		if !strings.EqualFold(canonicalName(signerKeyHint.Hdr.Name), signerCanon) || signerKeyHint.KeyTag() != sigRR.KeyTag || signerKeyHint.Algorithm != sigRR.Algorithm {
+			return nil, nil, fmt.Errorf("provided signer KEY does not match SIG(0) signer %q", sigRR.SignerName)
+		}
+		if err := sig0.VerifySignature(msg, signerKeyHint); err != nil {
+			return nil, nil, fmt.Errorf("SIG(0) cryptographic verification failed using provided signer KEY: %w", err)
+		}
+		h.logger.Debugf("SIG(0) cryptographic verification passed for provided signer KEY %s", signerKeyHint.Hdr.Name)
+		return sigRR, signerKeyHint, nil
 	}
 
 	verifyFromCandidates := func(candidates []*dns.KEY) (*dns.KEY, error) {
@@ -516,7 +596,8 @@ func (h *UpdateHandler) extractAndValidateSig0(ctx context.Context, msg *dns.Msg
 		return sigRR, resolved, nil
 	}
 
-	leaseRecord := h.leaseManager.Lookup(sigRR.SignerName)
+	// Check if the key is present in the Lease Store
+	leaseRecord := h.leaseManager.LookupBySIG(sigRR.SignerName, sigRR.Algorithm, sigRR.KeyTag)
 	if leaseRecord != nil && leaseRecord.KeyRR != nil {
 		leaseKey := leaseRecord.KeyRR
 		if strings.EqualFold(canonicalName(leaseKey.Hdr.Name), signerCanon) && leaseKey.KeyTag() == sigRR.KeyTag && leaseKey.Algorithm == sigRR.Algorithm {
@@ -529,6 +610,7 @@ func (h *UpdateHandler) extractAndValidateSig0(ctx context.Context, msg *dns.Msg
 		}
 	}
 
+	// Check if the key is present online
 	authRRS, err := h.queryAuthoritativeRRs(ctx, downstreamZone, sigRR.SignerName, dns.TypeKEY)
 	if err != nil {
 		return nil, nil, fmt.Errorf("failed to resolve signer KEY from authoritative DNS: %w", err)

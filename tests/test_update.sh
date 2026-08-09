@@ -294,8 +294,16 @@ ensure_rr_absent() {
 make_rr() {
     local rr_type="$1"
     local ttl="$2"
+    local wrong="${3:-0}"
     case "$rr_type" in
-        KEY) echo "" ;;
+        KEY)
+            if [ "$wrong" == "1" ]; then
+                echo "$WRONG_CLIENT_KEY_RR"
+            else
+                echo "$CLIENT_KEY_RR"
+            fi
+        
+        ;;
         TXT) echo "${DOWNSTREAM_ZONE} ${ttl} IN TXT \"lease-txt-$(date +%s)\"" ;;
         A) echo "${DOWNSTREAM_ZONE} ${ttl} IN A 192.0.2.33" ;;
         AAAA) echo "${DOWNSTREAM_ZONE} ${ttl} IN AAAA 2001:db8::33" ;;
@@ -317,15 +325,12 @@ make_rr() {
 
 register_rr_type() {
     local key_name="$1"
-    local lease_seconds="$2"
-    local key_lease_seconds="$3"
+    local lease_seconds=$2
+    local key_lease_seconds=$3
     local rr_spec="$4"
-    
-    if [ -n "$rr_spec" ]; then
-        run_client register "$key_name" "$lease_seconds" "$key_lease_seconds" "$rr_spec"
-    else
-        run_client register "$key_name" "$lease_seconds" "$key_lease_seconds"
-    fi
+    local cmd="run_client register \"$key_name\" $lease_seconds $key_lease_seconds \"$rr_spec\""
+    log_step "running $cmd"
+    eval "$cmd"
 }
 
 proxy_consistent_with_authoritative() {
@@ -425,11 +430,11 @@ test_single_rr_register_expire_remove() {
     esac
 
     local case_start lease_start expected_min
-    rr_spec=$(make_rr $rr_type $lease)
+    rr_spec="$(make_rr $rr_type $lease)"
     case_start=$(date +%s)
     log_step "Registering lease "
     lease_start=$(date +%s)
-    register_rr_type $CLIENT_KEY_NAME $lease_time $key_lease_time $rr_type "$rr_spec" 
+    register_rr_type $CLIENT_KEY_NAME $lease_time $key_lease_time "$rr_spec" 
     wait_for_rr_state $rr_type "$CLIENT_KEY_RR" present
 
     # Verify lease store via dump query (INFO level summary).

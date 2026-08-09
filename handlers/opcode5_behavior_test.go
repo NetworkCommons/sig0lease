@@ -213,15 +213,15 @@ func TestDataLeaseExpiresBeforeKeyLease(t *testing.T) {
 	data := &dns.TXT{Hdr: dns.Header{Name: "test.dev.zenr.io.", Class: dns.ClassINET, TTL: 60}}
 	data.TXT.Txt = []string{"payload"}
 
-	if err := h.leaseManager.Register(ctx, key.Hdr.Name, key, 2, 2, "dev.zenr.io."); err != nil {
+	if err := h.leaseManager.Register(ctx, key, 2, 2, "dev.zenr.io."); err != nil {
 		t.Fatalf("register key lease: %v", err)
 	}
-	h.setDataLease(key.Hdr.Name, []dns.RR{data}, 1, "dev.zenr.io.")
-	h.scheduleLeaseExpiry(key.Hdr.Name)
-	defer h.clearLeaseTimer(key.Hdr.Name)
+	h.setDataLease(lease.NodeKey(key), []dns.RR{data}, 1, "dev.zenr.io.")
+	h.scheduleLeaseExpiry(lease.NodeKey(key))
+	defer h.clearLeaseTimer(lease.NodeKey(key))
 
 	time.Sleep(1300 * time.Millisecond)
-	dataLease := h.getDataLease(key.Hdr.Name)
+	dataLease := h.getDataLease(lease.NodeKey(key))
 	if dataLease == nil {
 		t.Fatalf("expected data lease entry to still exist after data lease expiry")
 	}
@@ -231,12 +231,12 @@ func TestDataLeaseExpiresBeforeKeyLease(t *testing.T) {
 			t.Fatalf("expected individual record to be marked deleted after data lease expiry")
 		}
 	}
-	if got := h.leaseManager.Lookup(key.Hdr.Name); got == nil {
+	if got := h.leaseManager.LookupByKEY(key); got == nil {
 		t.Fatalf("expected key lease still active after data lease expiry")
 	}
 
 	time.Sleep(1100 * time.Millisecond)
-	if got := h.leaseManager.Lookup(key.Hdr.Name); got != nil {
+	if got := h.leaseManager.LookupByKEY(key); got != nil {
 		t.Fatalf("expected key lease removed after key-lease expiry")
 	}
 }
@@ -294,24 +294,24 @@ func TestKeyLeaseZeroDeleteKeyNoOtherRecords(t *testing.T) {
 
 	// First, register a key lease.
 	key := testKeyRR("test.dev.zenr.io.", "AAAATESTKEY555=")
-	if err := h.leaseManager.Register(ctx, key.Hdr.Name, key, 1, 1, "dev.zenr.io."); err != nil {
+	if err := h.leaseManager.Register(ctx, key, 1, 1, "dev.zenr.io."); err != nil {
 		t.Fatalf("register initial lease: %v", err)
 	}
-	h.scheduleLeaseExpiry(key.Hdr.Name)
+	h.scheduleLeaseExpiry(lease.NodeKey(key))
 
 	// Verify the lease exists.
-	if h.leaseManager.Lookup(key.Hdr.Name) == nil {
+	if h.leaseManager.LookupByKEY(key) == nil {
 		t.Fatalf("expected active lease after registration")
 	}
 
 	// Now simulate the deletion path: KEY-LEASE == 0, LEASE != 0, no otherRecords.
 	// This calls leaseManager.Delete directly (as the Handle() deletion path would).
-	if err := h.leaseManager.Delete(key.Hdr.Name); err != nil {
+	if err := h.leaseManager.Delete(lease.NodeKey(key)); err != nil {
 		t.Fatalf("delete key lease: %v", err)
 	}
-	h.clearLeaseTimer(key.Hdr.Name)
+	h.clearLeaseTimer(lease.NodeKey(key))
 
-	if got := h.leaseManager.Lookup(key.Hdr.Name); got != nil {
+	if got := h.leaseManager.LookupByKEY(key); got != nil {
 		t.Fatalf("expected lease removed after deletion")
 	}
 }
@@ -323,21 +323,21 @@ func TestKeyLeaseZeroDeleteKeyAndDataWithOtherRecords(t *testing.T) {
 
 	// Register a key lease with data.
 	key := testKeyRR("test.dev.zenr.io.", "AAAATESTKEY666=")
-	if err := h.leaseManager.Register(ctx, key.Hdr.Name, key, 1, 1, "dev.zenr.io."); err != nil {
+	if err := h.leaseManager.Register(ctx, key, 1, 1, "dev.zenr.io."); err != nil {
 		t.Fatalf("register initial lease: %v", err)
 	}
-	h.scheduleLeaseExpiry(key.Hdr.Name)
+	h.scheduleLeaseExpiry(lease.NodeKey(key))
 
 	// Register a data lease.
 	data := &dns.TXT{Hdr: dns.Header{Name: "test.dev.zenr.io.", Class: dns.ClassINET, TTL: 60}}
 	data.TXT.Txt = []string{"payload"}
-	h.setDataLease(key.Hdr.Name, []dns.RR{data}, 1, "dev.zenr.io()")
+	h.setDataLease(lease.NodeKey(key), []dns.RR{data}, 1, "dev.zenr.io()")
 
 	// Verify both leases exist.
-	if h.leaseManager.Lookup(key.Hdr.Name) == nil {
+	if h.leaseManager.LookupByKEY(key) == nil {
 		t.Fatalf("expected active key lease after registration")
 	}
-	dataLease := h.getDataLease(key.Hdr.Name)
+	dataLease := h.getDataLease(lease.NodeKey(key))
 	if dataLease == nil {
 		t.Fatalf("expected active data lease after registration")
 	}
@@ -350,17 +350,17 @@ func TestKeyLeaseZeroDeleteKeyAndDataWithOtherRecords(t *testing.T) {
 
 	// Now simulate deletion: KEY-LEASE == 0, LEASE == 0, otherRecords present.
 	// This deletes both key lease and data lease.
-	if err := h.leaseManager.Delete(key.Hdr.Name); err != nil {
+	if err := h.leaseManager.Delete(lease.NodeKey(key)); err != nil {
 		t.Fatalf("delete key lease: %v", err)
 	}
-	h.clearLeaseTimer(key.Hdr.Name)
+	h.clearLeaseTimer(lease.NodeKey(key))
 	h.deleteDataLease(key.Hdr.Name)
 
 	// Verify both leases are gone.
-	if got := h.leaseManager.Lookup(key.Hdr.Name); got != nil {
+	if got := h.leaseManager.LookupByKEY(key); got != nil {
 		t.Fatalf("expected key lease removed after deletion")
 	}
-	dataLease = h.getDataLease(key.Hdr.Name)
+	dataLease = h.getDataLease(lease.NodeKey(key))
 	// DataLeaseRecord entry still exists (map persists), but all records are marked deleted.
 	if dataLease == nil {
 		t.Fatalf("expected data lease entry to still exist after deletion")
@@ -379,24 +379,24 @@ func TestKeyLeaseZeroDataOnlyRegistration(t *testing.T) {
 
 	// Register a key lease (existing key).
 	key := testKeyRR("test.dev.zenr.io.", "AAAATESTKEY777=")
-	if err := h.leaseManager.Register(ctx, key.Hdr.Name, key, 1, 1, "dev.zenr.io."); err != nil {
+	if err := h.leaseManager.Register(ctx, key, 1, 1, "dev.zenr.io."); err != nil {
 		t.Fatalf("register initial lease: %v", err)
 	}
-	h.scheduleLeaseExpiry(key.Hdr.Name)
+	h.scheduleLeaseExpiry(lease.NodeKey(key))
 
 	// Now register a data lease only (KEY-LEASE == 0, otherRecords present).
 	data := &dns.TXT{Hdr: dns.Header{Name: "test.dev.zenr.io.", Class: dns.ClassINET, TTL: 60}}
 	data.TXT.Txt = []string{"payload"}
-	h.setDataLease(key.Hdr.Name, []dns.RR{data}, 1, "dev.zenr.io()")
-	h.scheduleLeaseExpiry(key.Hdr.Name)
+	h.setDataLease(lease.NodeKey(key), []dns.RR{data}, 1, "dev.zenr.io()")
+	h.scheduleLeaseExpiry(lease.NodeKey(key))
 
 	// Verify key lease still active.
-	if h.leaseManager.Lookup(key.Hdr.Name) == nil {
+	if h.leaseManager.LookupByKEY(key) == nil {
 		t.Fatalf("expected key lease still active")
 	}
 
 	// Verify data lease was registered.
-	dataLease := h.getDataLease(key.Hdr.Name)
+	dataLease := h.getDataLease(lease.NodeKey(key))
 	if dataLease == nil || dataLease.Deleted {
 		t.Fatalf("expected data lease to be registered")
 	}
@@ -408,30 +408,30 @@ func TestKeyLeaseZeroDeleteKeyNoOtherRecords_Expires(t *testing.T) {
 	ctx := context.Background()
 
 	key := testKeyRR("test.dev.zenr.io.", "AAAATESTKEY888=")
-	if err := h.leaseManager.Register(ctx, key.Hdr.Name, key, 1, 1, "dev.zenr.io."); err != nil {
+	if err := h.leaseManager.Register(ctx, key, 1, 1, "dev.zenr.io."); err != nil {
 		t.Fatalf("register initial lease: %v", err)
 	}
-	h.scheduleLeaseExpiry(key.Hdr.Name)
+	h.scheduleLeaseExpiry(lease.NodeKey(key))
 
 	// Wait for initial lease to expire.
 	time.Sleep(1500 * time.Millisecond)
-	if h.leaseManager.Lookup(key.Hdr.Name) != nil {
+	if h.leaseManager.LookupByKEY(key) != nil {
 		t.Fatalf("expected initial lease to have expired")
 	}
 
 	// Now register a new lease and immediately delete it (KEY-LEASE == 0, no otherRecords).
-	if err := h.leaseManager.Register(ctx, key.Hdr.Name, key, 2, 2, "dev.zenr.io()"); err != nil {
+	if err := h.leaseManager.Register(ctx, key, 2, 2, "dev.zenr.io()"); err != nil {
 		t.Fatalf("register new lease: %v", err)
 	}
-	h.scheduleLeaseExpiry(key.Hdr.Name)
+	h.scheduleLeaseExpiry(lease.NodeKey(key))
 
 	// Immediately delete (simulating KEY-LEASE == 0, LEASE != 0, no otherRecords).
-	if err := h.leaseManager.Delete(key.Hdr.Name); err != nil {
+	if err := h.leaseManager.Delete(lease.NodeKey(key)); err != nil {
 		t.Fatalf("delete key lease: %v", err)
 	}
-	h.clearLeaseTimer(key.Hdr.Name)
+	h.clearLeaseTimer(lease.NodeKey(key))
 
-	if got := h.leaseManager.Lookup(key.Hdr.Name); got != nil {
+	if got := h.leaseManager.LookupByKEY(key); got != nil {
 		t.Fatalf("expected key lease to be removed immediately after deletion")
 	}
 }
@@ -469,16 +469,16 @@ func TestSetDataLease_StoresMXRecordsWithDifferentPriority(t *testing.T) {
 	ctx := context.Background()
 
 	key := testKeyRR("test.dev.zenr.io.", "AAAAMXPRIORITYKEY=")
-	if err := h.leaseManager.Register(ctx, key.Hdr.Name, key, 120, 120, "dev.zenr.io."); err != nil {
+	if err := h.leaseManager.Register(ctx, key, 120, 120, "dev.zenr.io."); err != nil {
 		t.Fatalf("register key lease: %v", err)
 	}
 
 	mxLow := &dns.MX{Hdr: dns.Header{Name: key.Hdr.Name, Class: dns.ClassINET, TTL: 60}, MX: rdata.MX{Preference: 10, Mx: "mx1.test.dev.zenr.io."}}
 	mxHigh := &dns.MX{Hdr: dns.Header{Name: key.Hdr.Name, Class: dns.ClassINET, TTL: 60}, MX: rdata.MX{Preference: 20, Mx: "mx1.test.dev.zenr.io."}}
 
-	h.setDataLease(key.Hdr.Name, []dns.RR{mxLow, mxHigh}, 120, "dev.zenr.io.")
+	h.setDataLease(lease.NodeKey(key), []dns.RR{mxLow, mxHigh}, 120, "dev.zenr.io.")
 
-	dataLease := h.getDataLease(key.Hdr.Name)
+	dataLease := h.getDataLease(lease.NodeKey(key))
 	if dataLease == nil {
 		t.Fatalf("expected data lease")
 	}
@@ -541,19 +541,19 @@ func TestRollbackLeaseStateForUpdateRemovesKeyAndDataEntries(t *testing.T) {
 	h := NewUpdateHandler()
 	ctx := context.Background()
 	key := testKeyRR("test.dev.zenr.io.", "AAAATESTKEY101=")
-	if err := h.leaseManager.Register(ctx, key.Hdr.Name, key, 120, 120, "dev.zenr.io."); err != nil {
+	if err := h.leaseManager.Register(ctx, key, 120, 120, "dev.zenr.io."); err != nil {
 		t.Fatalf("register key lease: %v", err)
 	}
 	data := &dns.TXT{Hdr: dns.Header{Name: key.Hdr.Name, Class: dns.ClassINET, TTL: 60}}
 	data.TXT.Txt = []string{"payload"}
-	h.setDataLease(key.Hdr.Name, []dns.RR{data}, 120, "dev.zenr.io.")
+	h.setDataLease(lease.NodeKey(key), []dns.RR{data}, 120, "dev.zenr.io.")
 
-	h.rollbackLeaseStateForUpdate([]string{key.Hdr.Name})
+	h.rollbackLeaseStateForUpdate([]string{lease.NodeKey(key)})
 
-	if h.leaseManager.Lookup(key.Hdr.Name) != nil {
+	if h.leaseManager.LookupByKEY(key) != nil {
 		t.Fatal("expected key lease to be removed")
 	}
-	if got := h.getDataLease(key.Hdr.Name); got != nil {
+	if got := h.getDataLease(lease.NodeKey(key)); got != nil {
 		t.Fatalf("expected data lease to be removed, got %+v", got)
 	}
 }
@@ -579,16 +579,16 @@ func TestSetDataLease_SameRecordDifferentTTL_SingleEntry(t *testing.T) {
 	ctx := context.Background()
 
 	key := testKeyRR("test.dev.zenr.io.", "AAAATESTKEY999=")
-	if err := h.leaseManager.Register(ctx, key.Hdr.Name, key, 2, 2, "dev.zenr.io."); err != nil {
+	if err := h.leaseManager.Register(ctx, key, 2, 2, "dev.zenr.io."); err != nil {
 		t.Fatalf("register key lease: %v", err)
 	}
 
 	// First registration: TTL 60.
 	txt1 := &dns.TXT{Hdr: dns.Header{Name: "test.dev.zenr.io.", Class: dns.ClassINET, TTL: 60}}
 	txt1.Txt = []string{"hello"}
-	h.setDataLease(key.Hdr.Name, []dns.RR{txt1}, 60, "dev.zenr.io.")
+	h.setDataLease(lease.NodeKey(key), []dns.RR{txt1}, 60, "dev.zenr.io.")
 
-	dataLease := h.getDataLease(key.Hdr.Name)
+	dataLease := h.getDataLease(lease.NodeKey(key))
 	if len(dataLease.Records) != 1 {
 		t.Fatalf("expected 1 record after first registration, got %d", len(dataLease.Records))
 	}
@@ -598,9 +598,9 @@ func TestSetDataLease_SameRecordDifferentTTL_SingleEntry(t *testing.T) {
 	// so this overwrites the first entry rather than creating a new one.
 	txt2 := &dns.TXT{Hdr: dns.Header{Name: "test.dev.zenr.io.", Class: dns.ClassINET, TTL: 120}}
 	txt2.Txt = []string{"hello"}
-	h.setDataLease(key.Hdr.Name, []dns.RR{txt2}, 120, "dev.zenr.io.")
+	h.setDataLease(lease.NodeKey(key), []dns.RR{txt2}, 120, "dev.zenr.io.")
 
-	dataLease = h.getDataLease(key.Hdr.Name)
+	dataLease = h.getDataLease(lease.NodeKey(key))
 	if len(dataLease.Records) != 1 {
 		t.Fatalf("expected 1 record (RFC 2136: TTL excluded from comparison, overwrite), got %d", len(dataLease.Records))
 	}

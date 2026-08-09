@@ -5,3 +5,4 @@ keystore/server
 .pi
 coverage.out
 *.old
+__debug_bin*

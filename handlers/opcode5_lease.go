@@ -46,8 +46,7 @@ func (h *UpdateHandler) validateRefreshOwnership(clientKeyRR *dns.KEY) error {
 		return fmt.Errorf("refresh rejected: missing key")
 	}
 
-	clientKeyName := clientKeyRR.Hdr.Name
-	existing := h.leaseManager.Lookup(clientKeyName)
+	existing := h.leaseManager.LookupByKEY(clientKeyRR)
 	if existing == nil {
 		return fmt.Errorf("refresh rejected: lease does not exist")
 	}
@@ -58,18 +57,17 @@ func (h *UpdateHandler) validateRefreshOwnership(clientKeyRR *dns.KEY) error {
 	return nil
 }
 
-func (h *UpdateHandler) registerKeyLease(ctx context.Context, signerName, keyName string, keyRR *dns.KEY, leaseDuration uint32, keyLeaseDuration uint32) error {
+func (h *UpdateHandler) registerKeyLease(ctx context.Context, signerID keyID, keyRR *dns.KEY, leaseDuration uint32, keyLeaseDuration uint32) error {
 	if hs, ok := h.leaseManager.(leasepkg.HierarchicalLeaseStore); ok {
 		parent := ""
-		signerCanon := canonicalName(signerName)
-		keyCanon := canonicalName(keyName)
-		if signerCanon != "" && keyCanon != "" && signerCanon != keyCanon {
-			parent = signerName
+		signerNodeKey := leasepkg.NodeKeyFromSIG(signerID.Name, signerID.Algorithm, signerID.KeyTag)
+		keyNodeKey := leasepkg.NodeKey(keyRR)
+		if signerNodeKey != keyNodeKey {
+			parent = signerNodeKey
 		}
-		return hs.RegisterWithParent(ctx, parent, keyName, keyRR, leaseDuration, keyLeaseDuration, h.upstreamZone)
+		return hs.RegisterWithParent(ctx, parent, keyRR, leaseDuration, keyLeaseDuration, h.upstreamZone)
 	}
-
-	return h.leaseManager.Register(ctx, keyName, keyRR, leaseDuration, keyLeaseDuration, h.upstreamZone)
+	return h.leaseManager.Register(ctx, keyRR, leaseDuration, keyLeaseDuration, h.upstreamZone)
 }
 
 func (h *UpdateHandler) setDataLease(keyName string, records []dns.RR, leaseDuration uint32, upstreamZone string) {
@@ -288,20 +286,20 @@ func (h *UpdateHandler) nextLeaseEventAfter(keyName string) (time.Duration, bool
 	return d, true
 }
 
-func (h *UpdateHandler) clearLeaseTimer(keyName string) {
+func (h *UpdateHandler) clearLeaseTimer(nodeKey string) {
 	h.leaseTimersMu.Lock()
 	defer h.leaseTimersMu.Unlock()
 
-	if t, ok := h.leaseTimers[keyName]; ok {
+	if t, ok := h.leaseTimers[nodeKey]; ok {
 		t.Stop()
-		delete(h.leaseTimers, keyName)
+		delete(h.leaseTimers, nodeKey)
 	}
 }
 
-func (h *UpdateHandler) scheduleLeaseExpiry(keyName string) {
-	h.clearLeaseTimer(keyName)
+func (h *UpdateHandler) scheduleLeaseExpiry(nodeKey string) {
+	h.clearLeaseTimer(nodeKey)
 
-	d, ok := h.nextLeaseEventAfter(keyName)
+	d, ok := h.nextLeaseEventAfter(nodeKey)
 	if !ok {
 		return
 	}
@@ -309,11 +307,11 @@ func (h *UpdateHandler) scheduleLeaseExpiry(keyName string) {
 	t := time.AfterFunc(d, func() {
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
-		h.processExpiredLease(ctx, keyName)
+		h.processExpiredLease(ctx, nodeKey)
 	})
 
 	h.leaseTimersMu.Lock()
-	h.leaseTimers[keyName] = t
+	h.leaseTimers[nodeKey] = t
 	h.leaseTimersMu.Unlock()
 }
 
@@ -640,13 +638,13 @@ func (h *UpdateHandler) DumpLeases() string {
 	return h.DumpLeasesLevel("debug")
 }
 
-func (h *UpdateHandler) processExpiredLease(ctx context.Context, keyName string) {
-	defer h.scheduleLeaseExpiry(keyName)
+func (h *UpdateHandler) processExpiredLease(ctx context.Context, nodeKey string) {
+	defer h.scheduleLeaseExpiry(nodeKey)
 
-	record := h.leaseManager.Get(keyName)
-	dataLease := h.getDataLease(keyName)
+	record := h.leaseManager.Get(nodeKey)
+	dataLease := h.getDataLease(nodeKey)
 	if record == nil && (dataLease == nil || len(dataLease.Records) == 0) {
-		h.clearLeaseTimer(keyName)
+		h.clearLeaseTimer(nodeKey)
 		return
 	}
 
@@ -680,21 +678,30 @@ func (h *UpdateHandler) processExpiredLease(ctx context.Context, keyName string)
 				if h.upstreamCoordinator != nil && signingKey != nil {
 					deleteMsg, err := h.constructUpstreamDeleteForRecords([]dns.RR{entry.RR}, signingKey, effectiveZone)
 					if err != nil {
-						h.logger.Debugf("Failed to construct upstream data lease-expiry delete for %s record %s: %v", keyName, key, err)
+						h.logger.Debugf("Failed to construct upstream data lease-expiry delete for %s record %s: %v", nodeKey, key, err)
 					} else if _, err := h.upstreamCoordinator.SendUpdate(ctx, effectiveZone, deleteMsg); err != nil {
-						h.logger.Debugf("Upstream data lease-expiry delete failed for %s record %s: %v", keyName, key, err)
+						h.logger.Debugf("Upstream data lease-expiry delete failed for %s record %s: %v", nodeKey, key, err)
 					}
 				}
 				entry.Deleted = true
 			}
 		}
 		if expiredAny {
-			h.markDataLeaseDeleted(keyName)
+			h.markDataLeaseDeleted(nodeKey)
 		}
 	}
 
 	if record == nil || now.Before(record.ExpiresAt) {
 		return
+	}
+
+	// KEY is expired. Cascade upstream deletes to the entire subtree first.
+	if hs, ok := h.leaseManager.(leasepkg.HierarchicalLeaseStore); ok {
+		descendants := hs.ListSubtreeKeys(nodeKey)
+		for _, childKey := range descendants {
+			h.deleteNodeUpstream(ctx, childKey)
+			h.clearLeaseTimer(childKey)
+		}
 	}
 
 	effectiveUpstreamZone := record.UpstreamZone
@@ -714,19 +721,59 @@ func (h *UpdateHandler) processExpiredLease(ctx context.Context, keyName string)
 		}
 		deleteMsg, err := h.constructUpstreamDelete(record.KeyRR, signingKey, effectiveUpstreamZone)
 		if err != nil {
-			h.logger.Debugf("Failed to construct upstream lease-expiry delete for %s: %v", keyName, err)
+			h.logger.Debugf("Failed to construct upstream lease-expiry delete for %s: %v", nodeKey, err)
 		} else {
 			if _, err := h.upstreamCoordinator.SendUpdate(ctx, effectiveUpstreamZone, deleteMsg); err != nil {
-				h.logger.Debugf("Upstream lease-expiry delete failed for %s: %v", keyName, err)
+				h.logger.Debugf("Upstream lease-expiry delete failed for %s: %v", nodeKey, err)
 			}
 		}
 	}
 
-	if err := h.leaseManager.Delete(keyName); err != nil {
-		h.logger.Debugf("Failed to delete expired local lease for %s: %v", keyName, err)
+	if err := h.leaseManager.Delete(nodeKey); err != nil {
+		h.logger.Debugf("Failed to delete expired local lease for %s: %v", nodeKey, err)
 	}
-	h.deleteDataLease(keyName)
-	h.clearLeaseTimer(keyName)
+	h.deleteDataLease(nodeKey)
+	h.clearLeaseTimer(nodeKey)
+}
+
+// deleteNodeUpstream sends upstream DNS deletes for a descendant node's KEY and non-KEY records.
+func (h *UpdateHandler) deleteNodeUpstream(ctx context.Context, nodeKey string) {
+	record := h.leaseManager.Get(nodeKey)
+	dataLease := h.getDataLease(nodeKey)
+
+	if dataLease != nil {
+		effectiveZone := dataLease.UpstreamZone
+		if dc, ok := h.upstreamCoordinator.(*DefaultUpstreamCoordinator); ok {
+			if resolved, err := dc.resolveAuthoritativeZone(ctx, dataLease.UpstreamZone); err == nil {
+				effectiveZone = resolved
+			}
+		}
+		if h.upstreamCoordinator != nil {
+			if signingKey, _, err := h.findAuthorizedProxyKeyForZone(effectiveZone); err == nil {
+				for _, entry := range dataLease.Records {
+					if !entry.Deleted {
+						if deleteMsg, err := h.constructUpstreamDeleteForRecords([]dns.RR{entry.RR}, signingKey, effectiveZone); err == nil {
+							_, _ = h.upstreamCoordinator.SendUpdate(ctx, effectiveZone, deleteMsg)
+						}
+					}
+				}
+			}
+		}
+	}
+
+	if record != nil && record.KeyRR != nil && h.upstreamCoordinator != nil {
+		effectiveZone := record.UpstreamZone
+		if dc, ok := h.upstreamCoordinator.(*DefaultUpstreamCoordinator); ok {
+			if resolved, err := dc.resolveAuthoritativeZone(ctx, record.UpstreamZone); err == nil {
+				effectiveZone = resolved
+			}
+		}
+		if signingKey, _, err := h.findAuthorizedProxyKeyForZone(effectiveZone); err == nil {
+			if deleteMsg, err := h.constructUpstreamDelete(record.KeyRR, signingKey, effectiveZone); err == nil {
+				_, _ = h.upstreamCoordinator.SendUpdate(ctx, effectiveZone, deleteMsg)
+			}
+		}
+	}
 }
 
 // Handle processes an UPDATE query and returns a HandlerResult.
