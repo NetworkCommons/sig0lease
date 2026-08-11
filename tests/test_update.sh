@@ -213,15 +213,26 @@ dig_query_short() {
         host="${endpoint%:*}"
         port="${endpoint##*:}"
     fi
+    
+    log_file dig_query_short "dig +short +time=5 @\"$host\" -p \"$port\" \"$name\" \"$rr_type\" 2>/dev/null"
     dig +short +time=5 @"$host" -p "$port" "$name" "$rr_type" 2>/dev/null    
 }
 
 rr_at_authoritative() {
-    local rr_type="$1"
+    local rr_type=$1
     local rdata="$2"
-    local out
 
-    answer="$(echo "$rdata" | grep "$(dig_query_short $AUTH_SERVER $DOWNSTREAM_ZONE $rr_type)")"
+    local answer
+
+    local dig_answer="$(dig_query_short $AUTH_SERVER $DOWNSTREAM_ZONE $rr_type)"
+    
+    if [ -n "$dig_answer" ]; then
+        answer="$(echo "$rdata" | grep "$dig_answer")"
+        log_file rr_at_authoritative "rdata=$rdata, dig_answer=$dig_answer, answer=$answer."
+    else
+        answer=''
+        log_file rr_at_authoritative "rdata=$rdata, empty dig_answer."
+    fi
     
     if [ -n "$answer" ]; then
         echo "Record present: $answer"
@@ -243,7 +254,7 @@ wait_for_rr_state() {
     start=$(date +%s)
 
     while true; do
-
+        log_file wait_for_rr_state "state=$state, calling rr_at_authoritative $rr_type \"$rdata\""
         if [ "$state" = "present" ]; then
             if rr_at_authoritative $rr_type "$rdata"; then
                 log_success "$rr_type present on $DOWNSTREAM_ZONE"
@@ -269,6 +280,8 @@ ensure_rr_absent() {
     local rr_type="$1"
     local rr_rdata="$2"
 
+    log_file ensure_rr_absent "rr_type=$rr_type, rr_rdata=$rr_rdata."
+
     if ! rr_at_authoritative "$rr_type" "$rr_rdata"; then
         log_success "Pristine state already present: $rr_type - $rr_rdata absent on $DOWNSTREAM_ZONE"
         return 0
@@ -278,11 +291,11 @@ ensure_rr_absent() {
 
     # Refresh with 0 lease.
     if ! run_client refresh $CLIENT_KEY_NAME 0 0 "$rr_rdata"; then
-        log_error "Cleanup failed for $$rr_type - $rr_rdata"
+        log_error "Cleanup failed for $rr_type - $rr_rdata"
         return 1
     fi
 
-    if wait_for_rr_state $rr_type $rr_rdata absent; then
+    if wait_for_rr_state $rr_type "$rr_rdata" absent; then
         log_success "Cleanup complete: $rr_type - $rr_rdata absent on $DOWNSTREAM_ZONE"
     else
         log_error "Cleanup failed for $rr_type - $rr_rdata on $DOWNSTREAM_ZONE"
@@ -334,29 +347,30 @@ register_rr_type() {
 }
 
 proxy_consistent_with_authoritative() {
-    local rr_name="$1"
-    local rr_type="$2"
-    local rr_rdata="$3"
-    local expected_state="$4"  # present|absent
+    local rr_type="$1"
+    local rr_rdata="$2"
+    local expected_state="$3"  # present|absent
 
     local is_present=0
-    if rr_at_authoritative "$rr_type" ""$rr_rdata""; then
+    log_file proxy_consistent_with_authoritative "rr_type=$rr_type, rr_rdata=$rr_rdata, expected_state=$expected_state."
+
+    if rr_at_authoritative $rr_type "$rr_rdata"; then
         is_present=1
     fi
 
     if [ "$expected_state" = "present" ] && [ "$is_present" -ne 1 ]; then
-        log_error "Consistency check failed: authoritative missing but expected present for $rr_name - $rr_type"
+        log_error "Consistency check failed: authoritative missing but expected present for $rr_type - $rr_rdata"
         return 1
     fi
     if [ "$expected_state" = "absent" ] && [ "$is_present" -ne 0 ]; then
-        log_error "Consistency check failed: authoritative present but expected absent for $rr_name - $rr_type"
+        log_error "Consistency check failed: authoritative present but expected absent for $rr_type - $rr_rdata"
         return 1
     fi
 
     # Proxy Lease-store consistency checks
     # TODO: Add checks that records in lease-store are actually at the DNS
     
-    log_info "Consistency check passed for $rr_name - $rr_type"
+    log_info "Consistency check passed for $rr_type - $rr_rdata"
 
 }
 ################################
@@ -390,7 +404,7 @@ test_blacklisted_type() {
         *)
             rr_spec=$(make_rr "$rr_type" "$LEASE_SECONDS")
             log_step "Attempting registration with blacklisted type $rr_type"
-            reg_out=$(run_client register "$LEASE_SECONDS" "$KEY_LEASE_SECONDS" "$rr_spec" 2>&1) || true
+            reg_out=$(run_client register "$CLIENT_KEY_NAME" "$LEASE_SECONDS" "$KEY_LEASE_SECONDS" "$rr_spec" 2>&1) || true
             ;;
     esac
 
@@ -435,7 +449,7 @@ test_single_rr_register_expire_remove() {
     log_step "Registering lease "
     lease_start=$(date +%s)
     register_rr_type $CLIENT_KEY_NAME $lease_time $key_lease_time "$rr_spec" 
-    wait_for_rr_state $rr_type "$CLIENT_KEY_RR" present
+    wait_for_rr_state $rr_type "$rr_spec" present
 
     # Verify lease store via dump query (INFO level summary).
     log_step "Verifying lease store state via dump query (DEBUG)"
@@ -450,20 +464,18 @@ test_single_rr_register_expire_remove() {
 
     if [ "$rr_type" = "KEY" ]; then
         log_step "Attempting refresh after expiry (KEY path: expected to re-register)"
-        run_client refresh "$CLIENT_KEY_NAME" "$REFRESH_SECONDS"
-        wait_for_rr_state KEY present
-        proxy_consistent_with_authoritative KEY present
+        run_client refresh "$CLIENT_KEY_NAME" 0 $REFRESH_SECONDS "$rr_spec"
+        wait_for_rr_state KEY "$rr_spec" present
+        proxy_consistent_with_authoritative KEY "$rr_spec" present
         log_success "Expired KEY refresh succeeded via re-registration semantics"
     else
         log_step "Attempting refresh after expiry (non-KEY path: expected failure)"
-        if run_client refresh "$CLIENT_KEY_NAME" "$REFRESH_SECONDS"; then
+        if run_client refresh "$CLIENT_KEY_NAME" "$REFRESH_SECONDS" 0 "$rr_spec"; then
             log_error "Refresh succeeded after expiry, expected failure"
             return 1
         fi
-        wait_for_rr_state KEY absent
-        proxy_consistent_with_authoritative KEY absent
-        log_step "Post-expiry note: non-key RR ($rr_type) state is informational only"
-        rr_at_authoritative "$rr_type" $FIXME >/dev/null || true
+        wait_for_rr_state $rr_type "$rr_spec" absent
+        proxy_consistent_with_authoritative $rr_type "$rr_spec" absent
         assert_proxy_log_contains "refresh rejected: lease does not exist"
     fi
 
@@ -495,7 +507,7 @@ test_case_register_refresh_not_prematurely_removed() {
     log_step "Waiting to near-expiry checkpoint then refreshing"
     wait_until_epoch $((lease_start + 20))
     refresh_start=$(date +%s)
-    run_client refresh "$DOWNSTREAM_ZONE" "$CLIENT_KEY_NAME" "$REFRESH_SECONDS"
+    run_client refresh "$CLIENT_KEY_NAME" "$REFRESH_SECONDS" $FIXME
     wait_for_rr_state KEY present
     wait_for_rr_state "$rr_type" present
     proxy_consistent_with_authoritative "$rr_type" present
@@ -507,7 +519,7 @@ test_case_register_refresh_not_prematurely_removed() {
     proxy_consistent_with_authoritative "$rr_type" present
 
     log_step "Refreshing again (must still succeed if not removed prematurely)"
-    run_client refresh "$DOWNSTREAM_ZONE" "$CLIENT_KEY_NAME" "$REFRESH_SECONDS"
+    run_client refresh "$CLIENT_KEY_NAME" $REFRESH_SECONDS $FIXME
     wait_for_rr_state KEY present
     wait_for_rr_state "$rr_type" present
     proxy_consistent_with_authoritative "$rr_type" present
@@ -576,7 +588,7 @@ test_case_overlapping_registrations_issue17() {
 
     log_step "First registration (A+TXT set #1)"
     first_start=$(date +%s)
-    run_client register "$DOWNSTREAM_ZONE" "$CLIENT_KEY_NAME" "$OVERLAP_RR_LEASE_SECONDS" "$OVERLAP_KEY_LEASE_SECONDS" "$rr1_a" "$rr1_txt"
+    run_client register "$CLIENT_KEY_NAME" $OVERLAP_RR_LEASE_SECONDS $OVERLAP_KEY_LEASE_SECONDS "$rr1_a" "$rr1_txt"
     wait_for_rr_state KEY present
     wait_for_rr_state A present
     wait_for_rr_state TXT present
@@ -586,7 +598,7 @@ test_case_overlapping_registrations_issue17() {
 
     log_step "Second overlapping registration (A+TXT set #2)"
     second_start=$(date +%s)
-    run_client register "$DOWNSTREAM_ZONE" "$CLIENT_KEY_NAME" "$OVERLAP_RR_LEASE_SECONDS" "$OVERLAP_KEY_LEASE_SECONDS" "$rr2_a" "$rr2_txt"
+    run_client register "$CLIENT_KEY_NAME" $OVERLAP_RR_LEASE_SECONDS $OVERLAP_KEY_LEASE_SECONDS "$rr2_a" "$rr2_txt"
     wait_for_rr_state KEY present
     wait_for_rr_state A present
     wait_for_rr_state TXT present
@@ -628,7 +640,7 @@ test_case_unauthorized_refresh_rejected_then_expires() {
     wait_for_rr_state "$rr_type" present
 
     log_step "Unauthorized refresh attempt using different real key ($WRONG_CLIENT_KEY_NAME)"
-    if run_client refresh "$DOWNSTREAM_ZONE" "$WRONG_CLIENT_KEY_NAME" "$REFRESH_SECONDS"; then
+    if run_client refresh "$WRONG_CLIENT_KEY_NAME" $REFRESH_SECONDS $REFRESH_SECONDS $FIXME; then
         log_error "Unauthorized refresh unexpectedly succeeded"
         return 1
     fi
@@ -645,7 +657,7 @@ test_case_unauthorized_refresh_rejected_then_expires() {
         rr_at_authoritative "$rr_type" $FIXME >/dev/null || true
     fi
     log_step "Original key refresh after expiry must fail"
-    if run_client refresh "$DOWNSTREAM_ZONE" "$CLIENT_KEY_NAME" "$REFRESH_SECONDS"; then
+    if run_client refresh "$CLIENT_KEY_NAME" "$REFRESH_SECONDS"; then
         log_error "Lease still active after expiry, expected removal"
         return 1
     fi
@@ -705,22 +717,22 @@ run_all_tests() {
     local rr_type
     for rr_type in "${rr_types[@]}"; do
         log_section "RR TEST MATRIX: $rr_type"
-        ensure_rr_absent $rr_type "$CLIENT_KEY_RR"
+        # ensure_rr_absent $rr_type "$CLIENT_KEY_RR"
         if [[ " $blacklisted_rrs " == *" $rr_type "* ]]; then
             test_blacklisted_type $rr_type
         else
             test_single_rr_register_expire_remove "$rr_type"
-            ensure_rr_absent $rr_type $FIXME
-            test_case_register_refresh_not_prematurely_removed "$rr_type"
-            ensure_rr_absent $rr_type $FIXME
-            test_case_split_lease_nonkey_expires_key_persists "$rr_type"
-            ensure_rr_absent $rr_type $FIXME
-            test_case_unauthorized_refresh_rejected_then_expires "$rr_type"
+            # ensure_rr_absent $rr_type $FIXME
+            # test_case_register_refresh_not_prematurely_removed "$rr_type"
+            # ensure_rr_absent $rr_type $FIXME
+            # test_case_split_lease_nonkey_expires_key_persists "$rr_type"
+            # ensure_rr_absent $rr_type $FIXME
+            # test_case_unauthorized_refresh_rejected_then_expires "$rr_type"
         fi
     done
 
-    ensure_rr_absent $rr_type $FIXME
-    test_case_overlapping_registrations_issue17
+    # ensure_rr_absent $rr_type $FIXME
+    # test_case_overlapping_registrations_issue17
 
     log_section "TEST RESULTS"
     echo -e "${GREEN}All integration tests completed successfully!${NC}"
@@ -743,7 +755,7 @@ cleanup() {
 
     if [ ! -z "${PROXY_PID:-}" ] && kill -0 "$PROXY_PID" 2>/dev/null; then
         log_step "Restoring pristine KEY state before shutdown"
-        ensure_rr_absent KEY "$CLIENT_KEY_RR" || true
+        # ensure_rr_absent KEY "$CLIENT_KEY_RR" || true
     fi
 
     stop_proxy

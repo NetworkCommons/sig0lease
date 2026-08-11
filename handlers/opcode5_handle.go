@@ -349,6 +349,14 @@ func (h *UpdateHandler) Handle(ctx context.Context, w dns.ResponseWriter, r *dns
 	// This handles the case where some or all KEY RRs were registered locally
 	// but also need to be forwarded to the authoritative server.
 	if len(upstreamKeys) > 0 || len(acceptedRecordsForUpstream) > 0 {
+		signingKey, matchedKeyZone, err := h.findAuthorizedProxyKeyForZone(h.upstreamZone)
+		if err != nil {
+			h.logger.Debugf("Failed to resolve proxy authorization key for upstream zone %s: %v", h.upstreamZone, err)
+			msg := h.makeErrorResponse(r, dns.RcodeServerFailure, fmt.Sprintf("upstream signing key resolution failed: %v", err))
+			return NewErrorResult(msg, fmt.Sprintf("upstream signing key resolution failed: %v", err), err)
+		}
+		h.logger.Debugf("Resolved proxy authorization key for upstream zone %s from key zone %s", h.upstreamZone, matchedKeyZone)
+
 		// Determine effective upstream zone from the upstream coordinator.
 		effectiveUpstreamZone := h.upstreamZone
 		if dc, ok := h.upstreamCoordinator.(*DefaultUpstreamCoordinator); ok {
@@ -361,14 +369,6 @@ func (h *UpdateHandler) Handle(ctx context.Context, w dns.ResponseWriter, r *dns
 			effectiveUpstreamZone = resolvedZone
 			h.logger.Debugf("Resolved effective upstream zone: configured=%s effective=%s", h.upstreamZone, effectiveUpstreamZone)
 		}
-
-		signingKey, matchedKeyZone, err := h.findAuthorizedProxyKeyForZone(effectiveUpstreamZone)
-		if err != nil {
-			h.logger.Debugf("Failed to resolve proxy authorization key for upstream zone %s: %v", effectiveUpstreamZone, err)
-			msg := h.makeErrorResponse(r, dns.RcodeServerFailure, fmt.Sprintf("upstream signing key resolution failed: %v", err))
-			return NewErrorResult(msg, fmt.Sprintf("upstream signing key resolution failed: %v", err), err)
-		}
-		h.logger.Debugf("Resolved proxy authorization key for upstream zone %s from key zone %s", effectiveUpstreamZone, matchedKeyZone)
 
 		upstreamUpdate, err := h.constructUpstreamUpdate(upstreamKeys, acceptedRecordsForUpstream, signingKey, effectiveUpstreamZone)
 		if err != nil {

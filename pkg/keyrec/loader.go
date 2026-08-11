@@ -76,6 +76,12 @@ func LoadKeyFromFile(keystoreDir, keyName string) (*LoadedKey, error) {
 // ListKeysInDirectory lists all key names in a keystore directory.
 // Provenance: Adapted from sig0namectl's ListKeys() in keys_nowasm.go
 func ListKeysInDirectory(keystoreDir string) ([]string, error) {
+	curdir, err := os.Getwd()
+	if err != nil {
+		fmt.Println("Error:", err)
+	}
+	fmt.Println("Current working directory:", curdir)
+
 	entries, err := os.ReadDir(keystoreDir)
 	if err != nil {
 		return nil, fmt.Errorf("failed to read keystore directory %q: %w", keystoreDir, err)

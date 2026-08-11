@@ -7,6 +7,7 @@ CLIENT_BIN="${SCRIPT_DIR}/../bin/${OS}/sig0lease-client"
 BLACKLISTED_TESTER_BIN="${SCRIPT_DIR}/../bin/${OS}/blacklisted_tester"
 CONFIG_FILE="${SCRIPT_DIR}/../config.yaml"
 LOG_FILE="/tmp/sig0lease_proxy.log"
+CLIENT_LOG_FILE="/tmp/sig0lease_client.log"
 
 PROXY_ADDR="${PROXY_ADDR:-127.0.0.1}"
 PROXY_PORT="${PROXY_PORT:-8053}"
@@ -51,6 +52,12 @@ log_info() {
     echo -e "  [INFO] $1"
 }
 
+log_file() {
+    local function=$1
+    local message="$2"
+
+    echo -e "$(date "+%Y-%m-%d %H:%M:%S") $function - $message" >> $CLIENT_LOG_FILE
+}
 yaml_get_lease_time() {
     local key="$1"
 

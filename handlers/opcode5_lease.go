@@ -713,11 +713,11 @@ func (h *UpdateHandler) processExpiredLease(ctx context.Context, nodeKey string)
 	}
 
 	if h.upstreamCoordinator != nil && record.KeyRR != nil {
-		signingKey, matchedKeyZone, err := h.findAuthorizedProxyKeyForZone(effectiveUpstreamZone)
+		signingKey, matchedKeyZone, err := h.findAuthorizedProxyKeyForZone(record.UpstreamZone)
 		if err != nil {
-			h.logger.Debugf("Failed to resolve proxy authorization key for key lease-expiry delete in zone %s: %v", effectiveUpstreamZone, err)
+			h.logger.Debugf("Failed to resolve proxy authorization key for key lease-expiry delete in zone %s: %v", record.UpstreamZone, err)
 		} else {
-			h.logger.Debugf("Resolved proxy authorization key for key lease-expiry delete in zone %s from key zone %s", effectiveUpstreamZone, matchedKeyZone)
+			h.logger.Debugf("Resolved proxy authorization key for key lease-expiry delete in zone %s from key zone %s", record.UpstreamZone, matchedKeyZone)
 		}
 		deleteMsg, err := h.constructUpstreamDelete(record.KeyRR, signingKey, effectiveUpstreamZone)
 		if err != nil {
