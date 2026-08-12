@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"strings"
+	"time"
 
 	"codeberg.org/miekg/dns"
 )
@@ -40,10 +41,17 @@ func toUint32(v any) (uint32, bool) {
 //   - "upstream_zone": Authoritative zone (e.g., "dev.zenr.io.") [REQUIRED]
 //   - "upstream_key": Path to upstream private key file [OPTIONAL, needed for upstream UPDATE signing]
 //   - "upstream_coordinator": Custom UpstreamCoordinator implementation [OPTIONAL]
-//   - "lease_manager": Custom LeaseManager implementation [OPTIONAL, defaults to InMemoryLeaseManager]
-//   - "persistence_hook": Persistence function for leases [OPTIONAL]
+//   - "lease_manager": Custom LeaseManager implementation [OPTIONAL, defaults to InMemoryLeaseManager].
+//     Go-embedding only: a LeaseManager value, not expressible in YAML, so
+//     this can only be set by code constructing the cfg map directly, never
+//     via config.yaml.
+//   - "persistence_hook": Persistence function for leases [OPTIONAL]. Same
+//     Go-embedding-only caveat as lease_manager: a func value, not settable
+//     from config.yaml.
 //   - "lease_policy": Bounds applied to local lease durations and forwarded RR TTLs [OPTIONAL]
 //   - "prefer_4byte_variant": Enable 4-byte variant for backward compatibility [OPTIONAL, defaults to false]
+//   - "allow_online_key_registration": Allow a signer resolved only via authoritative DNS
+//     (not lease-managed, not present in the request) to register new KEY RRs [OPTIONAL, defaults to false]
 func (h *UpdateHandler) Setup(cfg map[string]any) error {
 	// Extract upstream zone
 	if zone, ok := cfg["upstream_zone"].(string); ok && zone != "" {
@@ -70,17 +78,13 @@ func (h *UpdateHandler) Setup(cfg map[string]any) error {
 	h.upstreamKeyRecord = upstreamKey
 	h.logger.Debugf("Loaded upstream key for configured zone %s from key zone %s: %s", h.upstreamZone, matchedZone, upstreamKey)
 
-	// Optional: Custom lease manager
-	// FIXME option for lease_manager is not in config
-	// and unclear how to define it
+	// Optional: Custom lease manager (Go-embedding only, see Setup doc comment).
 	if lm, ok := cfg["lease_manager"].(LeaseManager); ok && lm != nil {
 		h.leaseManager = lm
 		h.logger.Debugf("Custom lease manager configured")
 	}
 
-	// Optional: Persistence hook for leases
-	// FIXME option for persistence_hook is not in config
-	// and unclear how to define it
+	// Optional: Persistence hook for leases (Go-embedding only, see Setup doc comment).
 	if hook, ok := cfg["persistence_hook"].(func(context.Context, string, *LeaseRecord) error); ok {
 		h.leaseManager.SetPersistenceHook(hook)
 		h.logger.Debugf("Persistence hook configured for leases")
@@ -131,6 +135,12 @@ func (h *UpdateHandler) Setup(cfg map[string]any) error {
 		h.prefer4ByteVariant = prefer
 	}
 
+	// Whether a signer resolved only via authoritative DNS may register new KEY RRs.
+	// Default: false (fail closed).
+	if allow, ok := cfg["allow_online_key_registration"].(bool); ok {
+		h.AllowOnlineKeyRegistration = allow
+	}
+
 	// Parse blacklisted RR types from config.
 	if raw, ok := cfg["blacklisted_types"]; ok {
 		h.blacklistedTypes = make(map[uint16]struct{})
@@ -164,6 +174,12 @@ func (h *UpdateHandler) Setup(cfg map[string]any) error {
 			h.logger.Debugf("Blacklisted RR types: %d entries", len(h.blacklistedTypes))
 		}
 	}
+
+	// Backup expiry-timer reconciliation: catches any lease-store node that
+	// lacks a live expiry timer (e.g. after a future snapshot restore) and
+	// schedules one, routing it through the same upstream-aware expiry path
+	// as every other lease instead of leaving it unmanaged.
+	h.startLeaseReconciliation(30 * time.Second)
 
 	return nil
 }

@@ -29,13 +29,23 @@ type Server struct {
 // New creates and returns a new Server instance.
 func New(cfg *config.Config, logger *logging.Logger) (*Server, error) {
 	// Create upstream resolver
+	if len(cfg.Upstreams) == 0 {
+		return nil, fmt.Errorf("at least one upstream server required in config")
+	}
 	fwdServers := make([]string, 0, len(cfg.Upstreams))
 	for _, u := range cfg.Upstreams {
 		if u.Address != "" {
 			fwdServers = append(fwdServers, u.Address)
 		}
 	}
-	// FIXME: servers is a list, but protocol and timeout are single values, differently in config. Should we support per-server protocol/timeout?
+	// NOTE: config.yaml lets each upstream declare its own protocol/timeout,
+	// but forward.Resolver only takes one protocol/timeout for the whole
+	// pool, so only the first configured upstream's values apply -- any
+	// other upstreams' protocol/timeout settings are silently ignored. This
+	// is a real config-schema/behavior mismatch, not just a documentation
+	// gap; fixing it properly means giving Resolver a per-server
+	// protocol/timeout instead of one shared pair, which is a larger change
+	// than a FIXME warrants on its own.
 	resolver, err := forward.NewResolver(
 		fwdServers,
 		cfg.Upstreams[0].Protocol,
@@ -63,12 +73,6 @@ func New(cfg *config.Config, logger *logging.Logger) (*Server, error) {
 // RegisterHandler registers a processing module handler with the server.
 func (s *Server) RegisterHandler(h handlers.Handler) {
 	s.router.RegisterHandler(h)
-}
-
-// GetResolver returns the upstream resolver for handlers to use.
-// Used for upstream coordination.
-func (s *Server) GetResolver() *forward.Resolver {
-	return s.resolver
 }
 
 // Serve starts the DNS proxy server and blocks until shutdown.
@@ -174,7 +178,7 @@ func (s *Server) serveUDP(ctx context.Context, handler dns.HandlerFunc) error {
 		default:
 		}
 
-		s.logger.Infof("UDP: Received %d bytes from %s", n, remoteAddr.String())
+		s.logger.Debugf("UDP: Received %d bytes from %s", n, remoteAddr.String())
 		rawData := buf[:n]
 
 		// Strict parsing: unpack raw wire message only.
@@ -332,28 +336,26 @@ func (s *Server) serveTCP(ctx context.Context, handler dns.HandlerFunc) error {
 
 // handleRequest is the main request handler that routes based on opcode.
 func (s *Server) handleRequest(ctx context.Context, w dns.ResponseWriter, r *dns.Msg) {
-	s.logger.Infof("handleRequest: Received DNS message from %s", w.RemoteAddr().String())
+	s.logger.Debugf("handleRequest: Received DNS message from %s", w.RemoteAddr().String())
 	if len(r.Question) > 0 {
 		q := r.Question[0]
-		s.logger.Infof("  ID: %d, Opcode: %d, Query: %s %s",
+		s.logger.Debugf("  ID: %d, Opcode: %d, Query: %s %s",
 			r.ID, r.Opcode, q.Header().Name, dns.TypeToString[dns.RRToType(q)])
 	}
 
 	resp := s.router.Route(ctx, w, r)
 
 	if resp != nil {
-		s.logger.Infof("handleRequest: Response has Data len=%d, Rcode=%d", len(resp.Data), resp.Rcode)
-		s.logger.Infof("handleRequest: About to write response...")
+		s.logger.Debugf("handleRequest: Response has Data len=%d, Rcode=%d", len(resp.Data), resp.Rcode)
 
-		// Debug: check if Data needs packing
+		// Check if Data needs packing
 		if len(resp.Data) == 0 {
-			s.logger.Infof("handleRequest: Data is empty, calling Pack()...")
+			s.logger.Debugf("handleRequest: Data is empty, calling Pack()...")
 			if err := resp.Pack(); err != nil {
 				s.logger.Errorf("handleRequest: Pack() failed: %v", err)
 				return
-			} else {
-				s.logger.Infof("handleRequest: Pack() succeeded, new Data len=%d", len(resp.Data))
 			}
+			s.logger.Debugf("handleRequest: Pack() succeeded, new Data len=%d", len(resp.Data))
 		}
 
 		// Call Write directly on the response writer
@@ -361,7 +363,7 @@ func (s *Server) handleRequest(ctx context.Context, w dns.ResponseWriter, r *dns
 		if err != nil {
 			s.logger.Errorf("handleRequest: Write error: %v", err)
 		} else {
-			s.logger.Infof("handleRequest: Write succeeded")
+			s.logger.Debugf("handleRequest: Write succeeded")
 		}
 	} else {
 		s.logger.Errorf("No response generated for query from %s", w.RemoteAddr().String())

@@ -52,10 +52,10 @@ func (r *Router) Route(ctx context.Context, w dns.ResponseWriter, rMsg *dns.Msg)
 
 	moduleName, found := r.moduleForOpcode(rMsg.Opcode)
 
-	r.logger.Infof("Route: Opcode=%d, FoundModule=%v, Module=%s", rMsg.Opcode, found, moduleName)
+	r.logger.Debugf("Route: Opcode=%d, FoundModule=%v, Module=%s", rMsg.Opcode, found, moduleName)
 
 	if !found {
-		r.logger.Infof("No handler for opcode %d, forwarding to upstream", rMsg.Opcode)
+		r.logger.Debugf("No handler for opcode %d, forwarding to upstream", rMsg.Opcode)
 		resp := r.forwardToUpstream(rMsg)
 		return resp
 	}
@@ -86,7 +86,7 @@ func (r *Router) Route(ctx context.Context, w dns.ResponseWriter, rMsg *dns.Msg)
 	case handlers.StatusNotRelevant:
 		// Packet not relevant to this handler (e.g., UPDATE without UPDATE-LEASE EDNS option)
 		// Apply default upstream routing.
-		r.logger.Infof("Handler declined packet (not relevant), forwarding to upstream")
+		r.logger.Debugf("Handler declined packet (not relevant), forwarding to upstream")
 		resp := r.forwardToUpstream(rMsg)
 		return resp
 
@@ -196,7 +196,7 @@ func (r *Router) handleDumpQuery(m *dns.Msg) *dns.Msg {
 			},
 		}
 		txt.TXT.Txt = append(txt.TXT.Txt, dumpText[i:end])
-		resp.Extra = append(resp.Extra, txt)
+		resp.Answer = append(resp.Answer, txt)
 	}
 
 	return resp
@@ -229,7 +229,7 @@ func (r *Router) forwardMessage(msg *dns.Msg) (*dns.Msg, error) {
 		r.logger.Errorf("Forward query failed: %v", err)
 		return nil, err
 	}
-	r.logger.Infof("Got response from upstream: Rcode=%d, Question count=%d",
+	r.logger.Debugf("Got response from upstream: Rcode=%d, Question count=%d",
 		resp.Rcode, len(resp.Question))
 	return resp, nil
 }

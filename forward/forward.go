@@ -18,7 +18,11 @@ type Result struct {
 }
 
 // Resolver forwards DNS queries to upstream servers.
-// FIXME: servers is a list, but protocol and timeout are single values, differently in config. Should we support per-server protocol/timeout?
+// NOTE: servers is a list, but protocol and timeout are single shared
+// values, applied to every server -- config.yaml lets each upstream declare
+// its own, but only server/server.go's New() picks one upstream's values
+// for the whole pool (see the NOTE there). Not fixed here since per-server
+// protocol/timeout would need a real API change to this struct.
 type Resolver struct {
 	servers  []string
 	protocol string
@@ -129,25 +133,8 @@ func (r *Resolver) exchange(ctx context.Context, server string, msg *dns.Msg) (*
 	return resp, nil
 }
 
-// extractDomain extracts the domain name from an address.
-func extractDomain(addr string) string {
-	host, _, err := net.SplitHostPort(addr)
-	if err != nil {
-		return addr
-	}
-	return host
-}
-
 // Shutdown gracefully stops the resolver.
 func (r *Resolver) Shutdown() {
 	r.cancel()
 	r.wg.Wait()
-}
-
-// SetServers updates the upstream server list.
-func (r *Resolver) SetServers(servers []string) {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	r.servers = make([]string, len(servers))
-	copy(r.servers, servers)
 }

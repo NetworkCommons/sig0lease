@@ -68,12 +68,3 @@ func ParseAdditionalRRSpec(spec string) (dns.RR, error) {
 
 	return rr, nil
 }
-
-// NewDataOnlyUpdate builds a DNS UPDATE message with only data RRs (no KEY RR) and
-// an 8-byte UPDATE-LEASE EDNS option with KEY-LEASE = 0.
-// Per RFC 9664 §4, KEY-LEASE == 0 means "no KEY RRs are being registered".
-// This is used for data-only operations where the client's key is resolved
-// from the lease store or DNS server on the proxy side.
-func NewDataOnlyUpdate(zone string, additional []dns.RR, leaseDuration uint32) (*dns.Msg, error) {
-	return NewLeaseUpdate(zone, nil, additional, leaseDuration, 0)
-}

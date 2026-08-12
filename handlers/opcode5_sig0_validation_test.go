@@ -131,6 +131,40 @@ func buildSignedUpdateWithSignerKeyInAdditionalForTest(t *testing.T, signerKey *
 	return signed
 }
 
+func buildSignedDataOnlyLeaseUpdateForHandleTest(t *testing.T, signerKey *keyrec.LoadedKey, leaseOwner string, leaseDuration uint32, includeSignerKeyInUpdate bool) *dns.Msg {
+	t.Helper()
+
+	msg := dns.NewMsg("test.dev.zenr.io.", dns.TypeSOA)
+	if msg == nil {
+		t.Fatalf("expected message")
+	}
+	msg.Opcode = dns.OpcodeUpdate
+
+	if includeSignerKeyInUpdate {
+		keyRR := signerKey.PublicKey.Clone().(*dns.KEY)
+		keyRR.Hdr.Name = signerKey.PublicKey.Hdr.Name
+		msg.Ns = append(msg.Ns, keyRR)
+	}
+
+	txt := &dns.TXT{Hdr: dns.Header{Name: leaseOwner, Class: dns.ClassINET, TTL: 60}}
+	txt.TXT.Txt = []string{"payload"}
+	msg.Ns = append(msg.Ns, txt)
+
+	opt := &dns.OPT{Hdr: dns.Header{Name: "."}}
+	opt.SetUDPSize(uint16(dns.DefaultMsgSize))
+	leaseOpt := leasepkg.Encode8Byte(leaseDuration, 0)
+	if err := leaseOpt.Encode(opt); err != nil {
+		t.Fatalf("encode lease option: %v", err)
+	}
+	msg.Extra = append(msg.Extra, opt)
+
+	signed, err := sig0.SignMessage(msg, signerKey.PublicKey, signerKey.PrivateKey)
+	if err != nil {
+		t.Fatalf("sign message: %v", err)
+	}
+	return signed
+}
+
 func TestExtractAndValidateSig0_UsesAuthoritativeSignerKey(t *testing.T) {
 	keystoreDir, err := createTestKeystore(t)
 	if err != nil {
@@ -150,7 +184,7 @@ func TestExtractAndValidateSig0_UsesAuthoritativeSignerKey(t *testing.T) {
 	}
 
 	signed := buildSignedUpdateForTest(t, loaded, "test.dev.zenr.io.")
-	sig, resolved, err := h.extractAndValidateSig0(context.Background(), signed, "test.dev.zenr.io.", nil, nil, nil)
+	sig, resolved, source, err := h.extractAndValidateSig0(context.Background(), signed, "test.dev.zenr.io.", nil, nil)
 	if err != nil {
 		t.Fatalf("expected validation success: %v", err)
 	}
@@ -159,6 +193,9 @@ func TestExtractAndValidateSig0_UsesAuthoritativeSignerKey(t *testing.T) {
 	}
 	if resolved.KeyTag() != loaded.PublicKey.KeyTag() {
 		t.Fatalf("expected resolved key tag %d, got %d", loaded.PublicKey.KeyTag(), resolved.KeyTag())
+	}
+	if source != signerKeySourceAuthoritative {
+		t.Fatalf("expected signer source authoritative, got %v", source)
 	}
 }
 
@@ -189,7 +226,7 @@ func TestExtractAndValidateSig0_RejectsSignerOutsideLeaseHierarchy(t *testing.T)
 	}
 
 	signed := buildSignedUpdateForTest(t, outsideLoaded, "test.dev.zenr.io.")
-	_, _, err = h.extractAndValidateSig0(context.Background(), signed, "test.dev.zenr.io.", nil, nil, nil)
+	_, _, _, err = h.extractAndValidateSig0(context.Background(), signed, "test.dev.zenr.io.", nil, nil)
 	if err == nil {
 		t.Fatalf("expected hierarchy validation failure")
 	}
@@ -214,12 +251,15 @@ func TestExtractAndValidateSig0_DNSFailureFallsBackToLeaseStore(t *testing.T) {
 	}
 
 	signed := buildSignedUpdateForTest(t, loaded, "test.dev.zenr.io.")
-	_, resolved, err := h.extractAndValidateSig0(context.Background(), signed, "test.dev.zenr.io.", nil, nil, nil)
+	_, resolved, source, err := h.extractAndValidateSig0(context.Background(), signed, "test.dev.zenr.io.", nil, nil)
 	if err != nil {
 		t.Fatalf("expected lease-store fallback success when authoritative lookup fails: %v", err)
 	}
 	if resolved == nil {
 		t.Fatalf("expected resolved key from lease store")
+	}
+	if source != signerKeySourceLeaseStore {
+		t.Fatalf("expected signer source lease-store, got %v", source)
 	}
 }
 
@@ -242,12 +282,15 @@ func TestExtractAndValidateSig0_DNSNoKeyFallsBackToLeaseStore(t *testing.T) {
 	}
 
 	signed := buildSignedUpdateForTest(t, loaded, "test.dev.zenr.io.")
-	_, resolved, err := h.extractAndValidateSig0(context.Background(), signed, "test.dev.zenr.io.", nil, nil, nil)
+	_, resolved, source, err := h.extractAndValidateSig0(context.Background(), signed, "test.dev.zenr.io.", nil, nil)
 	if err != nil {
 		t.Fatalf("expected lease-store fallback success when authoritative DNS has no signer key: %v", err)
 	}
 	if resolved == nil {
 		t.Fatalf("expected resolved key from lease store")
+	}
+	if source != signerKeySourceLeaseStore {
+		t.Fatalf("expected signer source lease-store, got %v", source)
 	}
 }
 
@@ -271,12 +314,15 @@ func TestExtractAndValidateSig0_RequestKeyWorksWhenDnsAndLeaseStoreDontHaveSigne
 	signed := buildSignedUpdateWithSignerKeyInUpdateForTest(t, loaded, "test.dev.zenr.io.")
 	requestKey := loaded.PublicKey.Clone().(*dns.KEY)
 
-	_, resolved, err := h.extractAndValidateSig0(context.Background(), signed, "test.dev.zenr.io.", nil, []*dns.KEY{requestKey}, nil)
+	_, resolved, source, err := h.extractAndValidateSig0(context.Background(), signed, "test.dev.zenr.io.", nil, []*dns.KEY{requestKey})
 	if err != nil {
 		t.Fatalf("expected validation success using request KEY only: %v", err)
 	}
 	if resolved == nil {
 		t.Fatalf("expected resolved signer key")
+	}
+	if source != signerKeySourceRequest {
+		t.Fatalf("expected signer source request, got %v", source)
 	}
 }
 
@@ -299,12 +345,15 @@ func TestExtractAndValidateSig0_AdditionalSigningKeyWorksWithoutAuthoritativeMat
 	signed := buildSignedUpdateWithSignerKeyInAdditionalForTest(t, loaded, "test.dev.zenr.io.")
 	requestKey := loaded.PublicKey.Clone().(*dns.KEY)
 
-	_, resolved, err := h.extractAndValidateSig0(context.Background(), signed, "test.dev.zenr.io.", nil, []*dns.KEY{requestKey}, nil)
+	_, resolved, source, err := h.extractAndValidateSig0(context.Background(), signed, "test.dev.zenr.io.", []*dns.KEY{requestKey}, nil)
 	if err != nil {
 		t.Fatalf("expected validation success using Additional-section signing KEY: %v", err)
 	}
 	if resolved == nil {
 		t.Fatalf("expected resolved signer key")
+	}
+	if source != signerKeySourceRequest {
+		t.Fatalf("expected signer source request, got %v", source)
 	}
 }
 
@@ -354,6 +403,144 @@ func TestHandle_DoesNotPersistLeaseWhenUpstreamRejectsUpdate(t *testing.T) {
 	}
 	if got := h.leaseManager.FindByName(leaseOwner); len(got) != 0 {
 		t.Fatalf("expected lease store unchanged when upstream update fails, got %+v", got)
+	}
+}
+
+func TestHandle_ReRegistersManagedKeyWhenAuthoritativeFQDNIsMissing(t *testing.T) {
+	keystoreDir, err := createTestKeystore(t)
+	if err != nil {
+		t.Fatalf("setup test keystore: %v", err)
+	}
+	loaded, err := keyrec.LoadKeyFromFile(keystoreDir, "Kdev.zenr.io.+015+35317")
+	if err != nil {
+		t.Fatalf("load key: %v", err)
+	}
+
+	h := NewUpdateHandler()
+	h.SetLogger(newTestHandler().logger)
+	if err := h.Setup(map[string]any{
+		"upstream_zone": "dev.zenr.io.",
+		"keystore_dir":  keystoreDir,
+	}); err != nil {
+		t.Fatalf("setup handler: %v", err)
+	}
+	h.authoritativeLookup = func(ctx context.Context, zoneHint, fqdn string, rrType uint16) ([]dns.RR, error) {
+		return []dns.RR{}, nil
+	}
+	h.upstreamCoordinator = &stubUpstreamCoordinator{resp: &dns.Msg{MsgHeader: dns.MsgHeader{Rcode: dns.RcodeSuccess}}}
+
+	keyRR := loaded.PublicKey.Clone().(*dns.KEY)
+	if err := h.leaseManager.Register(context.Background(), keyRR, 10, 10, "dev.zenr.io."); err != nil {
+		t.Fatalf("register existing key lease: %v", err)
+	}
+
+	leaseOwner := "test.dev.zenr.io."
+	req := buildSignedLeaseRegistrationForHandleTest(t, loaded, leaseOwner, 120, 120)
+
+	res := h.Handle(context.Background(), stubResponseWriter{}, req)
+	if res == nil || res.Message == nil {
+		t.Fatalf("expected response message")
+	}
+	if res.Message.Rcode != dns.RcodeSuccess {
+		t.Fatalf("expected success, got rcode=%d", res.Message.Rcode)
+	}
+
+	got := h.leaseManager.LookupByKEY(keyRR)
+	if got == nil {
+		t.Fatalf("expected key lease to remain managed")
+	}
+	if got.LeaseDuration >= 120 {
+		t.Fatalf("expected key lease to be re-registered with remaining lease time, got %d", got.LeaseDuration)
+	}
+}
+
+func TestHandle_DataOnlyLeaseWithoutUpdateKeyRR_RegistersNonKeyRRs(t *testing.T) {
+	keystoreDir, err := createTestKeystore(t)
+	if err != nil {
+		t.Fatalf("setup test keystore: %v", err)
+	}
+	loaded, err := keyrec.LoadKeyFromFile(keystoreDir, "Kdev.zenr.io.+015+35317")
+	if err != nil {
+		t.Fatalf("load key: %v", err)
+	}
+
+	h := NewUpdateHandler()
+	h.SetLogger(newTestHandler().logger)
+	if err := h.Setup(map[string]any{
+		"upstream_zone": "dev.zenr.io.",
+		"keystore_dir":  keystoreDir,
+	}); err != nil {
+		t.Fatalf("setup handler: %v", err)
+	}
+
+	signerKey := loaded.PublicKey.Clone().(*dns.KEY)
+	if err := h.leaseManager.Register(context.Background(), signerKey, 120, 120, "dev.zenr.io."); err != nil {
+		t.Fatalf("register signer key in lease store: %v", err)
+	}
+
+	h.authoritativeLookup = func(ctx context.Context, zoneHint, fqdn string, rrType uint16) ([]dns.RR, error) {
+		if rrType == dns.TypeKEY && canonicalName(fqdn) == canonicalName(signerKey.Hdr.Name) {
+			return []dns.RR{loaded.PublicKey}, nil
+		}
+		return []dns.RR{}, nil
+	}
+	h.upstreamCoordinator = &stubUpstreamCoordinator{resp: &dns.Msg{MsgHeader: dns.MsgHeader{Rcode: dns.RcodeSuccess}}}
+
+	owner := "host.test.dev.zenr.io."
+	req := buildSignedDataOnlyLeaseUpdateForHandleTest(t, loaded, owner, 120, false)
+	res := h.Handle(context.Background(), stubResponseWriter{}, req)
+	if res == nil || res.Message == nil {
+		t.Fatalf("expected response message")
+	}
+	if res.Message.Rcode != dns.RcodeSuccess {
+		t.Fatalf("expected successful data-only update without KEY RR, got rcode=%d", res.Message.Rcode)
+	}
+
+	if !h.hasActiveDataRecord(leasepkg.NodeKey(signerKey), req.Ns[0]) {
+		t.Fatalf("expected non-KEY RR to be registered under signer ownership")
+	}
+}
+
+func TestHandle_DataOnlyLeaseRejectsUpdateKeyRR(t *testing.T) {
+	keystoreDir, err := createTestKeystore(t)
+	if err != nil {
+		t.Fatalf("setup test keystore: %v", err)
+	}
+	loaded, err := keyrec.LoadKeyFromFile(keystoreDir, "Kdev.zenr.io.+015+35317")
+	if err != nil {
+		t.Fatalf("load key: %v", err)
+	}
+
+	h := NewUpdateHandler()
+	h.SetLogger(newTestHandler().logger)
+	if err := h.Setup(map[string]any{
+		"upstream_zone": "dev.zenr.io.",
+		"keystore_dir":  keystoreDir,
+	}); err != nil {
+		t.Fatalf("setup handler: %v", err)
+	}
+
+	signerKey := loaded.PublicKey.Clone().(*dns.KEY)
+	if err := h.leaseManager.Register(context.Background(), signerKey, 120, 120, "dev.zenr.io."); err != nil {
+		t.Fatalf("register signer key in lease store: %v", err)
+	}
+
+	h.authoritativeLookup = func(ctx context.Context, zoneHint, fqdn string, rrType uint16) ([]dns.RR, error) {
+		if rrType == dns.TypeKEY && canonicalName(fqdn) == canonicalName(signerKey.Hdr.Name) {
+			return []dns.RR{loaded.PublicKey}, nil
+		}
+		return []dns.RR{}, nil
+	}
+	h.upstreamCoordinator = &stubUpstreamCoordinator{resp: &dns.Msg{MsgHeader: dns.MsgHeader{Rcode: dns.RcodeSuccess}}}
+
+	owner := "host.test.dev.zenr.io."
+	req := buildSignedDataOnlyLeaseUpdateForHandleTest(t, loaded, owner, 120, true)
+	res := h.Handle(context.Background(), stubResponseWriter{}, req)
+	if res == nil || res.Message == nil {
+		t.Fatalf("expected response message")
+	}
+	if res.Message.Rcode != dns.RcodeRefused {
+		t.Fatalf("expected REFUSED for data-only update containing KEY RR, got rcode=%d", res.Message.Rcode)
 	}
 }
 

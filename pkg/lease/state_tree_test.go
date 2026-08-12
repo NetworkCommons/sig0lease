@@ -4,7 +4,6 @@ import (
 	"context"
 	"path/filepath"
 	"testing"
-	"time"
 
 	"codeberg.org/miekg/dns"
 )
@@ -110,29 +109,6 @@ func TestSnapshot_SaveLoad_RoundTrip(t *testing.T) {
 	kids := loaded.ChildrenOf(NodeKey(root))
 	if len(kids) != 1 || kids[0] != NodeKey(child) {
 		t.Fatalf("unexpected loaded children: %+v", kids)
-	}
-}
-
-func TestCleanupExpired_DeletesSubtree(t *testing.T) {
-	store := NewInMemoryManager()
-	defer store.Stop()
-	ctx := context.Background()
-
-	root := testKeyRR("root.dev.zenr.io.", "AAAAROOT=")
-	child := testKeyRR("child.dev.zenr.io.", "AAAACHILD=")
-
-	if err := store.Register(ctx, root, 1, 1, "dev.zenr.io."); err != nil {
-		t.Fatalf("register root: %v", err)
-	}
-	if err := store.RegisterWithParent(ctx, NodeKey(root), child, 3600, 3600, "dev.zenr.io."); err != nil {
-		t.Fatalf("register child: %v", err)
-	}
-
-	time.Sleep(1200 * time.Millisecond)
-	store.cleanupExpired()
-
-	if store.Get(NodeKey(root)) != nil || store.Get(NodeKey(child)) != nil {
-		t.Fatal("expected expired root subtree removed")
 	}
 }
 

@@ -78,11 +78,58 @@ func cmdRefresh(proxyAddr string, args []string) {
 	cmdRegRefWithMode(proxyAddr, args, "refresh", false)
 }
 
-// FIXME: Now the Key is automatically added to the the Update section
-// and therefore registered or refreshed
+// Signer key placement modes for --signer=<mode>. These exercise the three
+// ways the proxy can resolve a signer's KEY material: present directly in
+// the request (update or additional section), or absent from the request
+// entirely (resolved via the lease store or authoritative DNS instead).
+const (
+	signerLocationAuto       = "auto" // default: additional, unless a matching KEY rr-spec is already in Update
+	signerLocationUpdate     = "update"
+	signerLocationAdditional = "additional"
+	signerLocationNone       = "none"
+)
+
+// extractSignerLocationFlag pulls a --signer=<mode> token out of args,
+// wherever it appears, returning the remaining positional args and the
+// requested mode (signerLocationAuto if not specified).
+func extractSignerLocationFlag(args []string) ([]string, string) {
+	const prefix = "--signer="
+	location := signerLocationAuto
+	out := make([]string, 0, len(args))
+	for _, a := range args {
+		if strings.HasPrefix(a, prefix) {
+			location = strings.TrimPrefix(a, prefix)
+			continue
+		}
+		out = append(out, a)
+	}
+	return out, location
+}
+
+func addSignerKeyToAdditional(msg *dns.Msg, clientKey *keyrec.LoadedKey, keyLeaseDuration uint32) {
+	signingKeyRR := new(dns.KEY)
+	signingKeyRR.Hdr.Name = clientKey.KeyName()
+	signingKeyRR.Hdr.Class = dns.ClassINET
+	signingKeyRR.Hdr.TTL = keyLeaseDuration
+	signingKeyRR.Flags = clientKey.PublicKey.Flags
+	signingKeyRR.Protocol = clientKey.PublicKey.Protocol
+	signingKeyRR.Algorithm = clientKey.PublicKey.Algorithm
+	signingKeyRR.PublicKey = clientKey.PublicKey.PublicKey
+	msg.Extra = append(msg.Extra, signingKeyRR)
+	fmt.Printf("  ✓ Added signer KEY RR to Additional section: %s\n", signingKeyRR.String())
+}
+
 func cmdRegRefWithMode(proxyAddr string, args []string, operation string, tamper bool) {
+	args, signerLocation := extractSignerLocationFlag(args)
+	switch signerLocation {
+	case signerLocationAuto, signerLocationUpdate, signerLocationAdditional, signerLocationNone:
+	default:
+		fmt.Fprintf(os.Stderr, "ERROR: invalid --signer=%s (expected update|additional|none)\n", signerLocation)
+		os.Exit(1)
+	}
+
 	if len(args) < 3 {
-		fmt.Fprintf(os.Stderr, "Usage: sig0lease-client <proxy> register|register-tamper|refresh <keyname> [lease] [key-lease] [rr-spec...]\n")
+		fmt.Fprintf(os.Stderr, "Usage: sig0lease-client <proxy> register|register-tamper|refresh <keyname> [lease] [key-lease] [rr-spec...] [--signer=update|additional|none]\n")
 		os.Exit(1)
 	}
 
@@ -126,7 +173,7 @@ func cmdRegRefWithMode(proxyAddr string, args []string, operation string, tamper
 
 	// Load client key by keyname used for SIG(0) signing
 	fmt.Printf("Loading client key for key name (%s) from keystore (%s)\n", keyname, keystoreDir)
-	err := keyrec.KeyExists(keystoreDir, keyname)
+	err := keyrec.KeyExists(keystoreDir, keyname, nil)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "ERROR: Could not find client key for key name %s: %v\n", keyname, err)
 		os.Exit(1)
@@ -200,19 +247,28 @@ func cmdRegRefWithMode(proxyAddr string, args []string, operation string, tamper
 		}
 	}
 
-	if !signerKeyInUpdate {
-		signingKeyRR := new(dns.KEY)
-		signingKeyRR.Hdr.Name = clientKey.KeyName()
-		signingKeyRR.Hdr.Class = dns.ClassINET
-		signingKeyRR.Hdr.TTL = keyLeaseDuration
-		signingKeyRR.Flags = clientKey.PublicKey.Flags
-		signingKeyRR.Protocol = clientKey.PublicKey.Protocol
-		signingKeyRR.Algorithm = clientKey.PublicKey.Algorithm
-		signingKeyRR.PublicKey = clientKey.PublicKey.PublicKey
-		msg.Extra = append(msg.Extra, signingKeyRR)
-		fmt.Printf("  ✓ Added signer KEY RR to Additional section: %s\n", signingKeyRR.String())
-	} else {
-		fmt.Printf("  ✓ Signer KEY RR already present in Authority section; not duplicated in Additional\n")
+	fmt.Printf("\nSigner KEY placement: --signer=%s\n", signerLocation)
+	switch signerLocation {
+	case signerLocationUpdate:
+		if !signerKeyInUpdate {
+			fmt.Fprintf(os.Stderr, "ERROR: --signer=update requires a KEY rr-spec for %s among the rr-spec arguments\n", clientKey.KeyName())
+			os.Exit(1)
+		}
+		fmt.Printf("  ✓ Signer KEY RR present in Update section\n")
+	case signerLocationAdditional:
+		addSignerKeyToAdditional(msg, clientKey, keyLeaseDuration)
+	case signerLocationNone:
+		if signerKeyInUpdate {
+			fmt.Fprintf(os.Stderr, "ERROR: --signer=none conflicts with a KEY rr-spec for %s already among the rr-spec arguments\n", clientKey.KeyName())
+			os.Exit(1)
+		}
+		fmt.Printf("  ✓ Signer KEY RR omitted from request; proxy must resolve it via the lease store or authoritative DNS\n")
+	case signerLocationAuto:
+		if signerKeyInUpdate {
+			fmt.Printf("  ✓ Signer KEY RR already present in Authority section; not duplicated in Additional\n")
+		} else {
+			addSignerKeyToAdditional(msg, clientKey, keyLeaseDuration)
+		}
 	}
 
 	fmt.Printf("\nAdded UPDATE-LEASE EDNS option\n")
@@ -291,12 +347,22 @@ func cmdRegRefWithMode(proxyAddr string, args []string, operation string, tamper
 	fmt.Printf("  Flags: AA=%v, RD=%v, RA=%v\n", resp.Authoritative, resp.RecursionDesired, resp.RecursionAvailable)
 
 	if resp.Rcode == dns.RcodeSuccess {
-		effectiveLease := client.EffectiveLeaseDuration(resp, leaseDuration)
+		effectiveLease, effectiveKeyLease := client.EffectiveLeaseDuration(resp, leaseDuration, keyLeaseDuration)
 		fmt.Printf("\n✓ %s SUCCESSFUL\n", strings.ToUpper(operation))
 		fmt.Printf("  Lease granted for: %s\n", keyname)
-		fmt.Printf("  Lease duration: %d seconds (%d minutes)\n", effectiveLease, effectiveLease/60)
-		fmt.Printf("  Key-lease duration: %d seconds (%d minutes)\n", keyLeaseDuration, keyLeaseDuration/60)
-		fmt.Printf("  Expiration time: %s\n", client.ExpiryFromResponse(time.Now(), leaseDuration, resp).Format(time.RFC3339))
+		fmt.Printf("  Lease duration: %d seconds (%d minutes)", effectiveLease, effectiveLease/60)
+		if effectiveLease != leaseDuration {
+			fmt.Printf(" (requested %d, changed by proxy)", leaseDuration)
+		}
+		fmt.Println()
+		fmt.Printf("  Key-lease duration: %d seconds (%d minutes)", effectiveKeyLease, effectiveKeyLease/60)
+		if effectiveKeyLease != keyLeaseDuration {
+			fmt.Printf(" (requested %d, changed by proxy)", keyLeaseDuration)
+		}
+		fmt.Println()
+		dataExpiry, keyExpiry := client.ExpiryFromResponse(time.Now(), leaseDuration, keyLeaseDuration, resp)
+		fmt.Printf("  Data expiration time: %s\n", dataExpiry.Format(time.RFC3339))
+		fmt.Printf("  Key expiration time: %s\n", keyExpiry.Format(time.RFC3339))
 
 		if len(resp.Answer) > 0 {
 			fmt.Printf("\nAnswer Section:\n")
@@ -407,7 +473,7 @@ func cmdListKeys(args []string) {
 
 	fmt.Printf("=== Available Keys in Keystore ===\n")
 	fmt.Printf("Directory: %s\n\n", dir)
-	keyFiles, err := keyrec.ListKeysInDirectory(dir)
+	keyFiles, err := keyrec.ListKeysInDirectory(dir, nil)
 	if err != nil {
 		fmt.Printf("Error: %v)\n", err)
 		return
@@ -438,34 +504,45 @@ Usage:
   sig0lease-client <proxy> <command> [args...]
 
 Commands:
-	register <keyname> [lease] [key-lease] [rr-spec...]
+	register <keyname> [lease] [key-lease] [rr-spec...] [--signer=update|additional|none]
 		Send a sig0lease UPDATE-LEASE registration request
-		
+
 		keyname: filename of the key in the keystore (e.g., Ktest.dev.zenr.io.+015+05044)
 		lease: lease duration in seconds
 		key-lease: key-lease duration in seconds
 			rr-spec: optional additional RR in DNS presentation format:
 				<owner> <ttl> <class> <type> <rdata...>
-		
+			--signer: where the signer's KEY RR should appear in the request. Tests the
+				proxy's signer resolution: request-provided (update/additional) vs.
+				resolved server-side (lease store or authoritative DNS).
+					update:     signer's own KEY rr-spec must also be passed; no Additional copy
+					additional: signer KEY is placed in the Additional section (default when
+					            no matching KEY rr-spec is given)
+					none:       signer KEY is omitted entirely; proxy must resolve it from the
+					            lease store or authoritative DNS
+
 		Example:
-		// Key-only registration   
+		// Key-only registration
 		sig0lease-client 127.0.0.1:8053 register Ktest.dev.zenr.io.+015+05044 300 0
 		// Key and other RRs registration
 		sig0lease-client 127.0.0.1:8053 register Ktest.dev.zenr.io.+015+05044 300 3600 "client.test.dev.zenr.io. 300 IN TXT \"hello\""
+		// Refresh signed by an already-managed or online-only key, key omitted from the request
+		sig0lease-client 127.0.0.1:8053 register Ktest.dev.zenr.io.+015+05044 300 3600 --signer=none
 
-	refresh <keyname> [lease] [key-lease]
+	refresh <keyname> [lease] [key-lease] [rr-spec...] [--signer=update|additional|none]
 		Send a sig0lease UPDATE-LEASE refresh request (8-byte variant)
 
 		keyname: filename of the key in the keystore (e.g., Ktest.dev.zenr.io.+015+05044)
 		lease: new lease duration in seconds
 		key-lease: key-lease duration in seconds
+		--signer: see register above
 
 		Example:
 		// Key-only refresh
         sig0lease-client 127.0.0.1:8053 refresh Ktest.dev.zenr.io.+015+05044 300 0
 	    // Key and other RRs refresh
         sig0lease-client 127.0.0.1:8053 refresh Ktest.dev.zenr.io.+015+05044 300 3600 "client.test.dev.zenr.io. 300 IN TXT \"hello\""
-		
+
 
   verify <zone> <keyname>
     Query if a key registration is active

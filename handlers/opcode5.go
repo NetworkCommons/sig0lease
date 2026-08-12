@@ -22,13 +22,13 @@ type LeaseRecord = leasepkg.Record
 // Records are tracked individually by their RFC 2136 key (rfc2136 - 1.1 -
 // Comparison Rules), so each record can have its own lease duration and
 // expiry time. The key excludes TTL and applies special rules for SOA,
-// CNAME, and WKS record types.
+// CNAME, and WKS record types. A deleted or expired record is removed from
+// Records outright, never flagged in place.
 type DataLeaseRecord struct {
 	Records       map[string]*dataRecordEntry // key = RFC 2136 RR key (excludes TTL)
 	ExpiresAt     time.Time
 	UpstreamZone  string
 	LeaseDuration uint32
-	Deleted       bool
 }
 
 // dataRecordEntry holds a single data record with its own lease metadata.
@@ -36,7 +36,6 @@ type dataRecordEntry struct {
 	RR            dns.RR
 	ExpiresAt     time.Time
 	LeaseDuration uint32
-	Deleted       bool
 }
 
 // recordKey returns an RFC 2136-compliant key for a DNS RR.
@@ -181,7 +180,7 @@ func (h *UpdateHandler) findAuthorizedProxyKeyForZone(zone string) (*keyrec.Load
 	}
 
 	for candidate := zone; candidate != ""; candidate = parentZone(candidate) {
-		keyNames, err := keyrec.FindKeysByZone(h.keystoreDir, candidate+".")
+		keyNames, err := keyrec.FindKeysByZone(h.keystoreDir, candidate+".", h.logger)
 		if len(keyNames) == 0 {
 			continue
 		}
@@ -219,7 +218,14 @@ func (u *DefaultUpstreamCoordinator) SendUpdate(ctx context.Context, upstreamZon
 	}
 	msgZone := updateMsg.Question[0].Header().Name
 	u.logger.Debugf("Message zone: %s", msgZone)
-	if msgZone != upstreamZone {
+	// Compare canonically (case-insensitive, trailing-dot-insensitive):
+	// callers pass zone strings from several sources (config, resolved via
+	// live NS lookup with a trailing dot, or normalizeZone()'d lease-store
+	// values without one) that are the same zone but not byte-identical. A
+	// raw string comparison here rejects valid same-zone deletes whenever
+	// the caller couldn't re-resolve the FQDN form (e.g. resolveAuthoritativeZone
+	// failing/timing out), which silently orphans records at authoritative DNS.
+	if canonicalName(msgZone) != canonicalName(upstreamZone) {
 		return nil, fmt.Errorf("update zone mismatch: message zone %q, expected upstream zone %q", msgZone, upstreamZone)
 	}
 
@@ -262,12 +268,20 @@ type UpdateHandler struct {
 	keystoreDir         string
 	LeasePolicy         LeasePolicy
 	prefer4ByteVariant  bool // When true, use 4-byte variant (legacy); default false uses 8-byte always.
+	// AllowOnlineKeyRegistration controls whether a signer resolved only via
+	// authoritative DNS (not in the lease store, not present anywhere in the
+	// request) may authorize registration of new KEY RRs. Such a signer can
+	// always be used for SIG(0) verification and for deletes; this flag only
+	// gates whether it may also be used to create new managed state. Default
+	// false (fail closed).
+	AllowOnlineKeyRegistration bool
 	leaseTimersMu       sync.Mutex
 	leaseTimers         map[string]*time.Timer
 	dataLeasesMu        sync.RWMutex
 	dataLeases          map[string]*DataLeaseRecord
 	blacklistedTypes    map[uint16]struct{} // RR types blocked from registration (type code -> empty)
 	authoritativeLookup func(ctx context.Context, zoneHint string, fqdn string, rrType uint16) ([]dns.RR, error)
+	reconcileTicker     *time.Ticker
 }
 
 // NewUpdateHandler creates a new handler for opcode 5 (UPDATE) queries.

@@ -32,7 +32,7 @@ func TestLeaseCreationAndSigning(t *testing.T) {
 	keystoreDir := getKeystoreDir(t)
 
 	// Find and load the test key
-	err := keyrec.KeyExists(keystoreDir, keyName)
+	err := keyrec.KeyExists(keystoreDir, keyName, nil)
 	if err != nil {
 		t.Skipf("Could not find test key: %v", err)
 	}
@@ -88,7 +88,7 @@ func TestLeaseVerification(t *testing.T) {
 	keystoreDir := getKeystoreDir(t)
 
 	// Find and load the test key
-	err := keyrec.KeyExists(keystoreDir, keyName)
+	err := keyrec.KeyExists(keystoreDir, keyName, nil)
 	if err != nil {
 		t.Skipf("Could not find test key: %v", err)
 	}
@@ -124,7 +124,7 @@ func TestLeaseRefreshRequest(t *testing.T) {
 	keystoreDir := getKeystoreDir(t)
 
 	// Find and load the test key
-	err := keyrec.KeyExists(keystoreDir, keyName)
+	err := keyrec.KeyExists(keystoreDir, keyName, nil)
 	if err != nil {
 		t.Skipf("Could not find test key: %v", err)
 	}
@@ -169,7 +169,7 @@ func TestLeaseTimingCycle(t *testing.T) {
 	keystoreDir := getKeystoreDir(t)
 
 	// Find and load the test key
-	err := keyrec.KeyExists(keystoreDir, keyName)
+	err := keyrec.KeyExists(keystoreDir, keyName, nil)
 	if err != nil {
 		t.Skipf("Could not find test key: %v", err)
 	}
@@ -238,7 +238,7 @@ func TestLeaseSignatureVariations(t *testing.T) {
 	keystoreDir := getKeystoreDir(t)
 
 	// Find and load the test key
-	err := keyrec.KeyExists(keystoreDir, keyName)
+	err := keyrec.KeyExists(keystoreDir, keyName, nil)
 	if err != nil {
 		t.Skipf("Could not find test key: %v", err)
 	}

@@ -12,6 +12,7 @@ import (
 	"strings"
 
 	"codeberg.org/miekg/dns"
+	"github.com/NetworkCommons/sig0lease/logging"
 )
 
 // LoadedKey represents a fully loaded key with private key material for signing.
@@ -74,14 +75,12 @@ func LoadKeyFromFile(keystoreDir, keyName string) (*LoadedKey, error) {
 }
 
 // ListKeysInDirectory lists all key names in a keystore directory.
+// logger may be nil (no logging); when non-nil and no keys are found, the
+// current working directory is logged too, since keystoreDir is often a
+// relative path and an empty result is frequently caused by it resolving
+// against an unexpected CWD.
 // Provenance: Adapted from sig0namectl's ListKeys() in keys_nowasm.go
-func ListKeysInDirectory(keystoreDir string) ([]string, error) {
-	curdir, err := os.Getwd()
-	if err != nil {
-		fmt.Println("Error:", err)
-	}
-	fmt.Println("Current working directory:", curdir)
-
+func ListKeysInDirectory(keystoreDir string, logger *logging.Logger) ([]string, error) {
 	entries, err := os.ReadDir(keystoreDir)
 	if err != nil {
 		return nil, fmt.Errorf("failed to read keystore directory %q: %w", keystoreDir, err)
@@ -107,6 +106,14 @@ func ListKeysInDirectory(keystoreDir string) ([]string, error) {
 		}
 	}
 
+	if len(keyNames) == 0 && logger != nil {
+		if cwd, err := os.Getwd(); err == nil {
+			logger.Debugf("No keys found in keystore directory %q (current working directory: %s)", keystoreDir, cwd)
+		} else {
+			logger.Debugf("No keys found in keystore directory %q", keystoreDir)
+		}
+	}
+
 	return keyNames, nil
 }
 
@@ -114,12 +121,12 @@ func ListKeysInDirectory(keystoreDir string) ([]string, error) {
 // Returns the key names. possibly none.
 // First searches ED25519 (algorithm 15) and then other algorithms.
 // Provenance: Inspired by sig0namectl's LoadOrGenerateKey()
-func FindKeysByZone(keystoreDir, zoneName string) ([]string, error) {
+func FindKeysByZone(keystoreDir, zoneName string, logger *logging.Logger) ([]string, error) {
 	if !strings.HasSuffix(zoneName, ".") {
 		zoneName += "."
 	}
 
-	keys, err := ListKeysInDirectory(keystoreDir)
+	keys, err := ListKeysInDirectory(keystoreDir, logger)
 	if err != nil {
 		return nil, err
 	}
@@ -153,19 +160,14 @@ func FindKeysByZone(keystoreDir, zoneName string) ([]string, error) {
 	for key := range keyNamesSet {
 		keyNames = append(keyNames, key)
 	}
-	if len(keyNames) == 0 {
-		fmt.Printf("no key found for zone %s in keystore %s", zoneName, keystoreDir)
-	}
-	fmt.Printf("zone %s keys %v", zoneName, keyNames)
 	return keyNames, nil
-
 }
 
 // KeyExists searches for a key by filename without .key in the keystore.
 // Returns the key name or error if none found.
-func KeyExists(keystoreDir, keyName string) error {
+func KeyExists(keystoreDir, keyName string, logger *logging.Logger) error {
 
-	keyFiles, err := ListKeysInDirectory(keystoreDir)
+	keyFiles, err := ListKeysInDirectory(keystoreDir, logger)
 	if err != nil {
 		return err
 	}

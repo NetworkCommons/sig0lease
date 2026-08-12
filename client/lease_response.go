@@ -1,67 +1,36 @@
 package client
 
 import (
-	"encoding/hex"
 	"time"
 
 	"codeberg.org/miekg/dns"
+	leasepkg "github.com/NetworkCommons/sig0lease/pkg/lease"
 )
 
-func decodeLeaseFromERFC(erfc *dns.ERFC3597) (uint32, bool) {
-	if erfc == nil || erfc.EDNS0Code != 2 || erfc.Code == "" {
-		return 0, false
-	}
-	binary, err := hex.DecodeString(erfc.Code)
+// EffectiveLeaseDuration returns the LEASE and KEY-LEASE durations the
+// client should use for expiry calculations. If the server response
+// contains an UPDATE-LEASE option, those (possibly clamped) values are
+// authoritative — the proxy applies its own LeasePolicy bounds and may
+// grant less than what was requested for either value independently.
+// Otherwise the originally-requested values are used. For the 4-byte
+// variant (a single shared value), that value is used for both.
+func EffectiveLeaseDuration(resp *dns.Msg, requestedLease, requestedKeyLease uint32) (lease uint32, keyLease uint32) {
+	lo, err := leasepkg.FindAndDecode(resp)
 	if err != nil {
-		return 0, false
+		return requestedLease, requestedKeyLease
 	}
-	if len(binary) != 4 && len(binary) != 8 {
-		return 0, false
+	lease = lo.Lease
+	if lo.KeyLease != nil {
+		keyLease = *lo.KeyLease
+	} else {
+		keyLease = lo.Lease
 	}
-	lease := uint32(binary[0])<<24 | uint32(binary[1])<<16 | uint32(binary[2])<<8 | uint32(binary[3])
-	return lease, true
+	return lease, keyLease
 }
 
-// EffectiveLeaseDuration returns the lease duration that should be used by the
-// client for expiry calculations. If the server response contains an
-// UPDATE-LEASE option, that LEASE value is authoritative. Otherwise requested is used.
-// FIXME: There are two lease times to read from the server
-func EffectiveLeaseDuration(resp *dns.Msg, requested uint32) uint32 {
-	if resp == nil {
-		return requested
-	}
-
-	scan := func(rrs []dns.RR) (uint32, bool) {
-		for _, rr := range rrs {
-			if erfc, ok := rr.(*dns.ERFC3597); ok {
-				if lease, ok := decodeLeaseFromERFC(erfc); ok {
-					return lease, true
-				}
-			}
-			if opt, ok := rr.(*dns.OPT); ok {
-				for _, option := range opt.Options {
-					if erfc, ok := option.(*dns.ERFC3597); ok {
-						if lease, ok := decodeLeaseFromERFC(erfc); ok {
-							return lease, true
-						}
-					}
-				}
-			}
-		}
-		return 0, false
-	}
-
-	if lease, ok := scan(resp.Pseudo); ok {
-		return lease
-	}
-	if lease, ok := scan(resp.Extra); ok {
-		return lease
-	}
-	return requested
-}
-
-// ExpiryFromResponse computes expiration time using server-granted lease when present.
-func ExpiryFromResponse(now time.Time, requested uint32, resp *dns.Msg) time.Time {
-	lease := EffectiveLeaseDuration(resp, requested)
-	return now.Add(time.Duration(lease) * time.Second)
+// ExpiryFromResponse computes the data-record and KEY expiration times using
+// the server-granted LEASE and KEY-LEASE when present in the response.
+func ExpiryFromResponse(now time.Time, requestedLease, requestedKeyLease uint32, resp *dns.Msg) (dataExpiry, keyExpiry time.Time) {
+	lease, keyLease := EffectiveLeaseDuration(resp, requestedLease, requestedKeyLease)
+	return now.Add(time.Duration(lease) * time.Second), now.Add(time.Duration(keyLease) * time.Second)
 }

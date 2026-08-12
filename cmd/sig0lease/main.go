@@ -35,6 +35,11 @@ func applyUpdateHandlerEnvOverrides(cfg map[string]any) map[string]any {
 	if v := os.Getenv("KEYSTORE_DIR"); v != "" {
 		out["keystore_dir"] = v
 	}
+	if v := os.Getenv("ALLOW_ONLINE_KEY_REGISTRATION"); v != "" {
+		if b, err := strconv.ParseBool(v); err == nil {
+			out["allow_online_key_registration"] = b
+		}
+	}
 
 	rawPolicy, _ := out["lease_policy"].(map[string]any)
 	if rawPolicy == nil {
@@ -68,19 +73,20 @@ func main() {
 		}
 	}
 
+	// Create logger. Default to "info": per-packet/per-request tracing is
+	// available via DEBUG_LEVEL=debug, but shouldn't be on by default.
+	logLevel := os.Getenv("DEBUG_LEVEL")
+	if logLevel == "" {
+		logLevel = "info"
+	}
+	logger := logging.NewLogger(logLevel, "text")
+
 	// Load configuration
 	cfg, err := config.LoadConfig(cfgPath)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "Error loading config: %v\n", err)
+		logger.Errorf("Error loading config: %v", err)
 		os.Exit(1)
 	}
-
-	// Create logger
-	logLevel := os.Getenv("DEBUG_LEVEL")
-	if logLevel == "" {
-		logLevel = "debug"
-	}
-	logger := logging.NewLogger(logLevel, "text")
 
 	if dumpMode {
 		// Dump mode: create handler, print lease state, exit.
@@ -119,7 +125,7 @@ func main() {
 	// Create server
 	srv, err := server.New(cfg, logger)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "Error creating server: %v\n", err)
+		logger.Errorf("Error creating server: %v", err)
 		os.Exit(1)
 	}
 
@@ -154,7 +160,7 @@ func main() {
 
 	// Start server
 	if err := srv.Serve(); err != nil {
-		fmt.Fprintf(os.Stderr, "Server error: %v\n", err)
+		logger.Errorf("Server error: %v", err)
 		os.Exit(1)
 	}
 }

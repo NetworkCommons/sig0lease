@@ -9,11 +9,20 @@ package main
 //
 // Build with ldflags to inject test parameters:
 //
-// 	go build -ldflags="-X main.rrType=NULL -X main.rrOwner=test.dev.zenr.io. -X main.leaseDuration=30 -X main.keyLeaseSec=30 -X main.proxyAddr=127.0.0.1:8053 -X main.zone=test.dev.zenr.io." ./tests/blacklisted_tester.go
+// 	go build -ldflags="-X main.rrType=NULL -X main.rrOwner=test.dev.zenr.io. -X main.keyName=Ktest.dev.zenr.io.+015+05044 -X main.leaseDurationStr=30 -X main.keyLeaseSecStr=30 -X main.proxyAddr=127.0.0.1:8053 -X main.zone=test.dev.zenr.io." ./tests/blacklisted_tester.go
+//
+// leaseDurationStr/keyLeaseSecStr are strings (parsed to uint32 in main),
+// not the underlying uint32 lease durations directly: -ldflags -X can only
+// set string-typed package-level variables. rrOwner (the DNS owner name for
+// the constructed RR) and keyName (the keystore filename to sign with) are
+// deliberately separate: rrOwner is a zone name like "test.dev.zenr.io."
+// while keyName is a keystore filename like "Ktest.dev.zenr.io.+015+05044"
+// -- keyrec.KeyExists/LoadKeyFromFile need the latter, not the former.
 
 import (
 	"fmt"
 	"os"
+	"strconv"
 	"time"
 
 	"codeberg.org/miekg/dns"
@@ -26,21 +35,37 @@ import (
 )
 
 var (
-	rrType        string // NULL or NXNAME
-	rrOwner       string // owner name for the RR
-	leaseDuration uint32 = 30
-	keyLeaseSec   uint32 = 30
-	proxyAddr     string // proxy address (e.g., 127.0.0.1:8053)
-	zone          string // downstream zone
-	keystoreDir   string = os.Getenv("CLIENT_KEYSTORE_DIR")
+	rrType           string // NULL or NXNAME
+	rrOwner          string // owner name for the RR
+	keyName          string // keystore filename to sign with (e.g. Ktest.dev.zenr.io.+015+05044)
+	leaseDurationStr string = "30"
+	keyLeaseSecStr   string = "30"
+	proxyAddr        string // proxy address (e.g., 127.0.0.1:8053)
+	zone             string // downstream zone
+	keystoreDir      string = os.Getenv("CLIENT_KEYSTORE_DIR")
 )
 
 func main() {
-	if rrType == "" || rrOwner == "" || proxyAddr == "" || zone == "" {
+	if rrType == "" || rrOwner == "" || keyName == "" || proxyAddr == "" || zone == "" {
 		fmt.Fprintf(os.Stderr, "ERROR: Missing required parameters.\n")
-		fmt.Fprintf(os.Stderr, "Usage: build with -ldflags=\"-X main.rrType=... -X main.rrOwner=... -X main.proxyAddr=... -X main.zone=...\"\n")
+		fmt.Fprintf(os.Stderr, "Usage: build with -ldflags=\"-X main.rrType=... -X main.rrOwner=... -X main.keyName=... -X main.proxyAddr=... -X main.zone=...\"\n")
 		os.Exit(1)
 	}
+
+	// -ldflags -X can only set string-typed package vars, so lease/key-lease
+	// are injected as strings and parsed here.
+	leaseDuration64, err := strconv.ParseUint(leaseDurationStr, 10, 32)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "ERROR: invalid leaseDuration %q: %v\n", leaseDurationStr, err)
+		os.Exit(1)
+	}
+	keyLeaseSec64, err := strconv.ParseUint(keyLeaseSecStr, 10, 32)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "ERROR: invalid keyLeaseSec %q: %v\n", keyLeaseSecStr, err)
+		os.Exit(1)
+	}
+	leaseDuration := uint32(leaseDuration64)
+	keyLeaseSec := uint32(keyLeaseSec64)
 
 	// Validate rrType
 	if rrType != "NULL" && rrType != "NXNAME" {
@@ -58,20 +83,20 @@ func main() {
 	fmt.Printf("\n")
 
 	// Step 1: Load client key by keyname
-	fmt.Printf("Step 1: Loading client key for key name (%s) from keystore (%s)\n", rrOwner, keystoreDir)
+	fmt.Printf("Step 1: Loading client key for key name (%s) from keystore (%s)\n", keyName, keystoreDir)
 	if keystoreDir == "" {
 		fmt.Fprintf(os.Stderr, "ERROR: CLIENT_KEYSTORE_DIR environment variable not set\n")
 		os.Exit(1)
 	}
 
-	err := keyrec.KeyExists(keystoreDir, rrOwner)
+	err = keyrec.KeyExists(keystoreDir, keyName, nil)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "ERROR: Could not find client key for key name %s: %v\n", rrOwner, err)
+		fmt.Fprintf(os.Stderr, "ERROR: Could not find client key for key name %s: %v\n", keyName, err)
 		os.Exit(1)
 	}
-	fmt.Printf("  Found client key: %s\n", rrOwner)
+	fmt.Printf("  Found client key: %s\n", keyName)
 
-	clientKey, err := keyrec.LoadKeyFromFile(keystoreDir, rrOwner)
+	clientKey, err := keyrec.LoadKeyFromFile(keystoreDir, keyName)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "ERROR: Failed to load client key: %v\n", err)
 		os.Exit(1)

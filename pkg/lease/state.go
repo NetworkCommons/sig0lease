@@ -44,20 +44,20 @@ type Record struct {
 type KEYRecord = Record
 
 // NonKEYRecord represents a non-KEY RR lease node in the tree.
+// Presence in a NonKEYRecordSet's Records map is what defines "active" — a
+// deleted or expired record is removed outright, never flagged in place.
 type NonKEYRecord struct {
 	BaseRecord
 	OwnerKeyName string
 	RRKey        string
 	RR           dns.RR
 	UpstreamZone string
-	Deleted      bool
 }
 
 // NonKEYRecordSet groups non-KEY records by owner key.
 type NonKEYRecordSet struct {
 	Records      map[string]*NonKEYRecord
 	UpstreamZone string
-	Deleted      bool
 }
 
 // IsExpired returns true if the lease has expired.
@@ -112,9 +112,8 @@ type HierarchicalLeaseStore interface {
 type LeaseTreeStore interface {
 	HierarchicalLeaseStore
 	UpsertNonKEYRecords(ownerNodeKey string, records []dns.RR, leaseDuration uint32, upstreamZone string) error
-	RefreshNonKEYRecords(ownerNodeKey string, leaseDuration uint32) error
-	MarkNonKEYRecordsDeleted(ownerNodeKey string)
 	RemoveNonKEYRecords(ownerNodeKey string)
+	RemoveSingleNonKEYRecord(ownerNodeKey, rrKey string)
 	GetNonKEYRecordSet(ownerNodeKey string) *NonKEYRecordSet
 	HasActiveNonKEYRecord(ownerNodeKey string, rr dns.RR) bool
 }
@@ -147,7 +146,9 @@ type LeaseNodeSnapshot struct {
 	ChildKeys        []string  `json:"child_keys,omitempty"`
 }
 
-// NonKEYNodeSnapshot is a persisted non-KEY node row.
+// NonKEYNodeSnapshot is a persisted non-KEY node row. A record that has been
+// deleted or expired is removed from the store, so it is never persisted;
+// there is no "deleted" flag to carry here.
 type NonKEYNodeSnapshot struct {
 	OwnerKeyName  string    `json:"owner_key_name"`
 	RRType        uint16    `json:"rr_type,omitempty"`
@@ -158,10 +159,17 @@ type NonKEYNodeSnapshot struct {
 	LeaseDuration uint32    `json:"lease_duration"`
 	RegisteredAt  time.Time `json:"registered_at"`
 	ExpiresAt     time.Time `json:"expires_at"`
-	Deleted       bool      `json:"deleted"`
 }
 
 // InMemoryLeaseStore is an in-memory lease manager implementation.
+//
+// The store never deletes anything on its own initiative: expiry is a
+// handler-level concern, because only the handler can also send the
+// corresponding upstream DNS delete. A store-driven timer here would race
+// the handler's own precise per-node timer and — whichever fired first —
+// silently erase local state without ever notifying the authoritative
+// server. See UpdateHandler.reconcileLeaseTimers for the single, upstream-
+// aware path that owns expiry.
 type InMemoryLeaseStore struct {
 	mu              sync.RWMutex
 	leases          map[string]*Record             // composite NodeKey → Record
@@ -170,32 +178,17 @@ type InMemoryLeaseStore struct {
 	rootsByZone     map[string]map[string]struct{}
 	nonKeySets      map[string]*NonKEYRecordSet // NodeKey → NonKEYRecordSet
 	persistenceHook func(ctx context.Context, op string, record *Record) error
-	cleanupTicker   *time.Ticker
-	cleanupDone     chan struct{}
 }
 
 // NewInMemoryManager creates a new in-memory lease manager.
 func NewInMemoryManager() *InMemoryLeaseStore {
-	m := &InMemoryLeaseStore{
+	return &InMemoryLeaseStore{
 		leases:      make(map[string]*Record),
 		nameIdx:     make(map[string][]string),
 		children:    make(map[string]map[string]struct{}),
 		rootsByZone: make(map[string]map[string]struct{}),
 		nonKeySets:  make(map[string]*NonKEYRecordSet),
-		cleanupDone: make(chan struct{}),
 	}
-	m.cleanupTicker = time.NewTicker(30 * time.Second)
-	go func() {
-		for {
-			select {
-			case <-m.cleanupTicker.C:
-				m.cleanupExpired()
-			case <-m.cleanupDone:
-				return
-			}
-		}
-	}()
-	return m
 }
 
 // Register creates or updates a KEY lease. Node identity is derived from keyRR.
@@ -390,6 +383,12 @@ func (m *InMemoryLeaseStore) SetPersistenceHook(hook func(ctx context.Context, o
 	m.persistenceHook = hook
 }
 
+// UpsertNonKEYRecords attaches records to ownerNodeKey. The owner is not
+// required to have a KEY Record in m.leases: a non-KEY record set can be
+// owned by a "phantom" node the same way a child KEY can already have a
+// ParentKeyName pointing at one (see RegisterWithParent/attachNodeLocked).
+// This lets a signer that is deliberately never self-registered (e.g. an
+// online-only key authorized via AllowOnlineKeyRegistration) still own data.
 func (m *InMemoryLeaseStore) UpsertNonKEYRecords(ownerNodeKey string, records []dns.RR, leaseDuration uint32, upstreamZone string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -397,9 +396,6 @@ func (m *InMemoryLeaseStore) UpsertNonKEYRecords(ownerNodeKey string, records []
 	ownerNodeKey = normalizeName(ownerNodeKey)
 	if ownerNodeKey == "" {
 		return fmt.Errorf("owner key name is empty")
-	}
-	if _, ok := m.leases[ownerNodeKey]; !ok {
-		return fmt.Errorf("owner key %s not found", ownerNodeKey)
 	}
 
 	set := m.ensureNonKeySetLocked(ownerNodeKey)
@@ -431,54 +427,28 @@ func (m *InMemoryLeaseStore) UpsertNonKEYRecords(ownerNodeKey string, records []
 		entry.LeaseDuration = leaseDuration
 		entry.RegisteredAt = now
 		entry.ExpiresAt = now.Add(time.Duration(leaseDuration) * time.Second)
-		entry.Deleted = false
 	}
 	set.UpstreamZone = normalizeZone(upstreamZone)
-	set.Deleted = false
 	return nil
 }
 
-func (m *InMemoryLeaseStore) RefreshNonKEYRecords(ownerNodeKey string, leaseDuration uint32) error {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-
-	ownerNodeKey = normalizeName(ownerNodeKey)
-	set := m.nonKeySets[ownerNodeKey]
-	if set == nil {
-		return fmt.Errorf("refresh rejected: lease does not exist")
-	}
-	now := time.Now()
-	for _, entry := range set.Records {
-		if entry.Deleted {
-			continue
-		}
-		entry.LeaseDuration = leaseDuration
-		entry.RegisteredAt = now
-		entry.ExpiresAt = now.Add(time.Duration(leaseDuration) * time.Second)
-	}
-	set.Deleted = false
-	return nil
-}
-
-func (m *InMemoryLeaseStore) MarkNonKEYRecordsDeleted(ownerNodeKey string) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-
-	ownerNodeKey = normalizeName(ownerNodeKey)
-	set := m.nonKeySets[ownerNodeKey]
-	if set == nil {
-		return
-	}
-	for _, entry := range set.Records {
-		entry.Deleted = true
-	}
-	set.Deleted = true
-}
-
+// RemoveNonKEYRecords removes every non-KEY record owned by ownerNodeKey.
 func (m *InMemoryLeaseStore) RemoveNonKEYRecords(ownerNodeKey string) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	delete(m.nonKeySets, normalizeName(ownerNodeKey))
+}
+
+// RemoveSingleNonKEYRecord removes one record (identified by its RFC 2136 key)
+// from ownerNodeKey's set, leaving the rest of the set untouched.
+func (m *InMemoryLeaseStore) RemoveSingleNonKEYRecord(ownerNodeKey, rrKey string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	set := m.nonKeySets[normalizeName(ownerNodeKey)]
+	if set == nil {
+		return
+	}
+	delete(set.Records, rrKey)
 }
 
 func (m *InMemoryLeaseStore) GetNonKEYRecordSet(ownerNodeKey string) *NonKEYRecordSet {
@@ -504,11 +474,8 @@ func (m *InMemoryLeaseStore) HasActiveNonKEYRecord(ownerNodeKey string, rr dns.R
 	if k == "" {
 		return false
 	}
-	entry, ok := set.Records[k]
-	if !ok {
-		return false
-	}
-	return !entry.Deleted
+	_, ok := set.Records[k]
+	return ok
 }
 
 func (m *InMemoryLeaseStore) ExportSnapshot() (*LeaseTreeSnapshot, error) {
@@ -584,7 +551,6 @@ func (m *InMemoryLeaseStore) ExportSnapshot() (*LeaseTreeSnapshot, error) {
 				LeaseDuration: rec.LeaseDuration,
 				RegisteredAt:  rec.RegisteredAt,
 				ExpiresAt:     rec.ExpiresAt,
-				Deleted:       rec.Deleted,
 			})
 		}
 	}
@@ -719,13 +685,9 @@ func (m *InMemoryLeaseStore) ImportSnapshot(snapshot *LeaseTreeSnapshot) error {
 			RRKey:        rrKey,
 			RR:           rr,
 			UpstreamZone: normalizeZone(node.UpstreamZone),
-			Deleted:      node.Deleted,
 		}
 		if set.UpstreamZone == "" {
 			set.UpstreamZone = normalizeZone(node.UpstreamZone)
-		}
-		if node.Deleted {
-			set.Deleted = true
 		}
 	}
 
@@ -766,47 +728,10 @@ func (m *InMemoryLeaseStore) LoadSnapshot(path string) error {
 	return m.ImportSnapshot(&snapshot)
 }
 
-func (m *InMemoryLeaseStore) cleanupExpired() {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-
-	expiredRoots := make([]string, 0)
-	for nodeKey, record := range m.leases {
-		if record.IsExpired() {
-			expiredRoots = append(expiredRoots, nodeKey)
-		}
-	}
-	for _, nodeKey := range expiredRoots {
-		m.deleteSubtreeLocked(context.Background(), nodeKey)
-	}
-
-	for owner, set := range m.nonKeySets {
-		if _, ok := m.leases[owner]; !ok {
-			set.Deleted = true
-			for _, rec := range set.Records {
-				rec.Deleted = true
-			}
-			continue
-		}
-		for rrKey, rec := range set.Records {
-			if rec == nil {
-				delete(set.Records, rrKey)
-				continue
-			}
-			if rec.ExpiresAt.Before(time.Now()) {
-				rec.Deleted = true
-			}
-		}
-	}
-}
-
-// Stop terminates cleanup goroutine.
-func (m *InMemoryLeaseStore) Stop() {
-	if m.cleanupTicker != nil {
-		m.cleanupTicker.Stop()
-		close(m.cleanupDone)
-	}
-}
+// Stop is a no-op retained for API compatibility with callers that stop the
+// store as part of their own shutdown sequence. The store no longer runs a
+// background goroutine of its own; see NewInMemoryManager.
+func (m *InMemoryLeaseStore) Stop() {}
 
 func normalizeName(name string) string {
 	return strings.TrimSuffix(strings.ToLower(strings.TrimSpace(name)), ".")
@@ -861,7 +786,6 @@ func cloneNonKeySet(s *NonKEYRecordSet) *NonKEYRecordSet {
 	out := &NonKEYRecordSet{
 		Records:      make(map[string]*NonKEYRecord, len(s.Records)),
 		UpstreamZone: s.UpstreamZone,
-		Deleted:      s.Deleted,
 	}
 	for k, v := range s.Records {
 		out.Records[k] = cloneNonKeyRecord(v)
@@ -986,11 +910,6 @@ func (m *InMemoryLeaseStore) deleteSubtreeLocked(ctx context.Context, rootKey st
 			}
 		}
 		delete(m.children, key)
-		if set := m.nonKeySets[key]; set != nil {
-			set.Deleted = true
-			for _, rec := range set.Records {
-				rec.Deleted = true
-			}
-		}
+		delete(m.nonKeySets, key)
 	}
 }

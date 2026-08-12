@@ -1,10 +1,10 @@
 # !/usr/bin/env bash
 
 # Configuration
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
 OS=$(uname -s | tr '[:upper:]' '[:lower:]')
 PROXY_BIN="${SCRIPT_DIR}/../bin/${OS}/sig0lease"
-CLIENT_BIN="${SCRIPT_DIR}/../bin/${OS}/sig0lease-client"
-BLACKLISTED_TESTER_BIN="${SCRIPT_DIR}/../bin/${OS}/blacklisted_tester"
 CONFIG_FILE="${SCRIPT_DIR}/../config.yaml"
 LOG_FILE="/tmp/sig0lease_proxy.log"
 CLIENT_LOG_FILE="/tmp/sig0lease_client.log"
@@ -12,6 +12,25 @@ CLIENT_LOG_FILE="/tmp/sig0lease_client.log"
 PROXY_ADDR="${PROXY_ADDR:-127.0.0.1}"
 PROXY_PORT="${PROXY_PORT:-8053}"
 PROXY_URL="$PROXY_ADDR:$PROXY_PORT"
+
+# Configuration
+TMP_CONFIG_FILE=""
+AUTH_SERVER="${AUTH_SERVER:-ns1.free2air.org}"
+PROXY_KEYSTORE_DIR="./keystore/server"
+PROXY_KEY_NAME="${PROXY_KEYSTORE_DIR}/Kdev.zenr.io.+015+35317.key"
+
+# Get keystore from environment
+CLIENT_KEYSTORE_DIR="${CLIENT_KEYSTORE_DIR:-}"
+if [ -z "$CLIENT_KEYSTORE_DIR" ]; then
+    echo "ERROR: CLIENT_KEYSTORE_DIR environment variable not set"
+    exit 1
+fi
+
+# Keys
+CLIENT_KEY_NAME="Ktest.dev.zenr.io.+015+05044"
+WRONG_CLIENT_KEY_NAME="Ktest.dev.zenr.io.+015+42176"
+
+
 
 # Color output
 RED='\033[0;31m'
@@ -191,4 +210,62 @@ stop_proxy() {
 restart_proxy() {
     stop_proxy
     start_proxy
+}
+
+delete_rr(){
+    local record="$1"
+    local payload
+
+    echo "Deleting $record"
+    if [ "$record" = "key" ]; then
+        # Read the secret string straight out of the private file
+        payload="$(cat $CLIENT_KEYSTORE_DIR/$CLIENT_KEY_NAME.key | sed 's/test.dev.zenr.io. IN \(.*\)/\1/g')"
+    else
+        payload="$record"
+    fi
+    echo "payload is $payload"
+
+    cat <<EOF | nsupdate -k $PROXY_KEY_NAME
+    server $AUTH_SERVER
+    zone zenr.io
+    update delete test.dev.zenr.io $payload
+    send
+EOF
+}
+
+# add_rr publishes a record directly at the authoritative server, bypassing
+# the proxy entirely. Used to simulate a key or record that exists online but
+# was never registered through the proxy (e.g. an "online-only" signer, or a
+# pre-existing authoritative record for duplicate-registration tests).
+#
+# Usage: add_rr <record> [ttl]
+#   record: "key" for the well-known client test KEY, or an explicit
+#           "<TYPE> <rdata...>" payload (e.g. "TXT \"hello\"")
+#   ttl:    TTL in seconds for the added record (default 60)
+#
+# Requires a modern nsupdate with ED25519 SIG(0)/TSIG support (BIND 9.10.6,
+# the version macOS ships at /usr/bin/nsupdate, predates RFC 8080 and cannot
+# sign/verify this project's ED25519 keys correctly -- install a current
+# nsupdate via `brew install bind` and make sure /opt/homebrew/bin precedes
+# /usr/bin in PATH).
+add_rr(){
+    local record="$1"
+    local ttl="${2:-60}"
+    local payload
+
+    echo "Adding $record (ttl=$ttl)"
+    if [ "$record" = "key" ]; then
+        # Read the secret string straight out of the private file
+        payload="$(cat $CLIENT_KEYSTORE_DIR/$CLIENT_KEY_NAME.key | sed 's/test.dev.zenr.io. IN \(.*\)/\1/g')"
+    else
+        payload="$record"
+    fi
+    echo "payload is $payload"
+
+    cat <<EOF | nsupdate -k $PROXY_KEY_NAME
+    server $AUTH_SERVER
+    zone zenr.io
+    update add test.dev.zenr.io $ttl $payload
+    send
+EOF
 }

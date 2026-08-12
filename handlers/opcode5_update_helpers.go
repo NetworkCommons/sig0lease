@@ -3,12 +3,47 @@ package handlers
 import (
 	"context"
 	"fmt"
+	"sort"
 	"strings"
 
 	"codeberg.org/miekg/dns"
 	"github.com/NetworkCommons/sig0lease/pkg/keyrec"
 	"github.com/NetworkCommons/sig0lease/pkg/sig0"
 )
+
+// summarizeRRTypes builds a compact, deterministic "TYPE:count" summary of
+// the RR types present in an UPDATE request's KEY and non-KEY records, for
+// INFO-level request logging (e.g. "KEY:1 TXT:2 A:1").
+func summarizeRRTypes(keyRRs []*dns.KEY, otherRRs []dns.RR) string {
+	counts := make(map[string]int)
+	for _, rr := range keyRRs {
+		if rr == nil {
+			continue
+		}
+		counts[dns.TypeToString[dns.RRToType(rr)]]++
+	}
+	for _, rr := range otherRRs {
+		if rr == nil {
+			continue
+		}
+		counts[dns.TypeToString[dns.RRToType(rr)]]++
+	}
+	if len(counts) == 0 {
+		return "(none)"
+	}
+
+	types := make([]string, 0, len(counts))
+	for t := range counts {
+		types = append(types, t)
+	}
+	sort.Strings(types)
+
+	parts := make([]string, 0, len(types))
+	for _, t := range types {
+		parts = append(parts, fmt.Sprintf("%s:%d", t, counts[t]))
+	}
+	return strings.Join(parts, " ")
+}
 
 func newUnsignedUpstreamUpdate(upstreamZone string) (*dns.Msg, error) {
 	msg := dns.NewMsg(upstreamZone, dns.TypeSOA)
@@ -83,6 +118,65 @@ func (h *UpdateHandler) constructUpstreamDeleteForRecords(records []dns.RR, sign
 	msg.Extra = append(msg.Extra, opt)
 
 	return h.signUpstreamUpdate(msg, "DELETE", signingKey)
+}
+
+// constructUpstreamDeleteForKeysAndRecords builds a single combined RFC 2136
+// delete UPDATE for both KEY RRs and non-KEY RRs, used by Case C so a
+// multi-record delete request is confirmed upstream in one round-trip before
+// any local lease-store state is touched.
+func (h *UpdateHandler) constructUpstreamDeleteForKeysAndRecords(keyRRs []*dns.KEY, records []dns.RR, signingKey *keyrec.LoadedKey, upstreamZone string) (*dns.Msg, error) {
+	msg, err := newUnsignedUpstreamUpdate(upstreamZone)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create DNS delete message: %w", err)
+	}
+
+	for _, keyRR := range keyRRs {
+		if keyRR == nil {
+			continue
+		}
+		deleteRR := *keyRR
+		deleteRR.Hdr.Class = dns.ClassNONE
+		deleteRR.Hdr.TTL = 0
+		msg.Ns = append(msg.Ns, &deleteRR)
+	}
+	for _, rr := range records {
+		if rr == nil || rr.Header() == nil {
+			continue
+		}
+		cpy := copyRR(rr)
+		cpyHdr := cpy.Header()
+		cpyHdr.Class = dns.ClassNONE
+		cpyHdr.TTL = 0
+		msg.Ns = append(msg.Ns, cpy)
+	}
+
+	opt := &dns.OPT{Hdr: dns.Header{Name: "."}}
+	opt.SetUDPSize(uint16(dns.DefaultMsgSize))
+	msg.Extra = append(msg.Extra, opt)
+
+	return h.signUpstreamUpdate(msg, "DELETE", signingKey)
+}
+
+// resolveUpstreamSigningContext resolves the proxy's own signing key and the
+// effective (post-SOA-resolution) upstream zone used to sign and address
+// forwarded UPDATE messages. Shared by add- and delete-style forwarding.
+func (h *UpdateHandler) resolveUpstreamSigningContext(ctx context.Context) (*keyrec.LoadedKey, string, error) {
+	signingKey, matchedKeyZone, err := h.findAuthorizedProxyKeyForZone(h.upstreamZone)
+	if err != nil {
+		return nil, "", fmt.Errorf("upstream signing key resolution failed: %w", err)
+	}
+	h.logger.Debugf("Resolved proxy authorization key for upstream zone %s from key zone %s", h.upstreamZone, matchedKeyZone)
+
+	effectiveUpstreamZone := h.upstreamZone
+	if dc, ok := h.upstreamCoordinator.(*DefaultUpstreamCoordinator); ok {
+		resolvedZone, err := dc.resolveAuthoritativeZone(ctx, h.upstreamZone)
+		if err != nil {
+			return nil, "", fmt.Errorf("upstream zone resolution failed: %w", err)
+		}
+		effectiveUpstreamZone = resolvedZone
+		h.logger.Debugf("Resolved effective upstream zone: configured=%s effective=%s", h.upstreamZone, effectiveUpstreamZone)
+	}
+	return signingKey, effectiveUpstreamZone, nil
 }
 
 func extractUpdateRecords(msg *dns.Msg, blacklistedTypes map[uint16]struct{}) ([]*dns.KEY, []dns.RR, error) {
@@ -179,6 +273,20 @@ func isNameAtOrAbove(baseName, candidate string, mustBeAbove bool) bool {
 }
 
 // Verify that each RR in the Update section is at or below
+// signerAuthorizedForNewRegistration reports whether a signer may author new
+// lease-store state — a new KEY RR, or non-KEY RRs owned by itself. This is
+// one policy, applied identically regardless of record type: the signer must
+// already be lease-managed, be registering itself in this same request, or —
+// only if explicitly enabled — be a signer resolved solely via authoritative
+// DNS (signerKeySourceAuthoritative). AllowOnlineKeyRegistration governs that
+// third case generically; it is not specific to KEY RRs.
+func (h *UpdateHandler) signerAuthorizedForNewRegistration(signerManaged, signerInUpdate bool, signerSource signerKeySource) bool {
+	if signerManaged || signerInUpdate {
+		return true
+	}
+	return signerSource == signerKeySourceAuthoritative && h.AllowOnlineKeyRegistration
+}
+
 func (h *UpdateHandler) validateSignerHierarchyForUpdateRecords(signerName string, keyRRs []*dns.KEY, otherRecords []dns.RR) error {
 	signerCanon := canonicalName(signerName)
 	if signerCanon == "" {
@@ -474,84 +582,41 @@ func (h *UpdateHandler) filterDuplicateRegistrations(ctx context.Context, keyNam
 	return accepted, notes, nil
 }
 
-func (h *UpdateHandler) rollbackLeaseStateForUpdate(nodeKeys []string) {
-	seen := make(map[string]struct{}, len(nodeKeys))
-	for _, nodeKey := range nodeKeys {
-		nk := canonicalName(nodeKey)
-		if nk == "" {
-			continue
-		}
-		if _, ok := seen[nk]; ok {
-			continue
-		}
-		seen[nk] = struct{}{}
+// signerKeySource records how a SIG(0) signer's KEY material was resolved.
+// This provenance drives policy decisions downstream (see AllowOnlineKeyRegistration):
+// a key resolved only via authoritative DNS was neither proven in this request
+// nor previously brought under lease management by this proxy.
+type signerKeySource int
 
-		if err := h.leaseManager.Delete(nk); err != nil {
-			h.logger.Debugf("rollback: failed to delete key lease for %s: %v", nk, err)
-		}
-		h.removeDataLease(nk)
-		h.clearLeaseTimer(nk)
-	}
-}
-
-func (h *UpdateHandler) resolveSignerKeyForOwnership(sigRR *dns.SIG, additionalSigningKeys, updateKeys []*dns.KEY) (*dns.KEY, error) {
-	signerCanon := canonicalName(sigRR.SignerName)
-	if signerCanon == "" {
-		return nil, fmt.Errorf("SIG(0) signer name is empty")
-	}
-
-	matchesSigner := func(key *dns.KEY) bool {
-		return key != nil && strings.EqualFold(canonicalName(key.Hdr.Name), signerCanon) && key.KeyTag() == sigRR.KeyTag && key.Algorithm == sigRR.Algorithm
-	}
-
-	for _, key := range additionalSigningKeys {
-		if matchesSigner(key) {
-			return key, nil
-		}
-	}
-	for _, key := range updateKeys {
-		if matchesSigner(key) {
-			return key, nil
-		}
-	}
-
-	leaseRecord := h.leaseManager.LookupBySIG(sigRR.SignerName, sigRR.Algorithm, sigRR.KeyTag)
-	if leaseRecord != nil && leaseRecord.KeyRR != nil && matchesSigner(leaseRecord.KeyRR) {
-		return leaseRecord.KeyRR, nil
-	}
-
-	return nil, fmt.Errorf("signing KEY %q must be present in the request or lease store", sigRR.SignerName)
-}
+const (
+	signerKeySourceUnknown signerKeySource = iota
+	signerKeySourceRequest
+	signerKeySourceLeaseStore
+	signerKeySourceAuthoritative
+)
 
 // extractAndValidateSig0 extracts and validates SIG(0) from the message.
 // KEY RRs in Additional are interpreted as signing-key material.
 // KEY RRs in Update are interpreted as update targets, but may still be used as
 // verification candidates when they match the signer identity.
-func (h *UpdateHandler) extractAndValidateSig0(ctx context.Context, msg *dns.Msg, downstreamZone string, signerKeyHint *dns.KEY, additionalSigningKeys []*dns.KEY, updateKeys []*dns.KEY) (*dns.SIG, *dns.KEY, error) {
+//
+// Resolution follows the three-stage fallback: request-provided KEY RRs
+// (Additional or Update), then the lease store, then authoritative DNS.
+func (h *UpdateHandler) extractAndValidateSig0(ctx context.Context, msg *dns.Msg, downstreamZone string, additionalSigningKeys []*dns.KEY, updateKeys []*dns.KEY) (*dns.SIG, *dns.KEY, signerKeySource, error) {
 	sigRR, err := extractSig0(msg)
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, signerKeySourceUnknown, err
 	}
 	downstreamZoneCanon := canonicalName(downstreamZone)
 	if downstreamZoneCanon == "" {
-		return nil, nil, fmt.Errorf("empty downstream zone")
+		return nil, nil, signerKeySourceUnknown, fmt.Errorf("empty downstream zone")
 	}
 	signerCanon := canonicalName(sigRR.SignerName)
 	if signerCanon == "" {
-		return nil, nil, fmt.Errorf("SIG(0) signer name is empty")
+		return nil, nil, signerKeySourceUnknown, fmt.Errorf("SIG(0) signer name is empty")
 	}
 	if !isNameAtOrAbove(downstreamZoneCanon, signerCanon, false) {
-		return nil, nil, fmt.Errorf("SIG(0) signer %q is outside allowed hierarchy for downstream zone %q", sigRR.SignerName, downstreamZone)
-	}
-	if signerKeyHint != nil {
-		if !strings.EqualFold(canonicalName(signerKeyHint.Hdr.Name), signerCanon) || signerKeyHint.KeyTag() != sigRR.KeyTag || signerKeyHint.Algorithm != sigRR.Algorithm {
-			return nil, nil, fmt.Errorf("provided signer KEY does not match SIG(0) signer %q", sigRR.SignerName)
-		}
-		if err := sig0.VerifySignature(msg, signerKeyHint); err != nil {
-			return nil, nil, fmt.Errorf("SIG(0) cryptographic verification failed using provided signer KEY: %w", err)
-		}
-		h.logger.Debugf("SIG(0) cryptographic verification passed for provided signer KEY %s", signerKeyHint.Hdr.Name)
-		return sigRR, signerKeyHint, nil
+		return nil, nil, signerKeySourceUnknown, fmt.Errorf("SIG(0) signer %q is outside allowed hierarchy for downstream zone %q", sigRR.SignerName, downstreamZone)
 	}
 
 	verifyFromCandidates := func(candidates []*dns.KEY) (*dns.KEY, error) {
@@ -591,9 +656,9 @@ func (h *UpdateHandler) extractAndValidateSig0(ctx context.Context, msg *dns.Msg
 		}
 	}
 	if resolved, err := verifyFromCandidates(verifyCandidates); err != nil {
-		return nil, nil, err
+		return nil, nil, signerKeySourceUnknown, err
 	} else if resolved != nil {
-		return sigRR, resolved, nil
+		return sigRR, resolved, signerKeySourceRequest, nil
 	}
 
 	// Check if the key is present in the Lease Store
@@ -602,10 +667,10 @@ func (h *UpdateHandler) extractAndValidateSig0(ctx context.Context, msg *dns.Msg
 		leaseKey := leaseRecord.KeyRR
 		if strings.EqualFold(canonicalName(leaseKey.Hdr.Name), signerCanon) && leaseKey.KeyTag() == sigRR.KeyTag && leaseKey.Algorithm == sigRR.Algorithm {
 			if resolved, err := verifyFromCandidates([]*dns.KEY{leaseKey}); err != nil {
-				return nil, nil, err
+				return nil, nil, signerKeySourceUnknown, err
 			} else if resolved != nil {
 				h.logger.Debugf("Using signer KEY from lease store for %s", sigRR.SignerName)
-				return sigRR, resolved, nil
+				return sigRR, resolved, signerKeySourceLeaseStore, nil
 			}
 		}
 	}
@@ -613,7 +678,7 @@ func (h *UpdateHandler) extractAndValidateSig0(ctx context.Context, msg *dns.Msg
 	// Check if the key is present online
 	authRRS, err := h.queryAuthoritativeRRs(ctx, downstreamZone, sigRR.SignerName, dns.TypeKEY)
 	if err != nil {
-		return nil, nil, fmt.Errorf("failed to resolve signer KEY from authoritative DNS: %w", err)
+		return nil, nil, signerKeySourceUnknown, fmt.Errorf("failed to resolve signer KEY from authoritative DNS: %w", err)
 	}
 	authCandidates := make([]*dns.KEY, 0, len(authRRS))
 	for _, rr := range authRRS {
@@ -627,16 +692,16 @@ func (h *UpdateHandler) extractAndValidateSig0(ctx context.Context, msg *dns.Msg
 	}
 	if len(authCandidates) == 0 {
 		h.logger.Debugf("No authoritative KEY match for signer %s (keytag=%d algorithm=%d)", sigRR.SignerName, sigRR.KeyTag, sigRR.Algorithm)
-		return nil, nil, fmt.Errorf("no matching KEY candidate found for signer %q in request, lease store, or authoritative DNS", sigRR.SignerName)
+		return nil, nil, signerKeySourceUnknown, fmt.Errorf("no matching KEY candidate found for signer %q in request, lease store, or authoritative DNS", sigRR.SignerName)
 	}
 
 	if resolved, err := verifyFromCandidates(authCandidates); err != nil {
-		return nil, nil, err
+		return nil, nil, signerKeySourceUnknown, err
 	} else if resolved != nil {
-		return sigRR, resolved, nil
+		return sigRR, resolved, signerKeySourceAuthoritative, nil
 	}
 
-	return nil, nil, fmt.Errorf("no matching KEY candidate found for signer %q in request, lease store, or authoritative DNS", sigRR.SignerName)
+	return nil, nil, signerKeySourceUnknown, fmt.Errorf("no matching KEY candidate found for signer %q in request, lease store, or authoritative DNS", sigRR.SignerName)
 }
 
 // constructUpstreamUpdate builds an UPDATE message for the upstream zone.

@@ -13,7 +13,7 @@ The project is intended to provide a light, explicit control point for lease reg
 - Route the registration opcode to the update handler and forward unrelated traffic upstream.
 - Process DNS UPDATE requests carrying an UPDATE-LEASE EDNS option.
 - Verify downstream SIG(0) signatures before the proxy accepts the request.
-- Re-sign the upstream UPDATE with the proxy’s zone key before forwarding.
+- Re-sign the upstream UPDATE with the proxy's zone key before forwarding.
 - Forward unhandled opcodes to the configured upstream resolver path.
 
 ## Main Commands
@@ -82,13 +82,110 @@ The proxy is designed to support two practical scenarios:
 - Registration: a client submits an authenticated UPDATE-LEASE request and the proxy forwards a signed UPDATE to the authoritative server.
 - Pass-through routing: non-registration traffic is forwarded according to the configured opcode routing and upstream settings.
 
+## Protocol Behavior
+
+This section describes how the proxy interprets UPDATE-LEASE packets. It reflects the current implementation; `protocol.md` in the repository root is kept as a more granular, spec-style reference for the same rules and is not duplicated in full here.
+
+### UPDATE-LEASE EDNS Option Encoding
+
+Clients include an UPDATE-LEASE option (EDNS option code 2) in their UPDATE packets. Two encodings are supported:
+
+- **8-byte variant (default):** 4 bytes encode the LEASE value (lease duration for non-KEY RRs), followed by 4 bytes encoding the KEY-LEASE value (lease duration for KEY RRs). Both are big-endian `uint32` values.
+- **4-byte variant (legacy):** 4 bytes encode a single LEASE value used for both KEY and non-KEY RRs. Off by default; enabled per handler via `prefer_4byte_variant`.
+
+LEASE and KEY-LEASE together select one of four behavioral cases:
+
+| Case | KEY-LEASE | LEASE | Behavior |
+|---|---|---|---|
+| A | Non-zero | Non-zero | Full registration/refresh of a KEY RR and its non-KEY RRs together. |
+| B | 0 | Non-zero | Data-only registration/refresh; the signing KEY must already be managed. |
+| C | 0 | 0 | Delete: removes whichever of the named KEY/non-KEY RRs are actually locally managed. |
+| D | Non-zero | 0 | KEY-only registration/refresh, with optional deletion of accompanying non-KEY RRs. |
+
+Both the request-side decoding (`handlers/opcode5_lease_option.go`) and the response/client-side decoding (`client/lease_response.go`) share one low-level decoder (`pkg/lease.FindOption` + `pkg/lease.DecodeOption`/`FindAndDecode`) so there is a single place that knows how to locate and parse the option, whether it appears as a bare `ERFC3597` RR or nested inside an `OPT` record's options.
+
+### Signer Resolution (Three-Stage Fallback)
+
+Before processing the case matrix, the proxy validates the SIG(0) signature on the UPDATE packet (`UpdateHandler.extractAndValidateSig0`). The signer key must be at or above the FQDN of every record in the Update section. Candidate signer key material is tried in order:
+
+1. **Request-provided:** a KEY RR matching the SIG(0) signer identity (name, algorithm, key tag) present in the Update or Additional section.
+2. **Lease store:** a KEY previously registered under that identity.
+3. **Authoritative DNS:** a KEY RR published at the signer's name, queried live.
+
+The first candidate that cryptographically verifies the signature is used. If verification succeeds via stage 3 only (not request-provided, not lease-managed), the signer is "online-only" — its material was neither proven fresh in this request nor already under lease management.
+
+### Online-Only Signers and `allow_online_key_registration`
+
+An online-only signer can always be used to authenticate a request — SIG(0) verification does not depend on the flag. What the signer is subsequently *allowed to do* does:
+
+- **Deletes (Case C)** are governed purely by DNS-name hierarchy, independent of this flag: any signer at or above a managed record's name can delete it.
+- **Authoring new lease-store state** — a new KEY RR, or non-KEY RRs owned by the signer — requires the signer to be either already lease-managed, itself present in the Update section (a normal self-registration), or, if `allow_online_key_registration: true` is configured for the handler, an online-only signer. This is one policy (`UpdateHandler.signerAuthorizedForNewRegistration`) applied identically to KEY and non-KEY registration in Case A and Case D; it is not KEY-RR-specific. Default is `false` (fail closed).
+
+When an online-only signer registers a *different* KEY RR than itself (e.g. delegating a new child key it will never itself be lease-managed under), any non-KEY RRs in the same request are still attached to the **signer's own node** per the rule below — including when that node has no backing KEY record (a signer that is deliberately never self-registered). The lease store permits this "phantom owner" for non-KEY records the same way it already permits a KEY RR's `ParentKeyName` to reference a node that has no record of its own.
+
+### Non-KEY RR Ownership
+
+Non-KEY RRs registered in Case A always belong to the signer of the request — never to some other KEY RR that happens to be registered in the same packet — regardless of whether the signer is itself present in the Update section. If the signer is present, this happens naturally as part of that KEY's own registration/refresh; if not (the signer is only authorizing a different KEY's registration), the data is attached to the signer's node in a separate step after the per-KEY loop.
+
+Additional rules:
+
+- The signer KEY used for SIG(0) verification and a KEY RR being registered/refreshed in the Update section can be different keys.
+- Multiple KEY RRs can be present in the Update section; each is dispatched independently.
+- A KEY used only for signing should be in the Additional section; a KEY in the Update section is interpreted as intended for lease register/refresh/delete.
+- **Key lease ownership:** when a KEY RR is registered (Case A or D), its public key becomes the "owner" for the non-KEY RRs registered alongside it and for other KEY RRs registered under it. This is tracked via `ParentKeyName` in the lease tree.
+
+### Registration and Refresh Details
+
+- **Refresh ownership check:** before treating a KEY RR as a refresh of an existing lease, `UpdateHandler.validateRefreshOwnership` compares the *actual* stored KEY RDATA (flags, protocol, algorithm, public key) against the one in the request. The lease store's node key is a composite of name + algorithm + key tag, which is not collision-free (the key tag is a 16-bit checksum); this check is what makes ownership verification exact rather than relying on the composite key alone.
+- **Missing-at-FQDN recovery:** if a signer's managed KEY is found to be missing at the authoritative DNS (Cases A, B, D), the proxy re-registers it with whatever lease time remains in the local store, rather than granting a fresh full-duration lease or failing the request outright.
+- **Duplicate registration rejection:** before treating a KEY or non-KEY RR as a *new* registration, the proxy checks whether an identical record already exists at the authoritative DNS. If so, the request fails — this applies uniformly to every case that can register something new (Cases A and D for KEY RRs; Cases A and B for non-KEY RRs), not only to the KEY-RR path.
+- **Delete semantics (Case C):** for each named KEY or non-KEY RR, if it is not found in the local lease store, the request does not fail — a note is returned informing the client, and that record is excluded from both the local delete and the upstream delete. Only records actually found locally are included in the upstream delete request.
+
+### Upstream Forwarding and Write Ordering
+
+The proxy never mutates the local lease store before the corresponding upstream UPDATE has been confirmed successful:
+
+1. All case-matrix outcomes are staged as deferred mutations.
+2. The proxy signs and forwards the resulting change to the authoritative server (add-style for Cases A/B/D, a combined RFC 2136 delete for Case C).
+3. Only if the upstream server returns `NOERROR` are the staged local mutations applied.
+4. If the upstream server rejects the update (or is unreachable), the proxy returns an error to the client and the local lease store is left exactly as it was before the request — there is nothing to roll back, because nothing was written yet.
+
+This means the local lease store's view of the world and the authoritative DNS server's view can never diverge as a direct result of a single request's outcome. Case C's delete additionally cascades: deleting a KEY also removes its descendant subtree, with best-effort upstream cleanup for the descendants (they are not blocking — a single unreachable descendant does not fail the whole delete).
+
+### TTL Clamping and Response Echo
+
+Before forwarding, the proxy clamps LEASE and KEY-LEASE (and, correspondingly, RR/KEY TTLs) to `LeasePolicy` bounds (`min_key_lease_sec`/`max_key_lease_sec`/`min_rr_lease_sec`/`max_rr_lease_sec`). The *actual* durations used after clamping — not the client's originally-requested values — are echoed back to the client in the response's UPDATE-LEASE option, so the client can detect when the proxy granted less than what was requested. `client.EffectiveLeaseDuration(resp, requestedLease, requestedKeyLease)` returns both the effective LEASE and KEY-LEASE from a response.
+
+### Blacklisted RR Types
+
+The proxy maintains a configurable list of blacklisted RR types (`handlers.update.blacklisted_types` in `config.yaml`). Any UPDATE packet attempting to register one of these RR types is rejected outright.
+
+### Storage Model and Expiry
+
+The lease store is a tree rooted at each configured zone. Children of a root must be KEY nodes; a KEY node can itself be the parent of other KEY nodes (registered by it) or non-KEY nodes (data it owns). Expiry of a KEY node cascades to its entire subtree.
+
+- `BaseRecord` fields (type, expiry, lease duration, registration time, parent) are shared by KEY (`Record`) and non-KEY (`NonKEYRecord`) nodes.
+- **Deletion is always physical, never a soft flag.** A record is either present in the store (active) or absent (gone) — there is no intermediate "marked deleted" state to track or eventually reap.
+- **Expiry is handler-driven, not store-driven.** `UpdateHandler.processExpiredLease` — triggered by a per-node `time.AfterFunc` timer (`scheduleLeaseExpiry`, re-armed after every mutation and after every expiry event) — is the only code path that removes an expired KEY or non-KEY record, and it always attempts the corresponding upstream delete first. The store itself never deletes anything on its own initiative, because it has no way to also notify the authoritative server.
+- **Reconciliation backstop:** `UpdateHandler.startLeaseReconciliation` runs every 30 seconds and ensures every KEY node in the store has a live expiry timer, scheduling one via the same `scheduleLeaseExpiry` for any node that lacks one (for example, a node populated by a future snapshot-restore path that doesn't itself arm a timer). For an already-expired node this routes it through the same `processExpiredLease` almost immediately — there is exactly one deletion implementation, not a second one that might skip the upstream call.
+
+### Reference to Source Files
+
+- `handlers/opcode5_handle.go` — `Handle()`, the full case dispatch, `buildSuccessResponse`.
+- `handlers/opcode5_lease.go` — lease-store read/write helpers, `validateRefreshOwnership`, `processExpiredLease`, `scheduleLeaseExpiry`, `startLeaseReconciliation`.
+- `handlers/opcode5_update_helpers.go` — SIG(0) resolution (`extractAndValidateSig0`), upstream message construction, duplicate-registration checks.
+- `handlers/opcode5_lease_option.go` — UPDATE-LEASE option parsing and request-side policy validation.
+- `pkg/lease/state.go` — `InMemoryLeaseStore`, the tree-structured lease store implementation.
+- `pkg/lease/lease.go` — `LeaseOption` encode/decode and the shared `FindOption`/`DecodeOption`/`FindAndDecode` helpers.
+- `client/lease_response.go` — client-side decoding of the server's granted LEASE/KEY-LEASE.
+
 ## Configuration
 
 `config.yaml` controls:
 
 - listening address and enabled transport networks;
 - default upstream resolvers;
-- handler-specific settings such as the upstream zone and keystore directory for the update handler;
+- handler-specific settings such as the upstream zone, keystore directory, lease policy bounds, blacklisted RR types, and `allow_online_key_registration` for the update handler;
 - opcode-to-module routing.
 
 The update handler uses the configured zone to discover the authoritative server for the effective zone, then sends the rewritten UPDATE there.
@@ -100,8 +197,8 @@ The update handler uses the configured zone to discover the authoritative server
 - `config/` - YAML config loading and validation
 - `forward/` - upstream forwarding logic
 - `handlers/` - opcode handlers and result types
-- `pkg/keyrec/` - KEY RR parsing and keystore helpers
-- `pkg/lease/` - UPDATE-LEASE option encoding helpers
+- `pkg/keyrec/` - keystore loading helpers (`LoadedKey`, `LoadKeyFromFile`, `FindKeysByZone`)
+- `pkg/lease/` - lease store, tree model, and UPDATE-LEASE option encoding/decoding
 - `pkg/sig0/` - SIG(0) signing and verification helpers
 - `server/` - UDP/TCP listener and request dispatch
 
@@ -150,7 +247,7 @@ The following project-side patches are currently in place:
 1. `pkg/dnscompat` imports `codeberg.org/miekg/dns` and registers code `2` as `ERFC3597` on startup.
 2. `cmd/sig0lease/main.go` imports the compatibility package so the proxy process gets the patch before reading packets.
 3. `cmd/sig0lease-client/main.go` imports the same compatibility package so client-side pack/unpack behavior stays consistent.
-4. `handlers/opcode5.go` recognizes UPDATE-LEASE whether it arrives as a direct `ERFC3597` record or under an `OPT` wrapper.
+4. `pkg/lease.FindOption` recognizes UPDATE-LEASE whether it arrives as a direct `ERFC3597` record or under an `OPT` wrapper, for both request and response parsing.
 
 # Implementation Status
 
@@ -160,7 +257,7 @@ The following project-side patches are currently in place:
 - The proxy resolves the effective authoritative zone and SOA MNAME and forwards UPDATE there.
 
 2. Upstream signing
-- Forwarded UPDATE messages are signed with the the proxy's key for the zone.
+- Forwarded UPDATE messages are signed with the proxy's key for the zone.
 
 ## Test Layout
 
@@ -173,5 +270,5 @@ The following project-side patches are currently in place:
 ## Client Behavior
 
 1. Lease adoption from server response
-- Client expiry calculations now adopt server-returned UPDATE-LEASE values when present.
-- If no lease option is returned, client falls back to requested lease duration.
+- Client expiry calculations adopt the server-returned LEASE and KEY-LEASE values independently when present (`client.EffectiveLeaseDuration`, `client.ExpiryFromResponse`) — the proxy's `LeasePolicy` can clamp either value differently, so both are read back rather than assuming they moved together.
+- If no lease option is returned, the client falls back to the originally-requested LEASE and KEY-LEASE.
