@@ -175,12 +175,12 @@ func (h *UpdateHandler) Handle(ctx context.Context, w dns.ResponseWriter, r *dns
 					pendingMutations = append(pendingMutations, pendingLeaseMutation{
 						keyName: pendingKeyName,
 						apply: func() error {
-							if err := h.registerKeyLease(ctx, keyIDFromSIG(sigRR), pendingKeyRR, pendingKeyLease, pendingKeyLease); err != nil {
+							if err := h.leaseManager.RenewLease(ctx, pendingKeyRR, pendingKeyLease, pendingKeyLease); err != nil {
 								return err
 							}
 							h.setNonKeyLease(leasepkg.NodeKey(pendingKeyRR), pendingRecords, leaseDuration, h.upstreamZone)
 							h.scheduleLeaseExpiry(leasepkg.NodeKey(pendingKeyRR))
-							h.logger.Debugf("Lease re-registered for %s (KEY-LEASE != 0, key missing at FQDN, remaining key lease=%d)", pendingKeyName, pendingKeyLease)
+							h.logger.Debugf("Lease renewed for %s (KEY-LEASE != 0, key missing at FQDN, remaining key lease=%d)", pendingKeyName, pendingKeyLease)
 							return nil
 						},
 					})
@@ -200,7 +200,7 @@ func (h *UpdateHandler) Handle(ctx context.Context, w dns.ResponseWriter, r *dns
 				pendingMutations = append(pendingMutations, pendingLeaseMutation{
 					keyName: pendingKeyName,
 					apply: func() error {
-						if err := h.registerKeyLease(ctx, keyIDFromSIG(sigRR), pendingKeyRR, keyLeaseDuration, keyLeaseDuration); err != nil {
+						if err := h.leaseManager.RenewLease(ctx, pendingKeyRR, keyLeaseDuration, keyLeaseDuration); err != nil {
 							return err
 						}
 						if len(pendingRecords) > 0 {
@@ -342,7 +342,7 @@ func (h *UpdateHandler) Handle(ctx context.Context, w dns.ResponseWriter, r *dns
 			pendingMutations = append(pendingMutations, pendingLeaseMutation{
 				keyName: pendingKeyRR.Hdr.Name,
 				apply: func() error {
-					return h.registerKeyLease(ctx, keyIDFromSIG(sigRR), pendingKeyRR, pendingKeyLease, pendingKeyLease)
+					return h.leaseManager.RenewLease(ctx, pendingKeyRR, pendingKeyLease, pendingKeyLease)
 				},
 			})
 			responseKeys = append(responseKeys, pendingKeyRR)
@@ -518,7 +518,8 @@ func (h *UpdateHandler) Handle(ctx context.Context, w dns.ResponseWriter, r *dns
 
 			effectiveKeyLease := keyLeaseDuration
 			existingKey := h.leaseManager.LookupByKEY(keyRR)
-			if existingKey == nil {
+			keyIsRefresh := existingKey != nil
+			if !keyIsRefresh {
 				// New KEY registration: must not already exist identically at the
 				// authoritative DNS, mirroring Case A's duplicate protection
 				// (protocol.md item 6 applies to every case, not just Case A).
@@ -557,10 +558,17 @@ func (h *UpdateHandler) Handle(ctx context.Context, w dns.ResponseWriter, r *dns
 			pendingKeyName := keyName
 			pendingRecords := scopedOtherRecords
 			pendingKeyLease := effectiveKeyLease
+			pendingIsRefresh := keyIsRefresh
 			pendingMutations = append(pendingMutations, pendingLeaseMutation{
 				keyName: pendingKeyName,
 				apply: func() error {
-					if err := h.registerKeyLease(ctx, keyIDFromSIG(sigRR), pendingKeyRR, pendingKeyLease, pendingKeyLease); err != nil {
+					var err error
+					if pendingIsRefresh {
+						err = h.leaseManager.RenewLease(ctx, pendingKeyRR, pendingKeyLease, pendingKeyLease)
+					} else {
+						err = h.registerKeyLease(ctx, keyIDFromSIG(sigRR), pendingKeyRR, pendingKeyLease, pendingKeyLease)
+					}
+					if err != nil {
 						return err
 					}
 					if len(pendingRecords) > 0 {

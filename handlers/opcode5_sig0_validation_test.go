@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net"
 	"testing"
+	"time"
 
 	"codeberg.org/miekg/dns"
 	"github.com/NetworkCommons/sig0lease/pkg/keyrec"
@@ -451,6 +452,71 @@ func TestHandle_ReRegistersManagedKeyWhenAuthoritativeFQDNIsMissing(t *testing.T
 	}
 	if got.LeaseDuration >= 120 {
 		t.Fatalf("expected key lease to be re-registered with remaining lease time, got %d", got.LeaseDuration)
+	}
+}
+
+// TestHandle_RefreshPreservesOriginalRegisteredAt exercises the "normal
+// refresh" branch of Case A (key still present at its authoritative FQDN)
+// end to end through Handle(), confirming the RenewLease wiring: a refresh
+// must extend the lease timers without resetting RegisteredAt, unlike the
+// old design where every refresh silently re-created the node with
+// RegisteredAt = now.
+func TestHandle_RefreshPreservesOriginalRegisteredAt(t *testing.T) {
+	keystoreDir, err := createTestKeystore(t)
+	if err != nil {
+		t.Fatalf("setup test keystore: %v", err)
+	}
+	loaded, err := keyrec.LoadKeyFromFile(keystoreDir, "Kdev.zenr.io.+015+35317")
+	if err != nil {
+		t.Fatalf("load key: %v", err)
+	}
+
+	h := NewUpdateHandler()
+	h.SetLogger(newTestHandler().logger)
+	if err := h.Setup(map[string]any{
+		"upstream_zone": "dev.zenr.io.",
+		"keystore_dir":  keystoreDir,
+	}); err != nil {
+		t.Fatalf("setup handler: %v", err)
+	}
+	h.authoritativeLookup = func(ctx context.Context, zoneHint, fqdn string, rrType uint16) ([]dns.RR, error) {
+		if rrType == dns.TypeKEY {
+			return []dns.RR{loaded.PublicKey}, nil
+		}
+		return []dns.RR{}, nil
+	}
+	h.upstreamCoordinator = &stubUpstreamCoordinator{resp: &dns.Msg{MsgHeader: dns.MsgHeader{Rcode: dns.RcodeSuccess}}}
+
+	keyRR := loaded.PublicKey.Clone().(*dns.KEY)
+	if err := h.leaseManager.Register(context.Background(), keyRR, 60, 60, "dev.zenr.io."); err != nil {
+		t.Fatalf("register key: %v", err)
+	}
+	original := h.leaseManager.LookupByKEY(keyRR)
+	if original == nil {
+		t.Fatalf("expected key to be registered")
+	}
+	registeredAt := original.RegisteredAt
+
+	time.Sleep(5 * time.Millisecond)
+
+	req := buildSignedLeaseRegistrationForHandleTest(t, loaded, "test.dev.zenr.io.", 120, 120)
+	res := h.Handle(context.Background(), stubResponseWriter{}, req)
+	if res == nil || res.Message == nil {
+		t.Fatalf("expected response message")
+	}
+	if res.Message.Rcode != dns.RcodeSuccess {
+		t.Fatalf("expected successful refresh, got rcode=%d", res.Message.Rcode)
+	}
+
+	after := h.leaseManager.LookupByKEY(keyRR)
+	if after == nil {
+		t.Fatalf("expected key to remain registered after refresh")
+	}
+	if !after.RegisteredAt.Equal(registeredAt) {
+		t.Fatalf("expected RegisteredAt to survive a Handle()-driven refresh unchanged, got %v want %v", after.RegisteredAt, registeredAt)
+	}
+	if after.LeaseDuration != 120 {
+		t.Fatalf("expected renewed key-lease duration to be applied, got %d", after.LeaseDuration)
 	}
 }
 

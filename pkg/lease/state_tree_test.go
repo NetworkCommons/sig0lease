@@ -4,6 +4,7 @@ import (
 	"context"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"codeberg.org/miekg/dns"
 )
@@ -43,6 +44,76 @@ func TestRegisterWithParent_BuildsTree(t *testing.T) {
 	kids := store.ChildrenOf(NodeKey(root))
 	if len(kids) != 1 || kids[0] != NodeKey(child) {
 		t.Fatalf("unexpected children: %+v", kids)
+	}
+}
+
+// TestRenewLease_PreservesIdentityAndRegisteredAt is the regression case for
+// the design this replaced: Register/RegisterWithParent rebuilt the whole
+// node on every call, including a fresh RegisteredAt and a detach/reattach
+// of the same parent -- so a lease's "originally registered at" timestamp
+// was silently reset on every refresh. RenewLease must only move the expiry
+// forward, leaving identity (ParentKeyName, RegisteredAt, tree position)
+// untouched.
+func TestRenewLease_PreservesIdentityAndRegisteredAt(t *testing.T) {
+	store := NewInMemoryManager()
+	defer store.Stop()
+	ctx := context.Background()
+
+	root := testKeyRR("root.dev.zenr.io.", "AAAAROOT2=")
+	child := testKeyRR("child.dev.zenr.io.", "AAAACHILD2=")
+
+	if err := store.Register(ctx, root, 300, 300, "dev.zenr.io."); err != nil {
+		t.Fatalf("register root: %v", err)
+	}
+	if err := store.RegisterWithParent(ctx, NodeKey(root), child, 300, 300, "dev.zenr.io."); err != nil {
+		t.Fatalf("register child with parent: %v", err)
+	}
+
+	before := store.Get(NodeKey(child))
+	if before == nil {
+		t.Fatal("expected child record")
+	}
+	registeredAt := before.RegisteredAt
+	parentKeyName := before.ParentKeyName
+	expiresAt := before.ExpiresAt
+
+	time.Sleep(5 * time.Millisecond)
+
+	if err := store.RenewLease(ctx, child, 600, 600); err != nil {
+		t.Fatalf("renew child: %v", err)
+	}
+
+	after := store.Get(NodeKey(child))
+	if after == nil {
+		t.Fatal("expected child record after renew")
+	}
+	if !after.RegisteredAt.Equal(registeredAt) {
+		t.Fatalf("expected RegisteredAt to survive a renew unchanged, got %v want %v", after.RegisteredAt, registeredAt)
+	}
+	if after.ParentKeyName != parentKeyName {
+		t.Fatalf("expected ParentKeyName to survive a renew unchanged, got %q want %q", after.ParentKeyName, parentKeyName)
+	}
+	if after.LeaseDuration != 600 || after.KeyLeaseDuration != 600 {
+		t.Fatalf("expected renewed durations to be applied, got lease=%d key-lease=%d", after.LeaseDuration, after.KeyLeaseDuration)
+	}
+	if !after.ExpiresAt.After(expiresAt) {
+		t.Fatalf("expected ExpiresAt to move forward after renew, got %v (was %v)", after.ExpiresAt, expiresAt)
+	}
+
+	kids := store.ChildrenOf(NodeKey(root))
+	if len(kids) != 1 || kids[0] != NodeKey(child) {
+		t.Fatalf("expected tree structure untouched by renew, got children: %+v", kids)
+	}
+}
+
+func TestRenewLease_RejectsUnregisteredKey(t *testing.T) {
+	store := NewInMemoryManager()
+	defer store.Stop()
+	ctx := context.Background()
+
+	neverRegistered := testKeyRR("ghost.dev.zenr.io.", "AAAAGHOST=")
+	if err := store.RenewLease(ctx, neverRegistered, 60, 60); err == nil {
+		t.Fatalf("expected renewing a never-registered key to fail")
 	}
 }
 
