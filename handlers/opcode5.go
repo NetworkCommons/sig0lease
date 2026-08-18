@@ -18,21 +18,21 @@ import (
 // LeaseRecord is the shared lease state record used by handlers.
 type LeaseRecord = leasepkg.Record
 
-// DataLeaseRecord tracks non-KEY RR lease state linked to a key registration.
+// NonKEYLeaseRecord tracks non-KEY RR lease state linked to a key registration.
 // Records are tracked individually by their RFC 2136 key (rfc2136 - 1.1 -
 // Comparison Rules), so each record can have its own lease duration and
 // expiry time. The key excludes TTL and applies special rules for SOA,
 // CNAME, and WKS record types. A deleted or expired record is removed from
 // Records outright, never flagged in place.
-type DataLeaseRecord struct {
-	Records       map[string]*dataRecordEntry // key = RFC 2136 RR key (excludes TTL)
+type NonKEYLeaseRecord struct {
+	Records       map[string]*nonKeyRecordEntry // key = RFC 2136 RR key (excludes TTL)
 	ExpiresAt     time.Time
 	UpstreamZone  string
 	LeaseDuration uint32
 }
 
-// dataRecordEntry holds a single data record with its own lease metadata.
-type dataRecordEntry struct {
+// nonKeyRecordEntry holds a single non-KEY record with its own lease metadata.
+type nonKeyRecordEntry struct {
 	RR            dns.RR
 	ExpiresAt     time.Time
 	LeaseDuration uint32
@@ -275,13 +275,13 @@ type UpdateHandler struct {
 	// gates whether it may also be used to create new managed state. Default
 	// false (fail closed).
 	AllowOnlineKeyRegistration bool
-	leaseTimersMu       sync.Mutex
-	leaseTimers         map[string]*time.Timer
-	dataLeasesMu        sync.RWMutex
-	dataLeases          map[string]*DataLeaseRecord
-	blacklistedTypes    map[uint16]struct{} // RR types blocked from registration (type code -> empty)
-	authoritativeLookup func(ctx context.Context, zoneHint string, fqdn string, rrType uint16) ([]dns.RR, error)
-	reconcileTicker     *time.Ticker
+	leaseTimersMu              sync.Mutex
+	leaseTimers                map[string]*time.Timer
+	nonKeyLeasesMu             sync.RWMutex
+	nonKeyLeases               map[string]*NonKEYLeaseRecord
+	blacklistedTypes           map[uint16]struct{} // RR types blocked from registration (type code -> empty)
+	authoritativeLookup        func(ctx context.Context, zoneHint string, fqdn string, rrType uint16) ([]dns.RR, error)
+	reconcileTicker            *time.Ticker
 }
 
 // NewUpdateHandler creates a new handler for opcode 5 (UPDATE) queries.

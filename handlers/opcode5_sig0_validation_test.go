@@ -131,7 +131,7 @@ func buildSignedUpdateWithSignerKeyInAdditionalForTest(t *testing.T, signerKey *
 	return signed
 }
 
-func buildSignedDataOnlyLeaseUpdateForHandleTest(t *testing.T, signerKey *keyrec.LoadedKey, leaseOwner string, leaseDuration uint32, includeSignerKeyInUpdate bool) *dns.Msg {
+func buildSignedNonKeyOnlyLeaseUpdateForHandleTest(t *testing.T, signerKey *keyrec.LoadedKey, leaseOwner string, leaseDuration uint32, includeSignerKeyInUpdate bool) *dns.Msg {
 	t.Helper()
 
 	msg := dns.NewMsg("test.dev.zenr.io.", dns.TypeSOA)
@@ -454,7 +454,7 @@ func TestHandle_ReRegistersManagedKeyWhenAuthoritativeFQDNIsMissing(t *testing.T
 	}
 }
 
-func TestHandle_DataOnlyLeaseWithoutUpdateKeyRR_RegistersNonKeyRRs(t *testing.T) {
+func TestHandle_NonKeyOnlyLeaseWithoutUpdateKeyRR_RegistersNonKeyRRs(t *testing.T) {
 	keystoreDir, err := createTestKeystore(t)
 	if err != nil {
 		t.Fatalf("setup test keystore: %v", err)
@@ -487,21 +487,21 @@ func TestHandle_DataOnlyLeaseWithoutUpdateKeyRR_RegistersNonKeyRRs(t *testing.T)
 	h.upstreamCoordinator = &stubUpstreamCoordinator{resp: &dns.Msg{MsgHeader: dns.MsgHeader{Rcode: dns.RcodeSuccess}}}
 
 	owner := "host.test.dev.zenr.io."
-	req := buildSignedDataOnlyLeaseUpdateForHandleTest(t, loaded, owner, 120, false)
+	req := buildSignedNonKeyOnlyLeaseUpdateForHandleTest(t, loaded, owner, 120, false)
 	res := h.Handle(context.Background(), stubResponseWriter{}, req)
 	if res == nil || res.Message == nil {
 		t.Fatalf("expected response message")
 	}
 	if res.Message.Rcode != dns.RcodeSuccess {
-		t.Fatalf("expected successful data-only update without KEY RR, got rcode=%d", res.Message.Rcode)
+		t.Fatalf("expected successful non-KEY-only update without KEY RR, got rcode=%d", res.Message.Rcode)
 	}
 
-	if !h.hasActiveDataRecord(leasepkg.NodeKey(signerKey), req.Ns[0]) {
+	if !h.hasActiveNonKeyRecord(leasepkg.NodeKey(signerKey), req.Ns[0]) {
 		t.Fatalf("expected non-KEY RR to be registered under signer ownership")
 	}
 }
 
-func TestHandle_DataOnlyLeaseRejectsUpdateKeyRR(t *testing.T) {
+func TestHandle_NonKeyOnlyLeaseRejectsUpdateKeyRR(t *testing.T) {
 	keystoreDir, err := createTestKeystore(t)
 	if err != nil {
 		t.Fatalf("setup test keystore: %v", err)
@@ -534,13 +534,13 @@ func TestHandle_DataOnlyLeaseRejectsUpdateKeyRR(t *testing.T) {
 	h.upstreamCoordinator = &stubUpstreamCoordinator{resp: &dns.Msg{MsgHeader: dns.MsgHeader{Rcode: dns.RcodeSuccess}}}
 
 	owner := "host.test.dev.zenr.io."
-	req := buildSignedDataOnlyLeaseUpdateForHandleTest(t, loaded, owner, 120, true)
+	req := buildSignedNonKeyOnlyLeaseUpdateForHandleTest(t, loaded, owner, 120, true)
 	res := h.Handle(context.Background(), stubResponseWriter{}, req)
 	if res == nil || res.Message == nil {
 		t.Fatalf("expected response message")
 	}
 	if res.Message.Rcode != dns.RcodeRefused {
-		t.Fatalf("expected REFUSED for data-only update containing KEY RR, got rcode=%d", res.Message.Rcode)
+		t.Fatalf("expected REFUSED for non-KEY-only update containing KEY RR, got rcode=%d", res.Message.Rcode)
 	}
 }
 
@@ -643,5 +643,162 @@ func TestGroupOtherRecordsByTargetKey_HierarchyRejectsUnmappedOwner(t *testing.T
 	_, err := groupOtherRecordsByTargetKey(signerID, keys, []dns.RR{txt}, true)
 	if err == nil {
 		t.Fatalf("expected grouping failure for unmapped owner in hierarchy mode")
+	}
+}
+
+// buildSignedCaseCDeleteForHandleTest builds a Case C delete request
+// (LEASE=0, KEY-LEASE=0) naming a single KEY RR, signed by signerKey.
+func buildSignedCaseCDeleteForHandleTest(t *testing.T, signerKey *keyrec.LoadedKey, keyRRToDelete *dns.KEY) *dns.Msg {
+	t.Helper()
+
+	msg := dns.NewMsg("test.dev.zenr.io.", dns.TypeSOA)
+	if msg == nil {
+		t.Fatalf("expected message")
+	}
+	msg.Opcode = dns.OpcodeUpdate
+	msg.Ns = append(msg.Ns, keyRRToDelete)
+
+	opt := &dns.OPT{Hdr: dns.Header{Name: "."}}
+	opt.SetUDPSize(uint16(dns.DefaultMsgSize))
+	leaseOpt := leasepkg.Encode8Byte(0, 0)
+	if err := leaseOpt.Encode(opt); err != nil {
+		t.Fatalf("encode lease option: %v", err)
+	}
+	msg.Extra = append(msg.Extra, opt)
+
+	signed, err := sig0.SignMessage(msg, signerKey.PublicKey, signerKey.PrivateKey)
+	if err != nil {
+		t.Fatalf("sign message: %v", err)
+	}
+	return signed
+}
+
+// setupCaseCDeleteHandler registers a parent key (test.dev.zenr.io.) and a
+// child key it registered (client.test.dev.zenr.io., ParentKeyName pointing
+// at the parent), and returns a handler plus the parent, child, and an
+// "unrelated" key (dev.zenr.io.) that is hierarchically above the child by
+// DNS name but is not the child's immediate parent -- used to prove that
+// hierarchy alone is no longer sufficient to authorize a Case C KEY delete.
+func setupCaseCDeleteHandler(t *testing.T) (h *UpdateHandler, parent, child, unrelated *keyrec.LoadedKey) {
+	t.Helper()
+
+	serverKeystoreDir, err := createTestKeystore(t)
+	if err != nil {
+		t.Fatalf("setup test keystore: %v", err)
+	}
+
+	parent, err = keyrec.LoadKeyFromFile("../keystore/client", "Ktest.dev.zenr.io.+015+05044")
+	if err != nil {
+		t.Fatalf("load parent key: %v", err)
+	}
+	child, err = keyrec.LoadKeyFromFile("../keystore/client", "Kclient.test.dev.zenr.io.+015+00457")
+	if err != nil {
+		t.Fatalf("load child key: %v", err)
+	}
+	unrelated, err = keyrec.LoadKeyFromFile("../keystore/server", "Kdev.zenr.io.+015+35317")
+	if err != nil {
+		t.Fatalf("load unrelated ancestor key: %v", err)
+	}
+
+	h = NewUpdateHandler()
+	h.SetLogger(newTestHandler().logger)
+	if err := h.Setup(map[string]any{
+		"upstream_zone": "dev.zenr.io.",
+		"keystore_dir":  serverKeystoreDir,
+	}); err != nil {
+		t.Fatalf("setup handler: %v", err)
+	}
+	h.upstreamCoordinator = &stubUpstreamCoordinator{resp: &dns.Msg{MsgHeader: dns.MsgHeader{Rcode: dns.RcodeSuccess}}}
+	// Stage-3 (authoritative) SIG(0) resolution for the unrelated key, which
+	// is never lease-managed and never present in the request itself.
+	h.authoritativeLookup = func(ctx context.Context, zoneHint, fqdn string, rrType uint16) ([]dns.RR, error) {
+		if rrType == dns.TypeKEY && canonicalName(fqdn) == canonicalName(unrelated.PublicKey.Hdr.Name) {
+			return []dns.RR{unrelated.PublicKey}, nil
+		}
+		return []dns.RR{}, nil
+	}
+
+	parentRR := parent.PublicKey.Clone().(*dns.KEY)
+	if err := h.leaseManager.Register(context.Background(), parentRR, 120, 120, "dev.zenr.io."); err != nil {
+		t.Fatalf("register parent key: %v", err)
+	}
+	treeStore, ok := h.leaseManager.(leasepkg.HierarchicalLeaseStore)
+	if !ok {
+		t.Fatalf("expected lease manager to support hierarchical registration")
+	}
+	childRR := child.PublicKey.Clone().(*dns.KEY)
+	if err := treeStore.RegisterWithParent(context.Background(), leasepkg.NodeKey(parentRR), childRR, 120, 120, "dev.zenr.io."); err != nil {
+		t.Fatalf("register child key under parent: %v", err)
+	}
+
+	return h, parent, child, unrelated
+}
+
+func TestHandle_CaseCDelete_ImmediateParentCanDeleteChildKey(t *testing.T) {
+	h, parent, child, _ := setupCaseCDeleteHandler(t)
+
+	childRR := child.PublicKey.Clone().(*dns.KEY)
+	req := buildSignedCaseCDeleteForHandleTest(t, parent, childRR)
+
+	res := h.Handle(context.Background(), stubResponseWriter{}, req)
+	if res == nil || res.Message == nil {
+		t.Fatalf("expected response message")
+	}
+	if res.Message.Rcode != dns.RcodeSuccess {
+		t.Fatalf("expected success, got rcode=%d", res.Message.Rcode)
+	}
+	if got := h.leaseManager.LookupByKEY(childRR); got != nil {
+		t.Fatalf("expected child key to be deleted by its immediate parent")
+	}
+}
+
+func TestHandle_CaseCDelete_UnrelatedHierarchicalAncestorCannotDeleteChildKey(t *testing.T) {
+	h, _, child, unrelated := setupCaseCDeleteHandler(t)
+
+	childRR := child.PublicKey.Clone().(*dns.KEY)
+	req := buildSignedCaseCDeleteForHandleTest(t, unrelated, childRR)
+
+	res := h.Handle(context.Background(), stubResponseWriter{}, req)
+	if res == nil || res.Message == nil {
+		t.Fatalf("expected response message")
+	}
+	if res.Message.Rcode != dns.RcodeSuccess {
+		t.Fatalf("expected soft no-op success (delete refused, request still succeeds), got rcode=%d", res.Message.Rcode)
+	}
+	if got := h.leaseManager.LookupByKEY(childRR); got == nil {
+		t.Fatalf("expected child key to remain after delete attempt by a non-parent hierarchical ancestor")
+	}
+
+	wantNote := fmt.Sprintf("KEY %s not found for delete", childRR.Hdr.Name)
+	foundNote := false
+	for _, rr := range res.Message.Answer {
+		if txt, ok := rr.(*dns.TXT); ok {
+			for _, line := range txt.TXT.Txt {
+				if line == wantNote {
+					foundNote = true
+				}
+			}
+		}
+	}
+	if !foundNote {
+		t.Fatalf("expected note %q when a non-parent ancestor attempts delete, got answers=%+v", wantNote, res.Message.Answer)
+	}
+}
+
+func TestHandle_CaseCDelete_SelfRegisteredKeyCanDeleteItself(t *testing.T) {
+	h, parent, _, _ := setupCaseCDeleteHandler(t)
+
+	parentRR := parent.PublicKey.Clone().(*dns.KEY)
+	req := buildSignedCaseCDeleteForHandleTest(t, parent, parentRR)
+
+	res := h.Handle(context.Background(), stubResponseWriter{}, req)
+	if res == nil || res.Message == nil {
+		t.Fatalf("expected response message")
+	}
+	if res.Message.Rcode != dns.RcodeSuccess {
+		t.Fatalf("expected success, got rcode=%d", res.Message.Rcode)
+	}
+	if got := h.leaseManager.LookupByKEY(parentRR); got != nil {
+		t.Fatalf("expected self-registered root key to be able to delete itself")
 	}
 }

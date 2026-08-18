@@ -493,9 +493,9 @@ test_single_rr_register_expire_remove() {
             rr_spec="$(make_rr $rr_type $lease)"
             ;;
         *)
-            # A non-KEY-only registration is Case B (data-only), which
-            # requires the signer to already be lease-managed -- not true at
-            # this point in a fresh run. So register via Case A (KEY+data
+            # A non-KEY-only registration is Case B, which requires the
+            # signer to already be lease-managed -- not true at this point in
+            # a fresh run. So register via Case A (KEY+non-KEY records
             # together, both timers equal so they expire together) instead,
             # mirroring the build_case_a_specs pattern used by Cases 2/2B/3.
             local lease_time=$LEASE_SECONDS
@@ -536,7 +536,7 @@ test_single_rr_register_expire_remove() {
         log_success "Expired KEY refresh succeeded via re-registration semantics"
     else
         # Both KEY and data expired together above, so the signer is no
-        # longer lease-managed: a data-only (Case B) refresh attempt must be
+        # longer lease-managed: a non-KEY-only (Case B) refresh attempt must be
         # refused for that reason, not because "the lease does not exist"
         # (that message is Case D's validateRefreshOwnership path, which
         # this request never reaches). Assert on the client-visible Rcode
@@ -549,7 +549,7 @@ test_single_rr_register_expire_remove() {
             return 1
         fi
         if ! echo "$post_expiry_out" | grep -q "Rcode=5\|REFUSED"; then
-            log_error "Expected REFUSED (Rcode=5) for post-expiry data-only refresh, got:"
+            log_error "Expected REFUSED (Rcode=5) for post-expiry non-KEY-only refresh, got:"
             echo "$post_expiry_out"
             return 1
         fi
@@ -616,7 +616,7 @@ test_case_register_refresh_not_prematurely_removed() {
     wait_for_rr_state "$data_type" "$data_spec" present
     proxy_consistent_with_authoritative "$data_type" "$data_spec" present
 
-    log_step "Waiting for refreshed data lease window while key-lease remains active"
+    log_step "Waiting for refreshed non-KEY lease window while key-lease remains active"
     wait_until_epoch $((refresh_start + REFRESH_SECONDS + 5))
     wait_for_rr_state KEY "$CLIENT_KEY_RR" present
     proxy_consistent_with_authoritative KEY "$CLIENT_KEY_RR" present
@@ -645,7 +645,7 @@ test_case_split_lease_nonkey_expires_key_persists() {
     case_start=$(date +%s)
     lease_start=$(date +%s)
     # Both LEASE and KEY-LEASE are nonzero here (Case A), which requires a
-    # companion KEY rr-spec in the Update section -- a data-only rr-spec
+    # companion KEY rr-spec in the Update section -- a non-KEY-only rr-spec
     # alone is rejected client-side before anything is even sent ("keyRRs
     # not present but keyLeaseDuration != 0").
     build_case_a_specs "$rr_type" "$LEASE_SECONDS"
@@ -810,7 +810,7 @@ test_case_unauthorized_refresh_rejected_then_expires() {
 # so each transition's effect on the other records is directly observable:
 #   A: KEY-LEASE!=0, LEASE!=0 -- full registration (KEY + txt_a together)
 #   D: KEY-LEASE!=0, LEASE=0  -- key-only refresh, must not disturb txt_a
-#   B: KEY-LEASE=0,  LEASE!=0 -- data-only registration of txt_b under the
+#   B: KEY-LEASE=0,  LEASE!=0 -- non-KEY-only registration of txt_b under the
 #      already-managed key, coexisting with txt_a
 #   C: KEY-LEASE=0,  LEASE=0  -- delete matrix: first a non-KEY-only delete
 #      (txt_b only), then a KEY delete that cascades and removes txt_a too
@@ -846,18 +846,18 @@ test_case_abcd_lease_policy_matrix() {
 
     needle_b="caseB-$(date +%s)"
     txt_b="${DOWNSTREAM_ZONE} ${LEASE_SECONDS} IN TXT \"${needle_b}\""
-    log_step "Case B (KEY-LEASE=0, LEASE!=0): data-only registration under the already-managed signer"
+    log_step "Case B (KEY-LEASE=0, LEASE!=0): non-KEY-only registration under the already-managed signer"
     run_client refresh "$CLIENT_KEY_NAME" "$LEASE_SECONDS" 0 "$txt_b"
     if ! rr_at_auth_contains "$DOWNSTREAM_ZONE" TXT "$needle_a"; then
         log_error "Case B: original Case A TXT record disappeared"
         return 1
     fi
     if ! rr_at_auth_contains "$DOWNSTREAM_ZONE" TXT "$needle_b"; then
-        log_error "Case B: new data-only TXT record not found at authoritative"
+        log_error "Case B: new non-KEY-only TXT record not found at authoritative"
         return 1
     fi
     query_lease_dump "debug"
-    log_success "Case B: data-only registration added a second TXT record alongside the first"
+    log_success "Case B: non-KEY-only registration added a second TXT record alongside the first"
 
     log_step "Case C (KEY-LEASE=0, LEASE=0): non-KEY-only delete removes just txt_b"
     run_client refresh "$CLIENT_KEY_NAME" 0 0 "$txt_b"
@@ -879,7 +879,7 @@ test_case_abcd_lease_policy_matrix() {
         log_error "Case C: KEY delete did not cascade-remove remaining txt_a"
         return 1
     fi
-    log_success "Case C: KEY delete cascaded and removed the remaining data lease"
+    log_success "Case C: KEY delete cascaded and removed the remaining non-KEY lease"
 
     log_case_timing "case-abcd-matrix" "$case_start" 0
     log_success "Lease-policy Case A/B/C/D matrix (A -> D -> B -> C) validated end-to-end"
@@ -893,7 +893,7 @@ test_case_abcd_lease_policy_matrix() {
 # online via add_rr, never registered through the proxy at all).
 #
 # Steps 1-3 reuse CLIENT_KEY_NAME across a self-registration (Update) and two
-# data-only refreshes (Additional, then lease-store), since Case B forbids a
+# non-KEY-only refreshes (Additional, then lease-store), since Case B forbids a
 # KEY rr-spec in the Update section entirely -- the only way to prove
 # Additional/omitted signer resolution. Step 4 uses WRONG_CLIENT_KEY_NAME,
 # published directly at authoritative and never registered through the
@@ -919,7 +919,7 @@ test_case_signer_location_matrix() {
 
     needle2="signerloc-additional-$(date +%s)"
     txt2="${DOWNSTREAM_ZONE} ${LEASE_SECONDS} IN TXT \"${needle2}\""
-    log_step "Signer location 2/4: Additional section (data-only refresh, Case B)"
+    log_step "Signer location 2/4: Additional section (non-KEY-only refresh, Case B)"
     run_client refresh "$CLIENT_KEY_NAME" "$LEASE_SECONDS" 0 "$txt2" --signer=additional
     if ! rr_at_auth_contains "$DOWNSTREAM_ZONE" TXT "$needle2"; then
         log_error "Signer-location[additional]: expected TXT record not found"
@@ -1020,12 +1020,12 @@ test_case_multi_rr_combination_registration() {
     log_success "Multi-RR combination registration validated: all types landed together and expired together"
 }
 
-# test_case_refresh_extends_data_not_key_lease inspects actual lease
+# test_case_refresh_extends_nonkey_not_key_lease inspects actual lease
 # timestamps via the DEBUG dump (not just presence/absence) to confirm a
-# data-only refresh (Case B) advances the data record's ExpiresAt while
+# non-KEY-only refresh (Case B) advances the non-KEY record's ExpiresAt while
 # leaving the KEY's own ExpiresAt untouched.
-test_case_refresh_extends_data_not_key_lease() {
-    log_section "REFRESH: Extends Data Lease Without Extending Key Lease"
+test_case_refresh_extends_nonkey_not_key_lease() {
+    log_section "REFRESH: Extends Non-KEY Lease Without Extending Key Lease"
 
     local case_start
     case_start=$(date +%s)
@@ -1042,15 +1042,15 @@ test_case_refresh_extends_data_not_key_lease() {
         return 1
     fi
 
-    local dump_before key_expires_before data_expires_before
+    local dump_before key_expires_before nonkey_expires_before
     dump_before="$(unescape_dump_text "$(query_lease_dump "debug")")"
     key_expires_before="$(printf '%s' "$dump_before" | awk '/^  Key: /{inkey=1} inkey && /ExpiresAt:/{print $2; exit}')"
-    data_expires_before="$(printf '%s' "$dump_before" | awk -v needle="$needle" '
+    nonkey_expires_before="$(printf '%s' "$dump_before" | awk -v needle="$needle" '
         /RR:/ && index($0, needle) { found=1; next }
         found && /ExpiresAt:/ { print $2; exit }
     ')"
-    log_step "Before refresh: KEY ExpiresAt=$key_expires_before  Data ExpiresAt=$data_expires_before"
-    if [ -z "$key_expires_before" ] || [ -z "$data_expires_before" ]; then
+    log_step "Before refresh: KEY ExpiresAt=$key_expires_before  Non-KEY ExpiresAt=$nonkey_expires_before"
+    if [ -z "$key_expires_before" ] || [ -z "$nonkey_expires_before" ]; then
         log_error "Refresh-lease-check: could not parse ExpiresAt values from debug dump"
         echo "$dump_before"
         return 1
@@ -1058,29 +1058,29 @@ test_case_refresh_extends_data_not_key_lease() {
 
     sleep 3
 
-    log_step "Refreshing data only (Case B: KEY-LEASE=0), same TXT rdata, extending LEASE"
+    log_step "Refreshing non-KEY-only (Case B: KEY-LEASE=0), same TXT rdata, extending LEASE"
     run_client refresh "$CLIENT_KEY_NAME" "$LEASE_SECONDS" 0 "$txt_spec"
 
-    local dump_after key_expires_after data_expires_after
+    local dump_after key_expires_after nonkey_expires_after
     dump_after="$(unescape_dump_text "$(query_lease_dump "debug")")"
     key_expires_after="$(printf '%s' "$dump_after" | awk '/^  Key: /{inkey=1} inkey && /ExpiresAt:/{print $2; exit}')"
-    data_expires_after="$(printf '%s' "$dump_after" | awk -v needle="$needle" '
+    nonkey_expires_after="$(printf '%s' "$dump_after" | awk -v needle="$needle" '
         /RR:/ && index($0, needle) { found=1; next }
         found && /ExpiresAt:/ { print $2; exit }
     ')"
-    log_step "After refresh: KEY ExpiresAt=$key_expires_after  Data ExpiresAt=$data_expires_after"
+    log_step "After refresh: KEY ExpiresAt=$key_expires_after  Non-KEY ExpiresAt=$nonkey_expires_after"
 
     if [ "$key_expires_after" != "$key_expires_before" ]; then
-        log_error "Refresh-lease-check: KEY ExpiresAt changed from a data-only (Case B) refresh: $key_expires_before -> $key_expires_after"
+        log_error "Refresh-lease-check: KEY ExpiresAt changed from a non-KEY-only (Case B) refresh: $key_expires_before -> $key_expires_after"
         return 1
     fi
-    if [[ ! "$data_expires_after" > "$data_expires_before" ]]; then
-        log_error "Refresh-lease-check: Data ExpiresAt did not advance after refresh: $data_expires_before -> $data_expires_after"
+    if [[ ! "$nonkey_expires_after" > "$nonkey_expires_before" ]]; then
+        log_error "Refresh-lease-check: Non-KEY ExpiresAt did not advance after refresh: $nonkey_expires_before -> $nonkey_expires_after"
         return 1
     fi
 
     log_case_timing "refresh-lease-check" "$case_start" 3
-    log_success "Refresh extended the data lease ($data_expires_before -> $data_expires_after) without touching the key lease ($key_expires_before)"
+    log_success "Refresh extended the non-KEY lease ($nonkey_expires_before -> $nonkey_expires_after) without touching the key lease ($key_expires_before)"
 }
 
 # test_case_dump_vs_dig_consistency cross-checks the lease-store dump (both
@@ -1198,7 +1198,7 @@ run_all_tests() {
     for rr_type in "${rr_types[@]}"; do
         log_section "RR TEST MATRIX: $rr_type"
         # Reset via the shared client KEY, not a per-type rdata: deleting the
-        # KEY lease (Case C) cascades and removes every data lease under it
+        # KEY lease (Case C) cascades and removes every non-KEY lease under it
         # (see handlers/opcode5_handle.go Case C subtree cleanup), so this is
         # the correct pristine-state reset regardless of $rr_type.
         ensure_rr_absent KEY "$CLIENT_KEY_RR"
@@ -1225,7 +1225,7 @@ run_all_tests() {
     ensure_rr_absent KEY "$CLIENT_KEY_RR"
     test_case_multi_rr_combination_registration
     ensure_rr_absent KEY "$CLIENT_KEY_RR"
-    test_case_refresh_extends_data_not_key_lease
+    test_case_refresh_extends_nonkey_not_key_lease
     ensure_rr_absent KEY "$CLIENT_KEY_RR"
     test_case_dump_vs_dig_consistency
     ensure_rr_absent KEY "$CLIENT_KEY_RR"
@@ -1243,7 +1243,7 @@ run_all_tests() {
     echo "  [OK] Explicit Case A/B/C/D lease-policy matrix"
     echo "  [OK] Signer-location matrix (Update/Additional/lease-store/online-only)"
     echo "  [OK] Multi-RR combination registration in a single Update"
-    echo "  [OK] Refresh extends data lease without extending key lease (dump-verified)"
+    echo "  [OK] Refresh extends non-KEY lease without extending key lease (dump-verified)"
     echo "  [OK] Lease-store dump (INFO/DEBUG) cross-checked against dig at authoritative"
     echo ""
     echo "Proxy process was exercised at $PROXY_URL"

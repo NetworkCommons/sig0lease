@@ -3,10 +3,11 @@
 1. Signature verification
    1. UPDATE requests must carry a valid SIG(0).
    2. An UPDATE request contains RRs to be updated. The name of those records determines the FQDN. The signer key must be at or above this FQDN. In the following we say that a key is "at-FQDN" when it is registered at or above that FQDN.
-   3. Verification uses authoritative DNS as the primary source for signer key resolution.
-   4. If authoritative DNS cannot be reached for signer-key lookup, the request fails (because we are modifying records for a DNS that does not respond).
-   5. If authoritative DNS is reachable but returns no matching signer KEY, lease-store key material is used as fallback.
-   6. If the lease-store does not contain the key, the key must be present in the request as KEY RR, either in the Update section, or in the Additional section.
+   3. The key can be present in the request as KEY RR, either in the Update section, or in the Additional section.
+   4. If the key is not present in the request, lease-store key material is used as fallback.
+   5. If lease-store does not contain the key, verification uses authoritative DNS as the last source for signer key resolution.
+   6. If authoritative DNS is reachable but returns no matching signer KEY, the request fails.
+      6.a. If the authoritative DNS cannot be reached for signer-key lookup, the request fails. This is because we are modifying records for a DNS that does not respond.
    7. According to RFC 2136, the Update Section contains RRs to be added to or deleted from the zone. Thus if a KEY RR is not been registered or refreshed, it should not be in the Authority/Update section of a signed lease-update request.
    8. Multiple KEY RRs can be present in a request in the Update section.
 2. When a signed registration comes in, the proxy first needs to verify the signature. This can be done either because the signing RR KEY is in the message (either in the Update or Additional section), or because the KEY is online (its name is already present at the FQDN or above of the records contained in the lease update request), or because the KEY is in the LeaseStore. Any of this can be used to verify the signature.
@@ -33,6 +34,7 @@
       2. If non-KEY RRs present -> delete non-KEY RRs
       3. Both present -> delete both
       4. Neither present -> error
+      5. Authorization for delete is ownership, not just at-FQDN: a KEY or non-KEY RR may only be deleted by its immediate parent (the KEY that registered it), or, for a KEY RR, by itself if it has no parent (self-registered/root). A signer that is at-FQDN but not the immediate parent cannot delete the record directly, even though it could sign the request; the record is treated the same as if it did not exist, and no error results.
    4. KEY-LEASE != 0, LEASE == 0:
       1. KEY RR must be present -> register or refresh KEY
       2. If non-KEY RRs present -> delete non-KEY RRs
