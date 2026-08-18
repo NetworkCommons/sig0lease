@@ -55,7 +55,7 @@ func (h *UpdateHandler) registerKeyLease(ctx context.Context, signerID keyID, ke
 	return h.leaseManager.Register(ctx, keyRR, leaseDuration, keyLeaseDuration, h.upstreamZone)
 }
 
-func (h *UpdateHandler) setDataLease(keyName string, records []dns.RR, leaseDuration uint32, upstreamZone string) {
+func (h *UpdateHandler) setNonKeyLease(keyName string, records []dns.RR, leaseDuration uint32, upstreamZone string) {
 	if treeStore, ok := h.leaseManager.(leasepkg.LeaseTreeStore); ok {
 		if err := treeStore.UpsertNonKEYRecords(keyName, records, leaseDuration, upstreamZone); err != nil {
 			h.logger.Debugf("failed to store non-KEY records in lease tree for %s: %v", keyName, err)
@@ -63,14 +63,14 @@ func (h *UpdateHandler) setDataLease(keyName string, records []dns.RR, leaseDura
 		return
 	}
 
-	h.dataLeasesMu.Lock()
-	defer h.dataLeasesMu.Unlock()
+	h.nonKeyLeasesMu.Lock()
+	defer h.nonKeyLeasesMu.Unlock()
 
 	keyName = canonicalName(keyName)
-	rec, ok := h.dataLeases[keyName]
+	rec, ok := h.nonKeyLeases[keyName]
 	if !ok {
-		rec = &DataLeaseRecord{Records: make(map[string]*dataRecordEntry)}
-		h.dataLeases[keyName] = rec
+		rec = &NonKEYLeaseRecord{Records: make(map[string]*nonKeyRecordEntry)}
+		h.nonKeyLeases[keyName] = rec
 	}
 
 	// Merge: update or append each record by DNS RR identity key.
@@ -89,7 +89,7 @@ func (h *UpdateHandler) setDataLease(keyName string, records []dns.RR, leaseDura
 			existing.ExpiresAt = time.Now().Add(time.Duration(leaseDuration) * time.Second)
 		} else {
 			// New record: append.
-			rec.Records[key] = &dataRecordEntry{
+			rec.Records[key] = &nonKeyRecordEntry{
 				RR:            newRR,
 				ExpiresAt:     time.Now().Add(time.Duration(leaseDuration) * time.Second),
 				LeaseDuration: leaseDuration,
@@ -100,52 +100,52 @@ func (h *UpdateHandler) setDataLease(keyName string, records []dns.RR, leaseDura
 	rec.UpstreamZone = upstreamZone
 }
 
-// removeDataLease removes every non-KEY record owned by keyName outright.
+// removeNonKeyLease removes every non-KEY record owned by keyName outright.
 // There is no soft-delete state: a record is either present (active) or gone.
-func (h *UpdateHandler) removeDataLease(keyName string) {
+func (h *UpdateHandler) removeNonKeyLease(keyName string) {
 	if treeStore, ok := h.leaseManager.(leasepkg.LeaseTreeStore); ok {
 		treeStore.RemoveNonKEYRecords(keyName)
 		return
 	}
 
-	h.dataLeasesMu.Lock()
-	defer h.dataLeasesMu.Unlock()
+	h.nonKeyLeasesMu.Lock()
+	defer h.nonKeyLeasesMu.Unlock()
 	keyName = canonicalName(keyName)
-	delete(h.dataLeases, keyName)
+	delete(h.nonKeyLeases, keyName)
 }
 
-// removeSingleDataRecord removes one record (by its RFC 2136 identity key)
+// removeSingleNonKeyRecord removes one record (by its RFC 2136 identity key)
 // from keyName's set, leaving the rest of the set untouched. Used for
 // per-record expiry, where only one of several records under a key expires.
-func (h *UpdateHandler) removeSingleDataRecord(keyName, recordKeyStr string) {
+func (h *UpdateHandler) removeSingleNonKeyRecord(keyName, recordKeyStr string) {
 	if treeStore, ok := h.leaseManager.(leasepkg.LeaseTreeStore); ok {
 		treeStore.RemoveSingleNonKEYRecord(keyName, recordKeyStr)
 		return
 	}
 
-	h.dataLeasesMu.Lock()
-	defer h.dataLeasesMu.Unlock()
+	h.nonKeyLeasesMu.Lock()
+	defer h.nonKeyLeasesMu.Unlock()
 	keyName = canonicalName(keyName)
-	if rec, ok := h.dataLeases[keyName]; ok {
+	if rec, ok := h.nonKeyLeases[keyName]; ok {
 		delete(rec.Records, recordKeyStr)
 	}
 }
 
-func (h *UpdateHandler) getDataLease(keyName string) *DataLeaseRecord {
+func (h *UpdateHandler) getNonKeyLease(keyName string) *NonKEYLeaseRecord {
 	if treeStore, ok := h.leaseManager.(leasepkg.LeaseTreeStore); ok {
 		set := treeStore.GetNonKEYRecordSet(keyName)
 		if set == nil {
 			return nil
 		}
-		rec := &DataLeaseRecord{
-			Records:      make(map[string]*dataRecordEntry, len(set.Records)),
+		rec := &NonKEYLeaseRecord{
+			Records:      make(map[string]*nonKeyRecordEntry, len(set.Records)),
 			UpstreamZone: set.UpstreamZone,
 		}
 		for rrKey, node := range set.Records {
 			if node == nil {
 				continue
 			}
-			rec.Records[rrKey] = &dataRecordEntry{
+			rec.Records[rrKey] = &nonKeyRecordEntry{
 				RR:            copyRR(node.RR),
 				ExpiresAt:     node.ExpiresAt,
 				LeaseDuration: node.LeaseDuration,
@@ -154,15 +154,15 @@ func (h *UpdateHandler) getDataLease(keyName string) *DataLeaseRecord {
 		return rec
 	}
 
-	h.dataLeasesMu.RLock()
-	defer h.dataLeasesMu.RUnlock()
+	h.nonKeyLeasesMu.RLock()
+	defer h.nonKeyLeasesMu.RUnlock()
 	keyName = canonicalName(keyName)
-	rec, ok := h.dataLeases[keyName]
+	rec, ok := h.nonKeyLeases[keyName]
 	if !ok {
 		return nil
 	}
 	// Return a shallow copy of the entry map (pointers preserved).
-	return &DataLeaseRecord{
+	return &NonKEYLeaseRecord{
 		Records:       rec.Records,
 		ExpiresAt:     rec.ExpiresAt,
 		UpstreamZone:  rec.UpstreamZone,
@@ -170,14 +170,14 @@ func (h *UpdateHandler) getDataLease(keyName string) *DataLeaseRecord {
 	}
 }
 
-func (h *UpdateHandler) hasActiveDataRecord(keyName string, rr dns.RR) bool {
+func (h *UpdateHandler) hasActiveNonKeyRecord(keyName string, rr dns.RR) bool {
 	if rr == nil {
 		return false
 	}
 	if treeStore, ok := h.leaseManager.(leasepkg.LeaseTreeStore); ok {
 		return treeStore.HasActiveNonKEYRecord(keyName, rr)
 	}
-	rec := h.getDataLease(keyName)
+	rec := h.getNonKeyLease(keyName)
 	if rec == nil {
 		return false
 	}
@@ -197,8 +197,8 @@ func (h *UpdateHandler) nextLeaseEventAfter(keyName string) (time.Duration, bool
 		next = &t
 	}
 
-	if dataRec := h.getDataLease(keyName); dataRec != nil {
-		for _, entry := range dataRec.Records {
+	if nonKeyRec := h.getNonKeyLease(keyName); nonKeyRec != nil {
+		for _, entry := range nonKeyRec.Records {
 			t := entry.ExpiresAt
 			if next == nil || t.Before(*next) {
 				next = &t
@@ -286,9 +286,9 @@ func (h *UpdateHandler) reconcileLeaseTimers() {
 }
 
 type leaseDumpNode struct {
-	keyRec   *leasepkg.Record
-	dataRec  *DataLeaseRecord
-	children []string
+	keyRec    *leasepkg.Record
+	nonKeyRec *NonKEYLeaseRecord
+	children  []string
 }
 
 func valueOrNone(value string) string {
@@ -339,24 +339,24 @@ func (h *UpdateHandler) dumpLeaseTreeLevel() string {
 			if set == nil {
 				continue
 			}
-			rec := &DataLeaseRecord{
-				Records:      make(map[string]*dataRecordEntry, len(set.Records)),
+			rec := &NonKEYLeaseRecord{
+				Records:      make(map[string]*nonKeyRecordEntry, len(set.Records)),
 				UpstreamZone: set.UpstreamZone,
 			}
 			for rrKey, entry := range set.Records {
 				if entry == nil {
 					continue
 				}
-				rec.Records[rrKey] = &dataRecordEntry{
+				rec.Records[rrKey] = &nonKeyRecordEntry{
 					RR:            copyRR(entry.RR),
 					ExpiresAt:     entry.ExpiresAt,
 					LeaseDuration: entry.LeaseDuration,
 				}
 			}
-			node.dataRec = rec
+			node.nonKeyRec = rec
 		}
 	} else {
-		for name, rec := range h.dataLeases {
+		for name, rec := range h.nonKeyLeases {
 			if rec == nil {
 				continue
 			}
@@ -364,7 +364,7 @@ func (h *UpdateHandler) dumpLeaseTreeLevel() string {
 			if node == nil {
 				continue
 			}
-			node.dataRec = rec
+			node.nonKeyRec = rec
 		}
 	}
 
@@ -374,15 +374,15 @@ func (h *UpdateHandler) dumpLeaseTreeLevel() string {
 	}
 
 	rootsByZone := make(map[string][]string)
-	orphanDataOnly := make([]string, 0)
+	orphanNonKeyOnly := make([]string, 0)
 
 	for name, node := range nodes {
 		if node == nil {
 			continue
 		}
 		if node.keyRec == nil {
-			if node.dataRec != nil {
-				orphanDataOnly = append(orphanDataOnly, name)
+			if node.nonKeyRec != nil {
+				orphanNonKeyOnly = append(orphanNonKeyOnly, name)
 			}
 			continue
 		}
@@ -426,20 +426,20 @@ func (h *UpdateHandler) dumpLeaseTreeLevel() string {
 			sb.WriteString(fmt.Sprintf("%s  RegisteredAt: %s\n", indent, node.keyRec.RegisteredAt.Format(time.RFC3339)))
 			sb.WriteString(fmt.Sprintf("%s  IsExpired: %v\n", indent, node.keyRec.IsExpired()))
 		} else {
-			sb.WriteString(fmt.Sprintf("%sData-only lease: %s\n", indent, name))
+			sb.WriteString(fmt.Sprintf("%sNon-KEY-only lease: %s\n", indent, name))
 		}
 
-		if node.dataRec != nil {
-			sb.WriteString(fmt.Sprintf("%s  Data lease:\n", indent))
-			if len(node.dataRec.Records) > 0 {
+		if node.nonKeyRec != nil {
+			sb.WriteString(fmt.Sprintf("%s  Non-KEY lease:\n", indent))
+			if len(node.nonKeyRec.Records) > 0 {
 				sb.WriteString(fmt.Sprintf("%s    Records:\n", indent))
-				recordKeys := make([]string, 0, len(node.dataRec.Records))
-				for rk := range node.dataRec.Records {
+				recordKeys := make([]string, 0, len(node.nonKeyRec.Records))
+				for rk := range node.nonKeyRec.Records {
 					recordKeys = append(recordKeys, rk)
 				}
 				sort.Strings(recordKeys)
 				for _, rk := range recordKeys {
-					entry := node.dataRec.Records[rk]
+					entry := node.nonKeyRec.Records[rk]
 					if entry == nil {
 						continue
 					}
@@ -451,7 +451,7 @@ func (h *UpdateHandler) dumpLeaseTreeLevel() string {
 			} else {
 				sb.WriteString(fmt.Sprintf("%s    Records: (none)\n", indent))
 			}
-			sb.WriteString(fmt.Sprintf("%s    UpstreamZone: %s\n", indent, valueOrNone(node.dataRec.UpstreamZone)))
+			sb.WriteString(fmt.Sprintf("%s    UpstreamZone: %s\n", indent, valueOrNone(node.nonKeyRec.UpstreamZone)))
 		}
 
 		if len(node.children) > 0 {
@@ -472,10 +472,10 @@ func (h *UpdateHandler) dumpLeaseTreeLevel() string {
 		}
 	}
 
-	if len(orphanDataOnly) > 0 {
-		sort.Strings(orphanDataOnly)
+	if len(orphanNonKeyOnly) > 0 {
+		sort.Strings(orphanNonKeyOnly)
 		sb.WriteString("Orphan data leases:\n")
-		for _, name := range orphanDataOnly {
+		for _, name := range orphanNonKeyOnly {
 			writeNode(name, "  ")
 		}
 	}
@@ -496,7 +496,7 @@ func (h *UpdateHandler) dumpLeaseTreeLevel() string {
 //	  KeyLeaseDuration: <seconds>s
 //	  UpstreamZone: <zone>
 //	  RegisteredAt: <time>
-//	Data lease: <keyName>
+//	Non-KEY lease: <keyName>
 //	  Records:
 //	    <recordKey>
 //	      RR: <dns.RR string>
@@ -509,11 +509,11 @@ func (h *UpdateHandler) dumpLeaseTreeLevel() string {
 // INFO format (summary):
 //
 //	=== Lease Store Summary ===
-//	Key: <keyName>  KEY=<active|expired|absent>  Data=<count>  Status=<active|empty|absent>
+//	Key: <keyName>  KEY=<active|expired|absent>  NonKEY=<count>  Status=<active|empty|absent>
 //
-// Keys that appear only in the KEY lease (no data lease) represent KEY-only registrations.
-// Keys that appear only in the data lease (no KEY lease) represent data-only refreshes.
-// Keys that appear in both have an active KEY + data RR lease.
+// Keys that appear only in the KEY lease (no non-KEY lease) represent KEY-only registrations.
+// Keys that appear only in the non-KEY lease (no KEY lease) represent non-KEY-only refreshes.
+// Keys that appear in both have an active KEY + non-KEY RR lease.
 func (h *UpdateHandler) DumpLeasesLevel(level string) string {
 	// Normalize level.
 	lower := strings.ToLower(strings.TrimSpace(level))
@@ -523,9 +523,9 @@ func (h *UpdateHandler) DumpLeasesLevel(level string) string {
 	h.leaseTimersMu.Lock()
 	defer h.leaseTimersMu.Unlock()
 
-	// Lock data leases for consistent snapshot.
-	h.dataLeasesMu.RLock()
-	defer h.dataLeasesMu.RUnlock()
+	// Lock non-KEY leases for consistent snapshot.
+	h.nonKeyLeasesMu.RLock()
+	defer h.nonKeyLeasesMu.RUnlock()
 
 	if isDebug {
 		return h.dumpLeaseTreeLevel()
@@ -533,7 +533,7 @@ func (h *UpdateHandler) DumpLeasesLevel(level string) string {
 
 	var sb strings.Builder
 
-	// Collect all node keys from both stores. Get/getDataLease are keyed by
+	// Collect all node keys from both stores. Get/getNonKeyLease are keyed by
 	// the composite NodeKey (name.+algo+tag), not the plain DNS owner name,
 	// so that is what must be collected here for the lookups below to find
 	// anything.
@@ -544,7 +544,7 @@ func (h *UpdateHandler) DumpLeasesLevel(level string) string {
 		}
 		keyNames[leasepkg.NodeKey(rec.KeyRR)] = true
 	}
-	for name := range h.dataLeases {
+	for name := range h.nonKeyLeases {
 		keyNames[name] = true
 	}
 
@@ -569,7 +569,7 @@ func (h *UpdateHandler) DumpLeasesLevel(level string) string {
 
 	for _, name := range sortedNames {
 		keyRec := h.leaseManager.Get(name)
-		dataRec := h.getDataLease(name)
+		nonKeyRec := h.getNonKeyLease(name)
 
 		// Determine key status.
 		keyStatus := "absent"
@@ -581,21 +581,21 @@ func (h *UpdateHandler) DumpLeasesLevel(level string) string {
 			}
 		}
 
-		// Count live data records. A record's presence is what defines
+		// Count live non-KEY records. A record's presence is what defines
 		// "active" — deleted or expired records are removed, not flagged.
-		dataCount := 0
-		dataStatus := "absent"
-		if dataRec != nil {
-			dataCount = len(dataRec.Records)
-			if dataCount > 0 {
-				dataStatus = "active"
+		nonKeyCount := 0
+		nonKeyStatus := "absent"
+		if nonKeyRec != nil {
+			nonKeyCount = len(nonKeyRec.Records)
+			if nonKeyCount > 0 {
+				nonKeyStatus = "active"
 			} else {
-				dataStatus = "empty"
+				nonKeyStatus = "empty"
 			}
 		}
 
-		sb.WriteString(fmt.Sprintf("Key: %-40s KEY=%-8s Data=%d  Status=%s\n",
-			name, keyStatus, dataCount, dataStatus))
+		sb.WriteString(fmt.Sprintf("Key: %-40s KEY=%-8s NonKEY=%d  Status=%s\n",
+			name, keyStatus, nonKeyCount, nonKeyStatus))
 	}
 
 	return sb.String()
@@ -611,25 +611,25 @@ func (h *UpdateHandler) processExpiredLease(ctx context.Context, nodeKey string)
 	defer h.scheduleLeaseExpiry(nodeKey)
 
 	record := h.leaseManager.Get(nodeKey)
-	dataLease := h.getDataLease(nodeKey)
-	if record == nil && (dataLease == nil || len(dataLease.Records) == 0) {
+	nonKeyLease := h.getNonKeyLease(nodeKey)
+	if record == nil && (nonKeyLease == nil || len(nonKeyLease.Records) == 0) {
 		h.clearLeaseTimer(nodeKey)
 		return
 	}
 
 	now := time.Now()
 
-	// Per-record expiry: expire each expired data record individually. A
+	// Per-record expiry: expire each expired non-KEY record individually. A
 	// record is only removed locally once its upstream delete has actually
 	// succeeded (or there was nothing to send it with in the first place);
 	// on failure it stays tracked with its already-past ExpiresAt, so the
 	// timer this function reschedules on every exit (see defer above) retries
 	// it on the next tick instead of silently forgetting a record that is
 	// still published at authoritative DNS.
-	if dataLease != nil {
-		effectiveZone := dataLease.UpstreamZone
+	if nonKeyLease != nil {
+		effectiveZone := nonKeyLease.UpstreamZone
 		if dc, ok := h.upstreamCoordinator.(*DefaultUpstreamCoordinator); ok {
-			resolvedZone, err := dc.resolveAuthoritativeZone(ctx, dataLease.UpstreamZone)
+			resolvedZone, err := dc.resolveAuthoritativeZone(ctx, nonKeyLease.UpstreamZone)
 			if err == nil {
 				effectiveZone = resolvedZone
 			}
@@ -637,30 +637,30 @@ func (h *UpdateHandler) processExpiredLease(ctx context.Context, nodeKey string)
 
 		var signingKey *keyrec.LoadedKey
 		if h.upstreamCoordinator != nil {
-			resolvedKey, matchedKeyZone, err := h.findAuthorizedProxyKeyForZone(dataLease.UpstreamZone)
+			resolvedKey, matchedKeyZone, err := h.findAuthorizedProxyKeyForZone(nonKeyLease.UpstreamZone)
 			if err != nil {
-				h.logger.Debugf("Failed to resolve proxy authorization key for data lease-expiry deletes in zone %s: %v", dataLease.UpstreamZone, err)
+				h.logger.Debugf("Failed to resolve proxy authorization key for non-KEY lease-expiry deletes in zone %s: %v", nonKeyLease.UpstreamZone, err)
 			} else {
 				signingKey = resolvedKey
-				h.logger.Debugf("Resolved proxy authorization key for data lease-expiry deletes in zone %s from key zone %s", dataLease.UpstreamZone, matchedKeyZone)
+				h.logger.Debugf("Resolved proxy authorization key for non-KEY lease-expiry deletes in zone %s from key zone %s", nonKeyLease.UpstreamZone, matchedKeyZone)
 			}
 		}
 
-		for key, entry := range dataLease.Records {
+		for key, entry := range nonKeyLease.Records {
 			if !now.Before(entry.ExpiresAt) {
 				upstreamDeleted := true
 				if h.upstreamCoordinator != nil && signingKey != nil {
 					deleteMsg, err := h.constructUpstreamDeleteForRecords([]dns.RR{entry.RR}, signingKey, effectiveZone)
 					if err != nil {
-						h.logger.Warnf("Failed to construct upstream data lease-expiry delete for %s record %s: %v (will retry)", nodeKey, key, err)
+						h.logger.Warnf("Failed to construct upstream non-KEY lease-expiry delete for %s record %s: %v (will retry)", nodeKey, key, err)
 						upstreamDeleted = false
 					} else if _, err := h.upstreamCoordinator.SendUpdate(ctx, effectiveZone, deleteMsg); err != nil {
-						h.logger.Warnf("Upstream data lease-expiry delete failed for %s record %s: %v (will retry)", nodeKey, key, err)
+						h.logger.Warnf("Upstream non-KEY lease-expiry delete failed for %s record %s: %v (will retry)", nodeKey, key, err)
 						upstreamDeleted = false
 					}
 				}
 				if upstreamDeleted {
-					h.removeSingleDataRecord(nodeKey, key)
+					h.removeSingleNonKeyRecord(nodeKey, key)
 				}
 			}
 		}
@@ -687,30 +687,30 @@ func (h *UpdateHandler) processExpiredLease(ctx context.Context, nodeKey string)
 	// record is only forgotten locally once its upstream delete actually
 	// succeeds -- the deferred scheduleLeaseExpiry still retries it later
 	// even though the KEY itself may already be gone.
-	if dataLease != nil {
-		effectiveDataZone := dataLease.UpstreamZone
+	if nonKeyLease != nil {
+		effectiveNonKeyZone := nonKeyLease.UpstreamZone
 		if dc, ok := h.upstreamCoordinator.(*DefaultUpstreamCoordinator); ok {
-			if resolved, err := dc.resolveAuthoritativeZone(ctx, dataLease.UpstreamZone); err == nil {
-				effectiveDataZone = resolved
+			if resolved, err := dc.resolveAuthoritativeZone(ctx, nonKeyLease.UpstreamZone); err == nil {
+				effectiveNonKeyZone = resolved
 			}
 		}
 		var catchupSigningKey *keyrec.LoadedKey
 		if h.upstreamCoordinator != nil {
-			resolvedKey, _, err := h.findAuthorizedProxyKeyForZone(dataLease.UpstreamZone)
+			resolvedKey, _, err := h.findAuthorizedProxyKeyForZone(nonKeyLease.UpstreamZone)
 			if err != nil {
-				h.logger.Warnf("Failed to resolve proxy authorization key for data lease-expiry deletes on KEY expiry in zone %s: %v (will retry)", dataLease.UpstreamZone, err)
+				h.logger.Warnf("Failed to resolve proxy authorization key for non-KEY lease-expiry deletes on KEY expiry in zone %s: %v (will retry)", nonKeyLease.UpstreamZone, err)
 			} else {
 				catchupSigningKey = resolvedKey
 			}
 		}
-		for key, entry := range dataLease.Records {
+		for key, entry := range nonKeyLease.Records {
 			upstreamDeleted := true
 			if h.upstreamCoordinator != nil && catchupSigningKey != nil {
-				deleteMsg, err := h.constructUpstreamDeleteForRecords([]dns.RR{entry.RR}, catchupSigningKey, effectiveDataZone)
+				deleteMsg, err := h.constructUpstreamDeleteForRecords([]dns.RR{entry.RR}, catchupSigningKey, effectiveNonKeyZone)
 				if err != nil {
 					h.logger.Warnf("Failed to construct upstream delete for %s record %s on KEY expiry: %v (will retry)", nodeKey, key, err)
 					upstreamDeleted = false
-				} else if _, err := h.upstreamCoordinator.SendUpdate(ctx, effectiveDataZone, deleteMsg); err != nil {
+				} else if _, err := h.upstreamCoordinator.SendUpdate(ctx, effectiveNonKeyZone, deleteMsg); err != nil {
 					h.logger.Warnf("Upstream delete failed for %s record %s on KEY expiry: %v (will retry)", nodeKey, key, err)
 					upstreamDeleted = false
 				}
@@ -720,7 +720,7 @@ func (h *UpdateHandler) processExpiredLease(ctx context.Context, nodeKey string)
 				upstreamDeleted = false
 			}
 			if upstreamDeleted {
-				h.removeSingleDataRecord(nodeKey, key)
+				h.removeSingleNonKeyRecord(nodeKey, key)
 			}
 		}
 	}
@@ -766,41 +766,41 @@ func (h *UpdateHandler) processExpiredLease(ctx context.Context, nodeKey string)
 	if err := h.leaseManager.Delete(nodeKey); err != nil {
 		h.logger.Warnf("Failed to delete expired local lease for %s: %v (upstream KEY delete already succeeded, local state may now diverge)", nodeKey, err)
 	}
-	// Not a blanket removeDataLease(nodeKey): the two loops above already
+	// Not a blanket removeNonKeyLease(nodeKey): the two loops above already
 	// removed each record they confirmed deleted upstream, one at a time.
 	// Wiping the whole set here would also discard any record that failed
 	// its upstream delete and is waiting on the rescheduled timer to retry.
 	h.clearLeaseTimer(nodeKey)
 }
 
-// deleteNodeDataUpstream sends upstream DNS deletes for a node's own non-KEY
+// deleteNodeNonKeyUpstream sends upstream DNS deletes for a node's own non-KEY
 // records only (no KEY involved). Split out of deleteNodeUpstream so a
 // caller that has already deleted the node's KEY RR upstream itself (Case C)
 // doesn't also pay for a redundant, no-op re-delete of that same KEY RR --
 // each upstream delete is a real network round trip to the authoritative
 // server, and doubling them raises the odds of a timeout/SERVFAIL for no
 // benefit. Failures are logged instead of silently discarded.
-func (h *UpdateHandler) deleteNodeDataUpstream(ctx context.Context, nodeKey string) {
-	dataLease := h.getDataLease(nodeKey)
-	if dataLease == nil {
+func (h *UpdateHandler) deleteNodeNonKeyUpstream(ctx context.Context, nodeKey string) {
+	nonKeyLease := h.getNonKeyLease(nodeKey)
+	if nonKeyLease == nil {
 		return
 	}
 
-	effectiveZone := dataLease.UpstreamZone
+	effectiveZone := nonKeyLease.UpstreamZone
 	if dc, ok := h.upstreamCoordinator.(*DefaultUpstreamCoordinator); ok {
-		if resolved, err := dc.resolveAuthoritativeZone(ctx, dataLease.UpstreamZone); err == nil {
+		if resolved, err := dc.resolveAuthoritativeZone(ctx, nonKeyLease.UpstreamZone); err == nil {
 			effectiveZone = resolved
 		}
 	}
 	if h.upstreamCoordinator == nil {
 		return
 	}
-	signingKey, _, err := h.findAuthorizedProxyKeyForZone(dataLease.UpstreamZone)
+	signingKey, _, err := h.findAuthorizedProxyKeyForZone(nonKeyLease.UpstreamZone)
 	if err != nil {
-		h.logger.Warnf("Failed to resolve proxy authorization key for %s data deletes in zone %s: %v (local state will still be forgotten)", nodeKey, dataLease.UpstreamZone, err)
+		h.logger.Warnf("Failed to resolve proxy authorization key for %s non-KEY deletes in zone %s: %v (local state will still be forgotten)", nodeKey, nonKeyLease.UpstreamZone, err)
 		return
 	}
-	for key, entry := range dataLease.Records {
+	for key, entry := range nonKeyLease.Records {
 		deleteMsg, err := h.constructUpstreamDeleteForRecords([]dns.RR{entry.RR}, signingKey, effectiveZone)
 		if err != nil {
 			h.logger.Warnf("Failed to construct upstream delete for %s record %s: %v (local state will still be forgotten)", nodeKey, key, err)
@@ -820,7 +820,7 @@ func (h *UpdateHandler) deleteNodeDataUpstream(ctx context.Context, nodeKey stri
 // descendant's records orphaned upstream with no local record to retry from.
 // Failures are now at least logged instead of silently discarded.
 func (h *UpdateHandler) deleteNodeUpstream(ctx context.Context, nodeKey string) {
-	h.deleteNodeDataUpstream(ctx, nodeKey)
+	h.deleteNodeNonKeyUpstream(ctx, nodeKey)
 
 	record := h.leaseManager.Get(nodeKey)
 	if record != nil && record.KeyRR != nil && h.upstreamCoordinator != nil {

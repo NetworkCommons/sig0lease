@@ -183,7 +183,7 @@ func (h *UpdateHandler) Handle(ctx context.Context, w dns.ResponseWriter, r *dns
 							if err := h.registerKeyLease(ctx, keyIDFromSIG(sigRR), pendingKeyRR, pendingKeyLease, pendingKeyLease); err != nil {
 								return err
 							}
-							h.setDataLease(leasepkg.NodeKey(pendingKeyRR), pendingRecords, leaseDuration, h.upstreamZone)
+							h.setNonKeyLease(leasepkg.NodeKey(pendingKeyRR), pendingRecords, leaseDuration, h.upstreamZone)
 							h.scheduleLeaseExpiry(leasepkg.NodeKey(pendingKeyRR))
 							h.logger.Debugf("Lease re-registered for %s (KEY-LEASE != 0, key missing at FQDN, remaining key lease=%d)", pendingKeyName, pendingKeyLease)
 							return nil
@@ -212,10 +212,10 @@ func (h *UpdateHandler) Handle(ctx context.Context, w dns.ResponseWriter, r *dns
 							// Upsert rather than refresh-only: scopedOtherRecords may
 							// include a non-KEY RR that is new to this key even though
 							// the key itself is being refreshed.
-							h.setDataLease(leasepkg.NodeKey(pendingKeyRR), pendingRecords, leaseDuration, h.upstreamZone)
+							h.setNonKeyLease(leasepkg.NodeKey(pendingKeyRR), pendingRecords, leaseDuration, h.upstreamZone)
 						}
 						h.scheduleLeaseExpiry(leasepkg.NodeKey(pendingKeyRR))
-						h.logger.Debugf("Lease refreshed for %s (data lease=%d seconds)", pendingKeyName, leaseDuration)
+						h.logger.Debugf("Lease refreshed for %s (non-KEY lease=%d seconds)", pendingKeyName, leaseDuration)
 						return nil
 					},
 				})
@@ -261,7 +261,7 @@ func (h *UpdateHandler) Handle(ctx context.Context, w dns.ResponseWriter, r *dns
 							return err
 						}
 						if len(pendingRecords) > 0 {
-							h.setDataLease(leasepkg.NodeKey(pendingKeyRR), pendingRecords, leaseDuration, h.upstreamZone)
+							h.setNonKeyLease(leasepkg.NodeKey(pendingKeyRR), pendingRecords, leaseDuration, h.upstreamZone)
 						}
 						h.scheduleLeaseExpiry(leasepkg.NodeKey(pendingKeyRR))
 						return nil
@@ -299,7 +299,7 @@ func (h *UpdateHandler) Handle(ctx context.Context, w dns.ResponseWriter, r *dns
 				pendingMutations = append(pendingMutations, pendingLeaseMutation{
 					keyName: signerNodeKey,
 					apply: func() error {
-						h.setDataLease(signerNodeKey, acceptedRecords, leaseDuration, h.upstreamZone)
+						h.setNonKeyLease(signerNodeKey, acceptedRecords, leaseDuration, h.upstreamZone)
 						h.scheduleLeaseExpiry(signerNodeKey)
 						return nil
 					},
@@ -309,23 +309,23 @@ func (h *UpdateHandler) Handle(ctx context.Context, w dns.ResponseWriter, r *dns
 			}
 		}
 	} else if keyLeaseDuration == 0 && leaseDuration != 0 {
-		// Case B: data-only registration/refresh.
+		// Case B: non-KEY-only registration/refresh.
 		if len(updateOtherRRs) == 0 {
 			msg := h.makeErrorResponse(r, dns.RcodeRefused,
 				"KEY-LEASE=0 and LEASE!=0 requires at least one non-KEY RR")
-			return NewErrorResult(msg, "invalid data-only lease request", fmt.Errorf("no non-KEY RR present"))
+			return NewErrorResult(msg, "invalid non-KEY-only lease request", fmt.Errorf("no non-KEY RR present"))
 		}
 		if len(updateKeyRRs) > 0 {
 			msg := h.makeErrorResponse(r, dns.RcodeRefused,
 				"KEY-LEASE=0 and LEASE!=0 does not allow KEY RRs in Update section")
-			return NewErrorResult(msg, "invalid data-only lease request", fmt.Errorf("unexpected KEY RR in data-only lease request"))
+			return NewErrorResult(msg, "invalid non-KEY-only lease request", fmt.Errorf("unexpected KEY RR in non-KEY-only lease request"))
 		}
 
 		signerLease := h.leaseManager.LookupBySIG(sigRR.SignerName, sigRR.Algorithm, sigRR.KeyTag)
 		if signerLease == nil {
 			msg := h.makeErrorResponse(r, dns.RcodeRefused,
 				"KEY-LEASE=0 and LEASE!=0 requires signing KEY to already be managed")
-			return NewErrorResult(msg, "signing key not managed for data-only lease", fmt.Errorf("signing key not found in lease store"))
+			return NewErrorResult(msg, "signing key not managed for non-KEY-only lease", fmt.Errorf("signing key not found in lease store"))
 		}
 
 		signerOwnerKey := leasepkg.NodeKey(signerKey)
@@ -364,7 +364,7 @@ func (h *UpdateHandler) Handle(ctx context.Context, w dns.ResponseWriter, r *dns
 			pendingMutations = append(pendingMutations, pendingLeaseMutation{
 				keyName: signerOwnerKey,
 				apply: func() error {
-					h.setDataLease(signerOwnerKey, acceptedRecords, leaseDuration, h.upstreamZone)
+					h.setNonKeyLease(signerOwnerKey, acceptedRecords, leaseDuration, h.upstreamZone)
 					h.scheduleLeaseExpiry(signerOwnerKey)
 					return nil
 				},
@@ -378,25 +378,36 @@ func (h *UpdateHandler) Handle(ctx context.Context, w dns.ResponseWriter, r *dns
 		// local lease store, for records we actually manage; records that
 		// aren't found locally are reported via a note but otherwise ignored
 		// (protocol.md item 7).
+		//
+		// Authorization is ownership-based, not just DNS-name hierarchy: a
+		// record (KEY or non-KEY) may only be deleted by its immediate
+		// parent -- the KEY that registered it -- or by itself in the case
+		// of a self-registered (root) KEY, which has no parent to defer to.
+		// A signer merely hierarchically "at or above" a record it did not
+		// itself register cannot delete it directly; it can only reach that
+		// data by deleting the record's actual parent, which cascades.
 		if len(updateKeyRRs) == 0 && len(updateOtherRRs) == 0 {
 			msg := h.makeErrorResponse(r, dns.RcodeFormatError,
 				"KEY-LEASE=0 and LEASE=0 requires at least one KEY RR or one non-KEY RR")
 			return NewErrorResult(msg, "invalid delete request", fmt.Errorf("no records present for delete"))
 		}
 
+		signerOwnerKey := leasepkg.NodeKey(signerKey)
+
 		keysToDelete := make([]*dns.KEY, 0, len(updateKeyRRs))
 		for _, keyRR := range updateKeyRRs {
-			if h.leaseManager.LookupByKEY(keyRR) == nil {
+			existing := h.leaseManager.LookupByKEY(keyRR)
+			isSelf := keyIDFromKEY(keyRR) == signerID
+			if existing == nil || (!isSelf && existing.ParentKeyName != signerOwnerKey) {
 				allNotes = append(allNotes, fmt.Sprintf("KEY %s not found for delete", keyRR.Hdr.Name))
 				continue
 			}
 			keysToDelete = append(keysToDelete, keyRR)
 		}
 
-		signerOwnerKey := leasepkg.NodeKey(signerKey)
 		recordsToDelete := make([]dns.RR, 0, len(updateOtherRRs))
 		for _, rr := range updateOtherRRs {
-			if !h.hasActiveDataRecord(signerOwnerKey, rr) {
+			if !h.hasActiveNonKeyRecord(signerOwnerKey, rr) {
 				allNotes = append(allNotes, fmt.Sprintf("record not found for delete: %s", rr.String()))
 				continue
 			}
@@ -451,7 +462,7 @@ func (h *UpdateHandler) Handle(ctx context.Context, w dns.ResponseWriter, r *dns
 			if hs, ok := h.leaseManager.(leasepkg.HierarchicalLeaseStore); ok {
 				for _, childKey := range hs.ListSubtreeKeys(nodeKey) {
 					h.deleteNodeUpstream(ctx, childKey)
-					h.removeDataLease(childKey)
+					h.removeNonKeyLease(childKey)
 					h.clearLeaseTimer(childKey)
 				}
 			}
@@ -459,25 +470,25 @@ func (h *UpdateHandler) Handle(ctx context.Context, w dns.ResponseWriter, r *dns
 			// KEY nodes) must be cleaned up upstream here too, or it is
 			// forgotten locally but never removed from the authoritative DNS
 			// server -- the same divergence processExpiredLease already
-			// guards against on lease-expiry. Data-only, not the full
+			// guards against on lease-expiry. Non-KEY-only, not the full
 			// deleteNodeUpstream: the KEY RR was already deleted upstream
 			// above, so re-deleting it here would just be a second, redundant
 			// round trip to the real authoritative server for no benefit.
-			h.deleteNodeDataUpstream(ctx, nodeKey)
+			h.deleteNodeNonKeyUpstream(ctx, nodeKey)
 			if err := h.leaseManager.Delete(nodeKey); err != nil {
 				h.logger.Warnf("Failed to delete key lease for %s: %v (upstream delete already succeeded, local state may now diverge)", keyRR.Hdr.Name, err)
 			}
-			h.removeDataLease(nodeKey)
+			h.removeNonKeyLease(nodeKey)
 			h.clearLeaseTimer(nodeKey)
 			h.logger.Debugf("Deleted key for %s (KEY-LEASE=0, LEASE=0)", keyRR.Hdr.Name)
 		}
 		// Remove only the specific records that were actually deleted
-		// upstream above -- removeDataLease(signerOwnerKey) would wipe the
+		// upstream above -- removeNonKeyLease(signerOwnerKey) would wipe the
 		// owner's *entire* non-KEY record set locally, silently forgetting
 		// (and thus orphaning upstream forever) any other records under the
 		// same owner that this request never asked to delete.
 		for _, rr := range recordsToDelete {
-			h.removeSingleDataRecord(signerOwnerKey, recordKey(rr))
+			h.removeSingleNonKeyRecord(signerOwnerKey, recordKey(rr))
 		}
 
 		return NewProcessedResult(h.buildSuccessResponse(r, zone, allNotes, nil, leaseDuration, keyLeaseDuration))
@@ -504,7 +515,7 @@ func (h *UpdateHandler) Handle(ctx context.Context, w dns.ResponseWriter, r *dns
 			notes := make([]string, 0)
 			if len(scopedOtherRecords) > 0 {
 				for _, rr := range scopedOtherRecords {
-					if !h.hasActiveDataRecord(leasepkg.NodeKey(keyRR), rr) {
+					if !h.hasActiveNonKeyRecord(leasepkg.NodeKey(keyRR), rr) {
 						notes = append(notes, fmt.Sprintf("record not found for delete: %s", rr.String()))
 					}
 				}
@@ -564,7 +575,7 @@ func (h *UpdateHandler) Handle(ctx context.Context, w dns.ResponseWriter, r *dns
 						return err
 					}
 					if len(pendingRecords) > 0 {
-						h.removeDataLease(leasepkg.NodeKey(pendingKeyRR))
+						h.removeNonKeyLease(leasepkg.NodeKey(pendingKeyRR))
 					}
 					h.scheduleLeaseExpiry(leasepkg.NodeKey(pendingKeyRR))
 					return nil

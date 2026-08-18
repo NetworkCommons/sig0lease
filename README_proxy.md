@@ -98,7 +98,7 @@ LEASE and KEY-LEASE together select one of four behavioral cases:
 | Case | KEY-LEASE | LEASE | Behavior |
 |---|---|---|---|
 | A | Non-zero | Non-zero | Full registration/refresh of a KEY RR and its non-KEY RRs together. |
-| B | 0 | Non-zero | Data-only registration/refresh; the signing KEY must already be managed. |
+| B | 0 | Non-zero | Non-KEY-only registration/refresh; the signing KEY must already be managed. |
 | C | 0 | 0 | Delete: removes whichever of the named KEY/non-KEY RRs are actually locally managed. |
 | D | Non-zero | 0 | KEY-only registration/refresh, with optional deletion of accompanying non-KEY RRs. |
 
@@ -118,7 +118,7 @@ The first candidate that cryptographically verifies the signature is used. If ve
 
 An online-only signer can always be used to authenticate a request — SIG(0) verification does not depend on the flag. What the signer is subsequently *allowed to do* does:
 
-- **Deletes (Case C)** are governed purely by DNS-name hierarchy, independent of this flag: any signer at or above a managed record's name can delete it.
+- **Deletes (Case C)** are ownership-based, independent of this flag: a record (KEY or non-KEY) may only be deleted by its immediate parent — the KEY that registered it — or, for a self-registered (root) KEY with no parent of its own, by itself. Hierarchy alone is not enough: a signer that is merely at or above a record's name by DNS naming, but is not the record's actual `ParentKeyName`, cannot delete it directly. Such a signer can still remove the data, but only indirectly, by deleting the record's true parent, which cascades (see "Upstream Forwarding and Write Ordering" below).
 - **Authoring new lease-store state** — a new KEY RR, or non-KEY RRs owned by the signer — requires the signer to be either already lease-managed, itself present in the Update section (a normal self-registration), or, if `allow_online_key_registration: true` is configured for the handler, an online-only signer. This is one policy (`UpdateHandler.signerAuthorizedForNewRegistration`) applied identically to KEY and non-KEY registration in Case A and Case D; it is not KEY-RR-specific. Default is `false` (fail closed).
 
 When an online-only signer registers a *different* KEY RR than itself (e.g. delegating a new child key it will never itself be lease-managed under), any non-KEY RRs in the same request are still attached to the **signer's own node** per the rule below — including when that node has no backing KEY record (a signer that is deliberately never self-registered). The lease store permits this "phantom owner" for non-KEY records the same way it already permits a KEY RR's `ParentKeyName` to reference a node that has no record of its own.
@@ -139,7 +139,7 @@ Additional rules:
 - **Refresh ownership check:** before treating a KEY RR as a refresh of an existing lease, `UpdateHandler.validateRefreshOwnership` compares the *actual* stored KEY RDATA (flags, protocol, algorithm, public key) against the one in the request. The lease store's node key is a composite of name + algorithm + key tag, which is not collision-free (the key tag is a 16-bit checksum); this check is what makes ownership verification exact rather than relying on the composite key alone.
 - **Missing-at-FQDN recovery:** if a signer's managed KEY is found to be missing at the authoritative DNS (Cases A, B, D), the proxy re-registers it with whatever lease time remains in the local store, rather than granting a fresh full-duration lease or failing the request outright.
 - **Duplicate registration rejection:** before treating a KEY or non-KEY RR as a *new* registration, the proxy checks whether an identical record already exists at the authoritative DNS. If so, the request fails — this applies uniformly to every case that can register something new (Cases A and D for KEY RRs; Cases A and B for non-KEY RRs), not only to the KEY-RR path.
-- **Delete semantics (Case C):** for each named KEY or non-KEY RR, if it is not found in the local lease store, the request does not fail — a note is returned informing the client, and that record is excluded from both the local delete and the upstream delete. Only records actually found locally are included in the upstream delete request.
+- **Delete semantics (Case C):** for each named KEY or non-KEY RR, if it is not found in the local lease store *or* the signer is not its immediate parent (nor, for a KEY RR, the record itself), the request does not fail — a note identical to the not-found case ("... not found for delete") is returned informing the client, and that record is excluded from both the local delete and the upstream delete. This deliberately does not distinguish "doesn't exist" from "exists but you don't own it," so a delete attempt cannot be used to probe for the existence of records outside the signer's own subtree. Only records the signer is actually authorized to delete are included in the upstream delete request.
 
 ### Upstream Forwarding and Write Ordering
 

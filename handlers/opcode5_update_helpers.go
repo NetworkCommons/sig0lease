@@ -562,7 +562,7 @@ func (h *UpdateHandler) filterDuplicateRegistrations(ctx context.Context, keyNam
 		if rr == nil || rr.Header() == nil {
 			continue
 		}
-		if h.hasActiveDataRecord(keyName, rr) {
+		if h.hasActiveNonKeyRecord(keyName, rr) {
 			accepted = append(accepted, rr)
 			continue
 		}
