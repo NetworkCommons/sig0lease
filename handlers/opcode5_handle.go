@@ -155,28 +155,23 @@ func (h *UpdateHandler) Handle(ctx context.Context, w dns.ResponseWriter, r *dns
 			keyIsRefresh := existingKey != nil
 
 			if keyIsRefresh {
-				if err := h.validateRefreshOwnership(keyRR); err != nil {
+				if err := h.authorizeKeyRefresh(keyRR, signerID); err != nil {
 					msg := h.makeErrorResponse(r, dns.RcodeRefused, err.Error())
 					return NewErrorResult(msg, err.Error(), err)
 				}
 
-				keyAtFQDN, err := h.authoritativeHasKeyAtName(ctx, zone, keyRR.Hdr.Name)
+				effectiveKeyLease, keyAtFQDN, err := h.effectiveRefreshKeyLease(ctx, zone, keyRR, existingKey, keyLeaseDuration)
 				if err != nil {
 					msg := h.makeErrorResponse(r, dns.RcodeServerFailure, fmt.Sprintf("authoritative key lookup failed: %v", err))
 					return NewErrorResult(msg, "authoritative key lookup failed", err)
 				}
 				if !keyAtFQDN {
-					remainingLease := uint32(existingKey.TimeRemaining() / time.Second)
-					if remainingLease == 0 {
-						remainingLease = 1
-					}
-
 					// Key is managed locally but missing at the DNS server: re-register
 					// it with the lease time that is still left in the lease store.
 					pendingKeyRR := keyRR
 					pendingKeyName := keyName
 					pendingRecords := scopedOtherRecords
-					pendingKeyLease := remainingLease
+					pendingKeyLease := effectiveKeyLease
 					pendingMutations = append(pendingMutations, pendingLeaseMutation{
 						keyName: pendingKeyName,
 						apply: func() error {
@@ -543,25 +538,19 @@ func (h *UpdateHandler) Handle(ctx context.Context, w dns.ResponseWriter, r *dns
 						fmt.Errorf("signer %q is neither lease-managed, present in the Update section, nor an authorized online signer", sigRR.SignerName))
 				}
 			} else {
-				if err := h.validateRefreshOwnership(keyRR); err != nil {
+				if err := h.authorizeKeyRefresh(keyRR, signerID); err != nil {
 					msg := h.makeErrorResponse(r, dns.RcodeRefused, err.Error())
 					return NewErrorResult(msg, err.Error(), err)
 				}
-				keyAtFQDN, err := h.authoritativeHasKeyAtName(ctx, zone, keyRR.Hdr.Name)
+				// Key is managed locally but missing at the DNS server: put it
+				// back with the lease time still remaining, rather than granting
+				// the full newly-requested duration.
+				lease, _, err := h.effectiveRefreshKeyLease(ctx, zone, keyRR, existingKey, keyLeaseDuration)
 				if err != nil {
 					msg := h.makeErrorResponse(r, dns.RcodeServerFailure, fmt.Sprintf("authoritative key lookup failed: %v", err))
 					return NewErrorResult(msg, "authoritative key lookup failed", err)
 				}
-				if !keyAtFQDN {
-					// Key is managed locally but missing at the DNS server: put it
-					// back with the lease time still remaining, rather than
-					// granting the full newly-requested duration.
-					remaining := uint32(existingKey.TimeRemaining() / time.Second)
-					if remaining == 0 {
-						remaining = 1
-					}
-					effectiveKeyLease = remaining
-				}
+				effectiveKeyLease = lease
 			}
 
 			pendingKeyRR := keyRR

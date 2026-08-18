@@ -26,7 +26,23 @@ func (h *UpdateHandler) clampLeaseDurations(leaseDuration, keyLeaseDuration uint
 	return leaseDuration, keyLeaseDuration
 }
 
-func (h *UpdateHandler) validateRefreshOwnership(clientKeyRR *dns.KEY) error {
+// authorizeKeyRefresh verifies that signerID may refresh the already
+// -registered KEY RR clientKeyRR. Two things must hold: the resubmitted
+// RDATA must match what is on record (a KEY RR's name+algo+keytag identity
+// alone is not a full identity check), and the signer must actually be the
+// node's owner -- either the key itself (self-refresh) or its recorded
+// ParentKeyName (the entity that originally registered it).
+//
+// The RDATA check alone is not enough: KEY RDATA is public DNS data, so
+// anyone can resubmit a byte-for-byte copy of someone else's registered KEY
+// RR. Without the ownership check below, that copy would be accepted as a
+// legitimate "refresh" by any signer that separately clears
+// signerAuthorizedForNewRegistration (e.g. it is registering itself for the
+// first time in the same request, or is an allowed online signer) --
+// registerKeyLease/RegisterWithParent recompute and overwrite the node's
+// parent on every call, so the resubmitting signer would silently become
+// the record's owner.
+func (h *UpdateHandler) authorizeKeyRefresh(clientKeyRR *dns.KEY, signerID keyID) error {
 	if clientKeyRR == nil {
 		return fmt.Errorf("refresh rejected: missing key")
 	}
@@ -39,7 +55,37 @@ func (h *UpdateHandler) validateRefreshOwnership(clientKeyRR *dns.KEY) error {
 		return fmt.Errorf("refresh rejected: key mismatch")
 	}
 
+	if keyIDFromKEY(clientKeyRR) != signerID {
+		signerOwnerKey := leasepkg.NodeKeyFromSIG(signerID.Name, signerID.Algorithm, signerID.KeyTag)
+		if existing.ParentKeyName != signerOwnerKey {
+			return fmt.Errorf("refresh rejected: signer %q is not the registered owner of %q", signerID.Name, clientKeyRR.Hdr.Name)
+		}
+	}
+
 	return nil
+}
+
+// effectiveRefreshKeyLease determines the key-lease duration to actually
+// grant a refresh (Case A and Case D share this once ownership has already
+// been authorized via authorizeKeyRefresh): the full requestedKeyLease when
+// the key is still published at its authoritative FQDN, or whatever lease
+// time remains locally (floored at 1s so a near-expiry key isn't handed a
+// zero-length lease) when it has disappeared from authoritative DNS and
+// needs to be re-published rather than granted a fresh full-length lease.
+func (h *UpdateHandler) effectiveRefreshKeyLease(ctx context.Context, zone string, keyRR *dns.KEY, existingKey *leasepkg.Record, requestedKeyLease uint32) (effectiveKeyLease uint32, keyAtFQDN bool, err error) {
+	keyAtFQDN, err = h.authoritativeHasKeyAtName(ctx, zone, keyRR.Hdr.Name)
+	if err != nil {
+		return 0, false, err
+	}
+	if keyAtFQDN {
+		return requestedKeyLease, true, nil
+	}
+
+	remaining := uint32(existingKey.TimeRemaining() / time.Second)
+	if remaining == 0 {
+		remaining = 1
+	}
+	return remaining, false, nil
 }
 
 func (h *UpdateHandler) registerKeyLease(ctx context.Context, signerID keyID, keyRR *dns.KEY, leaseDuration uint32, keyLeaseDuration uint32) error {
