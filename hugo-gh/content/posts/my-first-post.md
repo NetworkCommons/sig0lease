@@ -111,7 +111,7 @@ Designed, written and maintained by Adam Burns.
 
 ***
 ## 💼 License
-    sig0namectl - 
+    sig0lease - 
     Copyleft (ɔ) 2023 Adam Burns, free2air limited & Dyne.org foundation, Amsterdam
 
     This program is free software: you can redistribute it and/or modify
