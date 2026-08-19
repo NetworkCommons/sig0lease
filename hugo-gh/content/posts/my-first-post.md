@@ -63,7 +63,6 @@ Which will register and add the KEY record at adam.dev.zenr.io, as well as addin
 - a 'TXT record' that stores text information about that FQDN.
 
 The KEY record itself is leased, and unless refreshed, when the lease expires (in this example, in 120 seconds) the KEY will be removed from DNS.
-The 
 
 The A and TXT records are leased, and unless also refreshed by a request signed by that key, will expire in 60 seconds.
 
