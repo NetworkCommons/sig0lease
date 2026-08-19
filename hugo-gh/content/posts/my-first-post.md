@@ -1,7 +1,6 @@
 +++
 title = 'README'
 layout = 'posts'
-slug = 'sig0lease is a proxy DNS server and client that enable a secure leased based collaborative method to publish wide area DNS Service Discovery to communities across the Internet. Standard SIG(0) key based authentication allows users to register and refresh their service discovery information as required.'
 date = 2026-08-19T13:12:15+02:00
 draft = false
 #featured_image = '/images/mycosystem-quarter.jpg'
