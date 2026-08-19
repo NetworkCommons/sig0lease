@@ -124,14 +124,10 @@ func TestAuthorizeKeyRefresh_RegisteredParentCanRefreshChildKey(t *testing.T) {
 	parentKey := testKeyRR("test.dev.zenr.io.", "AAAAPARENT111=")
 	childKey := testKeyRR("client.test.dev.zenr.io.", "AAAACHILD111=")
 
-	treeStore, ok := h.leaseManager.(lease.HierarchicalLeaseStore)
-	if !ok {
-		t.Fatalf("expected hierarchical lease store")
-	}
 	if err := h.leaseManager.Register(ctx, parentKey, 60, 60, "dev.zenr.io."); err != nil {
 		t.Fatalf("register parent: %v", err)
 	}
-	if err := treeStore.RegisterWithParent(ctx, lease.NodeKey(parentKey), childKey, 60, 60, "dev.zenr.io."); err != nil {
+	if err := h.leaseManager.RegisterWithParent(ctx, lease.NodeKey(parentKey), childKey, 60, 60, "dev.zenr.io."); err != nil {
 		t.Fatalf("register child under parent: %v", err)
 	}
 

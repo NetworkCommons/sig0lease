@@ -454,12 +454,10 @@ func (h *UpdateHandler) Handle(ctx context.Context, w dns.ResponseWriter, r *dns
 		// above before any local state changed.
 		for _, keyRR := range keysToDelete {
 			nodeKey := leasepkg.NodeKey(keyRR)
-			if hs, ok := h.leaseManager.(leasepkg.HierarchicalLeaseStore); ok {
-				for _, childKey := range hs.ListSubtreeKeys(nodeKey) {
-					h.deleteNodeUpstream(ctx, childKey)
-					h.removeNonKeyLease(childKey)
-					h.clearLeaseTimer(childKey)
-				}
+			for _, childKey := range h.leaseManager.ListSubtreeKeys(nodeKey) {
+				h.deleteNodeUpstream(ctx, childKey)
+				h.removeNonKeyLease(childKey)
+				h.clearLeaseTimer(childKey)
 			}
 			// The KEY's own directly-owned non-KEY data (not just descendant
 			// KEY nodes) must be cleaned up upstream here too, or it is

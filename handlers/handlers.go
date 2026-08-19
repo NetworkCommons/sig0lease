@@ -25,6 +25,10 @@ type Handler interface {
 
 	// Setup initializes the handler with configuration
 	Setup(cfg map[string]any) error
+
+	// Shutdown releases any resources this handler owns (background
+	// goroutines, open files). Called exactly once during server shutdown.
+	Shutdown()
 }
 
 // BaseHandler provides common functionality for handlers.
@@ -53,3 +57,7 @@ func (b *BaseHandler) CanHandle(opcode uint8) bool {
 	}
 	return false
 }
+
+// Shutdown is a no-op default; handlers that own no resources needing
+// release on shutdown do not need to override it.
+func (b *BaseHandler) Shutdown() {}

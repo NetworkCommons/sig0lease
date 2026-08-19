@@ -99,7 +99,8 @@ func main() {
 				handlerCfg := applyUpdateHandlerEnvOverrides(cfg.Handlers["update"])
 				if handlerCfg != nil {
 					if err := h.Setup(handlerCfg); err != nil {
-						logger.Warnf("Failed to setup %s: %v", moduleName, err)
+						logger.Errorf("Failed to setup %s: %v", moduleName, err)
+						os.Exit(1)
 					}
 				}
 
@@ -143,10 +144,10 @@ func main() {
 			handlerCfg := applyUpdateHandlerEnvOverrides(cfg.Handlers["update"])
 			if handlerCfg != nil {
 				if err := h.Setup(handlerCfg); err != nil {
-					logger.Warnf("Failed to setup %s: %v", moduleName, err)
-				} else {
-					logger.Infof("Upstream coordination configured for %s", moduleName)
+					logger.Errorf("Failed to setup %s: %v", moduleName, err)
+					os.Exit(1)
 				}
+				logger.Infof("Upstream coordination configured for %s", moduleName)
 			}
 
 			srv.RegisterHandler(h)

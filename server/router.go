@@ -35,6 +35,13 @@ func (r *Router) RegisterHandler(h handlers.Handler) {
 	r.handlers[h.Name()] = h
 }
 
+// Shutdown calls Shutdown on every registered handler exactly once.
+func (r *Router) Shutdown() {
+	for _, h := range r.handlers {
+		h.Shutdown()
+	}
+}
+
 // Route determines how to handle a DNS message based on its opcode.
 // Flow:
 //  1. Check for internal dump query (admin/debug endpoint)

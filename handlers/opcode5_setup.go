@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"codeberg.org/miekg/dns"
+	leasepkg "github.com/NetworkCommons/sig0lease/pkg/lease"
 )
 
 func toUint32(v any) (uint32, bool) {
@@ -44,7 +45,18 @@ func toUint32(v any) (uint32, bool) {
 //   - "lease_manager": Custom LeaseManager implementation [OPTIONAL, defaults to InMemoryLeaseManager].
 //     Go-embedding only: a LeaseManager value, not expressible in YAML, so
 //     this can only be set by code constructing the cfg map directly, never
-//     via config.yaml.
+//     via config.yaml. A present-but-wrong-type value is a Setup error, not
+//     a silently-ignored one. Mutually exclusive with "storage" below.
+//   - "storage": Selects the lease storage backend [OPTIONAL, config-file-settable,
+//     defaults to an in-memory store with no persistence]. Mutually exclusive
+//     with "lease_manager". Shape: {"type": "memory"|"file", "path": "...",
+//     "save_interval": "30s"}. "type" defaults to "memory" if omitted --
+//     identical to today's default behavior, leases are lost on restart.
+//     "file" additionally requires "path" and persists a human-readable JSON
+//     snapshot there: loaded once on Setup (a corrupt existing file is a hard
+//     Setup error), saved periodically on "save_interval" (default 30s), and
+//     flushed once more on Shutdown(). Any unrecognized "type", or "file"
+//     missing "path", is a Setup error.
 //   - "persistence_hook": Persistence function for leases [OPTIONAL]. Same
 //     Go-embedding-only caveat as lease_manager: a func value, not settable
 //     from config.yaml.
@@ -78,10 +90,38 @@ func (h *UpdateHandler) Setup(cfg map[string]any) error {
 	h.upstreamKeyRecord = upstreamKey
 	h.logger.Debugf("Loaded upstream key for configured zone %s from key zone %s: %s", h.upstreamZone, matchedZone, upstreamKey)
 
-	// Optional: Custom lease manager (Go-embedding only, see Setup doc comment).
-	if lm, ok := cfg["lease_manager"].(LeaseManager); ok && lm != nil {
+	// Optional: exactly one of "lease_manager" (Go-embedding only) or
+	// "storage" (config-file-selectable) may be given. Both present at once
+	// is ambiguous. Neither present keeps the default in-memory,
+	// no-persistence store NewUpdateHandler() already set.
+	rawLeaseManager, lmPresent := cfg["lease_manager"]
+	lmPresent = lmPresent && rawLeaseManager != nil
+	rawStorage, storagePresent := cfg["storage"]
+	storagePresent = storagePresent && rawStorage != nil
+
+	switch {
+	case lmPresent && storagePresent:
+		return fmt.Errorf(`update handler config: "lease_manager" and "storage" are mutually exclusive, got both`)
+
+	case lmPresent:
+		lm, ok := rawLeaseManager.(LeaseManager)
+		if !ok || lm == nil {
+			return fmt.Errorf("update handler config: \"lease_manager\" must implement lease.LeaseStorage, got %T", rawLeaseManager)
+		}
 		h.leaseManager = lm
 		h.logger.Debugf("Custom lease manager configured")
+
+	case storagePresent:
+		storageCfg, ok := rawStorage.(map[string]any)
+		if !ok {
+			return fmt.Errorf("update handler config: \"storage\" must be a map, got %T", rawStorage)
+		}
+		lm, err := h.buildLeaseManagerFromConfig(storageCfg)
+		if err != nil {
+			return fmt.Errorf("update handler config: storage: %w", err)
+		}
+		h.leaseManager = lm
+		h.logger.Debugf("Storage backend configured from config: %+v", storageCfg)
 	}
 
 	// Optional: Persistence hook for leases (Go-embedding only, see Setup doc comment).
@@ -182,4 +222,52 @@ func (h *UpdateHandler) Setup(cfg map[string]any) error {
 	h.startLeaseReconciliation(30 * time.Second)
 
 	return nil
+}
+
+// buildLeaseManagerFromConfig builds a LeaseStorage backend from the
+// handlers.update.storage config block. "memory" (or an omitted "type") is
+// the same zero-persistence in-memory store NewUpdateHandler() already
+// defaults to; "file" additionally loads/saves a human-readable JSON
+// snapshot at "path". Any unrecognized "type", or a "file" type missing
+// "path", is a hard error -- never a silent fallback to the default.
+func (h *UpdateHandler) buildLeaseManagerFromConfig(storageCfg map[string]any) (leasepkg.LeaseStorage, error) {
+	storageType := "memory"
+	if raw, ok := storageCfg["type"]; ok {
+		s, ok := raw.(string)
+		if !ok || strings.TrimSpace(s) == "" {
+			return nil, fmt.Errorf("\"type\" must be a non-empty string, got %T", raw)
+		}
+		storageType = strings.ToLower(strings.TrimSpace(s))
+	}
+
+	switch storageType {
+	case "memory":
+		return leasepkg.NewInMemoryManager(), nil
+
+	case "file":
+		path, ok := storageCfg["path"].(string)
+		if !ok || strings.TrimSpace(path) == "" {
+			return nil, fmt.Errorf("\"path\" is required when \"type\" is \"file\"")
+		}
+
+		interval := 30 * time.Second
+		if raw, ok := storageCfg["save_interval"]; ok {
+			s, ok := raw.(string)
+			if !ok {
+				return nil, fmt.Errorf("\"save_interval\" must be a duration string (e.g. \"30s\"), got %T", raw)
+			}
+			d, err := time.ParseDuration(s)
+			if err != nil {
+				return nil, fmt.Errorf("\"save_interval\" %q is not a valid duration: %w", s, err)
+			}
+			interval = d
+		}
+
+		return leasepkg.NewFileLeaseStore(path, interval, func(err error) {
+			h.logger.Errorf("%v", err)
+		})
+
+	default:
+		return nil, fmt.Errorf("unrecognized \"type\" %q (expected \"memory\" or \"file\")", storageType)
+	}
 }

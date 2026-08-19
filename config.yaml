@@ -72,6 +72,17 @@ handlers:
       - "CLA"
       - "IPN"
 
+    # Lease storage backend. Optional; when omitted, leases are kept
+    # in-memory only and are lost on restart (the default shown below).
+    # storage:
+    #   type: memory
+
+    # To persist leases across restarts, use a file-backed store instead:
+    storage:
+      type: file
+      path: "./data/lease_snapshot.json"   # required for type: file
+      save_interval: "30s"                  # optional, default 30s
+
 # Processing rules map opcodes to module names
 processing_rules:
   # Route opcode 5 (UPDATE) to an update handler module

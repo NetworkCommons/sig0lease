@@ -788,12 +788,8 @@ func setupCaseCDeleteHandler(t *testing.T) (h *UpdateHandler, parent, child, unr
 	if err := h.leaseManager.Register(context.Background(), parentRR, 120, 120, "dev.zenr.io."); err != nil {
 		t.Fatalf("register parent key: %v", err)
 	}
-	treeStore, ok := h.leaseManager.(leasepkg.HierarchicalLeaseStore)
-	if !ok {
-		t.Fatalf("expected lease manager to support hierarchical registration")
-	}
 	childRR := child.PublicKey.Clone().(*dns.KEY)
-	if err := treeStore.RegisterWithParent(context.Background(), leasepkg.NodeKey(parentRR), childRR, 120, 120, "dev.zenr.io."); err != nil {
+	if err := h.leaseManager.RegisterWithParent(context.Background(), leasepkg.NodeKey(parentRR), childRR, 120, 120, "dev.zenr.io."); err != nil {
 		t.Fatalf("register child key under parent: %v", err)
 	}
 
