@@ -124,15 +124,11 @@ func (s *Server) Serve() error {
 
 // serveUDP starts a custom UDP listener that preserves EDNS options
 func (s *Server) serveUDP(ctx context.Context, handler dns.HandlerFunc) error {
-	addr := s.cfg.Server.Address
 
-	// Handle port-only syntax - explicitly use localhost for IPv4
-	if host, port, err := net.SplitHostPort(addr); err == nil && host == "" {
-		addr = "127.0.0.1:" + port
-	}
-
-	// Listen on UDP with explicit IPv4
-	udpAddr, err := net.ResolveUDPAddr("udp4", addr)
+	// Listen on UDP with explicit IPv4. A port-only address (e.g. ":8053")
+	// resolves to the wildcard IP, so the listener binds on all interfaces --
+	// consistent with serveTCP.
+	udpAddr, err := net.ResolveUDPAddr("udp4", s.cfg.Server.Address)
 	if err != nil {
 		return fmt.Errorf("resolve UDP address: %w", err)
 	}
@@ -300,16 +296,9 @@ func (w *udpResponseWriter) Session() *dns.Session {
 
 // serveTCP starts a TCP listener.
 func (s *Server) serveTCP(ctx context.Context, handler dns.HandlerFunc) error {
-	addr := s.cfg.Server.Address
-
-	// Handle port-only syntax
-	if host, port, err := net.SplitHostPort(addr); err == nil && host == "" {
-		addr = ":" + port
-	}
-
 	srv := &dns.Server{
 		Listener:  nil,
-		Addr:      addr,
+		Addr:      s.cfg.Server.Address,
 		Net:       "tcp",
 		Handler:   handler,
 		TLSConfig: nil,

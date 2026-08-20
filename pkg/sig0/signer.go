@@ -9,7 +9,6 @@ import (
 	"crypto/rand"
 	"encoding/base64"
 	"fmt"
-	"log"
 	"strings"
 	"time"
 
@@ -260,8 +259,6 @@ func VerifySignature(msg *dns.Msg, keyRR *dns.KEY) error {
 		return fmt.Errorf("KEY RR cannot be nil")
 	}
 
-	log.Println("-- Verifying SIG(0) signature on message --")
-
 	// Create CryptoSIG0 verifier (without private key for verification)
 	baseVerifier := dns.CryptoSIG0{
 		PublicKey: keyRR,
@@ -278,6 +275,5 @@ func VerifySignature(msg *dns.Msg, keyRR *dns.KEY) error {
 		return fmt.Errorf("SIG(0) verification failed: %w", err)
 	}
 
-	log.Println("-- SIG(0) signature verified --")
 	return nil
 }

@@ -3,6 +3,7 @@ package config
 
 import (
 	"fmt"
+	"net"
 	"os"
 	"time"
 
@@ -78,6 +79,9 @@ func NewDefaultConfig() *Config {
 func (c *Config) Validate() error {
 	if c.Server.Address == "" {
 		return fmt.Errorf("server address cannot be empty")
+	}
+	if _, _, err := net.SplitHostPort(c.Server.Address); err != nil {
+		return fmt.Errorf("invalid server address %q: %w", c.Server.Address, err)
 	}
 
 	if len(c.Upstreams) == 0 {

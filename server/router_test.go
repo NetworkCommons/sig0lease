@@ -25,7 +25,7 @@ func (s *stubHandler) Handle(ctx context.Context, w dns.ResponseWriter, r *dns.M
 func (s *stubHandler) Shutdown() { *s.shutdownHits++ }
 
 func TestRouter_Shutdown_CallsShutdownOnEveryRegisteredHandler(t *testing.T) {
-	logger := logging.NewLogger("debug", "text")
+	logger := logging.NewLogger("debug")
 	router, err := NewRouter(map[uint8]string{}, logger, nil)
 	if err != nil {
 		t.Fatalf("NewRouter: %v", err)

@@ -79,7 +79,7 @@ func main() {
 	if logLevel == "" {
 		logLevel = "info"
 	}
-	logger := logging.NewLogger(logLevel, "text")
+	logger := logging.NewLogger(logLevel)
 
 	// Load configuration
 	cfg, err := config.LoadConfig(cfgPath)
