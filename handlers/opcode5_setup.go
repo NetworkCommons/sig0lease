@@ -36,12 +36,48 @@ func toUint32(v any) (uint32, bool) {
 	}
 }
 
+// parseStringSlice accepts the two shapes a YAML/JSON list unmarshals into
+// under map[string]any ([]string, or []interface{} of strings) and returns
+// a clean []string, skipping blank/non-string entries. Returns nil for any
+// other type (including a missing key, i.e. raw == nil).
+func parseStringSlice(raw any) []string {
+	switch v := raw.(type) {
+	case []string:
+		out := make([]string, 0, len(v))
+		for _, s := range v {
+			if s = strings.TrimSpace(s); s != "" {
+				out = append(out, s)
+			}
+		}
+		return out
+	case []interface{}:
+		out := make([]string, 0, len(v))
+		for _, item := range v {
+			if s, ok := item.(string); ok {
+				if s = strings.TrimSpace(s); s != "" {
+					out = append(out, s)
+				}
+			}
+		}
+		return out
+	default:
+		return nil
+	}
+}
+
 // Setup initializes the handler configuration.
 //
 // Configuration options:
 //   - "upstream_zone": Authoritative zone (e.g., "dev.zenr.io.") [REQUIRED]
 //   - "upstream_key": Path to upstream private key file [OPTIONAL, needed for upstream UPDATE signing]
 //   - "upstream_coordinator": Custom UpstreamCoordinator implementation [OPTIONAL]
+//   - "bootstrap_resolvers": []string of resolver addresses (e.g. "8.8.8.8:53")
+//     used by the default upstream coordinator to look up SOA/NS records when
+//     locating the authoritative server for a zone [OPTIONAL, ignored when
+//     "upstream_coordinator" is set]. cmd/sig0lease/main.go populates this
+//     from the top-level "upstreams" config when not set explicitly here, so
+//     zone-authority resolution uses the same operator-configured resolvers
+//     as generic forwarding. Falls back to a small built-in default if unset.
 //   - "lease_manager": Custom LeaseManager implementation [OPTIONAL, defaults to InMemoryLeaseManager].
 //     Go-embedding only: a LeaseManager value, not expressible in YAML, so
 //     this can only be set by code constructing the cfg map directly, never
@@ -165,8 +201,13 @@ func (h *UpdateHandler) Setup(cfg map[string]any) error {
 		h.upstreamCoordinator = coordinator
 		h.logger.Debugf("Custom upstream coordinator configured")
 	} else {
-		h.upstreamCoordinator = NewDefaultUpstreamCoordinator(h.logger)
-		h.logger.Debugf("Default upstream coordinator configured")
+		bootstrapResolvers := parseStringSlice(cfg["bootstrap_resolvers"])
+		h.upstreamCoordinator = NewDefaultUpstreamCoordinator(h.logger, bootstrapResolvers)
+		if len(bootstrapResolvers) > 0 {
+			h.logger.Debugf("Default upstream coordinator configured with bootstrap resolvers: %v", bootstrapResolvers)
+		} else {
+			h.logger.Debugf("Default upstream coordinator configured with built-in default bootstrap resolvers")
+		}
 	}
 
 	// Check if 4-byte variant is explicitly enabled via config for backward compatibility.

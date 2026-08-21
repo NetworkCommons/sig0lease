@@ -134,8 +134,13 @@ func FindKeysByZone(keystoreDir, zoneName string, logger *logging.Logger) ([]str
 	keyNamesSet := make(map[string]struct{}, 10)
 
 	// Key filenames are in format: Kzone.+algorithm+keytag
-	// Look for a key that starts with this zone name
-	prefix := "K" + zoneName
+	// Look for a key that starts with this zone name. The trailing "+"
+	// anchors the match to the label boundary between the zone name and the
+	// algorithm/keytag suffix -- without it, "Kdev.zenr.io." would also
+	// wrongly match an unrelated key for e.g. "Kdev.zenr.io.evil.com.+...",
+	// since DNS names are hierarchical right-to-left and a literal string
+	// prefix match does not respect that.
+	prefix := "K" + zoneName + "+"
 
 	// First pass: look for ED25519 (algorithm 15)
 	for _, keyName := range keys {

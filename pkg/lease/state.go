@@ -651,13 +651,6 @@ func (m *InMemoryLeaseStore) ImportSnapshot(snapshot *LeaseTreeSnapshot) error {
 		}
 
 		parentKey := normalizeName(node.ParentKeyName)
-		// Normalise legacy parent format to composite key if possible.
-		if parentKey != "" && !strings.Contains(parentKey, ".+") {
-			// Cannot recompute parent composite key without its KEY RR data here;
-			// keep the plain name and the tree link will be rebuilt from ChildKeys.
-			_ = parentKey
-			parentKey = normalizeName(node.ParentKeyName)
-		}
 
 		rec := &Record{
 			BaseRecord: BaseRecord{

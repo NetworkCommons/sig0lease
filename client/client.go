@@ -27,11 +27,22 @@ func New(server string, protocol string, timeout time.Duration) *Client {
 		timeout = 5 * time.Second
 	}
 
+	// dns.NewClient()'s transport otherwise carries its own hardcoded
+	// defaults (2s read/write, 5s dial) regardless of what the caller asked
+	// for here; wire the requested timeout through so it actually governs
+	// the TCP path (queryUDP already applies it via a socket deadline).
+	dnsClient := dns.NewClient()
+	dnsClient.Transport = &dns.Transport{
+		Dialer:       &net.Dialer{Timeout: timeout},
+		ReadTimeout:  timeout,
+		WriteTimeout: timeout,
+	}
+
 	return &Client{
 		server:    server,
 		protocol:  protocol,
 		timeout:   timeout,
-		dnsClient: dns.NewClient(),
+		dnsClient: dnsClient,
 	}
 }
 
@@ -85,8 +96,14 @@ func (c *Client) queryUDP(msg *dns.Msg) (*dns.Msg, error) {
 		return nil, fmt.Errorf("write error: %w", err)
 	}
 
-	// Receive the response
-	buf := make([]byte, 512)
+	// Receive the response. The request above advertises an EDNS UDP
+	// payload size of dns.DefaultMsgSize via its OPT record (see
+	// dnsmsg.NewLeaseUpdate), so a reply within that negotiated size must be
+	// read whole; sizing this buffer at the historic pre-EDNS 512-byte limit
+	// silently truncated any larger response (e.g. a Case C delete with
+	// several status-note TXT records, or a large RSA KEY answer), corrupting
+	// or failing to unpack it. dns.MaxMsgSize covers any negotiated size.
+	buf := make([]byte, dns.MaxMsgSize)
 	n, err := conn.Read(buf)
 	if err != nil {
 		return nil, fmt.Errorf("read error: %w", err)
@@ -106,7 +123,8 @@ func (c *Client) queryUDP(msg *dns.Msg) (*dns.Msg, error) {
 // queryTCP sends a DNS query over TCP.
 func (c *Client) queryTCP(msg *dns.Msg) (*dns.Msg, error) {
 	// Use miekg/dns client for TCP - Exchange returns (msg, rtt, err)
-	ctx := context.Background()
+	ctx, cancel := context.WithTimeout(context.Background(), c.timeout)
+	defer cancel()
 	resp, _, err := c.dnsClient.Exchange(ctx, msg, "tcp", c.server)
 	return resp, err
 }
