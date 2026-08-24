@@ -86,7 +86,7 @@ type LeasePolicy struct {
 }
 
 // LeaseManager is the shared lease manager abstraction.
-type LeaseManager = leasepkg.LeaseStore
+type LeaseManager = leasepkg.LeaseStorage
 
 // InMemoryLeaseManager is a reusable in-memory lease manager implementation.
 type InMemoryLeaseManager = leasepkg.InMemoryLeaseStore
@@ -277,8 +277,6 @@ type UpdateHandler struct {
 	AllowOnlineKeyRegistration bool
 	leaseTimersMu              sync.Mutex
 	leaseTimers                map[string]*time.Timer
-	nonKeyLeasesMu             sync.RWMutex
-	nonKeyLeases               map[string]*NonKEYLeaseRecord
 	blacklistedTypes           map[uint16]struct{} // RR types blocked from registration (type code -> empty)
 	authoritativeLookup        func(ctx context.Context, zoneHint string, fqdn string, rrType uint16) ([]dns.RR, error)
 	reconcileTicker            *time.Ticker

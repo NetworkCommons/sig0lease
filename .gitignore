@@ -6,3 +6,5 @@ keystore/server
 coverage.out
 *.old
 __debug_bin*
+.vscode
+data

@@ -169,13 +169,22 @@ The lease store is a tree rooted at each configured zone. Children of a root mus
 - **Expiry is handler-driven, not store-driven.** `UpdateHandler.processExpiredLease` — triggered by a per-node `time.AfterFunc` timer (`scheduleLeaseExpiry`, re-armed after every mutation and after every expiry event) — is the only code path that removes an expired KEY or non-KEY record, and it always attempts the corresponding upstream delete first. The store itself never deletes anything on its own initiative, because it has no way to also notify the authoritative server.
 - **Reconciliation backstop:** `UpdateHandler.startLeaseReconciliation` runs every 30 seconds and ensures every KEY node in the store has a live expiry timer, scheduling one via the same `scheduleLeaseExpiry` for any node that lacks one (for example, a node populated by a future snapshot-restore path that doesn't itself arm a timer). For an already-expired node this routes it through the same `processExpiredLease` almost immediately — there is exactly one deletion implementation, not a second one that might skip the upstream call.
 
+**Storage backend abstraction.** All of the above is defined against a single interface, `lease.LeaseStorage` (`pkg/lease/state.go`) — KEY lifecycle, tree/hierarchy, non-KEY record sets, and snapshot import/export/persistence all live on this one interface, and every backend must implement all of it. There is no narrower interface for a partial implementation to fall back to, and the handler never type-asserts down to a subset: a backend either supports the full feature set or `Setup()` fails to configure it at all.
+
+Two backends are selectable via `handlers.update.storage` in `config.yaml` (see the Configuration section below):
+
+- **`type: memory`** (default) — `InMemoryLeaseStore`. Zero persistence: a process restart drops all lease state, and clients simply re-register (the "Signer Resolution" three-stage fallback above still lets an unrelated signer authenticate against live authoritative DNS even with an empty store; only lease bookkeeping, not authentication, is lost).
+- **`type: file`** — `FileLeaseStore` (`pkg/lease/file_store.go`), which wraps an `InMemoryLeaseStore` and adds human-readable JSON persistence via the existing `ExportSnapshot`/`ImportSnapshot`/`SaveSnapshot`/`LoadSnapshot` mechanism: loaded once at `Setup()` (a corrupt existing file is a hard `Setup()` error, never a silent "start empty"), saved periodically on `save_interval`, and flushed once more on `Shutdown()`.
+
 ### Reference to Source Files
 
 - `handlers/opcode5_handle.go` — `Handle()`, the full case dispatch, `buildSuccessResponse`.
-- `handlers/opcode5_lease.go` — lease-store read/write helpers, `validateRefreshOwnership`, `processExpiredLease`, `scheduleLeaseExpiry`, `startLeaseReconciliation`.
+- `handlers/opcode5_lease.go` — lease-store read/write helpers, `validateRefreshOwnership`, `processExpiredLease`, `scheduleLeaseExpiry`, `startLeaseReconciliation`, `UpdateHandler.Shutdown`.
 - `handlers/opcode5_update_helpers.go` — SIG(0) resolution (`extractAndValidateSig0`), upstream message construction, duplicate-registration checks.
 - `handlers/opcode5_lease_option.go` — UPDATE-LEASE option parsing and request-side policy validation.
-- `pkg/lease/state.go` — `InMemoryLeaseStore`, the tree-structured lease store implementation.
+- `handlers/opcode5_setup.go` — `Setup()`, including storage-backend selection (`buildLeaseManagerFromConfig`).
+- `pkg/lease/state.go` — the unified `LeaseStorage` interface and `InMemoryLeaseStore`, the tree-structured in-memory implementation.
+- `pkg/lease/file_store.go` — `FileLeaseStore`, the periodic/shutdown-flush JSON-snapshot-backed implementation.
 - `pkg/lease/lease.go` — `LeaseOption` encode/decode and the shared `FindOption`/`DecodeOption`/`FindAndDecode` helpers.
 - `client/lease_response.go` — client-side decoding of the server's granted LEASE/KEY-LEASE.
 
@@ -185,7 +194,7 @@ The lease store is a tree rooted at each configured zone. Children of a root mus
 
 - listening address and enabled transport networks;
 - default upstream resolvers;
-- handler-specific settings such as the upstream zone, keystore directory, lease policy bounds, blacklisted RR types, and `allow_online_key_registration` for the update handler;
+- handler-specific settings such as the upstream zone, keystore directory, lease policy bounds, blacklisted RR types, `allow_online_key_registration`, and the lease storage backend (`storage.type: memory|file`, see "Storage Model and Expiry" above) for the update handler;
 - opcode-to-module routing.
 
 The update handler uses the configured zone to discover the authoritative server for the effective zone, then sends the rewritten UPDATE there.

@@ -89,150 +89,61 @@ func (h *UpdateHandler) effectiveRefreshKeyLease(ctx context.Context, zone strin
 }
 
 func (h *UpdateHandler) registerKeyLease(ctx context.Context, signerID keyID, keyRR *dns.KEY, leaseDuration uint32, keyLeaseDuration uint32) error {
-	if hs, ok := h.leaseManager.(leasepkg.HierarchicalLeaseStore); ok {
-		parent := ""
-		signerNodeKey := leasepkg.NodeKeyFromSIG(signerID.Name, signerID.Algorithm, signerID.KeyTag)
-		keyNodeKey := leasepkg.NodeKey(keyRR)
-		if signerNodeKey != keyNodeKey {
-			parent = signerNodeKey
-		}
-		return hs.RegisterWithParent(ctx, parent, keyRR, leaseDuration, keyLeaseDuration, h.upstreamZone)
+	parent := ""
+	signerNodeKey := leasepkg.NodeKeyFromSIG(signerID.Name, signerID.Algorithm, signerID.KeyTag)
+	keyNodeKey := leasepkg.NodeKey(keyRR)
+	if signerNodeKey != keyNodeKey {
+		parent = signerNodeKey
 	}
-	return h.leaseManager.Register(ctx, keyRR, leaseDuration, keyLeaseDuration, h.upstreamZone)
+	return h.leaseManager.RegisterWithParent(ctx, parent, keyRR, leaseDuration, keyLeaseDuration, h.upstreamZone)
 }
 
 func (h *UpdateHandler) setNonKeyLease(keyName string, records []dns.RR, leaseDuration uint32, upstreamZone string) {
-	if treeStore, ok := h.leaseManager.(leasepkg.LeaseTreeStore); ok {
-		if err := treeStore.UpsertNonKEYRecords(keyName, records, leaseDuration, upstreamZone); err != nil {
-			h.logger.Debugf("failed to store non-KEY records in lease tree for %s: %v", keyName, err)
-		}
-		return
+	if err := h.leaseManager.UpsertNonKEYRecords(keyName, records, leaseDuration, upstreamZone); err != nil {
+		h.logger.Debugf("failed to store non-KEY records in lease tree for %s: %v", keyName, err)
 	}
-
-	h.nonKeyLeasesMu.Lock()
-	defer h.nonKeyLeasesMu.Unlock()
-
-	keyName = canonicalName(keyName)
-	rec, ok := h.nonKeyLeases[keyName]
-	if !ok {
-		rec = &NonKEYLeaseRecord{Records: make(map[string]*nonKeyRecordEntry)}
-		h.nonKeyLeases[keyName] = rec
-	}
-
-	// Merge: update or append each record by DNS RR identity key.
-	for _, newRR := range records {
-		if newRR == nil || newRR.Header() == nil {
-			continue
-		}
-		key := recordKey(newRR)
-		if key == "" {
-			continue
-		}
-		if existing, exists := rec.Records[key]; exists {
-			// Update existing record: replace RDATA, update lease.
-			existing.RR = newRR
-			existing.LeaseDuration = leaseDuration
-			existing.ExpiresAt = time.Now().Add(time.Duration(leaseDuration) * time.Second)
-		} else {
-			// New record: append.
-			rec.Records[key] = &nonKeyRecordEntry{
-				RR:            newRR,
-				ExpiresAt:     time.Now().Add(time.Duration(leaseDuration) * time.Second),
-				LeaseDuration: leaseDuration,
-			}
-		}
-	}
-
-	rec.UpstreamZone = upstreamZone
 }
 
 // removeNonKeyLease removes every non-KEY record owned by keyName outright.
 // There is no soft-delete state: a record is either present (active) or gone.
 func (h *UpdateHandler) removeNonKeyLease(keyName string) {
-	if treeStore, ok := h.leaseManager.(leasepkg.LeaseTreeStore); ok {
-		treeStore.RemoveNonKEYRecords(keyName)
-		return
-	}
-
-	h.nonKeyLeasesMu.Lock()
-	defer h.nonKeyLeasesMu.Unlock()
-	keyName = canonicalName(keyName)
-	delete(h.nonKeyLeases, keyName)
+	h.leaseManager.RemoveNonKEYRecords(keyName)
 }
 
 // removeSingleNonKeyRecord removes one record (by its RFC 2136 identity key)
 // from keyName's set, leaving the rest of the set untouched. Used for
 // per-record expiry, where only one of several records under a key expires.
 func (h *UpdateHandler) removeSingleNonKeyRecord(keyName, recordKeyStr string) {
-	if treeStore, ok := h.leaseManager.(leasepkg.LeaseTreeStore); ok {
-		treeStore.RemoveSingleNonKEYRecord(keyName, recordKeyStr)
-		return
-	}
-
-	h.nonKeyLeasesMu.Lock()
-	defer h.nonKeyLeasesMu.Unlock()
-	keyName = canonicalName(keyName)
-	if rec, ok := h.nonKeyLeases[keyName]; ok {
-		delete(rec.Records, recordKeyStr)
-	}
+	h.leaseManager.RemoveSingleNonKEYRecord(keyName, recordKeyStr)
 }
 
 func (h *UpdateHandler) getNonKeyLease(keyName string) *NonKEYLeaseRecord {
-	if treeStore, ok := h.leaseManager.(leasepkg.LeaseTreeStore); ok {
-		set := treeStore.GetNonKEYRecordSet(keyName)
-		if set == nil {
-			return nil
-		}
-		rec := &NonKEYLeaseRecord{
-			Records:      make(map[string]*nonKeyRecordEntry, len(set.Records)),
-			UpstreamZone: set.UpstreamZone,
-		}
-		for rrKey, node := range set.Records {
-			if node == nil {
-				continue
-			}
-			rec.Records[rrKey] = &nonKeyRecordEntry{
-				RR:            copyRR(node.RR),
-				ExpiresAt:     node.ExpiresAt,
-				LeaseDuration: node.LeaseDuration,
-			}
-		}
-		return rec
-	}
-
-	h.nonKeyLeasesMu.RLock()
-	defer h.nonKeyLeasesMu.RUnlock()
-	keyName = canonicalName(keyName)
-	rec, ok := h.nonKeyLeases[keyName]
-	if !ok {
+	set := h.leaseManager.GetNonKEYRecordSet(keyName)
+	if set == nil {
 		return nil
 	}
-	// Return a shallow copy of the entry map (pointers preserved).
-	return &NonKEYLeaseRecord{
-		Records:       rec.Records,
-		ExpiresAt:     rec.ExpiresAt,
-		UpstreamZone:  rec.UpstreamZone,
-		LeaseDuration: rec.LeaseDuration,
+	rec := &NonKEYLeaseRecord{
+		Records:      make(map[string]*nonKeyRecordEntry, len(set.Records)),
+		UpstreamZone: set.UpstreamZone,
 	}
+	for rrKey, node := range set.Records {
+		if node == nil {
+			continue
+		}
+		rec.Records[rrKey] = &nonKeyRecordEntry{
+			RR:            copyRR(node.RR),
+			ExpiresAt:     node.ExpiresAt,
+			LeaseDuration: node.LeaseDuration,
+		}
+	}
+	return rec
 }
 
 func (h *UpdateHandler) hasActiveNonKeyRecord(keyName string, rr dns.RR) bool {
 	if rr == nil {
 		return false
 	}
-	if treeStore, ok := h.leaseManager.(leasepkg.LeaseTreeStore); ok {
-		return treeStore.HasActiveNonKEYRecord(keyName, rr)
-	}
-	rec := h.getNonKeyLease(keyName)
-	if rec == nil {
-		return false
-	}
-	key := recordKey(rr)
-	if key == "" {
-		return false
-	}
-	_, ok := rec.Records[key]
-	return ok
+	return h.leaseManager.HasActiveNonKEYRecord(keyName, rr)
 }
 
 func (h *UpdateHandler) nextLeaseEventAfter(keyName string) (time.Duration, bool) {
@@ -331,6 +242,19 @@ func (h *UpdateHandler) reconcileLeaseTimers() {
 	}
 }
 
+// Shutdown stops the reconciliation ticker and releases the lease storage
+// backend's own resources (e.g. a file-backed store's periodic-save
+// goroutine, which also performs one final synchronous save here). Safe to
+// call once during server shutdown; overrides BaseHandler's no-op default.
+func (h *UpdateHandler) Shutdown() {
+	if h.reconcileTicker != nil {
+		h.reconcileTicker.Stop()
+	}
+	if h.leaseManager != nil {
+		h.leaseManager.Stop()
+	}
+}
+
 type leaseDumpNode struct {
 	keyRec    *leasepkg.Record
 	nonKeyRec *NonKEYLeaseRecord
@@ -372,46 +296,33 @@ func (h *UpdateHandler) dumpLeaseTreeLevel() string {
 		}
 	}
 
-	if treeStore, ok := h.leaseManager.(leasepkg.LeaseTreeStore); ok {
-		for _, node := range nodes {
-			if node == nil || node.keyRec == nil {
-				continue
-			}
-			// GetNonKEYRecordSet is keyed by the composite NodeKey
-			// (name+algo+keytag), not the plain DNS owner name used as this
-			// map's key -- same class of lookup bug already fixed for the
-			// INFO-level summary dump (DumpLeasesLevel).
-			set := treeStore.GetNonKEYRecordSet(leasepkg.NodeKey(node.keyRec.KeyRR))
-			if set == nil {
-				continue
-			}
-			rec := &NonKEYLeaseRecord{
-				Records:      make(map[string]*nonKeyRecordEntry, len(set.Records)),
-				UpstreamZone: set.UpstreamZone,
-			}
-			for rrKey, entry := range set.Records {
-				if entry == nil {
-					continue
-				}
-				rec.Records[rrKey] = &nonKeyRecordEntry{
-					RR:            copyRR(entry.RR),
-					ExpiresAt:     entry.ExpiresAt,
-					LeaseDuration: entry.LeaseDuration,
-				}
-			}
-			node.nonKeyRec = rec
+	for _, node := range nodes {
+		if node == nil || node.keyRec == nil {
+			continue
 		}
-	} else {
-		for name, rec := range h.nonKeyLeases {
-			if rec == nil {
-				continue
-			}
-			node := addNode(name)
-			if node == nil {
-				continue
-			}
-			node.nonKeyRec = rec
+		// GetNonKEYRecordSet is keyed by the composite NodeKey
+		// (name+algo+keytag), not the plain DNS owner name used as this
+		// map's key -- same class of lookup bug already fixed for the
+		// INFO-level summary dump (DumpLeasesLevel).
+		set := h.leaseManager.GetNonKEYRecordSet(leasepkg.NodeKey(node.keyRec.KeyRR))
+		if set == nil {
+			continue
 		}
+		rec := &NonKEYLeaseRecord{
+			Records:      make(map[string]*nonKeyRecordEntry, len(set.Records)),
+			UpstreamZone: set.UpstreamZone,
+		}
+		for rrKey, entry := range set.Records {
+			if entry == nil {
+				continue
+			}
+			rec.Records[rrKey] = &nonKeyRecordEntry{
+				RR:            copyRR(entry.RR),
+				ExpiresAt:     entry.ExpiresAt,
+				LeaseDuration: entry.LeaseDuration,
+			}
+		}
+		node.nonKeyRec = rec
 	}
 
 	if len(nodes) == 0 {
@@ -569,29 +480,21 @@ func (h *UpdateHandler) DumpLeasesLevel(level string) string {
 	h.leaseTimersMu.Lock()
 	defer h.leaseTimersMu.Unlock()
 
-	// Lock non-KEY leases for consistent snapshot.
-	h.nonKeyLeasesMu.RLock()
-	defer h.nonKeyLeasesMu.RUnlock()
-
 	if isDebug {
 		return h.dumpLeaseTreeLevel()
 	}
 
 	var sb strings.Builder
 
-	// Collect all node keys from both stores. Get/getNonKeyLease are keyed by
-	// the composite NodeKey (name.+algo+tag), not the plain DNS owner name,
-	// so that is what must be collected here for the lookups below to find
-	// anything.
+	// Collect all node keys. Get/getNonKeyLease are keyed by the composite
+	// NodeKey (name.+algo+tag), not the plain DNS owner name, so that is
+	// what must be collected here for the lookups below to find anything.
 	keyNames := make(map[string]bool)
 	for _, rec := range h.leaseManager.ListAll() {
 		if rec.KeyRR == nil {
 			continue
 		}
 		keyNames[leasepkg.NodeKey(rec.KeyRR)] = true
-	}
-	for name := range h.nonKeyLeases {
-		keyNames[name] = true
 	}
 
 	// INFO level: summary output.
@@ -717,12 +620,9 @@ func (h *UpdateHandler) processExpiredLease(ctx context.Context, nodeKey string)
 	}
 
 	// KEY is expired. Cascade upstream deletes to the entire subtree first.
-	if hs, ok := h.leaseManager.(leasepkg.HierarchicalLeaseStore); ok {
-		descendants := hs.ListSubtreeKeys(nodeKey)
-		for _, childKey := range descendants {
-			h.deleteNodeUpstream(ctx, childKey)
-			h.clearLeaseTimer(childKey)
-		}
+	for _, childKey := range h.leaseManager.ListSubtreeKeys(nodeKey) {
+		h.deleteNodeUpstream(ctx, childKey)
+		h.clearLeaseTimer(childKey)
 	}
 
 	// The KEY cannot outlive its own lease, so any non-KEY records still owned

@@ -74,8 +74,15 @@ func (r *Record) TimeRemaining() time.Duration {
 	return remaining
 }
 
-// LeaseStore manages lifecycle of client leases. Implementations must be thread-safe.
-type LeaseStore interface {
+// LeaseStorage is the single storage-backend abstraction for lease state:
+// KEY-lease lifecycle, tree/hierarchy operations, non-KEY record sets, and
+// snapshot import/export/persistence. Every backend (in-memory, file-backed,
+// or a caller-supplied Go-embedded implementation) must implement all of it
+// -- there is no narrower interface to fall back to, and callers must not
+// type-assert down to a subset. Implementations must be thread-safe.
+type LeaseStorage interface {
+	// -- KEY lease lifecycle --
+
 	// Register creates or updates a KEY lease. The node identity is derived from keyRR.
 	Register(ctx context.Context, keyRR *dns.KEY, leaseDuration uint32, keyLeaseDuration uint32, upstreamZone string) error
 	// RenewLease extends an already-registered KEY lease's timers in place.
@@ -97,31 +104,36 @@ type LeaseStore interface {
 	ListExpiring(within time.Duration) []*Record
 	ListAll() []*Record
 	SetPersistenceHook(hook func(ctx context.Context, op string, record *Record) error)
-}
 
-// HierarchicalLeaseStore adds tree-oriented and persistence-oriented operations
-// on top of LeaseStore.
-type HierarchicalLeaseStore interface {
-	LeaseStore
+	// -- Tree / hierarchy --
+
 	RegisterWithParent(ctx context.Context, parentNodeKey string, keyRR *dns.KEY, leaseDuration uint32, keyLeaseDuration uint32, upstreamZone string) error
 	DeleteSubtree(nodeKey string) error
 	ChildrenOf(nodeKey string) []string
 	// ListSubtreeKeys returns composite node keys of all descendants, deepest first.
 	ListSubtreeKeys(nodeKey string) []string
+
+	// -- Snapshot import/export/persistence --
+
 	ExportSnapshot() (*LeaseTreeSnapshot, error)
 	ImportSnapshot(snapshot *LeaseTreeSnapshot) error
 	SaveSnapshot(path string) error
 	LoadSnapshot(path string) error
-}
 
-// LeaseTreeStore extends tree operations with non-KEY node storage.
-type LeaseTreeStore interface {
-	HierarchicalLeaseStore
+	// -- Non-KEY record sets --
+
 	UpsertNonKEYRecords(ownerNodeKey string, records []dns.RR, leaseDuration uint32, upstreamZone string) error
 	RemoveNonKEYRecords(ownerNodeKey string)
 	RemoveSingleNonKEYRecord(ownerNodeKey, rrKey string)
 	GetNonKEYRecordSet(ownerNodeKey string) *NonKEYRecordSet
 	HasActiveNonKEYRecord(ownerNodeKey string, rr dns.RR) bool
+
+	// -- Lifecycle --
+
+	// Stop releases any resources this backend owns (background goroutines,
+	// open files, timers). Must be safe to call even when the backend owns
+	// nothing (a no-op), and safe to call exactly once from a shutdown path.
+	Stop()
 }
 
 // LeaseTreeSnapshot is a storage-neutral representation of the lease tree.
@@ -185,6 +197,8 @@ type InMemoryLeaseStore struct {
 	nonKeySets      map[string]*NonKEYRecordSet // NodeKey → NonKEYRecordSet
 	persistenceHook func(ctx context.Context, op string, record *Record) error
 }
+
+var _ LeaseStorage = (*InMemoryLeaseStore)(nil)
 
 // NewInMemoryManager creates a new in-memory lease manager.
 func NewInMemoryManager() *InMemoryLeaseStore {
@@ -591,7 +605,7 @@ func (m *InMemoryLeaseStore) ExportSnapshot() (*LeaseTreeSnapshot, error) {
 	}
 
 	return &LeaseTreeSnapshot{
-		Version:     2,
+		Version:     1,
 		GeneratedAt: time.Now().UTC(),
 		KeyNodes:    keyNodes,
 		NonKEYNodes: nonKeyNodes,
@@ -763,9 +777,9 @@ func (m *InMemoryLeaseStore) LoadSnapshot(path string) error {
 	return m.ImportSnapshot(&snapshot)
 }
 
-// Stop is a no-op retained for API compatibility with callers that stop the
-// store as part of their own shutdown sequence. The store no longer runs a
-// background goroutine of its own; see NewInMemoryManager.
+// Stop satisfies LeaseStorage.Stop(). InMemoryLeaseStore owns no background
+// goroutine or file handle, so this is a no-op; persistence-owning backends
+// (see FileLeaseStore) override it to flush state and release resources.
 func (m *InMemoryLeaseStore) Stop() {}
 
 func normalizeName(name string) string {

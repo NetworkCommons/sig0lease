@@ -373,6 +373,7 @@ func (s *Server) handleRequest(ctx context.Context, w dns.ResponseWriter, r *dns
 // shutdown gracefully shuts down the server.
 func (s *Server) shutdown() {
 	s.logger.Info("Shutting down DNS proxy...")
+	s.router.Shutdown()
 	s.resolver.Shutdown()
 	s.logger.Info("DNS proxy stopped")
 }
