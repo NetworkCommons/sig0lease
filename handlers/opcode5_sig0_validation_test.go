@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net"
 	"testing"
+	"time"
 
 	"codeberg.org/miekg/dns"
 	"github.com/NetworkCommons/sig0lease/pkg/keyrec"
@@ -454,6 +455,71 @@ func TestHandle_ReRegistersManagedKeyWhenAuthoritativeFQDNIsMissing(t *testing.T
 	}
 }
 
+// TestHandle_RefreshPreservesOriginalRegisteredAt exercises the "normal
+// refresh" branch of Case A (key still present at its authoritative FQDN)
+// end to end through Handle(), confirming the RenewLease wiring: a refresh
+// must extend the lease timers without resetting RegisteredAt, unlike the
+// old design where every refresh silently re-created the node with
+// RegisteredAt = now.
+func TestHandle_RefreshPreservesOriginalRegisteredAt(t *testing.T) {
+	keystoreDir, err := createTestKeystore(t)
+	if err != nil {
+		t.Fatalf("setup test keystore: %v", err)
+	}
+	loaded, err := keyrec.LoadKeyFromFile(keystoreDir, "Kdev.zenr.io.+015+35317")
+	if err != nil {
+		t.Fatalf("load key: %v", err)
+	}
+
+	h := NewUpdateHandler()
+	h.SetLogger(newTestHandler().logger)
+	if err := h.Setup(map[string]any{
+		"upstream_zone": "dev.zenr.io.",
+		"keystore_dir":  keystoreDir,
+	}); err != nil {
+		t.Fatalf("setup handler: %v", err)
+	}
+	h.authoritativeLookup = func(ctx context.Context, zoneHint, fqdn string, rrType uint16) ([]dns.RR, error) {
+		if rrType == dns.TypeKEY {
+			return []dns.RR{loaded.PublicKey}, nil
+		}
+		return []dns.RR{}, nil
+	}
+	h.upstreamCoordinator = &stubUpstreamCoordinator{resp: &dns.Msg{MsgHeader: dns.MsgHeader{Rcode: dns.RcodeSuccess}}}
+
+	keyRR := loaded.PublicKey.Clone().(*dns.KEY)
+	if err := h.leaseManager.Register(context.Background(), keyRR, 60, 60, "dev.zenr.io."); err != nil {
+		t.Fatalf("register key: %v", err)
+	}
+	original := h.leaseManager.LookupByKEY(keyRR)
+	if original == nil {
+		t.Fatalf("expected key to be registered")
+	}
+	registeredAt := original.RegisteredAt
+
+	time.Sleep(5 * time.Millisecond)
+
+	req := buildSignedLeaseRegistrationForHandleTest(t, loaded, "test.dev.zenr.io.", 120, 120)
+	res := h.Handle(context.Background(), stubResponseWriter{}, req)
+	if res == nil || res.Message == nil {
+		t.Fatalf("expected response message")
+	}
+	if res.Message.Rcode != dns.RcodeSuccess {
+		t.Fatalf("expected successful refresh, got rcode=%d", res.Message.Rcode)
+	}
+
+	after := h.leaseManager.LookupByKEY(keyRR)
+	if after == nil {
+		t.Fatalf("expected key to remain registered after refresh")
+	}
+	if !after.RegisteredAt.Equal(registeredAt) {
+		t.Fatalf("expected RegisteredAt to survive a Handle()-driven refresh unchanged, got %v want %v", after.RegisteredAt, registeredAt)
+	}
+	if after.LeaseDuration != 120 {
+		t.Fatalf("expected renewed key-lease duration to be applied, got %d", after.LeaseDuration)
+	}
+}
+
 func TestHandle_NonKeyOnlyLeaseWithoutUpdateKeyRR_RegistersNonKeyRRs(t *testing.T) {
 	keystoreDir, err := createTestKeystore(t)
 	if err != nil {
@@ -800,5 +866,215 @@ func TestHandle_CaseCDelete_SelfRegisteredKeyCanDeleteItself(t *testing.T) {
 	}
 	if got := h.leaseManager.LookupByKEY(parentRR); got != nil {
 		t.Fatalf("expected self-registered root key to be able to delete itself")
+	}
+}
+
+// Regression coverage for an ownership-hijack gap: "refreshing" an
+// already-registered KEY RR only ever checked that the resubmitted RDATA
+// matched what was on record (validateRefreshOwnership, now
+// authorizeKeyRefresh) -- it never checked that the SIG(0) signer performing
+// the refresh was actually the record's owner. Since a KEY RR's RDATA is
+// public DNS data, any signer that separately cleared
+// signerAuthorizedForNewRegistration could resubmit a byte-for-byte copy of
+// someone else's already-registered KEY RR and silently become its
+// registered parent (ParentKeyName), because registerKeyLease/
+// RegisterWithParent recompute and overwrite the parent on every call with
+// no check against the node's existing owner.
+//
+// CLIENT_KEY_NAME (Ktest.dev.zenr.io.+015+05044) and WRONG_CLIENT_KEY_NAME
+// (Ktest.dev.zenr.io.+015+42176) are two independently generated keys that
+// both happen to be owned by the name test.dev.zenr.io. (only
+// algorithm/keytag/pubkey differ) -- mirroring the case these tests
+// reproduce.
+
+func TestHandle_CaseARefresh_ForeignSignerWithOwnRegistrationCannotHijackExistingKey(t *testing.T) {
+	keystoreDir, err := createTestKeystore(t)
+	if err != nil {
+		t.Fatalf("setup test keystore: %v", err)
+	}
+	client, err := keyrec.LoadKeyFromFile("../keystore/client", "Ktest.dev.zenr.io.+015+05044")
+	if err != nil {
+		t.Fatalf("load client key: %v", err)
+	}
+	wrong, err := keyrec.LoadKeyFromFile("../keystore/client", "Ktest.dev.zenr.io.+015+42176")
+	if err != nil {
+		t.Fatalf("load wrong-client key: %v", err)
+	}
+
+	h := NewUpdateHandler()
+	h.SetLogger(newTestHandler().logger)
+	if err := h.Setup(map[string]any{
+		"upstream_zone": "dev.zenr.io.",
+		"keystore_dir":  keystoreDir,
+	}); err != nil {
+		t.Fatalf("setup handler: %v", err)
+	}
+	h.upstreamCoordinator = &stubUpstreamCoordinator{resp: &dns.Msg{MsgHeader: dns.MsgHeader{Rcode: dns.RcodeSuccess}}}
+	h.authoritativeLookup = func(ctx context.Context, zoneHint, fqdn string, rrType uint16) ([]dns.RR, error) {
+		if rrType == dns.TypeKEY && canonicalName(fqdn) == canonicalName(client.PublicKey.Hdr.Name) {
+			return []dns.RR{client.PublicKey}, nil
+		}
+		return []dns.RR{}, nil
+	}
+
+	// Client legitimately registered its KEY plus a companion TXT as its own
+	// self-registered (root) node.
+	clientKeyRR := client.PublicKey.Clone().(*dns.KEY)
+	if err := h.leaseManager.Register(context.Background(), clientKeyRR, 120, 120, "dev.zenr.io."); err != nil {
+		t.Fatalf("register client key: %v", err)
+	}
+	clientTXT := &dns.TXT{Hdr: dns.Header{Name: "test.dev.zenr.io.", Class: dns.ClassINET, TTL: 60}}
+	clientTXT.TXT.Txt = []string{"client-payload"}
+	h.setNonKeyLease(leasepkg.NodeKey(clientKeyRR), []dns.RR{clientTXT}, 120, "dev.zenr.io.")
+	h.scheduleLeaseExpiry(leasepkg.NodeKey(clientKeyRR))
+	defer h.clearLeaseTimer(leasepkg.NodeKey(clientKeyRR))
+
+	// Attack: WRONG_CLIENT_KEY_NAME registers itself for the first time
+	// (legitimately satisfying signerAuthorizedForNewRegistration via
+	// signerInUpdate) while also resubmitting a byte-for-byte copy of the
+	// client's already-registered KEY RR in the same Update section, all
+	// signed only by its own new key. No special config is required.
+	msg := dns.NewMsg("test.dev.zenr.io.", dns.TypeSOA)
+	if msg == nil {
+		t.Fatalf("expected message")
+	}
+	msg.Opcode = dns.OpcodeUpdate
+
+	wrongKeyRR := wrong.PublicKey.Clone().(*dns.KEY)
+	copiedClientKeyRR := client.PublicKey.Clone().(*dns.KEY)
+	msg.Ns = append(msg.Ns, wrongKeyRR, copiedClientKeyRR)
+
+	attackTXT := &dns.TXT{Hdr: dns.Header{Name: "test.dev.zenr.io.", Class: dns.ClassINET, TTL: 60}}
+	attackTXT.TXT.Txt = []string{"attacker-payload"}
+	msg.Ns = append(msg.Ns, attackTXT)
+
+	opt := &dns.OPT{Hdr: dns.Header{Name: "."}}
+	opt.SetUDPSize(uint16(dns.DefaultMsgSize))
+	leaseOpt := leasepkg.Encode8Byte(120, 120)
+	if err := leaseOpt.Encode(opt); err != nil {
+		t.Fatalf("encode lease option: %v", err)
+	}
+	msg.Extra = append(msg.Extra, opt)
+
+	signed, err := sig0.SignMessage(msg, wrong.PublicKey, wrong.PrivateKey)
+	if err != nil {
+		t.Fatalf("sign message: %v", err)
+	}
+
+	res := h.Handle(context.Background(), stubResponseWriter{}, signed)
+	if res == nil || res.Message == nil {
+		t.Fatalf("expected response message")
+	}
+	if res.Message.Rcode != dns.RcodeRefused {
+		t.Fatalf("expected refused when a foreign signer tries to refresh another key's registration, got rcode=%d", res.Message.Rcode)
+	}
+
+	got := h.leaseManager.LookupByKEY(clientKeyRR)
+	if got == nil {
+		t.Fatalf("expected client key lease to remain")
+	}
+	if got.ParentKeyName != "" {
+		t.Fatalf("expected client key to remain a self-registered root node, got hijacked parent %q", got.ParentKeyName)
+	}
+	if h.leaseManager.LookupByKEY(wrongKeyRR) != nil {
+		t.Fatalf("expected the whole request to fail closed: attacker's own new key must not be registered either")
+	}
+}
+
+func TestHandle_CaseARefresh_OnlineAuthorizedSignerCannotHijackExistingKey(t *testing.T) {
+	keystoreDir, err := createTestKeystore(t)
+	if err != nil {
+		t.Fatalf("setup test keystore: %v", err)
+	}
+	client, err := keyrec.LoadKeyFromFile("../keystore/client", "Ktest.dev.zenr.io.+015+05044")
+	if err != nil {
+		t.Fatalf("load client key: %v", err)
+	}
+	wrong, err := keyrec.LoadKeyFromFile("../keystore/client", "Ktest.dev.zenr.io.+015+42176")
+	if err != nil {
+		t.Fatalf("load wrong-client key: %v", err)
+	}
+
+	h := NewUpdateHandler()
+	h.SetLogger(newTestHandler().logger)
+	if err := h.Setup(map[string]any{
+		"upstream_zone": "dev.zenr.io.",
+		"keystore_dir":  keystoreDir,
+	}); err != nil {
+		t.Fatalf("setup handler: %v", err)
+	}
+	// This is the hypothetical the case explicitly raised: even if
+	// WRONG_CLIENT_KEY_NAME resolves as an authorized online signer, it must
+	// not be able to hijack RRs another key already registered.
+	h.AllowOnlineKeyRegistration = true
+	h.upstreamCoordinator = &stubUpstreamCoordinator{resp: &dns.Msg{MsgHeader: dns.MsgHeader{Rcode: dns.RcodeSuccess}}}
+	// Both keys are independently published under the same owner name, so
+	// WRONG_CLIENT_KEY_NAME resolves as a valid SIG(0) signer purely via
+	// authoritative DNS: it is never lease-managed and never present
+	// anywhere in the request itself (signerSource=Authoritative).
+	h.authoritativeLookup = func(ctx context.Context, zoneHint, fqdn string, rrType uint16) ([]dns.RR, error) {
+		if rrType == dns.TypeKEY && canonicalName(fqdn) == canonicalName(client.PublicKey.Hdr.Name) {
+			return []dns.RR{client.PublicKey, wrong.PublicKey}, nil
+		}
+		return []dns.RR{}, nil
+	}
+
+	clientKeyRR := client.PublicKey.Clone().(*dns.KEY)
+	if err := h.leaseManager.Register(context.Background(), clientKeyRR, 120, 120, "dev.zenr.io."); err != nil {
+		t.Fatalf("register client key: %v", err)
+	}
+	clientTXT := &dns.TXT{Hdr: dns.Header{Name: "test.dev.zenr.io.", Class: dns.ClassINET, TTL: 60}}
+	clientTXT.TXT.Txt = []string{"client-payload"}
+	h.setNonKeyLease(leasepkg.NodeKey(clientKeyRR), []dns.RR{clientTXT}, 120, "dev.zenr.io.")
+	h.scheduleLeaseExpiry(leasepkg.NodeKey(clientKeyRR))
+	defer h.clearLeaseTimer(leasepkg.NodeKey(clientKeyRR))
+
+	// Attack: "refresh" the client's already-registered KEY+TXT data, but
+	// sign the transaction with WRONG_CLIENT_KEY_NAME instead.
+	msg := dns.NewMsg("test.dev.zenr.io.", dns.TypeSOA)
+	if msg == nil {
+		t.Fatalf("expected message")
+	}
+	msg.Opcode = dns.OpcodeUpdate
+
+	copiedClientKeyRR := client.PublicKey.Clone().(*dns.KEY)
+	msg.Ns = append(msg.Ns, copiedClientKeyRR)
+
+	attackTXT := &dns.TXT{Hdr: dns.Header{Name: "test.dev.zenr.io.", Class: dns.ClassINET, TTL: 60}}
+	attackTXT.TXT.Txt = []string{"client-payload"}
+	msg.Ns = append(msg.Ns, attackTXT)
+
+	opt := &dns.OPT{Hdr: dns.Header{Name: "."}}
+	opt.SetUDPSize(uint16(dns.DefaultMsgSize))
+	leaseOpt := leasepkg.Encode8Byte(120, 120)
+	if err := leaseOpt.Encode(opt); err != nil {
+		t.Fatalf("encode lease option: %v", err)
+	}
+	msg.Extra = append(msg.Extra, opt)
+
+	signed, err := sig0.SignMessage(msg, wrong.PublicKey, wrong.PrivateKey)
+	if err != nil {
+		t.Fatalf("sign message: %v", err)
+	}
+
+	res := h.Handle(context.Background(), stubResponseWriter{}, signed)
+	if res == nil || res.Message == nil {
+		t.Fatalf("expected response message")
+	}
+	if res.Message.Rcode != dns.RcodeRefused {
+		t.Fatalf("expected refused when an online-authorized foreign signer tries to refresh another key's registration, got rcode=%d", res.Message.Rcode)
+	}
+
+	got := h.leaseManager.LookupByKEY(clientKeyRR)
+	if got == nil {
+		t.Fatalf("expected client key lease to remain")
+	}
+	if got.ParentKeyName != "" {
+		t.Fatalf("expected client key to remain a self-registered root node, got hijacked parent %q", got.ParentKeyName)
+	}
+
+	wrongSignerNodeKey := leasepkg.NodeKeyFromSIG(wrong.PublicKey.Hdr.Name, wrong.PublicKey.Algorithm, wrong.PublicKey.KeyTag())
+	if set := h.getNonKeyLease(wrongSignerNodeKey); set != nil && len(set.Records) > 0 {
+		t.Fatalf("expected no phantom data to be registered under the rejected foreign signer, got %+v", set.Records)
 	}
 }

@@ -78,6 +78,12 @@ func (r *Record) TimeRemaining() time.Duration {
 type LeaseStore interface {
 	// Register creates or updates a KEY lease. The node identity is derived from keyRR.
 	Register(ctx context.Context, keyRR *dns.KEY, leaseDuration uint32, keyLeaseDuration uint32, upstreamZone string) error
+	// RenewLease extends an already-registered KEY lease's timers in place.
+	// The node identity is derived from keyRR; it is an error if no such
+	// node is already registered. Unlike Register, it never touches
+	// ParentKeyName, RegisteredAt, or the node's position in the tree --
+	// renewing a lease is not re-creating the node.
+	RenewLease(ctx context.Context, keyRR *dns.KEY, leaseDuration uint32, keyLeaseDuration uint32) error
 	// FindByName returns all non-expired records at the given DNS name.
 	FindByName(dnsName string) []*Record
 	// LookupByKEY returns the non-expired record matching k's exact identity (name+algo+tag).
@@ -242,6 +248,35 @@ func (m *InMemoryLeaseStore) RegisterWithParent(ctx context.Context, parentNodeK
 
 	if m.persistenceHook != nil {
 		_ = m.persistenceHook(ctx, "register", cloneRecord(record))
+	}
+	return nil
+}
+
+// RenewLease extends an already-registered KEY lease's timers in place.
+// Unlike Register/RegisterWithParent, it never rebuilds the node: it leaves
+// ParentKeyName, RegisteredAt, and the node's position in the tree
+// completely untouched, since renewing a lease is not re-creating it.
+func (m *InMemoryLeaseStore) RenewLease(ctx context.Context, keyRR *dns.KEY, leaseDuration uint32, keyLeaseDuration uint32) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	if keyRR == nil {
+		return fmt.Errorf("key rr is nil")
+	}
+	nodeKey := NodeKey(keyRR)
+
+	existing, ok := m.leases[nodeKey]
+	if !ok {
+		return fmt.Errorf("no existing lease for %s to renew", nodeKey)
+	}
+
+	existing.ExpiresAt = time.Now().Add(time.Duration(leaseDuration) * time.Second)
+	existing.LeaseDuration = leaseDuration
+	existing.KeyLeaseDuration = keyLeaseDuration
+	existing.KeyRR = keyRR
+
+	if m.persistenceHook != nil {
+		_ = m.persistenceHook(ctx, "renew", cloneRecord(existing))
 	}
 	return nil
 }
