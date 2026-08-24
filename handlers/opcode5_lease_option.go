@@ -24,7 +24,14 @@ func (h *UpdateHandler) hasUpdateLeaseOption(msg *dns.Msg) bool {
 // The decision between refresh and registration is NOT made here —
 // it is determined by the caller based on lease existence (Lookup).
 func (h *UpdateHandler) parseLease(msg *dns.Msg) (uint32, uint32, error) {
-	const MinLeaseDuration = 30 // RFC 9664 minimum
+	// Minimums come from the configured lease_policy (min_rr_lease_sec /
+	// min_key_lease_sec), matching clampTTL's convention elsewhere in this
+	// handler: 0 means "no minimum enforced", not "use some hardcoded RFC
+	// 9664 default". A proxy launched with a different policy (e.g. a lower
+	// floor for testing) must actually enforce that policy here, at parse
+	// time, since this check runs before any clamping does.
+	minRRLease := h.LeasePolicy.MinRRLease
+	minKeyLease := h.LeasePolicy.MinKeyLease
 
 	erfc, found := leasepkg.FindOption(msg)
 	if !found {
@@ -37,8 +44,8 @@ func (h *UpdateHandler) parseLease(msg *dns.Msg) (uint32, uint32, error) {
 
 	if lo.KeyLease == nil {
 		// 4-byte variant: only permitted when prefer_4byte_variant is configured.
-		if lo.Lease < MinLeaseDuration {
-			return 0, 0, fmt.Errorf("lease duration %d below minimum %d", lo.Lease, MinLeaseDuration)
+		if minRRLease > 0 && lo.Lease < minRRLease {
+			return 0, 0, fmt.Errorf("lease duration %d below minimum %d", lo.Lease, minRRLease)
 		}
 		if !h.prefer4ByteVariant {
 			return 0, 0, fmt.Errorf("4-byte variant not permitted; prefer 8-byte variant")
@@ -52,20 +59,20 @@ func (h *UpdateHandler) parseLease(msg *dns.Msg) (uint32, uint32, error) {
 
 	// LEASE==0 is accepted for explicit delete semantics.
 	if lease == 0 {
-		if keyLease != 0 && keyLease < MinLeaseDuration {
-			return 0, 0, fmt.Errorf("key-lease duration %d below minimum %d", keyLease, MinLeaseDuration)
+		if keyLease != 0 && minKeyLease > 0 && keyLease < minKeyLease {
+			return 0, 0, fmt.Errorf("key-lease duration %d below minimum %d", keyLease, minKeyLease)
 		}
 		return lease, keyLease, nil
 	}
 
-	if lease < MinLeaseDuration {
-		return 0, 0, fmt.Errorf("lease duration %d below minimum %d", lease, MinLeaseDuration)
+	if minRRLease > 0 && lease < minRRLease {
+		return 0, 0, fmt.Errorf("lease duration %d below minimum %d", lease, minRRLease)
 	}
 
 	// KEY-LEASE == 0 means no KEY RR lease operation.
 	if keyLease != 0 {
-		if keyLease < MinLeaseDuration {
-			return 0, 0, fmt.Errorf("key-lease duration %d below minimum %d", keyLease, MinLeaseDuration)
+		if minKeyLease > 0 && keyLease < minKeyLease {
+			return 0, 0, fmt.Errorf("key-lease duration %d below minimum %d", keyLease, minKeyLease)
 		}
 		if lease > keyLease {
 			return 0, 0, fmt.Errorf("lease duration %d cannot exceed key-lease duration %d", lease, keyLease)

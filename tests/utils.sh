@@ -15,6 +15,13 @@ PROXY_URL="$PROXY_ADDR:$PROXY_PORT"
 
 # Configuration
 TMP_CONFIG_FILE=""
+LEASE_CONFIG_FILE="$CONFIG_FILE"
+LEASE_CONFIG_PREPARED=false
+REUSED_PROXY=false
+# Floor used for min_key_lease_sec/min_rr_lease_sec in the scratch config
+# prepare_lease_config() writes, so lease-cycle tests don't wait out the
+# real (production) policy minimums.
+TEST_MIN_LEASE_SECONDS="${TEST_MIN_LEASE_SECONDS:-10}"
 AUTH_SERVER="${AUTH_SERVER:-ns1.free2air.org}"
 PROXY_KEYSTORE_DIR="./keystore/server"
 PROXY_KEY_NAME="${PROXY_KEYSTORE_DIR}/Kdev.zenr.io.+015+35317.key"
@@ -83,7 +90,7 @@ yaml_get_lease_time() {
     local value=""
 
     if command -v yq >/dev/null 2>&1; then
-        value="$(yq -r ".handlers.update.lease_policy.${key} // \"\"" "$CONFIG_FILE" 2>/dev/null || true)"
+        value="$(yq -r ".handlers.update.lease_policy.${key} // \"\"" "$LEASE_CONFIG_FILE" 2>/dev/null || true)"
     else
         echo "please install jq!"
         exit 1
@@ -97,48 +104,78 @@ yaml_get_lease_time() {
     fi
 }
 
-start_proxy() {
-    log_section "START: Proxy Process"
-
-    # Check if a proxy/service is ALREADY listening on PROXY_PORT
-    local is_port_in_use=false
-
+# Check if a proxy/service is ALREADY listening on PROXY_PORT. Sets the
+# global PORT_HEX as a side effect (consumed later by start_proxy's
+# post-launch listener check).
+is_port_in_use() {
     PORT_HEX=$(printf '%04X' "$PROXY_PORT")
 
     if [ "${OS}" = "darwin" ]; then
-        if lsof -nP -iTCP:"${PROXY_PORT}" -sTCP:LISTEN >/dev/null 2>&1 || \
-           lsof -nP -iUDP:"${PROXY_PORT}" >/dev/null 2>&1; then
-            is_port_in_use=true
-        fi
+        lsof -nP -iTCP:"${PROXY_PORT}" -sTCP:LISTEN >/dev/null 2>&1 || \
+            lsof -nP -iUDP:"${PROXY_PORT}" >/dev/null 2>&1
     elif command -v ss >/dev/null 2>&1; then
-        if ss -tuln 2>/dev/null | grep -qE ":${PROXY_PORT}\\b"; then
-            is_port_in_use=true
-        fi
+        ss -tuln 2>/dev/null | grep -qE ":${PROXY_PORT}\\b"
     elif [ -f /proc/net/tcp ] || [ -f /proc/net/udp ]; then
-        if grep ":${PORT_HEX} " /proc/net/tcp 2>/dev/null | grep -q " 0A " || \
-           grep ":${PORT_HEX} " /proc/net/udp 2>/dev/null | grep -q " 07 "; then
-            is_port_in_use=true
-        fi
+        grep ":${PORT_HEX} " /proc/net/tcp 2>/dev/null | grep -q " 0A " || \
+            grep ":${PORT_HEX} " /proc/net/udp 2>/dev/null | grep -q " 07 "
+    else
+        return 1
     fi
+}
 
-    # If already running, reuse it and skip startup
-    if [ "$is_port_in_use" = true ]; then
-        log_success "Reusing proxy already listening on ${PROXY_ADDR}:${PROXY_PORT}"
-        REUSED_PROXY=true # Optional flag for cleanup scripts to avoid killing pre-existing proxies
+# prepare_lease_config decides, once, whether this run will start its own
+# proxy or reuse one already listening on PROXY_PORT, and sets
+# LEASE_CONFIG_FILE accordingly:
+#   - starting our own proxy: writes a scratch TMP_CONFIG_FILE with
+#     min_key_lease_sec/min_rr_lease_sec forced down to
+#     TEST_MIN_LEASE_SECONDS, so lease-cycle tests don't wait out the real
+#     policy minimums.
+#   - reusing an already-running proxy: we don't control that process's
+#     config, so LEASE_CONFIG_FILE falls back to the real CONFIG_FILE
+#     (whatever policy it's actually enforcing).
+# Idempotent: safe to call from multiple entry points (e.g. a caller that
+# needs lease values before start_proxy runs, and start_proxy itself).
+prepare_lease_config() {
+    if [ "$LEASE_CONFIG_PREPARED" = true ]; then
         return 0
     fi
-    
-    if ! [ -x "$PROXY_BIN" ]; then
-        log_error "Proxy binary not found or not executable: $PROXY_BIN"
-        exit 1
+    LEASE_CONFIG_PREPARED=true
+
+    if is_port_in_use; then
+        REUSED_PROXY=true
+        LEASE_CONFIG_FILE="$CONFIG_FILE"
+        return 0
     fi
 
     log_step "Preparing runtime config for listen address $PROXY_ADDR:$PROXY_PORT"
 
     TMP_CONFIG_FILE="$(mktemp /tmp/sig0lease-config.XXXXXX)"
     cp "$CONFIG_FILE" "$TMP_CONFIG_FILE"
-    sed -i.bak "s|^  address:.*$|  address: \"$PROXY_ADDR:$PROXY_PORT\"|" "$TMP_CONFIG_FILE"
+    sed -i.bak \
+        -e "s|^  address:.*$|  address: \"$PROXY_ADDR:$PROXY_PORT\"|" \
+        -e "s|^      min_key_lease_sec:.*$|      min_key_lease_sec: ${TEST_MIN_LEASE_SECONDS}|" \
+        -e "s|^      min_rr_lease_sec:.*$|      min_rr_lease_sec: ${TEST_MIN_LEASE_SECONDS}|" \
+        "$TMP_CONFIG_FILE"
     rm -f "$TMP_CONFIG_FILE.bak"
+
+    LEASE_CONFIG_FILE="$TMP_CONFIG_FILE"
+}
+
+start_proxy() {
+    log_section "START: Proxy Process"
+
+    prepare_lease_config
+
+    # If already running, reuse it and skip startup
+    if [ "$REUSED_PROXY" = true ]; then
+        log_success "Reusing proxy already listening on ${PROXY_ADDR}:${PROXY_PORT}"
+        return 0
+    fi
+
+    if ! [ -x "$PROXY_BIN" ]; then
+        log_error "Proxy binary not found or not executable: $PROXY_BIN"
+        exit 1
+    fi
 
     log_step "Starting proxy on $PROXY_URL with config: $TMP_CONFIG_FILE"
 
