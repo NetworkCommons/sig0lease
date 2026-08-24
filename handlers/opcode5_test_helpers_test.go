@@ -11,7 +11,7 @@ import (
 
 func newTestHandler() *UpdateHandler {
 	h := NewUpdateHandler()
-	h.SetLogger(logging.NewLogger("debug", "text"))
+	h.SetLogger(logging.NewLogger("debug"))
 	return h
 }
 

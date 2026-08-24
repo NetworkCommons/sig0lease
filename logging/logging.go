@@ -1,47 +1,105 @@
 // Package logging provides structured logging for the DNS proxy.
+//
+// Every Logger produced by this package renders records through the same
+// uniformHandler, so the on-disk format is defined in exactly one place:
+//
+//	2026/08/20 10:39:44.164+02:00 -- INFO -- "message"
+//
+// The only thing callers may vary between Logger instances is the minimum
+// level (e.g. to run one module at "debug" while the rest stay at "info");
+// the format itself is not configurable per instance.
 package logging
 
 import (
+	"context"
 	"fmt"
+	"io"
 	"log/slog"
 	"os"
+	"strconv"
+	"sync"
 )
+
+// timeFormat renders "2026/08/20 10:39:44.164+02:00".
+const timeFormat = "2006/01/02 15:04:05.000-07:00"
+
+// uniformHandler is the sole slog.Handler implementation used by this
+// package. It exists so the log line format has exactly one definition,
+// shared by every Logger regardless of level or module.
+type uniformHandler struct {
+	mu    *sync.Mutex
+	w     io.Writer
+	level slog.Leveler
+	attrs []slog.Attr
+}
+
+func newUniformHandler(w io.Writer, level slog.Leveler) *uniformHandler {
+	return &uniformHandler{mu: &sync.Mutex{}, w: w, level: level}
+}
+
+func (h *uniformHandler) Enabled(_ context.Context, level slog.Level) bool {
+	return level >= h.level.Level()
+}
+
+func (h *uniformHandler) Handle(_ context.Context, r slog.Record) error {
+	line := fmt.Sprintf("%s -- %s -- %s",
+		r.Time.Format(timeFormat), r.Level.String(), strconv.Quote(r.Message))
+
+	appendAttr := func(a slog.Attr) bool {
+		if a.Key != "" {
+			line += fmt.Sprintf(" %s=%v", a.Key, a.Value.Any())
+		}
+		return true
+	}
+	for _, a := range h.attrs {
+		appendAttr(a)
+	}
+	r.Attrs(appendAttr)
+
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	_, err := io.WriteString(h.w, line+"\n")
+	return err
+}
+
+func (h *uniformHandler) WithAttrs(attrs []slog.Attr) slog.Handler {
+	merged := make([]slog.Attr, 0, len(h.attrs)+len(attrs))
+	merged = append(merged, h.attrs...)
+	merged = append(merged, attrs...)
+	return &uniformHandler{mu: h.mu, w: h.w, level: h.level, attrs: merged}
+}
+
+func (h *uniformHandler) WithGroup(_ string) slog.Handler {
+	// Groups are unused in this codebase; the flat format has no notion
+	// of nesting, so this is a no-op rather than a second format.
+	return h
+}
 
 // Logger wraps slog.Logger with convenience methods including Debugf.
 type Logger struct {
 	logger *slog.Logger
 }
 
-// NewLogger creates a new logger instance.
-func NewLogger(level string, format string) *Logger {
-	var lvl slog.LevelVar
+func levelFromString(level string) slog.Level {
 	switch level {
 	case "debug":
-		lvl.Set(slog.LevelDebug)
-	case "info":
-		lvl.Set(slog.LevelInfo)
+		return slog.LevelDebug
 	case "warn":
-		lvl.Set(slog.LevelWarn)
+		return slog.LevelWarn
 	case "error":
-		lvl.Set(slog.LevelError)
+		return slog.LevelError
 	default:
-		lvl.Set(slog.LevelInfo)
+		return slog.LevelInfo
 	}
+}
 
-	var handler slog.Handler
-	switch format {
-	case "json":
-		handler = slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{
-			Level: &lvl,
-		})
-	default:
-		handler = slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{
-			Level: &lvl,
-		})
-	}
-
+// NewLogger creates a new logger instance writing the package's single
+// canonical log format to stdout. level is the only setting that may
+// differ between instances (e.g. a per-module override), so that every
+// logger in the process stays uniformly formatted.
+func NewLogger(level string) *Logger {
 	return &Logger{
-		logger: slog.New(handler),
+		logger: slog.New(newUniformHandler(os.Stdout, levelFromString(level))),
 	}
 }
 

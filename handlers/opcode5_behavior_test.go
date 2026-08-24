@@ -638,7 +638,7 @@ func TestUpdateHandlerSetupParsesBlacklistedTypes(t *testing.T) {
 		t.Fatalf("setup test keystore: %v", err)
 	}
 	h := NewUpdateHandler()
-	h.SetLogger(logging.NewLogger("debug", "text"))
+	h.SetLogger(logging.NewLogger("debug"))
 	cfg := map[string]interface{}{
 		"upstream_zone": "dev.zenr.io.",
 		"keystore_dir":  keystoreDir,
@@ -707,7 +707,7 @@ func TestUpdateHandlerSetupHandlesUnknownBlacklistedTypes(t *testing.T) {
 		t.Fatalf("setup test keystore: %v", err)
 	}
 	h := NewUpdateHandler()
-	h.SetLogger(logging.NewLogger("debug", "text"))
+	h.SetLogger(logging.NewLogger("debug"))
 	cfg := map[string]interface{}{
 		"upstream_zone": "dev.zenr.io.",
 		"keystore_dir":  keystoreDir,
@@ -757,7 +757,7 @@ func TestUpdateHandlerNoBlacklistAllowsAllTypes(t *testing.T) {
 		t.Fatalf("setup test keystore: %v", err)
 	}
 	h := NewUpdateHandler()
-	h.SetLogger(logging.NewLogger("debug", "text"))
+	h.SetLogger(logging.NewLogger("debug"))
 	cfg := map[string]interface{}{
 		"upstream_zone": "dev.zenr.io.",
 		"keystore_dir":  keystoreDir,
