@@ -211,9 +211,6 @@ func TestNonKEYRecords_AreTreeNodesWithBaseRecordFields(t *testing.T) {
 		if rec.ParentKeyName != NodeKey(owner) {
 			t.Fatalf("unexpected parent key: %q", rec.ParentKeyName)
 		}
-		if rec.OwnerKeyName != NodeKey(owner) {
-			t.Fatalf("unexpected owner key: %q", rec.OwnerKeyName)
-		}
 		if rec.LeaseDuration != 120 {
 			t.Fatalf("unexpected lease duration: %d", rec.LeaseDuration)
 		}

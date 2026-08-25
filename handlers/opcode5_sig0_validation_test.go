@@ -564,7 +564,7 @@ func TestHandle_NonKeyOnlyLeaseWithoutUpdateKeyRR_RegistersNonKeyRRs(t *testing.
 		t.Fatalf("expected successful non-KEY-only update without KEY RR, got rcode=%d", res.Message.Rcode)
 	}
 
-	if !h.hasActiveNonKeyRecord(leasepkg.NodeKey(signerKey), req.Ns[0]) {
+	if existing := h.leaseManager.LookupNonKEYRecord(req.Ns[0]); existing == nil || existing.ParentKeyName != leasepkg.NodeKey(signerKey) {
 		t.Fatalf("expected non-KEY RR to be registered under signer ownership")
 	}
 }
@@ -923,7 +923,9 @@ func TestHandle_CaseARefresh_ForeignSignerWithOwnRegistrationCannotHijackExistin
 	}
 	clientTXT := &dns.TXT{Hdr: dns.Header{Name: "test.dev.zenr.io.", Class: dns.ClassINET, TTL: 60}}
 	clientTXT.TXT.Txt = []string{"client-payload"}
-	h.setNonKeyLease(leasepkg.NodeKey(clientKeyRR), []dns.RR{clientTXT}, 120, "dev.zenr.io.")
+	if err := h.leaseManager.UpsertNonKEYRecords(leasepkg.NodeKey(clientKeyRR), []dns.RR{clientTXT}, 120, "dev.zenr.io."); err != nil {
+		t.Fatalf("upsert non-key record: %v", err)
+	}
 	h.scheduleLeaseExpiry(leasepkg.NodeKey(clientKeyRR))
 	defer h.clearLeaseTimer(leasepkg.NodeKey(clientKeyRR))
 
@@ -1023,7 +1025,9 @@ func TestHandle_CaseARefresh_OnlineAuthorizedSignerCannotHijackExistingKey(t *te
 	}
 	clientTXT := &dns.TXT{Hdr: dns.Header{Name: "test.dev.zenr.io.", Class: dns.ClassINET, TTL: 60}}
 	clientTXT.TXT.Txt = []string{"client-payload"}
-	h.setNonKeyLease(leasepkg.NodeKey(clientKeyRR), []dns.RR{clientTXT}, 120, "dev.zenr.io.")
+	if err := h.leaseManager.UpsertNonKEYRecords(leasepkg.NodeKey(clientKeyRR), []dns.RR{clientTXT}, 120, "dev.zenr.io."); err != nil {
+		t.Fatalf("upsert non-key record: %v", err)
+	}
 	h.scheduleLeaseExpiry(leasepkg.NodeKey(clientKeyRR))
 	defer h.clearLeaseTimer(leasepkg.NodeKey(clientKeyRR))
 
@@ -1072,7 +1076,7 @@ func TestHandle_CaseARefresh_OnlineAuthorizedSignerCannotHijackExistingKey(t *te
 	}
 
 	wrongSignerNodeKey := leasepkg.NodeKeyFromSIG(wrong.PublicKey.Hdr.Name, wrong.PublicKey.Algorithm, wrong.PublicKey.KeyTag())
-	if set := h.getNonKeyLease(wrongSignerNodeKey); set != nil && len(set.Records) > 0 {
+	if set := h.leaseManager.GetNonKEYRecordSet(wrongSignerNodeKey); set != nil && len(set.Records) > 0 {
 		t.Fatalf("expected no phantom data to be registered under the rejected foreign signer, got %+v", set.Records)
 	}
 }

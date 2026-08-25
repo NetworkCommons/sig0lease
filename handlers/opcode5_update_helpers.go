@@ -563,6 +563,16 @@ func (h *UpdateHandler) authoritativeHasKeyAtName(ctx context.Context, zoneHint 
 	return len(rrs) > 0, nil
 }
 
+// filterDuplicateRegistrations checks each candidate record against the
+// lease store first, since the store -- not the authoritative DNS server --
+// is the source of truth for what this proxy already manages: the DNS
+// server can be wiped, reset, or fail over to an empty secondary for
+// reasons entirely outside the proxy's control, and none of that should let
+// a record we still believe we're actively leasing be silently reassigned
+// to a different key. Only a record the store has no knowledge of at all
+// falls through to a live authoritative-DNS check, to catch data that
+// exists outside our management (registered before this proxy existed, or
+// by some other process) rather than ours to claim.
 func (h *UpdateHandler) filterDuplicateRegistrations(ctx context.Context, keyName, zoneHint string, records []dns.RR) ([]dns.RR, []string, error) {
 	accepted := make([]dns.RR, 0, len(records))
 	notes := make([]string, 0)
@@ -571,13 +581,18 @@ func (h *UpdateHandler) filterDuplicateRegistrations(ctx context.Context, keyNam
 		if rr == nil || rr.Header() == nil {
 			continue
 		}
-		if h.hasActiveNonKeyRecord(keyName, rr) {
+		if existing := h.leaseManager.LookupNonKEYRecord(rr); existing != nil {
+			if existing.ParentKeyName != keyName {
+				return nil, nil, fmt.Errorf("duplicate registration rejected: %s is already registered under a different key", rr.String())
+			}
+			// Already active under this same key: a refresh.
 			accepted = append(accepted, rr)
 			continue
 		}
 
-		// New registration attempt for this RR: fail the whole request if
-		// the authoritative zone already contains an identical RR.
+		// Not under our control locally: fail the whole request if the
+		// authoritative zone already contains an identical RR anyway (data
+		// outside this proxy's management, not ours to claim).
 		exists, err := h.authoritativeHasRR(ctx, zoneHint, rr)
 		if err != nil {
 			return nil, nil, err

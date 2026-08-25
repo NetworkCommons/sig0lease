@@ -98,54 +98,6 @@ func (h *UpdateHandler) registerKeyLease(ctx context.Context, signerID keyID, ke
 	return h.leaseManager.RegisterWithParent(ctx, parent, keyRR, leaseDuration, keyLeaseDuration, h.upstreamZone)
 }
 
-func (h *UpdateHandler) setNonKeyLease(keyName string, records []dns.RR, leaseDuration uint32, upstreamZone string) {
-	if err := h.leaseManager.UpsertNonKEYRecords(keyName, records, leaseDuration, upstreamZone); err != nil {
-		h.logger.Debugf("failed to store non-KEY records in lease tree for %s: %v", keyName, err)
-	}
-}
-
-// removeNonKeyLease removes every non-KEY record owned by keyName outright.
-// There is no soft-delete state: a record is either present (active) or gone.
-func (h *UpdateHandler) removeNonKeyLease(keyName string) {
-	h.leaseManager.RemoveNonKEYRecords(keyName)
-}
-
-// removeSingleNonKeyRecord removes one record (by its RFC 2136 identity key)
-// from keyName's set, leaving the rest of the set untouched. Used for
-// per-record expiry, where only one of several records under a key expires.
-func (h *UpdateHandler) removeSingleNonKeyRecord(keyName, recordKeyStr string) {
-	h.leaseManager.RemoveSingleNonKEYRecord(keyName, recordKeyStr)
-}
-
-func (h *UpdateHandler) getNonKeyLease(keyName string) *NonKEYLeaseRecord {
-	set := h.leaseManager.GetNonKEYRecordSet(keyName)
-	if set == nil {
-		return nil
-	}
-	rec := &NonKEYLeaseRecord{
-		Records:      make(map[string]*nonKeyRecordEntry, len(set.Records)),
-		UpstreamZone: set.UpstreamZone,
-	}
-	for rrKey, node := range set.Records {
-		if node == nil {
-			continue
-		}
-		rec.Records[rrKey] = &nonKeyRecordEntry{
-			RR:            copyRR(node.RR),
-			ExpiresAt:     node.ExpiresAt,
-			LeaseDuration: node.LeaseDuration,
-		}
-	}
-	return rec
-}
-
-func (h *UpdateHandler) hasActiveNonKeyRecord(keyName string, rr dns.RR) bool {
-	if rr == nil {
-		return false
-	}
-	return h.leaseManager.HasActiveNonKEYRecord(keyName, rr)
-}
-
 func (h *UpdateHandler) nextLeaseEventAfter(keyName string) (time.Duration, bool) {
 	var next *time.Time
 
@@ -154,7 +106,7 @@ func (h *UpdateHandler) nextLeaseEventAfter(keyName string) (time.Duration, bool
 		next = &t
 	}
 
-	if nonKeyRec := h.getNonKeyLease(keyName); nonKeyRec != nil {
+	if nonKeyRec := h.leaseManager.GetNonKEYRecordSet(keyName); nonKeyRec != nil {
 		for _, entry := range nonKeyRec.Records {
 			t := entry.ExpiresAt
 			if next == nil || t.Before(*next) {
@@ -308,21 +260,9 @@ func (h *UpdateHandler) dumpLeaseTreeLevel() string {
 		if set == nil {
 			continue
 		}
-		rec := &NonKEYLeaseRecord{
-			Records:      make(map[string]*nonKeyRecordEntry, len(set.Records)),
-			UpstreamZone: set.UpstreamZone,
-		}
-		for rrKey, entry := range set.Records {
-			if entry == nil {
-				continue
-			}
-			rec.Records[rrKey] = &nonKeyRecordEntry{
-				RR:            copyRR(entry.RR),
-				ExpiresAt:     entry.ExpiresAt,
-				LeaseDuration: entry.LeaseDuration,
-			}
-		}
-		node.nonKeyRec = rec
+		// GetNonKEYRecordSet already returns a cloned, point-in-time view --
+		// no need to re-clone it into a second, handlers-local copy.
+		node.nonKeyRec = set
 	}
 
 	if len(nodes) == 0 {
@@ -518,7 +458,7 @@ func (h *UpdateHandler) DumpLeasesLevel(level string) string {
 
 	for _, name := range sortedNames {
 		keyRec := h.leaseManager.Get(name)
-		nonKeyRec := h.getNonKeyLease(name)
+		nonKeyRec := h.leaseManager.GetNonKEYRecordSet(name)
 
 		// Determine key status.
 		keyStatus := "absent"
@@ -560,7 +500,7 @@ func (h *UpdateHandler) processExpiredLease(ctx context.Context, nodeKey string)
 	defer h.scheduleLeaseExpiry(nodeKey)
 
 	record := h.leaseManager.Get(nodeKey)
-	nonKeyLease := h.getNonKeyLease(nodeKey)
+	nonKeyLease := h.leaseManager.GetNonKEYRecordSet(nodeKey)
 	if record == nil && (nonKeyLease == nil || len(nonKeyLease.Records) == 0) {
 		h.clearLeaseTimer(nodeKey)
 		return
@@ -609,7 +549,9 @@ func (h *UpdateHandler) processExpiredLease(ctx context.Context, nodeKey string)
 					}
 				}
 				if upstreamDeleted {
-					h.removeSingleNonKeyRecord(nodeKey, key)
+					if err := h.leaseManager.RemoveSingleNonKEYRecord(nodeKey, key); err != nil {
+						h.logger.Warnf("Failed to remove expired non-KEY record %s for %s locally: %v", key, nodeKey, err)
+					}
 				}
 			}
 		}
@@ -666,7 +608,9 @@ func (h *UpdateHandler) processExpiredLease(ctx context.Context, nodeKey string)
 				upstreamDeleted = false
 			}
 			if upstreamDeleted {
-				h.removeSingleNonKeyRecord(nodeKey, key)
+				if err := h.leaseManager.RemoveSingleNonKEYRecord(nodeKey, key); err != nil {
+					h.logger.Warnf("Failed to remove non-KEY record %s for %s locally on KEY expiry: %v", key, nodeKey, err)
+				}
 			}
 		}
 	}
@@ -712,8 +656,9 @@ func (h *UpdateHandler) processExpiredLease(ctx context.Context, nodeKey string)
 	if err := h.leaseManager.Delete(nodeKey); err != nil {
 		h.logger.Warnf("Failed to delete expired local lease for %s: %v (upstream KEY delete already succeeded, local state may now diverge)", nodeKey, err)
 	}
-	// Not a blanket removeNonKeyLease(nodeKey): the two loops above already
-	// removed each record they confirmed deleted upstream, one at a time.
+	// Not a blanket h.leaseManager.RemoveNonKEYRecords(nodeKey): the two
+	// loops above already removed each record they confirmed deleted
+	// upstream, one at a time.
 	// Wiping the whole set here would also discard any record that failed
 	// its upstream delete and is waiting on the rescheduled timer to retry.
 	h.clearLeaseTimer(nodeKey)
@@ -727,7 +672,7 @@ func (h *UpdateHandler) processExpiredLease(ctx context.Context, nodeKey string)
 // server, and doubling them raises the odds of a timeout/SERVFAIL for no
 // benefit. Failures are logged instead of silently discarded.
 func (h *UpdateHandler) deleteNodeNonKeyUpstream(ctx context.Context, nodeKey string) {
-	nonKeyLease := h.getNonKeyLease(nodeKey)
+	nonKeyLease := h.leaseManager.GetNonKEYRecordSet(nodeKey)
 	if nonKeyLease == nil {
 		return
 	}
