@@ -16,9 +16,11 @@ import (
 type stubUpstreamCoordinator struct {
 	resp *dns.Msg
 	err  error
+	sent []*dns.Msg // every updateMsg passed to SendUpdate, in call order
 }
 
 func (s *stubUpstreamCoordinator) SendUpdate(ctx context.Context, upstreamZone string, updateMsg *dns.Msg) (*dns.Msg, error) {
+	s.sent = append(s.sent, updateMsg)
 	return s.resp, s.err
 }
 

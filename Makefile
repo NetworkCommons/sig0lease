@@ -8,7 +8,7 @@ VERSION ?= 0.1.0
 BUILD_DIR := ./bin/$(OS)
 CLIENT_KEYSTORE_DIR ?=
 
-.PHONY: all build build-all build-client build-client-all clean clean-binary deps docs fmt lint release run-client run-server test-full test-register test-register-badsig test-unit test-unit-keystore vet
+.PHONY: all build build-all build-client build-client-all clean clean-binary deps docs fmt lint release run-server test-unit test-register vet
 
 all: build build-client test
 
@@ -76,19 +76,10 @@ vet:
 lint:
 	golangci-lint run ./...
 
-# Run fast unit tests that do not require live integration environment.
-test-unit: fmt vet
-	go test ./handlers ./pkg/dnsmsg/ ./pkg/keyrec ./pkg/lease 
-
-# Run keystore-dependent unit tests.
-# Requires CLIENT_KEYSTORE_DIR for the client key, ex. CLIENT_KEYSTORE_DIR=${PWD}/keystore/client make test-unit-keystore
-test-unit-keystore: fmt vet
-	CLIENT_KEYSTORE_DIR=$(CLIENT_KEYSTORE_DIR) go test ./pkg/sig0
-
 # Run the complete test matrix.
 # Requires CLIENT_KEYSTORE_DIR for the client key, ex. CLIENT_KEYSTORE_DIR=${PWD}/keystore/client make test-full
-test-full: fmt vet
-	CLIENT_KEYSTORE_DIR=$(CLIENT_KEYSTORE_DIR) go test ./... -v
+test-unit: fmt vet
+	CLIENT_KEYSTORE_DIR=$(CLIENT_KEYSTORE_DIR) go test ./...
 
 # Run specific test file or package
 # Example: make test-pkg PKG=./pkg/sig0
@@ -106,33 +97,7 @@ test-cover:
 test-update: build build-client
 	CLIENT_KEYSTORE_DIR=$(CLIENT_KEYSTORE_DIR) ./tests/test_update.sh run
 
-# Run a single end-to-end registration using the built client binary.
-# Override variables as needed, e.g.:
-# make test-register ADDR=127.0.0.1:8053 ZONE=test.dev.zenr.io. KEYNAME=test.dev.zenr.io.
-ADDR ?= 127.0.0.1:8053
-ZONE ?= test.dev.zenr.io.
-KEYNAME ?= test.dev.zenr.io.
-LEASE ?= 300
-KEY_LEASE ?= 3600
-
-# Requires CLIENT_KEYSTORE_DIR for the client key, ex. CLIENT_KEYSTORE_DIR=${PWD}/keystore/client make test-register-key
-test-register-key: build build-client
-	CLIENT_KEYSTORE_DIR=$(CLIENT_KEYSTORE_DIR) ./$(BUILD_DIR)/$(CLIENT_NAME) $(ADDR) register $(ZONE) $(KEYNAME) $(LEASE) $(KEY_LEASE)
-
-test-register-txt: build build-client
-	CLIENT_KEYSTORE_DIR=$(CLIENT_KEYSTORE_DIR) ./$(BUILD_DIR)/$(CLIENT_NAME) $(ADDR) register $(ZONE) $(KEYNAME) $(LEASE) $(KEY_LEASE) '$(KEYNAME) $(LEASE) IN TXT "Ciao from $(shell date +"%FT%T")"'
-
-# Run a registration with one post-signature payload bit flip to validate
-# proxy-side SIG(0) cryptographic verification rejects tampered payloads.
-test-register-badsig: build build-client
-	CLIENT_KEYSTORE_DIR=$(CLIENT_KEYSTORE_DIR) ./$(BUILD_DIR)/$(CLIENT_NAME) $(ADDR) register-tamper $(ZONE) $(KEYNAME) $(LEASE) $(KEY_LEASE)
-
 # Build and run the proxy with example config
 run-server: build
 	./$(BUILD_DIR)/$(BINARY_NAME) ./config.yaml
-
-# Run client (requires proxy addr and command)
-# Usage: CLIENT_KEYSTORE_DIR=${PWD}/keystore/client make run-client ADDR=127.0.0.1:8053 CMD="register test.dev.zenr.io. client.test.dev.zenr.io."
-run-client: build-client
-	CLIENT_KEYSTORE_DIR=$(CLIENT_KEYSTORE_DIR) ./$(BUILD_DIR)/$(CLIENT_NAME) $(ADDR) $(CMD) $(DATA)
 

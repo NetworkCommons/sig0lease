@@ -56,6 +56,33 @@ func applyUpdateHandlerEnvOverrides(cfg map[string]any) map[string]any {
 	return out
 }
 
+// withBootstrapResolvers fills in "bootstrap_resolvers" for the update
+// handler from the top-level "upstreams" config, unless the handler config
+// already sets its own. Without this, the handler's own SOA/NS zone-
+// authority resolution (used to find where to forward signed UPDATEs, and
+// to check for pre-existing records upstream) has no configured resolver of
+// its own and falls back to a hardcoded default -- silently independent of
+// whatever the operator configured under "upstreams" for generic traffic.
+func withBootstrapResolvers(handlerCfg map[string]any, appCfg *config.Config) map[string]any {
+	out := make(map[string]any, len(handlerCfg)+1)
+	for k, v := range handlerCfg {
+		out[k] = v
+	}
+	if _, explicit := out["bootstrap_resolvers"]; explicit {
+		return out
+	}
+	addrs := make([]string, 0, len(appCfg.Upstreams))
+	for _, u := range appCfg.Upstreams {
+		if u.Address != "" {
+			addrs = append(addrs, u.Address)
+		}
+	}
+	if len(addrs) > 0 {
+		out["bootstrap_resolvers"] = addrs
+	}
+	return out
+}
+
 func main() {
 	cfgPath := "config.yaml"
 	dumpMode := false
@@ -96,7 +123,7 @@ func main() {
 				h := handlers.NewUpdateHandler()
 				h.SetLogger(logger)
 
-				handlerCfg := applyUpdateHandlerEnvOverrides(cfg.Handlers["update"])
+				handlerCfg := withBootstrapResolvers(applyUpdateHandlerEnvOverrides(cfg.Handlers["update"]), cfg)
 				if handlerCfg != nil {
 					if err := h.Setup(handlerCfg); err != nil {
 						logger.Errorf("Failed to setup %s: %v", moduleName, err)
@@ -104,12 +131,11 @@ func main() {
 					}
 				}
 
+				// DumpLeasesLevel's returned string already starts with its
+				// own "=== Lease Store Dump/Summary ===" header line; printing
+				// it again here duplicated it, misplaced at the end instead
+				// of the start.
 				fmt.Print(h.DumpLeasesLevel(dumpLevel))
-				if dumpLevel == "debug" {
-					fmt.Println("=== Lease Store Dump ===")
-				} else {
-					fmt.Println("=== Lease Store Summary ===")
-				}
 				return
 			}
 		}
@@ -141,7 +167,7 @@ func main() {
 
 			// Setup handler with configuration for upstream coordination.
 			// Coordinator resolves authoritative NS from upstream_zone and sends UPDATE directly.
-			handlerCfg := applyUpdateHandlerEnvOverrides(cfg.Handlers["update"])
+			handlerCfg := withBootstrapResolvers(applyUpdateHandlerEnvOverrides(cfg.Handlers["update"]), cfg)
 			if handlerCfg != nil {
 				if err := h.Setup(handlerCfg); err != nil {
 					logger.Errorf("Failed to setup %s: %v", moduleName, err)

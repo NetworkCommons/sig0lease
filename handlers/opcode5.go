@@ -107,7 +107,20 @@ type UpstreamCoordinator interface {
 // and sends UPDATE messages directly to that authoritative server.
 type DefaultUpstreamCoordinator struct {
 	logger *logging.Logger
+	// bootstrapResolvers are the resolvers used to look up SOA/NS records to
+	// find the authoritative server for a zone, before the actual UPDATE is
+	// forwarded there. Populated from the same "upstreams" config used for
+	// generic (non-UPDATE) forwarding (see cmd/sig0lease/main.go's
+	// withBootstrapResolvers), so the proxy has one operator-configured
+	// resolver pool instead of several independent, hardcoded ones.
+	bootstrapResolvers []string
 }
+
+// defaultBootstrapResolvers is used only when no bootstrap resolver list was
+// configured at all (see NewDefaultUpstreamCoordinator) -- the same pair
+// config.NewDefaultConfig uses for generic upstreams, so out-of-the-box
+// behavior for a caller that sets nothing is unchanged.
+var defaultBootstrapResolvers = []string{"8.8.8.8:53", "8.8.4.4:53"}
 
 func (u *DefaultUpstreamCoordinator) resolveSOAMasterServer(ctx context.Context, zone string) (string, string, error) {
 	zone = strings.TrimSuffix(zone, ".")
@@ -122,28 +135,36 @@ func (u *DefaultUpstreamCoordinator) resolveSOAMasterServer(ctx context.Context,
 			continue
 		}
 
-		resp, err := dns.Exchange(ctx, req, "udp", "8.8.4.4:53")
-		if err != nil || resp == nil || resp.Rcode != dns.RcodeSuccess {
-			continue
-		}
-
-		for _, rr := range resp.Answer {
-			soa, ok := rr.(*dns.SOA)
-			if !ok {
+		for _, bootstrapServer := range u.bootstrapResolvers {
+			resp, err := dns.Exchange(ctx, req, "udp", bootstrapServer)
+			if err != nil || resp == nil || resp.Rcode != dns.RcodeSuccess {
 				continue
 			}
-			mname := strings.TrimSuffix(soa.Ns, ".")
-			if mname == "" {
-				break
+
+			for _, rr := range resp.Answer {
+				soa, ok := rr.(*dns.SOA)
+				if !ok {
+					continue
+				}
+				mname := strings.TrimSuffix(soa.Ns, ".")
+				if mname == "" {
+					break
+				}
+				u.logger.Debugf("Selected SOA MNAME %s for effective zone %s (via bootstrap resolver %s)", mname, candidateFQDN, bootstrapServer)
+				return net.JoinHostPort(mname, "53"), candidateFQDN, nil
 			}
-			u.logger.Debugf("Selected SOA MNAME %s for effective zone %s", mname, candidateFQDN)
-			return net.JoinHostPort(mname, "53"), candidateFQDN, nil
 		}
 	}
 
 	return "", "", fmt.Errorf("no SOA master server found for %q", zone)
 }
 
+// resolveAuthoritativeZone finds the zone cut (the name that actually has NS
+// records) for zone or one of its parents, using the same configured
+// bootstrap resolvers as resolveSOAMasterServer -- previously this used
+// net.DefaultResolver.LookupNS (the OS resolver, e.g. /etc/resolv.conf),
+// a third, independent resolution path that could disagree with
+// resolveSOAMasterServer's (then-hardcoded) answer for the same zone.
 func (u *DefaultUpstreamCoordinator) resolveAuthoritativeZone(ctx context.Context, zone string) (string, error) {
 	zone = strings.TrimSuffix(zone, ".")
 	if zone == "" {
@@ -151,11 +172,24 @@ func (u *DefaultUpstreamCoordinator) resolveAuthoritativeZone(ctx context.Contex
 	}
 
 	for candidate := zone; candidate != ""; candidate = parentZone(candidate) {
-		nsRecords, err := net.DefaultResolver.LookupNS(ctx, candidate)
-		if err != nil || len(nsRecords) == 0 {
+		candidateFQDN := candidate + "."
+		req := dns.NewMsg(candidateFQDN, dns.TypeNS)
+		if req == nil {
 			continue
 		}
-		return candidate + ".", nil
+
+		for _, bootstrapServer := range u.bootstrapResolvers {
+			resp, err := dns.Exchange(ctx, req, "udp", bootstrapServer)
+			if err != nil || resp == nil || resp.Rcode != dns.RcodeSuccess {
+				continue
+			}
+			for _, rr := range resp.Answer {
+				if _, ok := rr.(*dns.NS); ok {
+					u.logger.Debugf("Selected authoritative zone %s via NS lookup (bootstrap resolver %s)", candidateFQDN, bootstrapServer)
+					return candidateFQDN, nil
+				}
+			}
+		}
 	}
 
 	return "", fmt.Errorf("no authoritative zone with NS records found for %q", zone)
@@ -199,9 +233,17 @@ func (h *UpdateHandler) findAuthorizedProxyKeyForZone(zone string) (*keyrec.Load
 }
 
 // NewDefaultUpstreamCoordinator creates a new upstream coordinator.
-func NewDefaultUpstreamCoordinator(logger *logging.Logger) *DefaultUpstreamCoordinator {
+// bootstrapResolvers are used to resolve SOA/NS records to find the
+// authoritative server for a zone; if empty, defaultBootstrapResolvers is
+// used.
+func NewDefaultUpstreamCoordinator(logger *logging.Logger, bootstrapResolvers []string) *DefaultUpstreamCoordinator {
+	resolvers := bootstrapResolvers
+	if len(resolvers) == 0 {
+		resolvers = defaultBootstrapResolvers
+	}
 	return &DefaultUpstreamCoordinator{
-		logger: logger,
+		logger:             logger,
+		bootstrapResolvers: resolvers,
 	}
 }
 

@@ -123,22 +123,35 @@ func (l *Logger) Error(msg string, keysAndValues ...any) {
 	l.logger.Error(msg, keysAndValues...)
 }
 
+// logf formats and emits a message at level, but only if level is actually
+// enabled. Debugf in particular is called many times per request with
+// arguments that are themselves expensive to stringify (full RRs/messages);
+// formatting them only to have the handler discard the result below its
+// level would pay that cost on every request regardless of log level.
+func (l *Logger) logf(level slog.Level, format string, args ...any) {
+	ctx := context.Background()
+	if !l.logger.Enabled(ctx, level) {
+		return
+	}
+	l.logger.Log(ctx, level, fmt.Sprintf(format, args...))
+}
+
 // Debugf logs a debug message with format.
 func (l *Logger) Debugf(format string, args ...any) {
-	l.Debug(fmt.Sprintf(format, args...))
+	l.logf(slog.LevelDebug, format, args...)
 }
 
 // Infof logs an info message with format.
 func (l *Logger) Infof(format string, args ...any) {
-	l.Info(fmt.Sprintf(format, args...))
+	l.logf(slog.LevelInfo, format, args...)
 }
 
 // Warnf logs a warning message with format.
 func (l *Logger) Warnf(format string, args ...any) {
-	l.Warn(fmt.Sprintf(format, args...))
+	l.logf(slog.LevelWarn, format, args...)
 }
 
 // Errorf logs an error message with format.
 func (l *Logger) Errorf(format string, args ...any) {
-	l.Error(fmt.Sprintf(format, args...))
+	l.logf(slog.LevelError, format, args...)
 }

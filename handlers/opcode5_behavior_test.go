@@ -14,6 +14,7 @@ import (
 	"github.com/NetworkCommons/sig0lease/logging"
 	"github.com/NetworkCommons/sig0lease/pkg/keyrec"
 	"github.com/NetworkCommons/sig0lease/pkg/lease"
+	"github.com/NetworkCommons/sig0lease/pkg/sig0"
 )
 
 func TestParseLeaseRegistrationIncludesKeyLease(t *testing.T) {
@@ -105,7 +106,7 @@ func TestConstructUpstreamUpdateIncludesNonKeyOnlyRecordsOnce(t *testing.T) {
 	txt := &dns.TXT{Hdr: dns.Header{Name: "test.dev.zenr.io.", Class: dns.ClassINET, TTL: 120}}
 	txt.TXT.Txt = []string{"payload"}
 
-	msg, err := h.constructUpstreamUpdate([]*dns.KEY{key1, key2}, []dns.RR{txt}, loaded, "dev.zenr.io.")
+	msg, err := h.constructUpstreamUpdate([]*dns.KEY{key1, key2}, []dns.RR{txt}, nil, loaded, "dev.zenr.io.")
 	if err != nil {
 		t.Fatalf("construct upstream update: %v", err)
 	}
@@ -122,7 +123,7 @@ func TestConstructUpstreamUpdateIncludesNonKeyOnlyRecordsOnce(t *testing.T) {
 		t.Fatalf("expected TXT record to appear once, got %d", txtCount)
 	}
 
-	nonKeyOnlyMsg, err := h.constructUpstreamUpdate(nil, []dns.RR{txt}, loaded, "dev.zenr.io.")
+	nonKeyOnlyMsg, err := h.constructUpstreamUpdate(nil, []dns.RR{txt}, nil, loaded, "dev.zenr.io.")
 	if err != nil {
 		t.Fatalf("construct upstream update for non-KEY-only request: %v", err)
 	}
@@ -768,5 +769,121 @@ func TestUpdateHandlerNoBlacklistAllowsAllTypes(t *testing.T) {
 	}
 	if h.blacklistedTypes != nil {
 		t.Fatalf("expected nil blacklistedTypes when not configured, got %d entries", len(h.blacklistedTypes))
+	}
+}
+
+// TestHandle_CaseD_KeyRefreshWithAccompanyingNonKeyDelete_ForwardsUpstreamAndKeepsUnrelatedRecords
+// covers Case D (KEY-LEASE != 0, LEASE == 0) with an accompanying non-KEY
+// record named for deletion. It previously never forwarded that delete
+// upstream at all (the record stayed published at the authoritative DNS
+// forever) while wiping *every* non-KEY record the key owned locally,
+// including ones the request never named. Both must be fixed: the upstream
+// UPDATE actually sent must contain an RFC 2136 delete for the named record,
+// and an unrelated record under the same key must survive locally.
+func TestHandle_CaseD_KeyRefreshWithAccompanyingNonKeyDelete_ForwardsUpstreamAndKeepsUnrelatedRecords(t *testing.T) {
+	serverKeystoreDir, err := createTestKeystore(t)
+	if err != nil {
+		t.Fatalf("setup test keystore: %v", err)
+	}
+	owner, err := keyrec.LoadKeyFromFile("../keystore/client", "Ktest.dev.zenr.io.+015+05044")
+	if err != nil {
+		t.Fatalf("load owner key: %v", err)
+	}
+
+	h := NewUpdateHandler()
+	h.SetLogger(newTestHandler().logger)
+	if err := h.Setup(map[string]any{
+		"upstream_zone": "dev.zenr.io.",
+		"keystore_dir":  serverKeystoreDir,
+	}); err != nil {
+		t.Fatalf("setup handler: %v", err)
+	}
+	coordinator := &stubUpstreamCoordinator{resp: &dns.Msg{MsgHeader: dns.MsgHeader{Rcode: dns.RcodeSuccess}}}
+	h.upstreamCoordinator = coordinator
+	h.authoritativeLookup = func(ctx context.Context, zoneHint, fqdn string, rrType uint16) ([]dns.RR, error) {
+		if rrType == dns.TypeKEY && canonicalName(fqdn) == canonicalName(owner.PublicKey.Hdr.Name) {
+			return []dns.RR{owner.PublicKey}, nil
+		}
+		return []dns.RR{}, nil
+	}
+
+	ownerRR := owner.PublicKey.Clone().(*dns.KEY)
+	if err := h.leaseManager.Register(context.Background(), ownerRR, 120, 120, "dev.zenr.io."); err != nil {
+		t.Fatalf("register owner key: %v", err)
+	}
+
+	toDelete := &dns.TXT{Hdr: dns.Header{Name: owner.PublicKey.Hdr.Name, Class: dns.ClassINET, TTL: 60}}
+	toDelete.TXT.Txt = []string{"delete-me"}
+	keep := &dns.TXT{Hdr: dns.Header{Name: owner.PublicKey.Hdr.Name, Class: dns.ClassINET, TTL: 60}}
+	keep.TXT.Txt = []string{"keep-me"}
+	h.setNonKeyLease(lease.NodeKey(ownerRR), []dns.RR{toDelete, keep}, 120, "dev.zenr.io.")
+
+	// Case D request: KEY-LEASE != 0 (refresh), LEASE == 0, KEY RR present
+	// plus the one non-KEY record to delete.
+	msg := dns.NewMsg(owner.PublicKey.Hdr.Name, dns.TypeSOA)
+	if msg == nil {
+		t.Fatalf("expected message")
+	}
+	msg.Opcode = dns.OpcodeUpdate
+	keyRR := owner.PublicKey.Clone().(*dns.KEY)
+	msg.Ns = append(msg.Ns, keyRR, toDelete)
+
+	opt := &dns.OPT{Hdr: dns.Header{Name: "."}}
+	opt.SetUDPSize(uint16(dns.DefaultMsgSize))
+	leaseOpt := lease.Encode8Byte(0, 300) // LEASE=0, KEY-LEASE=300
+	if err := leaseOpt.Encode(opt); err != nil {
+		t.Fatalf("encode lease option: %v", err)
+	}
+	msg.Extra = append(msg.Extra, opt)
+
+	signed, err := sig0.SignMessage(msg, owner.PublicKey, owner.PrivateKey)
+	if err != nil {
+		t.Fatalf("sign message: %v", err)
+	}
+
+	res := h.Handle(context.Background(), stubResponseWriter{}, signed)
+	if res == nil || res.Message == nil {
+		t.Fatalf("expected response message")
+	}
+	if res.Message.Rcode != dns.RcodeSuccess {
+		t.Fatalf("expected success, got rcode=%d", res.Message.Rcode)
+	}
+
+	// The upstream UPDATE that was actually sent must contain an RFC 2136
+	// delete (class NONE, TTL 0) for the named record -- this is the core of
+	// the bug: it previously never got forwarded upstream at all.
+	if len(coordinator.sent) == 0 {
+		t.Fatalf("expected an upstream UPDATE to be sent")
+	}
+	foundUpstreamDelete := false
+	for _, sentMsg := range coordinator.sent {
+		for _, rr := range sentMsg.Ns {
+			txt, ok := rr.(*dns.TXT)
+			if !ok || len(txt.TXT.Txt) == 0 || txt.TXT.Txt[0] != "delete-me" {
+				continue
+			}
+			if txt.Hdr.Class == dns.ClassNONE && txt.Hdr.TTL == 0 {
+				foundUpstreamDelete = true
+			}
+		}
+	}
+	if !foundUpstreamDelete {
+		t.Fatalf("expected upstream UPDATE to include an RFC 2136 delete (class NONE, TTL 0) for the named record, got sent=%+v", coordinator.sent)
+	}
+
+	// Locally: the named record is gone...
+	if h.hasActiveNonKeyRecord(lease.NodeKey(ownerRR), toDelete) {
+		t.Fatalf("expected the named record to be removed locally")
+	}
+	// ...but the unrelated record under the same key, never named in this
+	// request, must survive -- a blanket removeNonKeyLease would have wiped
+	// it too.
+	if !h.hasActiveNonKeyRecord(lease.NodeKey(ownerRR), keep) {
+		t.Fatalf("expected the unrelated record under the same key to survive the delete")
+	}
+
+	// The KEY itself was refreshed, not deleted.
+	if h.leaseManager.LookupByKEY(ownerRR) == nil {
+		t.Fatalf("expected key lease to still be active after refresh")
 	}
 }

@@ -85,6 +85,10 @@ func (h *UpdateHandler) Handle(ctx context.Context, w dns.ResponseWriter, r *dns
 	}
 
 	signerID := keyIDFromSIG(sigRR)
+	// useHierarchy is hardcoded false: non-KEY RRs always belong to the
+	// signer (protocol.md 5.1.4). See groupOtherRecordsByTargetKey's doc
+	// comment -- the useHierarchy=true path is reserved for a possible
+	// future config option and is not reachable from here today.
 	updateOtherRRsByKeyOwner, err := groupOtherRecordsByTargetKey(signerID, updateKeyRRs, updateOtherRRs, false)
 	if err != nil {
 		h.logger.Debugf("Failed to map non-KEY records to KEY owners: %v", err)
@@ -110,6 +114,10 @@ func (h *UpdateHandler) Handle(ctx context.Context, w dns.ResponseWriter, r *dns
 	var responseKeys []*dns.KEY
 	upstreamKeys := make([]*dns.KEY, 0)
 	var acceptedRecordsForUpstream []dns.RR
+	// recordsToDeleteForUpstream accumulates Case D's accompanying non-KEY
+	// deletes (see the case-D loop below), forwarded in the same shared
+	// upstream call as the KEY add/refresh at the end of Handle().
+	var recordsToDeleteForUpstream []dns.RR
 	type pendingLeaseMutation struct {
 		keyName string
 		apply   func() error
@@ -506,12 +514,17 @@ func (h *UpdateHandler) Handle(ctx context.Context, w dns.ResponseWriter, r *dns
 			keyName := keyRR.Hdr.Name
 			scopedOtherRecords := updateOtherRRsByKeyOwner[keyIDFromKEY(keyRR)]
 			notes := make([]string, 0)
-			if len(scopedOtherRecords) > 0 {
-				for _, rr := range scopedOtherRecords {
-					if !h.hasActiveNonKeyRecord(leasepkg.NodeKey(keyRR), rr) {
-						notes = append(notes, fmt.Sprintf("record not found for delete: %s", rr.String()))
-					}
+			// Only records actually present locally are real deletions: a
+			// record named here that isn't found gets a note (protocol.md
+			// item 7) but must not be sent upstream as a delete or removed
+			// from local state that never had it.
+			recordsToDelete := make([]dns.RR, 0, len(scopedOtherRecords))
+			for _, rr := range scopedOtherRecords {
+				if !h.hasActiveNonKeyRecord(leasepkg.NodeKey(keyRR), rr) {
+					notes = append(notes, fmt.Sprintf("record not found for delete: %s", rr.String()))
+					continue
 				}
+				recordsToDelete = append(recordsToDelete, rr)
 			}
 
 			effectiveKeyLease := keyLeaseDuration
@@ -554,7 +567,7 @@ func (h *UpdateHandler) Handle(ctx context.Context, w dns.ResponseWriter, r *dns
 
 			pendingKeyRR := keyRR
 			pendingKeyName := keyName
-			pendingRecords := scopedOtherRecords
+			pendingRecordsToRemove := recordsToDelete
 			pendingKeyLease := effectiveKeyLease
 			pendingIsRefresh := keyIsRefresh
 			pendingMutations = append(pendingMutations, pendingLeaseMutation{
@@ -569,8 +582,13 @@ func (h *UpdateHandler) Handle(ctx context.Context, w dns.ResponseWriter, r *dns
 					if err != nil {
 						return err
 					}
-					if len(pendingRecords) > 0 {
-						h.removeNonKeyLease(leasepkg.NodeKey(pendingKeyRR))
+					// Remove only the specific records confirmed deleted
+					// upstream (see recordsToDeleteForUpstream below) --
+					// h.removeNonKeyLease(nodeKey) would wipe every non-KEY
+					// record this key owns, including ones this request
+					// never named, silently orphaning them upstream forever.
+					for _, rr := range pendingRecordsToRemove {
+						h.removeSingleNonKeyRecord(leasepkg.NodeKey(pendingKeyRR), recordKey(rr))
 					}
 					h.scheduleLeaseExpiry(leasepkg.NodeKey(pendingKeyRR))
 					return nil
@@ -579,21 +597,24 @@ func (h *UpdateHandler) Handle(ctx context.Context, w dns.ResponseWriter, r *dns
 
 			responseKeys = append(responseKeys, keyRR)
 			upstreamKeys = append(upstreamKeys, keyRR)
+			recordsToDeleteForUpstream = append(recordsToDeleteForUpstream, recordsToDelete...)
 			allNotes = append(allNotes, notes...)
 		}
 	}
 
-	// Upstream forwarding: forward KEY RRs that need to be registered upstream.
-	// This handles the case where some or all KEY RRs were registered locally
-	// but also need to be forwarded to the authoritative server.
-	if len(upstreamKeys) > 0 || len(acceptedRecordsForUpstream) > 0 {
+	// Upstream forwarding: forward KEY RRs that need to be registered
+	// upstream, non-KEY RRs that need to be added, and (Case D) non-KEY
+	// records that need to be deleted -- all in one combined UPDATE, so
+	// the add and delete halves of a single request are confirmed or
+	// rejected together rather than racing across two separate round trips.
+	if len(upstreamKeys) > 0 || len(acceptedRecordsForUpstream) > 0 || len(recordsToDeleteForUpstream) > 0 {
 		signingKey, effectiveUpstreamZone, err := h.resolveUpstreamSigningContext(ctx)
 		if err != nil {
 			msg := h.makeErrorResponse(r, dns.RcodeServerFailure, err.Error())
 			return NewErrorResult(msg, err.Error(), err)
 		}
 
-		upstreamUpdate, err := h.constructUpstreamUpdate(upstreamKeys, acceptedRecordsForUpstream, signingKey, effectiveUpstreamZone)
+		upstreamUpdate, err := h.constructUpstreamUpdate(upstreamKeys, acceptedRecordsForUpstream, recordsToDeleteForUpstream, signingKey, effectiveUpstreamZone)
 		if err != nil {
 			h.logger.Debugf("Failed to construct upstream UPDATE: %v", err)
 			msg := h.makeErrorResponse(r, dns.RcodeServerFailure, fmt.Sprintf("upstream construction failed: %v", err))

@@ -343,6 +343,15 @@ func keyIDFromSIG(sig *dns.SIG) keyID {
 // When useHierarchy is true, ownership is inferred by DNS name hierarchy: each
 // non-KEY RR is assigned to the KEY whose owner name is its longest ancestor;
 // the signer breaks ties among keys at equal depth.
+//
+// useHierarchy is currently never set to true by Handle() -- it is reserved
+// for a possible future per-handler config option (e.g.
+// "non_key_ownership: signer|hierarchy") that would let a deployment opt
+// into hierarchy-based ownership instead of the current signer-owns-
+// everything rule. Until such an option exists and is wired up, this branch
+// is exercised only by unit tests, not by any production code path; if that
+// config option doesn't materialize, this branch should be removed rather
+// than carried indefinitely as dead weight.
 func groupOtherRecordsByTargetKey(signerID keyID, updateKeyRRs []*dns.KEY, updateOtherRRs []dns.RR, useHierarchy bool) (map[keyID][]dns.RR, error) {
 	grouped := make(map[keyID][]dns.RR)
 	if len(updateOtherRRs) == 0 {
@@ -707,7 +716,16 @@ func (h *UpdateHandler) extractAndValidateSig0(ctx context.Context, msg *dns.Msg
 // constructUpstreamUpdate builds an UPDATE message for the upstream zone.
 // This UPDATE will be sent to the authoritative server for the upstream zone.
 // If upstream key is loaded, it will be signed with SIG(0).
-func (h *UpdateHandler) constructUpstreamUpdate(clientKeyRRs []*dns.KEY, otherRecords []dns.RR, signingKey *keyrec.LoadedKey, upstreamZone string) (*dns.Msg, error) {
+//
+// recordsToDelete are included in the same message as RFC 2136 deletes
+// (class NONE, TTL 0) alongside clientKeyRRs/otherRecords' adds -- used by
+// Case D, which both registers/refreshes a KEY and (optionally) deletes
+// non-KEY records it owns in one request. Combining both into a single
+// signed UPDATE means one round trip is either fully confirmed or not, so
+// there is no window where the accompanying delete could succeed upstream
+// while the KEY add/refresh it was staged alongside never gets sent, or vice
+// versa. Callers with nothing to delete pass nil.
+func (h *UpdateHandler) constructUpstreamUpdate(clientKeyRRs []*dns.KEY, otherRecords []dns.RR, recordsToDelete []dns.RR, signingKey *keyrec.LoadedKey, upstreamZone string) (*dns.Msg, error) {
 	msg, err := newUnsignedUpstreamUpdate(upstreamZone)
 	if err != nil {
 		return nil, err
@@ -731,6 +749,20 @@ func (h *UpdateHandler) constructUpstreamUpdate(clientKeyRRs []*dns.KEY, otherRe
 
 	// Update section: optional KEYs plus supported non-KEY records.
 	msg.Ns = append(msg.Ns, policyOther...)
+
+	// RFC 2136 deletes (class NONE, TTL 0) for accompanying non-KEY records
+	// Case D asked to remove.
+	for _, rr := range recordsToDelete {
+		if rr == nil || rr.Header() == nil {
+			continue
+		}
+		cpy := copyRR(rr)
+		cpyHdr := cpy.Header()
+		cpyHdr.Class = dns.ClassNONE
+		cpyHdr.TTL = 0
+		msg.Ns = append(msg.Ns, cpy)
+	}
+
 	if len(msg.Ns) == 0 {
 		return msg, nil
 	}
