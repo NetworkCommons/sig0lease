@@ -10,7 +10,7 @@ enableInlineShortcodes = true
   custom_css = ["custom.css"]
   [[params.ananke_socials]]
     name = "mastodon"
-    url = "https://https://hachyderm.io/@sig0lease"
+    url = "https://hachyderm.io/@sig0lease"
   [[params.ananke_socials]]
     name = "github"
     url = "https://github.com/networkcommons/sig0lease"
