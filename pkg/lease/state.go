@@ -228,10 +228,10 @@ type NodeSnapshot struct {
 type InMemoryLeaseStore struct {
 	mu              sync.RWMutex
 	leases          map[string]*Record             // composite NodeKey → Record (KEY nodes)
-	nonKeyRecords   map[string]*NonKEYRecord        // RecordKey(rr) → NonKEYRecord (non-KEY nodes)
-	nameIdx         map[string][]string             // DNS name → []NodeKey (KEY nodes only)
-	children        map[string]map[string]struct{}  // node identity → set of child identities (KEY or non-KEY)
-	rootsByZone     map[string]map[string]struct{}  // KEY nodes with no parent, by zone
+	nonKeyRecords   map[string]*NonKEYRecord       // RecordKey(rr) → NonKEYRecord (non-KEY nodes)
+	nameIdx         map[string][]string            // DNS name → []NodeKey (KEY nodes only)
+	children        map[string]map[string]struct{} // node identity → set of child identities (KEY or non-KEY)
+	rootsByZone     map[string]map[string]struct{} // KEY nodes with no parent, by zone
 	persistenceHook func(ctx context.Context, op string, record *Record) error
 }
 

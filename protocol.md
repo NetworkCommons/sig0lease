@@ -51,7 +51,8 @@
 2. Non-KEY lease storage
 - Non-KEY records are tracked individually and are linked to their key owner.
 - This link is used to clear each records registered with a particular key when this key expires.
-- Record identity is as defined in comparison rules in RFC 2136 Section 1.1.
+- Record identity is as defined in comparison rules in RFC 2136 Section 1.1 (NAME, CLASS, TYPE, RDLENGTH, RDATA equal; TTL excluded), with SOA and CNAME further narrowed to NAME+CLASS+TYPE per that same section, since only one such RR can exist at a name.
+  - Exception: WKS records are compared on the full RDATA string, including the services bitmask, because the underlying DNS library has no WKS RDATA parser to split ADDRESS+PROTOCOL from the mask as the RFC specifies. This is a known, narrow deviation (see `RecordKey` in `pkg/lease/state.go` and `rrEqual` in `handlers/opcode5_update_helpers.go`), not a design choice -- WKS is effectively obsolete in current DNS use, so the practical impact is minimal.
 - It is not possible for 2 different keys to register identical RRs.
 - Records that differ in any field are treated as distinct records.
 
