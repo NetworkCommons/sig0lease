@@ -257,6 +257,16 @@ The update handler now checks both `Pseudo` and `Extra`, and it accepts either:
 
 This is a library packing bug, not a sig0lease protocol issue -- real DNS traffic essentially never sets QDCOUNT > 1 anyway, and this project's own `acceptMsg` (see [server/server.go](server/server.go)) rejects any message where `len(m.Question) != 1` with FORMERR, matching the library's own `DefaultMsgAcceptFunc`. No compatibility patch was written for it. It surfaced while writing [server/transport_equivalence_test.go](server/transport_equivalence_test.go), which needed a genuine two-question wire message to test that FORMERR-rejection branch; that specific case had to be dropped since the library can't produce valid bytes for it, and the message-with-zero-questions case was kept in its place to cover the same `acceptMsg` branch.
 
+### TCP server silently drops Ns/Extra/Pseudo (missing second Unpack)
+
+`(*dns.Server).serveDNS` (used internally by `(*dns.Server).ListenAndServe`, the library's own TCP server loop) unpacks each incoming message twice by design: once with `Options = MsgOptionUnpackQuestion` (header + question only, cheap enough to run before `MsgAcceptFunc` decides whether to bother with the rest), then again with `Options = MsgOptionUnpack` for the full message. In v0.6.82 (and every version checked up to and including the latest, v0.6.104 -- see [docs/upgrade-miekg-dns.md](docs/upgrade-miekg-dns.md) for the version-by-version check), the second call is simply missing: `Options` is set but `Unpack()` is never invoked again before the handler runs. `Ns`, `Extra`, and `Pseudo` are left at their header-only-parse zero values for every TCP-received message, regardless of what the client actually sent -- so a TCP `register`/`refresh` request always looked like "UPDATE without UPDATE-LEASE EDNS option" to the update handler, even though the option was present on the wire and the same bytes worked fine over UDP.
+
+This is a library server-loop bug, not a sig0lease protocol issue.
+
+### Applied patch
+
+`server/server.go`'s `serveTCP` no longer uses `(*dns.Server).ListenAndServe` at all. It's replaced with a custom accept loop, structurally identical to the pre-existing `serveUDP` (which already worked around this by never using the library's server in the first place): read one length-prefixed message (RFC 1035 4.2.2), call `Unpack()` exactly once with no `Options` set (an unconditional full unpack, sidestepping the two-stage split entirely), apply the shared `acceptMsg` accept/reject policy, then dispatch to the handler via a small `tcpResponseWriter`. `server/transport_equivalence_test.go`'s `TestServeTCPPreservesUpdateLeaseOption` regression-tests this directly (confirmed failing against the old library-based `serveTCP`, passing against the replacement).
+
 ## Applied Compatibility Patches
 
 The following project-side patches are currently in place:
@@ -265,6 +275,7 @@ The following project-side patches are currently in place:
 2. `cmd/sig0lease/main.go` imports the compatibility package so the proxy process gets the patch before reading packets.
 3. `cmd/sig0lease-client/main.go` imports the same compatibility package so client-side pack/unpack behavior stays consistent.
 4. `pkg/lease.FindOption` recognizes UPDATE-LEASE whether it arrives as a direct `ERFC3597` record or under an `OPT` wrapper, for both request and response parsing.
+5. `server/server.go`'s `serveTCP` replaces the library's own TCP server loop with a custom one (see above) so TCP-received messages get a real, complete `Unpack()`.
 
 # Implementation Status
 

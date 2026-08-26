@@ -3,7 +3,10 @@ package server
 
 import (
 	"context"
+	"encoding/binary"
+	"errors"
 	"fmt"
+	"io"
 	"net"
 	"os/signal"
 	"syscall"
@@ -357,48 +360,194 @@ func (w *udpResponseWriter) Session() *dns.Session {
 	return &dns.Session{Addr: w.remoteAddr}
 }
 
-// serveTCP starts a TCP listener.
+// tcpReadTimeout/tcpIdleTimeout mirror the dns library's own Server defaults
+// (ReadTimeout/IdleTimeout) for the TCP listener this replaces.
+const (
+	tcpReadTimeout = 2 * time.Second
+	tcpIdleTimeout = 8 * time.Second
+)
+
+// serveTCP starts a custom TCP listener that preserves EDNS options, the
+// same way serveUDP already does and for the same reason: the dns library's
+// own TCP server ((*dns.Server).ListenAndServe, used here previously) sets
+// Options = MsgOptionUnpack to request a full unpack after MsgAcceptFunc
+// runs, but never actually calls Unpack() a second time before invoking the
+// handler -- so Ns/Extra/Pseudo (and therefore any EDNS option, including
+// UPDATE-LEASE) stay empty for every TCP-received message, regardless of
+// what the client actually sent. A single, unconditional Unpack() call, as
+// serveUDP already does, sidesteps that bug entirely. Confirmed present
+// through the newest available release (v0.6.104) of
+// codeberg.org/miekg/dns; see docs/upgrade-miekg-dns.md.
 func (s *Server) serveTCP(ctx context.Context, handler dns.HandlerFunc) error {
-	// srv is declared separately (not :=) so NotifyStartedFunc below can
-	// close over it and read srv.Listener, which the library only
-	// populates once the bind actually succeeds.
-	var srv *dns.Server
-	srv = &dns.Server{
-		Listener:       nil,
-		Addr:           s.cfg.Server.Address,
-		Net:            "tcp",
-		Handler:        handler,
-		TLSConfig:      nil,
-		MsgAcceptFunc:  s.acceptMsg,
-		MsgInvalidFunc: s.invalidMsg,
-		// Mirrors serveUDP's s.logger.Infof("UDP listener started on %s",
-		// conn.LocalAddr().String()): fires only after the listener has
-		// actually bound (unlike a log placed before ListenAndServe, which
-		// would fire even if the bind then failed), using the real bound
-		// address rather than the pre-resolve config string.
-		NotifyStartedFunc: func(context.Context) {
-			s.logger.Infof("TCP listener started on %s", srv.Listener.Addr().String())
-		},
+	// Listen on TCP with explicit IPv4, consistent with serveUDP.
+	tcpAddr, err := net.ResolveTCPAddr("tcp4", s.cfg.Server.Address)
+	if err != nil {
+		return fmt.Errorf("resolve TCP address: %w", err)
 	}
-	// Monitor context cancellation in the background
+
+	ln, err := net.ListenTCP("tcp4", tcpAddr)
+	if err != nil {
+		return fmt.Errorf("listen TCP: %w", err)
+	}
+	defer ln.Close()
+
+	// Goroutine to force unblock AcceptTCP when ctx is canceled, mirroring
+	// serveUDP's shutdown handling.
 	go func() {
 		<-ctx.Done()
-		s.logger.Infof("TCP listener shutting down...")
-
-		srv.Shutdown(ctx)
+		ln.Close()
 	}()
 
-	err := srv.ListenAndServe()
+	s.logger.Infof("TCP listener started on %s", ln.Addr().String())
 
-	// Check if ListenAndServe returned an error due to server shutdown
-	select {
-	case <-ctx.Done():
-		s.logger.Infof("TCP listener shut down cleanly")
-		return nil
-	default:
-		return err
+	for {
+		conn, err := ln.AcceptTCP()
+		if err != nil {
+			select {
+			case <-ctx.Done():
+				s.logger.Infof("TCP listener shutting down cleanly")
+				return nil
+			default:
+				s.logger.Errorf("TCP accept error: %v", err)
+				continue
+			}
+		}
+		go s.serveTCPConn(ctx, conn, handler)
 	}
 }
+
+// serveTCPConn reads and handles DNS-over-TCP-framed messages (RFC 1035
+// 4.2.2: each message prefixed by a 2-byte big-endian length) from a single
+// accepted connection, up to dns.MaxTCPQueries messages before closing.
+// Queries on the same connection are handled one at a time, not
+// concurrently: this project's own client only ever sends one query per TCP
+// connection, so serializing keeps this simple and avoids racing a
+// handler's response write against the connection close on shutdown.
+func (s *Server) serveTCPConn(ctx context.Context, conn *net.TCPConn, handler dns.HandlerFunc) {
+	defer conn.Close()
+
+	readTimeout := tcpReadTimeout
+	for q := 0; q < dns.MaxTCPQueries; q++ {
+		conn.SetReadDeadline(time.Now().Add(readTimeout))
+
+		rawData, err := readTCPMsg(conn)
+		if err != nil {
+			if !isClosedOrTimeout(err) {
+				s.logger.Debugf("TCP: read error from %s: %v", conn.RemoteAddr().String(), err)
+			}
+			return
+		}
+
+		// Prevent processing new queries if shutdown signal arrived mid-read.
+		select {
+		case <-ctx.Done():
+			return
+		default:
+		}
+
+		s.logger.Debugf("TCP: Received %d bytes from %s", len(rawData), conn.RemoteAddr().String())
+
+		// Strict parsing: unpack raw wire message only, same as serveUDP.
+		msg := new(dns.Msg)
+		msg.Data = rawData
+		if err := msg.Unpack(); err != nil {
+			s.invalidMsg(msg, err)
+			continue
+		}
+
+		// Same accept/reject policy as serveUDP (see acceptMsg).
+		switch action := s.acceptMsg(msg); action {
+		case dns.MsgIgnore:
+			continue
+		case dns.MsgReject, dns.MsgRejectNotImplemented:
+			msg.Rcode = dns.RcodeFormatError
+			if action == dns.MsgRejectNotImplemented {
+				msg.Rcode = dns.RcodeNotImplemented
+			}
+			msg.Response = true
+			msg.Authoritative = false
+			msg.Zero = false
+			msg.Reset()
+			if err := msg.Pack(); err != nil {
+				s.logger.Errorf("TCP: failed to pack reject response for %s: %v", conn.RemoteAddr().String(), err)
+				continue
+			}
+			if err := writeTCPMsg(conn, msg.Data); err != nil {
+				s.logger.Errorf("TCP: failed to write reject response to %s: %v", conn.RemoteAddr().String(), err)
+			}
+			continue
+		}
+
+		s.logger.Debugf("After unpacking: Answer=%d, Ns=%d, Extra=%d, Pseudo=%d",
+			len(msg.Answer), len(msg.Ns), len(msg.Extra), len(msg.Pseudo))
+
+		w := &tcpResponseWriter{conn: conn}
+		handler(ctx, w, msg)
+
+		// The first read on a fresh connection uses the read timeout; any
+		// further pipelined queries on the same connection use the longer
+		// idle timeout, matching the library defaults this replaces.
+		readTimeout = tcpIdleTimeout
+	}
+}
+
+// isClosedOrTimeout reports whether err is an expected/quiet reason for a
+// TCP read loop to stop (peer closed, listener closed during shutdown, or
+// the read/idle deadline simply elapsed) as opposed to a real error worth
+// logging.
+func isClosedOrTimeout(err error) bool {
+	if errors.Is(err, io.EOF) || errors.Is(err, net.ErrClosed) {
+		return true
+	}
+	var netErr net.Error
+	return errors.As(err, &netErr) && netErr.Timeout()
+}
+
+// readTCPMsg reads one length-prefixed DNS message from conn.
+func readTCPMsg(conn net.Conn) ([]byte, error) {
+	lenBuf := make([]byte, 2)
+	if _, err := io.ReadFull(conn, lenBuf); err != nil {
+		return nil, err
+	}
+	buf := make([]byte, binary.BigEndian.Uint16(lenBuf))
+	if _, err := io.ReadFull(conn, buf); err != nil {
+		return nil, err
+	}
+	return buf, nil
+}
+
+// writeTCPMsg writes one length-prefixed DNS message to conn.
+func writeTCPMsg(conn net.Conn, data []byte) error {
+	lenBuf := make([]byte, 2)
+	binary.BigEndian.PutUint16(lenBuf, uint16(len(data)))
+	if _, err := conn.Write(lenBuf); err != nil {
+		return err
+	}
+	_, err := conn.Write(data)
+	return err
+}
+
+// tcpResponseWriter implements dns.ResponseWriter for TCP.
+type tcpResponseWriter struct {
+	conn *net.TCPConn
+}
+
+// Write must stay a dumb passthrough -- do not add a length prefix here.
+// handleRequest sends responses via resp.WriteTo(w), and the library's own
+// Msg.WriteTo already adds the required 2-byte length prefix itself before
+// calling w.Write, for any ResponseWriter whose Conn() isn't a *net.UDPConn
+// (see codeberg.org/miekg/dns's msg.go, WriteTo). Framing again here would
+// double-prefix every response and corrupt it.
+func (w *tcpResponseWriter) Write(data []byte) (int, error) {
+	return w.conn.Write(data)
+}
+
+func (w *tcpResponseWriter) LocalAddr() net.Addr   { return w.conn.LocalAddr() }
+func (w *tcpResponseWriter) RemoteAddr() net.Addr  { return w.conn.RemoteAddr() }
+func (w *tcpResponseWriter) Conn() net.Conn        { return w.conn }
+func (w *tcpResponseWriter) Close() error          { return nil } // conn lifetime is owned by serveTCPConn
+func (w *tcpResponseWriter) Session() *dns.Session { return nil }
+func (w *tcpResponseWriter) Hijack()               {}
 
 // handleRequest is the main request handler that routes based on opcode.
 func (s *Server) handleRequest(ctx context.Context, w dns.ResponseWriter, r *dns.Msg) {
