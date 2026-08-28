@@ -18,64 +18,13 @@ import (
 // LeaseRecord is the shared lease state record used by handlers.
 type LeaseRecord = leasepkg.Record
 
-// NonKEYLeaseRecord tracks non-KEY RR lease state linked to a key registration.
-// Records are tracked individually by their RFC 2136 key (rfc2136 - 1.1 -
-// Comparison Rules), so each record can have its own lease duration and
-// expiry time. The key excludes TTL and applies special rules for SOA,
-// CNAME, and WKS record types. A deleted or expired record is removed from
-// Records outright, never flagged in place.
-type NonKEYLeaseRecord struct {
-	Records       map[string]*nonKeyRecordEntry // key = RFC 2136 RR key (excludes TTL)
-	ExpiresAt     time.Time
-	UpstreamZone  string
-	LeaseDuration uint32
-}
-
-// nonKeyRecordEntry holds a single non-KEY record with its own lease metadata.
-type nonKeyRecordEntry struct {
-	RR            dns.RR
-	ExpiresAt     time.Time
-	LeaseDuration uint32
-}
-
-// recordKey returns an RFC 2136-compliant key for a DNS RR.
-// Per rfc2136 - 1.1 - Comparison Rules, two RRs are equal if their NAME,
-// CLASS, TYPE, RDLENGTH, and RDATA fields are equal. The TTL field is
-// explicitly excluded from the comparison.
-//
-// Special RR types (rfc2136 - 1.1 - Comparison Rules):
-//
-//	SOA:  compare only NAME, CLASS, TYPE (only one SOA per zone)
-//	WKS:  compare only NAME, CLASS, TYPE, ADDRESS, PROTOCOL (services mask excluded)
-func recordKey(rr dns.RR) string {
-	if rr == nil {
-		return ""
-	}
-	hdr := rr.Header()
-	name := hdr.Name
-	class := hdr.Class
-	typ := dns.RRToType(rr)
-
-	switch typ {
-	case dns.TypeSOA:
-		// rfc2136 - 1.1 - Comparison Rules: SOA compare only NAME, CLASS and TYPE
-		return name + " " + fmt.Sprint(class) + " " + fmt.Sprint(typ)
-	case dns.TypeCNAME:
-		// rfc2136 - 1.1 - Comparison Rules: CNAME compare only NAME, CLASS, and TYPE
-		return name + " " + fmt.Sprint(class) + " " + fmt.Sprint(typ)
-	case uint16(4): // WKS type code (not exported by the dns library)
-		// rfc2136 - 1.1 - Comparison Rules: WKS compare only NAME, CLASS, TYPE, ADDRESS, and PROTOCOL
-		// (services mask excluded). The dns library does not provide support for WKS RRs
-		// (no dns.WK type, no TypeWKS constant), so we have no proper parser for the RDATA.
-		// We fall back to comparing the full data string, which may include the services mask;
-		// this is not fully RFC 2136 compliant for WKS, but there is no better option available.
-		return name + " " + fmt.Sprint(class) + " " + fmt.Sprint(typ) + " " + rr.Data().String()
-	default:
-		// rfc2136 - 1.1 - Comparison Rules: two RRs are equal if their NAME,
-		// CLASS, TYPE, RDLENGTH and RDATA fields are equal (TTL excluded).
-		return name + " " + fmt.Sprint(class) + " " + fmt.Sprint(typ) + " " + fmt.Sprint(rr.Data().Len()) + " " + rr.Data().String()
-	}
-}
+// NonKEYLeaseRecord is the non-KEY equivalent of LeaseRecord: an alias
+// straight onto pkg/lease's own type, rather than a second, hand-maintained
+// copy of the same shape. leaseManager.GetNonKEYRecordSet already returns
+// cloned data, so there is nothing left for a handlers-local wrapper type to
+// add. Its Records map's value type (*leasepkg.NonKEYRecord) is used
+// directly wherever a single entry is needed, rather than a second alias.
+type NonKEYLeaseRecord = leasepkg.NonKEYRecordSet
 
 // LeasePolicy controls clamping for lease durations and forwarded RR TTLs.
 type LeasePolicy struct {

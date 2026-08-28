@@ -20,6 +20,13 @@ const (
 	NodeKindNonKEY NodeKind = "non-key"
 )
 
+// leaseSnapshotVersion is the on-disk snapshot format version. Bumped from 1
+// to 2 when non-KEY records moved from owner-nested storage to flat, first-
+// class tree nodes (same identity model KEY nodes already had) -- a v1 file
+// does not unmarshal into this shape, so ImportSnapshot rejects anything
+// that isn't exactly this version rather than silently loading as empty.
+const leaseSnapshotVersion = 2
+
 // BaseRecord is the shared lease node model used by KEY and non-KEY records.
 type BaseRecord struct {
 	NodeKind      NodeKind
@@ -43,18 +50,21 @@ type Record struct {
 // KEYRecord is an alias to Record for clarity in tree-oriented code.
 type KEYRecord = Record
 
-// NonKEYRecord represents a non-KEY RR lease node in the tree.
-// Presence in a NonKEYRecordSet's Records map is what defines "active" — a
-// deleted or expired record is removed outright, never flagged in place.
+// NonKEYRecord represents a non-KEY RR lease node in the tree. Like a KEY
+// node, it is a first-class node with its own globally unique identity
+// (RRKey, computed by RecordKey) -- it is not merely an entry in some
+// owner's local set. ParentKeyName (inherited from BaseRecord) is the one
+// and only place its owner is recorded.
 type NonKEYRecord struct {
 	BaseRecord
-	OwnerKeyName string
 	RRKey        string
 	RR           dns.RR
 	UpstreamZone string
 }
 
-// NonKEYRecordSet groups non-KEY records by owner key.
+// NonKEYRecordSet is a read-only, point-in-time view of the non-KEY records
+// owned by one node, returned by GetNonKEYRecordSet. It is not how records
+// are stored internally -- see InMemoryLeaseStore.nonKeyRecords.
 type NonKEYRecordSet struct {
 	Records      map[string]*NonKEYRecord
 	UpstreamZone string
@@ -80,6 +90,14 @@ func (r *Record) TimeRemaining() time.Duration {
 // or a caller-supplied Go-embedded implementation) must implement all of it
 // -- there is no narrower interface to fall back to, and callers must not
 // type-assert down to a subset. Implementations must be thread-safe.
+//
+// KEY and non-KEY records are both tree nodes with a globally unique
+// identity (see NodeKey / RecordKey) and a ParentKeyName; a non-KEY node can
+// never itself be a parent (RegisterWithParent rejects that). Uniqueness is
+// enforced by the store itself, not by callers pre-checking: UpsertNonKEYRecords
+// fails outright if any of the given records already exist under a
+// different owner, rather than silently allowing two different keys to
+// register the identical RR.
 type LeaseStorage interface {
 	// -- KEY lease lifecycle --
 
@@ -107,10 +125,14 @@ type LeaseStorage interface {
 
 	// -- Tree / hierarchy --
 
+	// RegisterWithParent creates or updates a KEY lease with an optional
+	// parent composite node key. Fails if parentNodeKey already identifies a
+	// non-KEY record -- a non-KEY node can never be a parent.
 	RegisterWithParent(ctx context.Context, parentNodeKey string, keyRR *dns.KEY, leaseDuration uint32, keyLeaseDuration uint32, upstreamZone string) error
 	DeleteSubtree(nodeKey string) error
 	ChildrenOf(nodeKey string) []string
-	// ListSubtreeKeys returns composite node keys of all descendants, deepest first.
+	// ListSubtreeKeys returns composite node keys of all descendants
+	// (KEY and non-KEY alike), deepest first.
 	ListSubtreeKeys(nodeKey string) []string
 
 	// -- Snapshot import/export/persistence --
@@ -122,11 +144,24 @@ type LeaseStorage interface {
 
 	// -- Non-KEY record sets --
 
+	// UpsertNonKEYRecords registers or refreshes records under ownerNodeKey.
+	// Fails outright, applying none of the given records, if any of them
+	// already exists in the store under a different owner -- this is the
+	// store's own enforcement of "two different keys cannot register the
+	// identical RR" (protocol.md), not merely a caller-side convention.
 	UpsertNonKEYRecords(ownerNodeKey string, records []dns.RR, leaseDuration uint32, upstreamZone string) error
 	RemoveNonKEYRecords(ownerNodeKey string)
-	RemoveSingleNonKEYRecord(ownerNodeKey, rrKey string)
+	// RemoveSingleNonKEYRecord removes the record identified by rrKey.
+	// Idempotent: a no-op, not an error, if no such record exists. Returns
+	// an error, without effect, if the record exists but is owned by a
+	// different node than ownerNodeKey.
+	RemoveSingleNonKEYRecord(ownerNodeKey, rrKey string) error
 	GetNonKEYRecordSet(ownerNodeKey string) *NonKEYRecordSet
-	HasActiveNonKEYRecord(ownerNodeKey string, rr dns.RR) bool
+	// LookupNonKEYRecord returns the record matching rr's RFC 2136 identity
+	// anywhere in the store (regardless of owner), or nil if none exists.
+	// Callers compare the result's ParentKeyName against their own candidate
+	// owner to distinguish "mine" (refresh) from "someone else's" (reject).
+	LookupNonKEYRecord(rr dns.RR) *NonKEYRecord
 
 	// -- Lifecycle --
 
@@ -138,48 +173,50 @@ type LeaseStorage interface {
 
 // LeaseTreeSnapshot is a storage-neutral representation of the lease tree.
 type LeaseTreeSnapshot struct {
-	Version     int                  `json:"version"`
-	GeneratedAt time.Time            `json:"generated_at"`
-	KeyNodes    []LeaseNodeSnapshot  `json:"key_nodes"`
-	NonKEYNodes []NonKEYNodeSnapshot `json:"non_key_nodes"`
+	Version     int            `json:"version"`
+	GeneratedAt time.Time      `json:"generated_at"`
+	Nodes       []NodeSnapshot `json:"nodes"`
 }
 
-// LeaseNodeSnapshot is a persisted KEY node row.
-type LeaseNodeSnapshot struct {
-	KeyName          string    `json:"key_name"`
-	RRType           uint16    `json:"rr_type,omitempty"`
-	ParentKeyName    string    `json:"parent_key_name,omitempty"`
-	UpstreamZone     string    `json:"upstream_zone"`
-	LeaseDuration    uint32    `json:"lease_duration"`
-	KeyLeaseDuration uint32    `json:"key_lease_duration"`
-	RegisteredAt     time.Time `json:"registered_at"`
-	ExpiresAt        time.Time `json:"expires_at"`
-	RRName           string    `json:"rr_name"`
-	RRClass          uint16    `json:"rr_class"`
-	RRTTL            uint32    `json:"rr_ttl"`
-	KeyFlags         uint16    `json:"key_flags"`
-	KeyProtocol      uint8     `json:"key_protocol"`
-	KeyAlgorithm     uint8     `json:"key_algorithm"`
-	KeyData          string    `json:"key_data"`
-	ChildKeys        []string  `json:"child_keys,omitempty"`
-}
-
-// NonKEYNodeSnapshot is a persisted non-KEY node row. A record that has been
-// deleted or expired is removed from the store, so it is never persisted;
-// there is no "deleted" flag to carry here.
-type NonKEYNodeSnapshot struct {
-	OwnerKeyName  string    `json:"owner_key_name"`
+// NodeSnapshot is a persisted tree node row -- KEY or non-KEY, discriminated
+// by NodeKind. Which of the KEY-only / non-KEY-only fields below are
+// populated follows from that. A record that has been deleted or expired is
+// removed from the store, so it is never persisted; there is no "deleted"
+// flag to carry here.
+type NodeSnapshot struct {
+	NodeKind      NodeKind  `json:"node_kind"`
+	NodeID        string    `json:"node_id"` // composite identity: KEY -> NodeKey(keyRR), non-KEY -> RecordKey(rr)
+	ParentKeyName string    `json:"parent_key_name,omitempty"`
 	RRType        uint16    `json:"rr_type,omitempty"`
-	ParentKeyName string    `json:"parent_key_name"`
-	RRKey         string    `json:"rr_key"`
-	RRText        string    `json:"rr_text"`
 	UpstreamZone  string    `json:"upstream_zone"`
 	LeaseDuration uint32    `json:"lease_duration"`
 	RegisteredAt  time.Time `json:"registered_at"`
 	ExpiresAt     time.Time `json:"expires_at"`
+
+	// KEY-only.
+	KeyLeaseDuration uint32 `json:"key_lease_duration,omitempty"`
+	RRName           string `json:"rr_name,omitempty"`
+	RRClass          uint16 `json:"rr_class,omitempty"`
+	RRTTL            uint32 `json:"rr_ttl,omitempty"`
+	KeyFlags         uint16 `json:"key_flags,omitempty"`
+	KeyProtocol      uint8  `json:"key_protocol,omitempty"`
+	KeyAlgorithm     uint8  `json:"key_algorithm,omitempty"`
+	KeyData          string `json:"key_data,omitempty"`
+
+	// non-KEY-only: full presentation-format RR, reparsed via dns.New on import.
+	RRText string `json:"rr_text,omitempty"`
 }
 
 // InMemoryLeaseStore is an in-memory lease manager implementation.
+//
+// KEY nodes (leases) and non-KEY nodes (nonKeyRecords) are each a flat map
+// keyed by the node's own globally unique identity -- the same shape for
+// both, so two attempts to register the identical identity (a KEY, or a
+// non-KEY RR under a different owner) collide at the map itself instead of
+// requiring every caller to remember to check first. children records
+// parent/child edges for both kinds of node together: a KEY's children can
+// be further KEY nodes or non-KEY nodes; a non-KEY node's entry in children
+// is always absent, since it can never be a parent.
 //
 // The store never deletes anything on its own initiative: expiry is a
 // handler-level concern, because only the handler can also send the
@@ -190,11 +227,11 @@ type NonKEYNodeSnapshot struct {
 // aware path that owns expiry.
 type InMemoryLeaseStore struct {
 	mu              sync.RWMutex
-	leases          map[string]*Record             // composite NodeKey → Record
-	nameIdx         map[string][]string            // DNS name → []NodeKey (secondary index)
-	children        map[string]map[string]struct{} // NodeKey → set of child NodeKeys
-	rootsByZone     map[string]map[string]struct{}
-	nonKeySets      map[string]*NonKEYRecordSet // NodeKey → NonKEYRecordSet
+	leases          map[string]*Record             // composite NodeKey → Record (KEY nodes)
+	nonKeyRecords   map[string]*NonKEYRecord       // RecordKey(rr) → NonKEYRecord (non-KEY nodes)
+	nameIdx         map[string][]string            // DNS name → []NodeKey (KEY nodes only)
+	children        map[string]map[string]struct{} // node identity → set of child identities (KEY or non-KEY)
+	rootsByZone     map[string]map[string]struct{} // KEY nodes with no parent, by zone
 	persistenceHook func(ctx context.Context, op string, record *Record) error
 }
 
@@ -203,11 +240,11 @@ var _ LeaseStorage = (*InMemoryLeaseStore)(nil)
 // NewInMemoryManager creates a new in-memory lease manager.
 func NewInMemoryManager() *InMemoryLeaseStore {
 	return &InMemoryLeaseStore{
-		leases:      make(map[string]*Record),
-		nameIdx:     make(map[string][]string),
-		children:    make(map[string]map[string]struct{}),
-		rootsByZone: make(map[string]map[string]struct{}),
-		nonKeySets:  make(map[string]*NonKEYRecordSet),
+		leases:        make(map[string]*Record),
+		nonKeyRecords: make(map[string]*NonKEYRecord),
+		nameIdx:       make(map[string][]string),
+		children:      make(map[string]map[string]struct{}),
+		rootsByZone:   make(map[string]map[string]struct{}),
 	}
 }
 
@@ -233,6 +270,11 @@ func (m *InMemoryLeaseStore) RegisterWithParent(ctx context.Context, parentNodeK
 	parentNodeKey = normalizeName(parentNodeKey)
 	if parentNodeKey == nodeKey {
 		parentNodeKey = ""
+	}
+	if parentNodeKey != "" {
+		if _, ok := m.nonKeyRecords[parentNodeKey]; ok {
+			return fmt.Errorf("cannot register KEY %s under %s: a non-KEY record can never be a parent", nodeKey, parentNodeKey)
+		}
 	}
 	upstreamZone = normalizeZone(upstreamZone)
 
@@ -359,7 +401,8 @@ func (m *InMemoryLeaseStore) DeleteSubtree(nodeKey string) error {
 	return nil
 }
 
-// ChildrenOf returns the composite node keys of direct children of the exact composite nodeKey.
+// ChildrenOf returns the composite node keys of direct children (KEY or
+// non-KEY) of the exact composite nodeKey.
 func (m *InMemoryLeaseStore) ChildrenOf(nodeKey string) []string {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
@@ -376,7 +419,8 @@ func (m *InMemoryLeaseStore) ChildrenOf(nodeKey string) []string {
 	return children
 }
 
-// ListSubtreeKeys returns composite node keys of all descendants of nodeKey, deepest first.
+// ListSubtreeKeys returns composite node keys of all descendants (KEY and
+// non-KEY alike) of nodeKey, deepest first.
 func (m *InMemoryLeaseStore) ListSubtreeKeys(nodeKey string) []string {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
@@ -433,11 +477,18 @@ func (m *InMemoryLeaseStore) SetPersistenceHook(hook func(ctx context.Context, o
 }
 
 // UpsertNonKEYRecords attaches records to ownerNodeKey. The owner is not
-// required to have a KEY Record in m.leases: a non-KEY record set can be
-// owned by a "phantom" node the same way a child KEY can already have a
+// required to have a KEY Record in m.leases: a non-KEY record can be owned
+// by a "phantom" node the same way a child KEY can already have a
 // ParentKeyName pointing at one (see RegisterWithParent/attachNodeLocked).
 // This lets a signer that is deliberately never self-registered (e.g. an
 // online-only key authorized via AllowOnlineKeyRegistration) still own data.
+//
+// Every record is validated against the whole batch before any of them is
+// applied: if any of the given records already exists in the store under a
+// different owner, the entire call fails and nothing is written -- the same
+// "fail the parts that would otherwise succeed" policy used for duplicate
+// KEY/RR registration elsewhere (protocol.md item 6), because partially
+// applying a batch here would leave the store's consistency unguaranteed.
 func (m *InMemoryLeaseStore) UpsertNonKEYRecords(ownerNodeKey string, records []dns.RR, leaseDuration uint32, upstreamZone string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -447,168 +498,211 @@ func (m *InMemoryLeaseStore) UpsertNonKEYRecords(ownerNodeKey string, records []
 		return fmt.Errorf("owner key name is empty")
 	}
 
-	set := m.ensureNonKeySetLocked(ownerNodeKey)
-	now := time.Now()
+	type candidate struct {
+		id string
+		rr dns.RR
+	}
+	toApply := make([]candidate, 0, len(records))
+
 	for _, rr := range records {
 		if rr == nil || rr.Header() == nil {
 			continue
 		}
-		rrKey := rrNodeKey(rr)
-		if rrKey == "" {
+		id := RecordKey(rr)
+		if id == "" {
 			continue
 		}
-		entry, ok := set.Records[rrKey]
+		if existing, ok := m.nonKeyRecords[id]; ok && existing.ParentKeyName != ownerNodeKey {
+			return fmt.Errorf("non-KEY record %s is already registered under a different owner (%s)", rr.String(), existing.ParentKeyName)
+		}
+		toApply = append(toApply, candidate{id: id, rr: rr})
+	}
+
+	now := time.Now()
+	zone := normalizeZone(upstreamZone)
+	for _, c := range toApply {
+		entry, ok := m.nonKeyRecords[c.id]
 		if !ok {
 			entry = &NonKEYRecord{
 				BaseRecord: BaseRecord{
 					NodeKind:      NodeKindNonKEY,
-					RRType:        dns.RRToType(rr),
 					ParentKeyName: ownerNodeKey,
 				},
-				OwnerKeyName: ownerNodeKey,
-				RRKey:        rrKey,
+				RRKey: c.id,
 			}
-			set.Records[rrKey] = entry
+			m.nonKeyRecords[c.id] = entry
+			m.attachNodeLocked(c.id, ownerNodeKey, "")
 		}
-		entry.RR = rr.Clone()
-		entry.RRType = dns.RRToType(rr)
-		entry.UpstreamZone = normalizeZone(upstreamZone)
+		entry.RR = c.rr.Clone()
+		entry.RRType = dns.RRToType(c.rr)
+		entry.UpstreamZone = zone
 		entry.LeaseDuration = leaseDuration
 		entry.RegisteredAt = now
 		entry.ExpiresAt = now.Add(time.Duration(leaseDuration) * time.Second)
 	}
-	set.UpstreamZone = normalizeZone(upstreamZone)
 	return nil
 }
 
 // RemoveNonKEYRecords removes every non-KEY record owned by ownerNodeKey.
+// KEY children of ownerNodeKey (if any) are untouched -- this only ever
+// removes non-KEY records, never cascades into a KEY subtree.
 func (m *InMemoryLeaseStore) RemoveNonKEYRecords(ownerNodeKey string) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	delete(m.nonKeySets, normalizeName(ownerNodeKey))
+
+	ownerNodeKey = normalizeName(ownerNodeKey)
+	kids := m.children[ownerNodeKey]
+	for childID := range kids {
+		if _, ok := m.nonKeyRecords[childID]; ok {
+			delete(m.nonKeyRecords, childID)
+			delete(kids, childID)
+		}
+	}
+	if len(kids) == 0 {
+		delete(m.children, ownerNodeKey)
+	}
 }
 
-// RemoveSingleNonKEYRecord removes one record (identified by its RFC 2136 key)
-// from ownerNodeKey's set, leaving the rest of the set untouched.
-func (m *InMemoryLeaseStore) RemoveSingleNonKEYRecord(ownerNodeKey, rrKey string) {
+// RemoveSingleNonKEYRecord removes the record identified by rrKey, leaving
+// the rest of ownerNodeKey's records untouched. Idempotent: a missing record
+// is a no-op, not an error (deleting something already gone -- e.g. a
+// caller racing its own earlier removal of the same record -- has already
+// reached its desired end state). Returns an error, without effect, if the
+// record exists but is owned by a different node: a caller passing a
+// mismatched owner is a bug worth surfacing loudly rather than silently
+// deleting nothing (or, worse, the wrong thing).
+func (m *InMemoryLeaseStore) RemoveSingleNonKEYRecord(ownerNodeKey, rrKey string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	set := m.nonKeySets[normalizeName(ownerNodeKey)]
-	if set == nil {
-		return
+
+	ownerNodeKey = normalizeName(ownerNodeKey)
+	entry, ok := m.nonKeyRecords[rrKey]
+	if !ok {
+		// Idempotent delete: a record that's already gone (e.g. a caller
+		// racing its own earlier removal of the same record, which happens
+		// legitimately when a record's own LEASE and its owning KEY's
+		// KEY-LEASE expire in the same tick) is not an error -- the desired
+		// end state ("this record is absent") already holds.
+		return nil
 	}
-	delete(set.Records, rrKey)
+	if entry.ParentKeyName != ownerNodeKey {
+		return fmt.Errorf("non-KEY record %q is not owned by %q (owned by %q)", rrKey, ownerNodeKey, entry.ParentKeyName)
+	}
+
+	delete(m.nonKeyRecords, rrKey)
+	if kids := m.children[ownerNodeKey]; kids != nil {
+		delete(kids, rrKey)
+		if len(kids) == 0 {
+			delete(m.children, ownerNodeKey)
+		}
+	}
+	return nil
 }
 
+// GetNonKEYRecordSet returns a point-in-time, cloned view of the non-KEY
+// records owned by ownerNodeKey, or nil if it owns none.
 func (m *InMemoryLeaseStore) GetNonKEYRecordSet(ownerNodeKey string) *NonKEYRecordSet {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 
-	set := m.nonKeySets[normalizeName(ownerNodeKey)]
-	if set == nil {
+	ownerNodeKey = normalizeName(ownerNodeKey)
+	kids := m.children[ownerNodeKey]
+	if len(kids) == 0 {
 		return nil
 	}
-	return cloneNonKeySet(set)
+
+	records := make(map[string]*NonKEYRecord)
+	zone := ""
+	for childID := range kids {
+		rec, ok := m.nonKeyRecords[childID]
+		if !ok {
+			continue // a KEY child, not a non-KEY one
+		}
+		records[childID] = cloneNonKeyRecord(rec)
+		zone = rec.UpstreamZone
+	}
+	if len(records) == 0 {
+		return nil
+	}
+	return &NonKEYRecordSet{Records: records, UpstreamZone: zone}
 }
 
-func (m *InMemoryLeaseStore) HasActiveNonKEYRecord(ownerNodeKey string, rr dns.RR) bool {
+// LookupNonKEYRecord returns the record matching rr's RFC 2136 identity
+// anywhere in the store, regardless of owner, or nil if none exists.
+func (m *InMemoryLeaseStore) LookupNonKEYRecord(rr dns.RR) *NonKEYRecord {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 
-	set := m.nonKeySets[normalizeName(ownerNodeKey)]
-	if set == nil {
-		return false
+	id := RecordKey(rr)
+	if id == "" {
+		return nil
 	}
-	k := rrNodeKey(rr)
-	if k == "" {
-		return false
-	}
-	_, ok := set.Records[k]
-	return ok
+	return cloneNonKeyRecord(m.nonKeyRecords[id])
 }
 
 func (m *InMemoryLeaseStore) ExportSnapshot() (*LeaseTreeSnapshot, error) {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 
-	keyNodes := make([]LeaseNodeSnapshot, 0, len(m.leases))
-	keys := make([]string, 0, len(m.leases))
-	for key := range m.leases {
-		keys = append(keys, key)
-	}
-	sort.Strings(keys)
+	nodes := make([]NodeSnapshot, 0, len(m.leases)+len(m.nonKeyRecords))
 
-	for _, key := range keys {
-		rec := m.leases[key]
+	keyIDs := make([]string, 0, len(m.leases))
+	for id := range m.leases {
+		keyIDs = append(keyIDs, id)
+	}
+	sort.Strings(keyIDs)
+	for _, id := range keyIDs {
+		rec := m.leases[id]
 		if rec == nil || rec.KeyRR == nil {
 			continue
 		}
-		childKeys := make([]string, 0)
-		for child := range m.children[key] {
-			childKeys = append(childKeys, child)
-		}
-		sort.Strings(childKeys)
-
-		keyNodes = append(keyNodes, LeaseNodeSnapshot{
-			KeyName:          key, // composite NodeKey
+		nodes = append(nodes, NodeSnapshot{
+			NodeKind:         NodeKindKEY,
+			NodeID:           id,
+			ParentKeyName:    rec.ParentKeyName,
 			RRType:           rec.RRType,
-			ParentKeyName:    rec.ParentKeyName, // composite NodeKey of parent
 			UpstreamZone:     rec.UpstreamZone,
 			LeaseDuration:    rec.LeaseDuration,
-			KeyLeaseDuration: rec.KeyLeaseDuration,
 			RegisteredAt:     rec.RegisteredAt,
 			ExpiresAt:        rec.ExpiresAt,
-			RRName:           rec.KeyRR.Hdr.Name, // DNS owner name
+			KeyLeaseDuration: rec.KeyLeaseDuration,
+			RRName:           rec.KeyRR.Hdr.Name,
 			RRClass:          rec.KeyRR.Hdr.Class,
 			RRTTL:            rec.KeyRR.Hdr.TTL,
 			KeyFlags:         rec.KeyRR.Flags,
 			KeyProtocol:      rec.KeyRR.Protocol,
 			KeyAlgorithm:     rec.KeyRR.Algorithm,
 			KeyData:          rec.KeyRR.PublicKey,
-			ChildKeys:        childKeys,
 		})
 	}
 
-	nonKeyNodes := make([]NonKEYNodeSnapshot, 0)
-	ownerNames := make([]string, 0, len(m.nonKeySets))
-	for owner := range m.nonKeySets {
-		ownerNames = append(ownerNames, owner)
+	nonKeyIDs := make([]string, 0, len(m.nonKeyRecords))
+	for id := range m.nonKeyRecords {
+		nonKeyIDs = append(nonKeyIDs, id)
 	}
-	sort.Strings(ownerNames)
-	for _, owner := range ownerNames {
-		set := m.nonKeySets[owner]
-		if set == nil {
+	sort.Strings(nonKeyIDs)
+	for _, id := range nonKeyIDs {
+		rec := m.nonKeyRecords[id]
+		if rec == nil || rec.RR == nil {
 			continue
 		}
-		rrKeys := make([]string, 0, len(set.Records))
-		for rrKey := range set.Records {
-			rrKeys = append(rrKeys, rrKey)
-		}
-		sort.Strings(rrKeys)
-		for _, rrKey := range rrKeys {
-			rec := set.Records[rrKey]
-			if rec == nil || rec.RR == nil {
-				continue
-			}
-			nonKeyNodes = append(nonKeyNodes, NonKEYNodeSnapshot{
-				OwnerKeyName:  owner,
-				RRType:        rec.RRType,
-				ParentKeyName: rec.ParentKeyName,
-				RRKey:         rec.RRKey,
-				RRText:        rec.RR.String(),
-				UpstreamZone:  rec.UpstreamZone,
-				LeaseDuration: rec.LeaseDuration,
-				RegisteredAt:  rec.RegisteredAt,
-				ExpiresAt:     rec.ExpiresAt,
-			})
-		}
+		nodes = append(nodes, NodeSnapshot{
+			NodeKind:      NodeKindNonKEY,
+			NodeID:        id,
+			ParentKeyName: rec.ParentKeyName,
+			RRType:        rec.RRType,
+			UpstreamZone:  rec.UpstreamZone,
+			LeaseDuration: rec.LeaseDuration,
+			RegisteredAt:  rec.RegisteredAt,
+			ExpiresAt:     rec.ExpiresAt,
+			RRText:        rec.RR.String(),
+		})
 	}
 
 	return &LeaseTreeSnapshot{
-		Version:     1,
+		Version:     leaseSnapshotVersion,
 		GeneratedAt: time.Now().UTC(),
-		KeyNodes:    keyNodes,
-		NonKEYNodes: nonKeyNodes,
+		Nodes:       nodes,
 	}, nil
 }
 
@@ -616,130 +710,130 @@ func (m *InMemoryLeaseStore) ImportSnapshot(snapshot *LeaseTreeSnapshot) error {
 	if snapshot == nil {
 		return fmt.Errorf("snapshot is nil")
 	}
-
-	newLeases := make(map[string]*Record, len(snapshot.KeyNodes))
-	newChildren := make(map[string]map[string]struct{}, len(snapshot.KeyNodes))
-	newRootsByZone := make(map[string]map[string]struct{})
-	newNonKeySets := make(map[string]*NonKEYRecordSet)
-
-	for _, node := range snapshot.KeyNodes {
-		if strings.TrimSpace(node.KeyData) == "" {
-			return fmt.Errorf("snapshot key data is empty for %s", node.KeyName)
-		}
-
-		keyRR := &dns.KEY{DNSKEY: dns.DNSKEY{Hdr: dns.Header{Name: node.RRName, Class: node.RRClass, TTL: node.RRTTL}}}
-		keyRR.Flags = node.KeyFlags
-		keyRR.Protocol = node.KeyProtocol
-		keyRR.Algorithm = node.KeyAlgorithm
-		keyRR.PublicKey = node.KeyData
-
-		// Accept both composite key format and legacy DNS-name format.
-		keyName := normalizeName(node.KeyName)
-		if !strings.Contains(keyName, ".+") {
-			keyName = NodeKey(keyRR)
-		}
-		if keyName == "" {
-			return fmt.Errorf("snapshot key node has empty key name")
-		}
-
-		rrType := node.RRType
-		if rrType == 0 {
-			rrType = dns.RRToType(keyRR)
-			if rrType == 0 {
-				rrType = dns.TypeKEY
-			}
-		}
-
-		parentKey := normalizeName(node.ParentKeyName)
-
-		rec := &Record{
-			BaseRecord: BaseRecord{
-				NodeKind:      NodeKindKEY,
-				RRType:        rrType,
-				ExpiresAt:     node.ExpiresAt,
-				LeaseDuration: node.LeaseDuration,
-				RegisteredAt:  node.RegisteredAt,
-				ParentKeyName: parentKey,
-			},
-			KeyName:          normalizeName(node.RRName),
-			KeyRR:            keyRR,
-			KeyLeaseDuration: node.KeyLeaseDuration,
-			UpstreamZone:     normalizeZone(node.UpstreamZone),
-		}
-		if rec.RegisteredAt.IsZero() {
-			rec.RegisteredAt = time.Now()
-		}
-		newLeases[keyName] = rec
+	if snapshot.Version != leaseSnapshotVersion {
+		return fmt.Errorf("unsupported snapshot version %d (expected %d)", snapshot.Version, leaseSnapshotVersion)
 	}
 
-	newNameIdx := make(map[string][]string, len(newLeases))
-	for nodeKey, rec := range newLeases {
-		dnsName := normalizeName(rec.KeyName)
-		newNameIdx[dnsName] = append(newNameIdx[dnsName], nodeKey)
+	newLeases := make(map[string]*Record)
+	newNonKeyRecords := make(map[string]*NonKEYRecord)
+
+	for _, node := range snapshot.Nodes {
+		switch node.NodeKind {
+		case NodeKindKEY:
+			if strings.TrimSpace(node.KeyData) == "" {
+				return fmt.Errorf("snapshot key data is empty for %s", node.NodeID)
+			}
+			nodeID := normalizeName(node.NodeID)
+			if nodeID == "" {
+				return fmt.Errorf("snapshot key node has empty node id")
+			}
+
+			keyRR := &dns.KEY{DNSKEY: dns.DNSKEY{Hdr: dns.Header{Name: node.RRName, Class: node.RRClass, TTL: node.RRTTL}}}
+			keyRR.Flags = node.KeyFlags
+			keyRR.Protocol = node.KeyProtocol
+			keyRR.Algorithm = node.KeyAlgorithm
+			keyRR.PublicKey = node.KeyData
+
+			rrType := node.RRType
+			if rrType == 0 {
+				rrType = dns.RRToType(keyRR)
+				if rrType == 0 {
+					rrType = dns.TypeKEY
+				}
+			}
+
+			rec := &Record{
+				BaseRecord: BaseRecord{
+					NodeKind:      NodeKindKEY,
+					RRType:        rrType,
+					ExpiresAt:     node.ExpiresAt,
+					LeaseDuration: node.LeaseDuration,
+					RegisteredAt:  node.RegisteredAt,
+					ParentKeyName: normalizeName(node.ParentKeyName),
+				},
+				KeyName:          normalizeName(node.RRName),
+				KeyRR:            keyRR,
+				KeyLeaseDuration: node.KeyLeaseDuration,
+				UpstreamZone:     normalizeZone(node.UpstreamZone),
+			}
+			if rec.RegisteredAt.IsZero() {
+				rec.RegisteredAt = time.Now()
+			}
+			newLeases[nodeID] = rec
+
+		case NodeKindNonKEY:
+			nodeID := node.NodeID
+			if nodeID == "" {
+				return fmt.Errorf("snapshot non-key node has empty node id")
+			}
+			parent := normalizeName(node.ParentKeyName)
+			if parent == "" {
+				return fmt.Errorf("snapshot non-key node %s has empty parent", nodeID)
+			}
+			rr, err := dns.New(node.RRText)
+			if err != nil {
+				return fmt.Errorf("invalid non-key RR for node %s: %w", nodeID, err)
+			}
+			rrType := node.RRType
+			if rrType == 0 {
+				rrType = dns.RRToType(rr)
+			}
+			newNonKeyRecords[nodeID] = &NonKEYRecord{
+				BaseRecord: BaseRecord{
+					NodeKind:      NodeKindNonKEY,
+					RRType:        rrType,
+					ExpiresAt:     node.ExpiresAt,
+					LeaseDuration: node.LeaseDuration,
+					RegisteredAt:  node.RegisteredAt,
+					ParentKeyName: parent,
+				},
+				RRKey:        nodeID,
+				RR:           rr,
+				UpstreamZone: normalizeZone(node.UpstreamZone),
+			}
+
+		default:
+			return fmt.Errorf("snapshot node %s has unknown node_kind %q", node.NodeID, node.NodeKind)
+		}
+	}
+
+	// Rebuild the tree/name indices from ParentKeyName now that every node
+	// is known -- children/rootsByZone/nameIdx are all derived, not persisted.
+	newChildren := make(map[string]map[string]struct{})
+	newRootsByZone := make(map[string]map[string]struct{})
+	newNameIdx := make(map[string][]string)
+
+	for nodeID, rec := range newLeases {
+		newNameIdx[rec.KeyName] = append(newNameIdx[rec.KeyName], nodeID)
 		if rec.ParentKeyName != "" {
-			if _, ok := newChildren[rec.ParentKeyName]; !ok {
+			if newChildren[rec.ParentKeyName] == nil {
 				newChildren[rec.ParentKeyName] = make(map[string]struct{})
 			}
-			newChildren[rec.ParentKeyName][nodeKey] = struct{}{}
+			newChildren[rec.ParentKeyName][nodeID] = struct{}{}
 			continue
 		}
 		if rec.UpstreamZone == "" {
 			continue
 		}
-		if _, ok := newRootsByZone[rec.UpstreamZone]; !ok {
+		if newRootsByZone[rec.UpstreamZone] == nil {
 			newRootsByZone[rec.UpstreamZone] = make(map[string]struct{})
 		}
-		newRootsByZone[rec.UpstreamZone][nodeKey] = struct{}{}
+		newRootsByZone[rec.UpstreamZone][nodeID] = struct{}{}
 	}
-
-	for _, node := range snapshot.NonKEYNodes {
-		owner := normalizeName(node.OwnerKeyName)
-		if owner == "" {
-			return fmt.Errorf("snapshot non-key owner is empty")
+	for nodeID, rec := range newNonKeyRecords {
+		if newChildren[rec.ParentKeyName] == nil {
+			newChildren[rec.ParentKeyName] = make(map[string]struct{})
 		}
-		rr, err := dns.New(node.RRText)
-		if err != nil {
-			return fmt.Errorf("invalid non-key RR for owner %s: %w", owner, err)
-		}
-		set := newNonKeySets[owner]
-		if set == nil {
-			set = &NonKEYRecordSet{Records: make(map[string]*NonKEYRecord)}
-			newNonKeySets[owner] = set
-		}
-		rrKey := node.RRKey
-		if rrKey == "" {
-			rrKey = rrNodeKey(rr)
-		}
-		rrType := node.RRType
-		if rrType == 0 {
-			rrType = dns.RRToType(rr)
-		}
-		set.Records[rrKey] = &NonKEYRecord{
-			BaseRecord: BaseRecord{
-				NodeKind:      NodeKindNonKEY,
-				RRType:        rrType,
-				ExpiresAt:     node.ExpiresAt,
-				LeaseDuration: node.LeaseDuration,
-				RegisteredAt:  node.RegisteredAt,
-				ParentKeyName: normalizeName(node.ParentKeyName),
-			},
-			OwnerKeyName: owner,
-			RRKey:        rrKey,
-			RR:           rr,
-			UpstreamZone: normalizeZone(node.UpstreamZone),
-		}
-		if set.UpstreamZone == "" {
-			set.UpstreamZone = normalizeZone(node.UpstreamZone)
-		}
+		newChildren[rec.ParentKeyName][nodeID] = struct{}{}
 	}
 
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.leases = newLeases
+	m.nonKeyRecords = newNonKeyRecords
 	m.nameIdx = newNameIdx
 	m.children = newChildren
 	m.rootsByZone = newRootsByZone
-	m.nonKeySets = newNonKeySets
 	return nil
 }
 
@@ -821,33 +915,27 @@ func cloneNonKeyRecord(r *NonKEYRecord) *NonKEYRecord {
 	return &copy
 }
 
-func cloneNonKeySet(s *NonKEYRecordSet) *NonKEYRecordSet {
-	if s == nil {
-		return nil
-	}
-	out := &NonKEYRecordSet{
-		Records:      make(map[string]*NonKEYRecord, len(s.Records)),
-		UpstreamZone: s.UpstreamZone,
-	}
-	for k, v := range s.Records {
-		out.Records[k] = cloneNonKeyRecord(v)
-	}
-	return out
-}
-
-func (m *InMemoryLeaseStore) ensureNonKeySetLocked(ownerKeyName string) *NonKEYRecordSet {
-	set := m.nonKeySets[ownerKeyName]
-	if set == nil {
-		set = &NonKEYRecordSet{Records: make(map[string]*NonKEYRecord)}
-		m.nonKeySets[ownerKeyName] = set
-	}
-	if set.Records == nil {
-		set.Records = make(map[string]*NonKEYRecord)
-	}
-	return set
-}
-
-func rrNodeKey(rr dns.RR) string {
+// RecordKey returns the canonical, globally unique identity for a non-KEY
+// RR's lease-store node, per RFC 2136 - 1.1 - Comparison Rules: two RRs are
+// equal if their NAME, CLASS, TYPE, RDLENGTH, and RDATA fields are equal.
+// The TTL field is explicitly excluded from the comparison.
+//
+// Special RR types (rfc2136 - 1.1 - Comparison Rules):
+//
+//	SOA:   compare only NAME, CLASS, TYPE (only one SOA per zone)
+//	CNAME: compare only NAME, CLASS, TYPE (only one CNAME per name)
+//	WKS:   compare only NAME, CLASS, TYPE, ADDRESS, PROTOCOL (services mask
+//	       excluded). The dns library does not provide support for WKS RRs
+//	       (no dns.WK type, no TypeWKS constant), so there is no proper
+//	       parser for the RDATA; the full data string is used instead, which
+//	       may include the services mask -- not fully RFC 2136 compliant for
+//	       WKS, but there is no better option available.
+//
+// This is the one function that must be used everywhere a non-KEY record's
+// identity is computed -- the store's own keys, duplicate/ownership checks,
+// and deletion-by-key all have to agree on the same string for the same RR,
+// or a lookup with different casing than what was stored silently misses.
+func RecordKey(rr dns.RR) string {
 	if rr == nil || rr.Header() == nil {
 		return ""
 	}
@@ -859,7 +947,7 @@ func rrNodeKey(rr dns.RR) string {
 	switch typ {
 	case dns.TypeSOA, dns.TypeCNAME:
 		return fmt.Sprintf("%s %d %d", name, class, typ)
-	case uint16(4):
+	case uint16(4): // WKS type code (not exported by the dns library)
 		return fmt.Sprintf("%s %d %d %s", name, class, typ, rr.Data().String())
 	default:
 		return fmt.Sprintf("%s %d %d %d %s", name, class, typ, rr.Data().Len(), rr.Data().String())
@@ -904,6 +992,9 @@ func (m *InMemoryLeaseStore) detachNodeLocked(nodeKey, parentNodeKey, zone strin
 	}
 }
 
+// deleteSubtreeLocked removes rootKey and every descendant reachable through
+// children, whether each is a KEY node (m.leases) or a non-KEY node
+// (m.nonKeyRecords).
 func (m *InMemoryLeaseStore) deleteSubtreeLocked(ctx context.Context, rootKey string) {
 	stack := []string{rootKey}
 	seen := make(map[string]struct{})
@@ -928,14 +1019,12 @@ func (m *InMemoryLeaseStore) deleteSubtreeLocked(ctx context.Context, rootKey st
 	})
 
 	for _, key := range keys {
-		rec := m.leases[key]
-		if rec != nil {
+		if rec, ok := m.leases[key]; ok {
 			m.detachNodeLocked(key, rec.ParentKeyName, rec.UpstreamZone)
 			if m.persistenceHook != nil {
 				_ = m.persistenceHook(ctx, "delete", cloneRecord(rec))
 			}
 			delete(m.leases, key)
-			// Remove from nameIdx
 			dnsName := dnsNameFromNodeKey(key)
 			if existing := m.nameIdx[dnsName]; len(existing) > 0 {
 				updated := existing[:0]
@@ -950,8 +1039,10 @@ func (m *InMemoryLeaseStore) deleteSubtreeLocked(ctx context.Context, rootKey st
 					m.nameIdx[dnsName] = updated
 				}
 			}
+		} else if nkRec, ok := m.nonKeyRecords[key]; ok {
+			m.detachNodeLocked(key, nkRec.ParentKeyName, "")
+			delete(m.nonKeyRecords, key)
 		}
 		delete(m.children, key)
-		delete(m.nonKeySets, key)
 	}
 }
