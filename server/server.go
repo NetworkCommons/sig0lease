@@ -122,6 +122,36 @@ func (s *Server) Serve() error {
 	return nil
 }
 
+// acceptMsg applies the DNS library's standard accept policy (ignore
+// response-flagged messages, reject unrecognized opcodes with NOTIMP,
+// reject anything without exactly one question with FORMERR) to a parsed
+// message, logging any non-accept decision. It is wired explicitly into
+// both serveTCP (as dns.Server.MsgAcceptFunc, replacing the implicit
+// library default) and serveUDP (invoked by hand, since the raw UDP loop
+// bypasses the library's server entirely), so both transports enforce the
+// same policy instead of diverging by accident.
+func (s *Server) acceptMsg(m *dns.Msg) dns.MsgAcceptAction {
+	action := dns.DefaultMsgAcceptFunc(m)
+	switch action {
+	case dns.MsgIgnore:
+		s.logger.Debugf("Ignoring message id=%d: response bit set", m.ID)
+	case dns.MsgReject:
+		s.logger.Debugf("Rejecting message id=%d opcode=%d questions=%d: FORMERR (question count != 1)", m.ID, m.Opcode, len(m.Question))
+	case dns.MsgRejectNotImplemented:
+		s.logger.Debugf("Rejecting message id=%d opcode=%d: NOTIMP (unrecognized opcode)", m.ID, m.Opcode)
+	}
+	return action
+}
+
+// invalidMsg logs a message that the dns library's TCP server could not
+// parse. Wired into dns.Server.MsgInvalidFunc so TCP unpack failures are
+// visible the same way serveUDP already logs its own Unpack() failures.
+// Unlike serveUDP, the library doesn't hand this callback the connection,
+// so the remote address isn't available here.
+func (s *Server) invalidMsg(m *dns.Msg, err error) {
+	s.logger.Errorf("Dropping malformed DNS/TCP message: unpack failed: %v", err)
+}
+
 // serveUDP starts a custom UDP listener that preserves EDNS options
 func (s *Server) serveUDP(ctx context.Context, handler dns.HandlerFunc) error {
 
@@ -183,6 +213,33 @@ func (s *Server) serveUDP(ctx context.Context, handler dns.HandlerFunc) error {
 		copy(msg.Data, rawData)
 		if err := msg.Unpack(); err != nil {
 			s.logger.Errorf("Dropping malformed DNS packet from %s: unpack failed: %v", remoteAddr.String(), err)
+			continue
+		}
+
+		// Apply the same accept/reject policy the dns library enforces on
+		// TCP (see acceptMsg) so response-flagged messages, unrecognized
+		// opcodes, and malformed question counts are handled identically
+		// on both transports instead of UDP passing them straight to the
+		// handler.
+		switch action := s.acceptMsg(msg); action {
+		case dns.MsgIgnore:
+			continue
+		case dns.MsgReject, dns.MsgRejectNotImplemented:
+			msg.Rcode = dns.RcodeFormatError
+			if action == dns.MsgRejectNotImplemented {
+				msg.Rcode = dns.RcodeNotImplemented
+			}
+			msg.Response = true
+			msg.Authoritative = false
+			msg.Zero = false
+			msg.Reset()
+			if err := msg.Pack(); err != nil {
+				s.logger.Errorf("UDP: failed to pack reject response for %s: %v", remoteAddr.String(), err)
+				continue
+			}
+			if _, err := conn.WriteToUDP(msg.Data, remoteAddr); err != nil {
+				s.logger.Errorf("UDP: failed to write reject response to %s: %v", remoteAddr.String(), err)
+			}
 			continue
 		}
 
@@ -291,17 +348,37 @@ func (w *udpResponseWriter) Conn() net.Conn {
 }
 
 func (w *udpResponseWriter) Session() *dns.Session {
-	return nil // UDP does not use sessions
+	// dns.Msg.WriteTo relies on this: since w.conn is the one shared,
+	// unconnected listening socket for every client (not a per-client
+	// connected UDPConn), WriteTo can't just call w.conn.Write -- it has
+	// no destination. Returning the per-request remote address here makes
+	// WriteTo route the reply with WriteMsgUDP(data, nil, Addr) instead,
+	// which correctly targets this request's client.
+	return &dns.Session{Addr: w.remoteAddr}
 }
 
 // serveTCP starts a TCP listener.
 func (s *Server) serveTCP(ctx context.Context, handler dns.HandlerFunc) error {
-	srv := &dns.Server{
-		Listener:  nil,
-		Addr:      s.cfg.Server.Address,
-		Net:       "tcp",
-		Handler:   handler,
-		TLSConfig: nil,
+	// srv is declared separately (not :=) so NotifyStartedFunc below can
+	// close over it and read srv.Listener, which the library only
+	// populates once the bind actually succeeds.
+	var srv *dns.Server
+	srv = &dns.Server{
+		Listener:       nil,
+		Addr:           s.cfg.Server.Address,
+		Net:            "tcp",
+		Handler:        handler,
+		TLSConfig:      nil,
+		MsgAcceptFunc:  s.acceptMsg,
+		MsgInvalidFunc: s.invalidMsg,
+		// Mirrors serveUDP's s.logger.Infof("UDP listener started on %s",
+		// conn.LocalAddr().String()): fires only after the listener has
+		// actually bound (unlike a log placed before ListenAndServe, which
+		// would fire even if the bind then failed), using the real bound
+		// address rather than the pre-resolve config string.
+		NotifyStartedFunc: func(context.Context) {
+			s.logger.Infof("TCP listener started on %s", srv.Listener.Addr().String())
+		},
 	}
 	// Monitor context cancellation in the background
 	go func() {
@@ -337,22 +414,18 @@ func (s *Server) handleRequest(ctx context.Context, w dns.ResponseWriter, r *dns
 	if resp != nil {
 		s.logger.Debugf("handleRequest: Response has Data len=%d, Rcode=%d", len(resp.Data), resp.Rcode)
 
-		// Check if Data needs packing
-		if len(resp.Data) == 0 {
-			s.logger.Debugf("handleRequest: Data is empty, calling Pack()...")
-			if err := resp.Pack(); err != nil {
-				s.logger.Errorf("handleRequest: Pack() failed: %v", err)
-				return
-			}
-			s.logger.Debugf("handleRequest: Pack() succeeded, new Data len=%d", len(resp.Data))
-		}
-
-		// Call Write directly on the response writer
-		_, err := w.Write(resp.Data)
+		// WriteTo (not Write) is required here: it Packs resp if needed,
+		// and for TCP it prefixes the message with the 2-byte length RFC
+		// 1035 requires -- w.Write(resp.Data) is a dumb passthrough to the
+		// socket and skips that, leaving TCP responses unframed and
+		// unreadable by any real DNS-over-TCP client. For UDP, WriteTo
+		// detects the *net.UDPConn and writes the raw bytes exactly as
+		// Write did, so this is a no-op change on that path.
+		n, err := resp.WriteTo(w)
 		if err != nil {
-			s.logger.Errorf("handleRequest: Write error: %v", err)
+			s.logger.Errorf("handleRequest: WriteTo error: %v", err)
 		} else {
-			s.logger.Debugf("handleRequest: Write succeeded")
+			s.logger.Debugf("handleRequest: WriteTo succeeded, wrote %d bytes", n)
 		}
 	} else {
 		s.logger.Errorf("No response generated for query from %s", w.RemoteAddr().String())
