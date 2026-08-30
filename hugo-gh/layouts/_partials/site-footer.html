@@ -1,19 +1,19 @@
-  <center>
-    <img src="/images/Prototype_Fund_Logo_2025.svg" style="max-height:343px;width:auto;height:auto">
-    <img src="/images/BMFTR_en_Web_RGB_gef_durch.svg">
-    <br><br>
-    Sponsored by the German Federal Ministry of Education & Research<br>
-    through participation in Round O2 of the Prototype Fund, June-November 2026<br>
-  </center>
-  <br><br>
-  <br><br>
-  <br><br>
+
 <footer class="{{ .Site.Params.background_color_class | compare.Default "bg-black" }} bottom-0 w-100 pa3" role="contentinfo">
+<div id="funder-footer">
+  <div class="funder-logos">
+    <img class="mbftr-logo" src="/images/BMFTR_en_Web_RGB_gef_durch.png">
+    <img class="prototype-logo" src="/images/Prototype_Fund_Logo_2025.svg">
+  </div>
+  <p>
+    Sponsored by the German Federal Ministry of Education & Research<br>
+    through participation in Round O2 of the Prototype Fund, June-November 2026
+  </p>
+</div>
   <div class="flex justify-between">
   <a class="f4 fw4 hover-white no-underline white-70 dn dib-ns pv2 ph3" href="{{ .Site.Home.Permalink }}" >
     &copy; {{ with .Site.Copyright | compare.Default .Site.Title }} {{ . | safe.HTML }} {{ now.Format "2006"}} {{ end }}
   </a>
     <div>{{ partials.IncludeCached "social/follow.html" . }}</div>
   </div>
-
 </footer>

@@ -1,28 +1,24 @@
 /* font definitions */
 /* ibm-plex-sans-regular - latin */
-
 @font-face {
-  font-display: swap;
+  font-display: swap; /* Check https://developer.mozilla.org/en-US/docs/Web/CSS/@font-face/font-display for other options. */
   font-family: 'IBM Plex Sans';
   font-style: normal;
   font-weight: 400;
-  src: url('../fonts/ibm-plex-sans-v23-latin_latin-ext-regular.woff2') format('woff2');
+  src: url('/fonts/ibm-plex-sans-v23-latin-regular.woff2') format('woff2'); /* Chrome 36+, Opera 23+, Firefox 39+, Safari 12+, iOS 10+ */
 }
-
 /* ibm-plex-mono-regular - latin */
 @font-face {
   font-display: swap;
   font-family: 'IBM Plex Mono';
   font-style: normal;
   font-weight: 400;
-  src: url('../fonts/ibm-plex-mono-v20-latin_latin-ext-regular.woff2') format('woff2');
+  src: url('/fonts/ibm-plex-mono-v20-latin-regular.woff2') format('woff2');
 }
+
 
 /* general definitions */
 body {
-  font-family: 'IBM Plex Sans', sans-serif;
-}
-.avenir {
   font-family: 'IBM Plex Sans', sans-serif;
 }
 
@@ -46,23 +42,4 @@ header h1, header h2 {
 #content {
 	margin-left: 2%;
 	margin-right: 2%;
-}
-
-/* footer */
-#funder-footer {
-	color: #ffffff;
-	padding: 1rem;
-}
-
-#funder-footer div.funder-logos {
-	display: inline;
-}
-#funder-footer img.prototype-logo {
-	filter: invert(100%);
-	width: 40rem;
-	vertical-align: center;
-}
-#funder-footer img.mbftr-logo {
-	width: 20rem;
-	margin-right: 2rem;
 }
