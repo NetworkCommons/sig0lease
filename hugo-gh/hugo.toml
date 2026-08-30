@@ -1,5 +1,5 @@
 baseURL = 'https://sig0lease.networkcommons.org/'
-languageCode = 'en-us'
+locale = 'en-us'
 title = 'sig0lease'
 theme = ["hugo-embed-pdf-shortcode", "gohugo-theme-ananke"]
 enableInlineShortcodes = true
@@ -7,13 +7,14 @@ enableInlineShortcodes = true
   subtitle = 'collaborative service discovery'
   toc = true
   # site_logo = "images/mycosystem-section-cut.jpg"
-  custom_css = ["custom.css"]
-  [[params.ananke_socials]]
-    name = "mastodon"
-    url = "https://hachyderm.io/@sig0lease"
-  [[params.ananke_socials]]
-    name = "github"
-    url = "https://github.com/networkcommons/sig0lease"
+  [params.ananke]
+    custom_css = ["custom.css"]
+  [params.ananke.social.follow]
+    networks = ["mastodon", "github"]
+  [params.ananke.social.mastodon]
+    profilelink = "https://hachyderm.io/@sig0lease"
+  [params.ananke.social.github]
+    profilelink = "https://github.com/networkcommons/sig0lease"
 [markup]
   [markup.tableOfContents]
     endLevel = 2
