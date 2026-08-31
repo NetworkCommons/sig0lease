@@ -608,7 +608,7 @@ test_case_register_refresh_not_prematurely_removed() {
     fi
     log_step "Registering initial lease (LEASE=$LEASE_SECONDS, KEY-LEASE=$LONG_KEY_LEASE_SECONDS)"
     lease_start=$(date +%s)
-    register_rr_type "$CLIENT_KEY_NAME" $LEASE_SECONDS "$LONG_KEY_LEASE_SECONDS" "${KEY_NONKEY_RRs[@]}"
+    register_rr_type "$CLIENT_KEY_NAME" $LEASE_SECONDS $LONG_KEY_LEASE_SECONDS "${KEY_NONKEY_RRs[@]}"
     wait_for_rr_state KEY "$CLIENT_KEY_RR" present
     wait_for_rr_state "$data_type" "$data_spec" present
     proxy_consistent_with_authoritative "$data_type" "$data_spec" present
@@ -660,13 +660,13 @@ test_case_overlapping_registrations_issue17() {
 
     log_step "First registration (A+TXT set #1)"
     first_start=$(date +%s)
-    run_client register "$CLIENT_KEY_NAME" $LEASE_SECONDS $LONG_KEY_LEASE_SECONDS "$(make_rr KEY "$LONG_KEY_LEASE_SECONDS")" "$rr1_a" "$rr1_txt"
+    run_client register "$CLIENT_KEY_NAME" $LEASE_SECONDS $LONG_KEY_LEASE_SECONDS "$(make_rr KEY $LONG_KEY_LEASE_SECONDS)" "$rr1_a" "$rr1_txt"
     wait_for_rr_state KEY "$CLIENT_KEY_RR" present
-    if ! rr_at_auth_contains "$DOWNSTREAM_ZONE" A "192.0.2.99"; then
+    if ! rr_at_authoritative A "$rr1_a"; then
         log_error "Expected first A record to be visible after first registration"
         return 1
     fi
-    if ! rr_at_auth_contains "$DOWNSTREAM_ZONE" TXT "issue17-first-${ts1}"; then
+    if ! rr_at_authoritative TXT "$rr1_txt"; then
         log_error "Expected first TXT record to be visible after first registration"
         return 1
     fi
@@ -810,39 +810,38 @@ test_case_abcd_lease_policy_matrix() {
     case_start=$(date +%s)
 
     local needle_a needle_b txt_a txt_b
-    needle_a="caseA-$(date +%s)"
+    needle_a="caseA-$(time_tag)"
     txt_a="${DOWNSTREAM_ZONE} ${LEASE_SECONDS} IN TXT \"${needle_a}\""
 
     log_step "Case A (KEY-LEASE!=0, LEASE!=0): full registration of KEY+TXT"
-    register_rr_type "$CLIENT_KEY_NAME" $LEASE_SECONDS "$LONG_KEY_LEASE_SECONDS" "$(make_rr KEY "$LONG_KEY_LEASE_SECONDS")" "$txt_a"
+    register_rr_type "$CLIENT_KEY_NAME" $LEASE_SECONDS $LONG_KEY_LEASE_SECONDS "$(make_rr KEY $LONG_KEY_LEASE_SECONDS)" "$txt_a"
     wait_for_rr_state KEY "$CLIENT_KEY_RR" present
-    if ! rr_at_auth_contains "$DOWNSTREAM_ZONE" TXT "$needle_a"; then
-        log_error "Case A: expected TXT record not found at authoritative"
-        return 1
-    fi
+    wait_for_rr_state TXT "$txt_a" present
+
     proxy_consistent_with_authoritative KEY "$CLIENT_KEY_RR" present
     query_lease_dump "info"
     log_success "Case A: KEY+TXT registered together"
 
     log_step "Case D (KEY-LEASE!=0, LEASE=0): key-only refresh must leave data untouched"
-    run_client refresh "$CLIENT_KEY_NAME" 0 "$LONG_KEY_LEASE_SECONDS" "$(make_rr KEY "$LONG_KEY_LEASE_SECONDS")"
+    run_client refresh "$CLIENT_KEY_NAME" 0 $LONG_KEY_LEASE_SECONDS "$(make_rr KEY $LONG_KEY_LEASE_SECONDS)"
     wait_for_rr_state KEY "$CLIENT_KEY_RR" present
-    if ! rr_at_auth_contains "$DOWNSTREAM_ZONE" TXT "$needle_a"; then
+    if ! rr_at_authoritative TXT "$txt_a"; then
         log_error "Case D: key-only refresh unexpectedly disturbed the Case A TXT record"
         return 1
     fi
     log_success "Case D: key-only refresh left Case A's TXT record untouched"
 
-    needle_b="caseB-$(date +%s)"
+    needle_b="caseB-$(time_tag)"
     txt_b="${DOWNSTREAM_ZONE} ${LEASE_SECONDS} IN TXT \"${needle_b}\""
     log_step "Case B (KEY-LEASE=0, LEASE!=0): non-KEY-only registration under the already-managed signer"
-    run_client refresh "$CLIENT_KEY_NAME" $LEASE_SECONDS 0 "$txt_b"
-    if ! rr_at_auth_contains "$DOWNSTREAM_ZONE" TXT "$needle_a"; then
-        log_error "Case B: original Case A TXT record disappeared"
+    run_client register "$CLIENT_KEY_NAME" $LEASE_SECONDS 0 "$txt_b"
+    
+    if ! wait_for_rr_state TXT "$txt_b" present; then
+        log_error "Case B: new non-KEY-only TXT record not found at authoritative"
         return 1
     fi
-    if ! rr_at_auth_contains "$DOWNSTREAM_ZONE" TXT "$needle_b"; then
-        log_error "Case B: new non-KEY-only TXT record not found at authoritative"
+    if ! rr_at_authoritative TXT "$txt_a"; then
+        log_error "Case B: original Case A TXT record disappeared"
         return 1
     fi
     query_lease_dump "debug"
@@ -850,21 +849,26 @@ test_case_abcd_lease_policy_matrix() {
 
     log_step "Case C (KEY-LEASE=0, LEASE=0): non-KEY-only delete removes just txt_b"
     run_client refresh "$CLIENT_KEY_NAME" 0 0 "$txt_b"
-    if rr_at_auth_contains "$DOWNSTREAM_ZONE" TXT "$needle_b"; then
+
+    if ! wait_for_rr_state TXT "$txt_b" absent; then
         log_error "Case C: targeted TXT delete did not remove txt_b"
         return 1
     fi
-    if ! rr_at_auth_contains "$DOWNSTREAM_ZONE" TXT "$needle_a"; then
+    if ! rr_at_authoritative KEY "$CLIENT_KEY_RR"; then
+        log_error "Case C: targeted TXT delete removed KEY"
+        return 1
+    fi
+    if ! rr_at_authoritative TXT "$txt_a"; then
         log_error "Case C: non-KEY-only delete unexpectedly removed txt_a too"
         return 1
     fi
-    wait_for_rr_state KEY "$CLIENT_KEY_RR" present
+    
     log_success "Case C: non-KEY-only delete removed txt_b while KEY and txt_a remained"
 
     log_step "Case C (KEY-LEASE=0, LEASE=0): KEY delete cascades and removes remaining data"
     run_client refresh "$CLIENT_KEY_NAME" 0 0 "$(make_rr KEY 0)"
     wait_for_rr_state KEY "$CLIENT_KEY_RR" absent
-    if rr_at_auth_contains "$DOWNSTREAM_ZONE" TXT "$needle_a"; then
+    if rr_at_authoritative TXT "$txt_a"; then
         log_error "Case C: KEY delete did not cascade-remove remaining txt_a"
         return 1
     fi
@@ -894,11 +898,11 @@ test_case_signer_location_matrix() {
     case_start=$(date +%s)
 
     local needle1 needle2 needle3 txt1 txt2 txt3
-    needle1="signerloc-update-$(date +%s)"
+    needle1="signerloc-update-$(time_tag)"
     txt1="${DOWNSTREAM_ZONE} ${LEASE_SECONDS} IN TXT \"${needle1}\""
 
     log_step "Signer location 1/4: Update section (self-registration, Case A)"
-    register_rr_type "$CLIENT_KEY_NAME" $LEASE_SECONDS "$LONG_KEY_LEASE_SECONDS" "$(make_rr KEY "$LONG_KEY_LEASE_SECONDS")" "$txt1" --signer=update
+    register_rr_type "$CLIENT_KEY_NAME" $LEASE_SECONDS $LONG_KEY_LEASE_SECONDS "$(make_rr KEY $LONG_KEY_LEASE_SECONDS)" "$txt1" --signer=update
     wait_for_rr_state KEY "$CLIENT_KEY_RR" present
     if ! rr_at_auth_contains "$DOWNSTREAM_ZONE" TXT "$needle1"; then
         log_error "Signer-location[update]: expected TXT record not found"
@@ -906,7 +910,7 @@ test_case_signer_location_matrix() {
     fi
     log_success "Signer-location[update]: signer KEY resolved from the Update section"
 
-    needle2="signerloc-additional-$(date +%s)"
+    needle2="signerloc-additional-$(time_tag)"
     txt2="${DOWNSTREAM_ZONE} ${LEASE_SECONDS} IN TXT \"${needle2}\""
     log_step "Signer location 2/4: Additional section (non-KEY-only refresh, Case B)"
     run_client refresh "$CLIENT_KEY_NAME" $LEASE_SECONDS 0 "$txt2" --signer=additional
@@ -916,7 +920,7 @@ test_case_signer_location_matrix() {
     fi
     log_success "Signer-location[additional]: signer KEY resolved from the Additional section"
 
-    needle3="signerloc-leasestore-$(date +%s)"
+    needle3="signerloc-leasestore-$(time_tag)"
     txt3="${DOWNSTREAM_ZONE} ${LEASE_SECONDS} IN TXT \"${needle3}\""
     log_step "Signer location 3/4: omitted from request, resolved via lease store (Case B)"
     run_client refresh "$CLIENT_KEY_NAME" $LEASE_SECONDS 0 "$txt3" --signer=none
@@ -930,7 +934,7 @@ test_case_signer_location_matrix() {
     local wrong_key_payload probe_needle probe_txt probe_out
     wrong_key_payload="$(cat "$CLIENT_KEYSTORE_DIR/${WRONG_CLIENT_KEY_NAME}.key" | sed 's/test.dev.zenr.io. IN \(.*\)/\1/g')"
     add_rr "$wrong_key_payload" 60
-    probe_needle="signerloc-online-$(date +%s)"
+    probe_needle="signerloc-online-$(time_tag)"
     probe_txt="${DOWNSTREAM_ZONE} 60 IN TXT \"${probe_needle}\""
     # This is a Case C request (LEASE=0, KEY-LEASE=0) for a record the
     # online-only signer does not own, so it resolves to a harmless no-op
@@ -972,7 +976,7 @@ test_case_multi_rr_combination_registration() {
     # macOS's bundled bash 3.2, which has no `declare -A` support.
     local combo_types=(TXT A AAAA WALLET)
     local combo_specs=() specs=() i t spec
-    specs=("$(make_rr KEY "$LONG_KEY_LEASE_SECONDS")")
+    specs=("$(make_rr KEY $LONG_KEY_LEASE_SECONDS)")
     for i in "${!combo_types[@]}"; do
         spec="$(make_rr "${combo_types[$i]}" $LEASE_SECONDS)"
         specs+=("$spec")
@@ -981,7 +985,7 @@ test_case_multi_rr_combination_registration() {
 
     log_step "Registering KEY + ${combo_types[*]} together in a single Update"
     lease_start=$(date +%s)
-    register_rr_type "$CLIENT_KEY_NAME" $LEASE_SECONDS "$LONG_KEY_LEASE_SECONDS" "${specs[@]}"
+    register_rr_type "$CLIENT_KEY_NAME" $LEASE_SECONDS $LONG_KEY_LEASE_SECONDS "${specs[@]}"
     wait_for_rr_state KEY "$CLIENT_KEY_RR" present
     for i in "${!combo_types[@]}"; do
         t="${combo_types[$i]}"
@@ -1020,11 +1024,11 @@ test_case_refresh_extends_nonkey_not_key_lease() {
     case_start=$(date +%s)
 
     local needle txt_spec
-    needle="refresh-lease-check-$(date +%s)"
+    needle="refresh-lease-check-$(time_tag)"
     txt_spec="${DOWNSTREAM_ZONE} ${LEASE_SECONDS} IN TXT \"${needle}\""
 
     log_step "Registering KEY (long key-lease) + TXT (short lease)"
-    register_rr_type "$CLIENT_KEY_NAME" $LEASE_SECONDS "$LONG_KEY_LEASE_SECONDS" "$(make_rr KEY "$LONG_KEY_LEASE_SECONDS")" "$txt_spec"
+    register_rr_type "$CLIENT_KEY_NAME" $LEASE_SECONDS $LONG_KEY_LEASE_SECONDS "$(make_rr KEY $LONG_KEY_LEASE_SECONDS)" "$txt_spec"
     wait_for_rr_state KEY "$CLIENT_KEY_RR" present
     if ! rr_at_auth_contains "$DOWNSTREAM_ZONE" TXT "$needle"; then
         log_error "Refresh-lease-check: TXT record not found after initial registration"
@@ -1084,7 +1088,7 @@ test_case_dump_vs_dig_consistency() {
     case_start=$(date +%s)
 
     local needle txt_spec node_key
-    needle="dumpcheck-$(date +%s)"
+    needle="dumpcheck-$(time_tag)"
     txt_spec="${DOWNSTREAM_ZONE} ${LEASE_SECONDS} IN TXT \"${needle}\""
     node_key="${DOWNSTREAM_ZONE%.}.+015+05044"
 
