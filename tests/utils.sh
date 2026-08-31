@@ -12,6 +12,10 @@ CLIENT_LOG_FILE="/tmp/sig0lease_client.log"
 PROXY_ADDR="${PROXY_ADDR:-127.0.0.1}"
 PROXY_PORT="${PROXY_PORT:-8053}"
 PROXY_URL="$PROXY_ADDR:$PROXY_PORT"
+# Transport run_client (tests/test_update.sh) uses to reach PROXY_URL.
+# Defaults to udp; set PROXY_PROTOCOL=tcp to run the whole suite over TCP
+# instead (passes --tcp through to sig0lease-client).
+PROXY_PROTOCOL="${PROXY_PROTOCOL:-udp}"
 
 # Configuration
 TMP_CONFIG_FILE=""

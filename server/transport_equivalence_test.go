@@ -11,6 +11,9 @@ import (
 	"github.com/NetworkCommons/sig0lease/client"
 	"github.com/NetworkCommons/sig0lease/config"
 	"github.com/NetworkCommons/sig0lease/logging"
+	_ "github.com/NetworkCommons/sig0lease/pkg/dnscompat" // registers EDNS code 2 so UPDATE-LEASE unpacks; see README_proxy.md
+	"github.com/NetworkCommons/sig0lease/pkg/dnsmsg"
+	"github.com/NetworkCommons/sig0lease/pkg/lease"
 )
 
 // reserveAddr grabs an OS-assigned free port on 127.0.0.1 for the given
@@ -218,4 +221,69 @@ func TestUDPTCPTransportEquivalence(t *testing.T) {
 			}
 		})
 	})
+}
+
+// TestServeTCPPreservesUpdateLeaseOption is a regression test for the bug
+// serveTCP's custom accept loop fixes: the dns library's own
+// (*dns.Server).serveDNS (used by ListenAndServe, which serveTCP previously
+// delegated to) sets Options = MsgOptionUnpack to request a full unpack
+// after MsgAcceptFunc runs, but never actually calls Unpack() a second time
+// before invoking the handler -- so Ns/Extra/Pseudo stayed empty for every
+// TCP-received message, and the UPDATE-LEASE EDNS option (or any other EDNS
+// option) silently vanished before it ever reached a handler, regardless of
+// what the client sent. TestUDPTCPTransportEquivalence above doesn't catch
+// this: none of its cases populate Ns/Extra/Pseudo, since acceptMsg only
+// looks at the header and Question. This test asserts the option actually
+// survives, identically, on both transports.
+func TestServeTCPPreservesUpdateLeaseOption(t *testing.T) {
+	udpAddr := reserveAddr(t, "udp")
+	tcpAddr := reserveAddr(t, "tcp")
+
+	logger := logging.NewLogger("debug")
+	udpSrv := &Server{cfg: &config.Config{Server: config.ServerConfig{Address: udpAddr}}, logger: logger}
+	tcpSrv := &Server{cfg: &config.Config{Server: config.ServerConfig{Address: tcpAddr}}, logger: logger}
+
+	var gotLeaseOpt bool
+	handler := dns.HandlerFunc(func(ctx context.Context, w dns.ResponseWriter, r *dns.Msg) {
+		_, gotLeaseOpt = lease.FindOption(r)
+		resp := &dns.Msg{MsgHeader: r.MsgHeader, Question: r.Question}
+		resp.Response = true
+		resp.Rcode = dns.RcodeSuccess
+		resp.WriteTo(w)
+	})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	go func() { _ = udpSrv.serveUDP(ctx, handler) }()
+	go func() { _ = tcpSrv.serveTCP(ctx, handler) }()
+
+	waitReady(t, udpAddr, "udp")
+	waitReady(t, tcpAddr, "tcp")
+
+	for _, proto := range []string{"udp", "tcp"} {
+		t.Run(proto, func(t *testing.T) {
+			gotLeaseOpt = false
+
+			msg, err := dnsmsg.NewLeaseUpdate("lease-test.example.", nil, nil, 0, 0)
+			if err != nil {
+				t.Fatalf("build lease update: %v", err)
+			}
+
+			addr := udpAddr
+			if proto == "tcp" {
+				addr = tcpAddr
+			}
+			c := client.New(addr, proto, 2*time.Second)
+			resp, err := c.Query(msg)
+			if err != nil {
+				t.Fatalf("query failed: %v", err)
+			}
+			if resp.Rcode != dns.RcodeSuccess {
+				t.Fatalf("got rcode=%d, want success", resp.Rcode)
+			}
+			if !gotLeaseOpt {
+				t.Fatalf("handler did not see the UPDATE-LEASE EDNS option -- it was lost in transit")
+			}
+		})
+	}
 }

@@ -110,6 +110,10 @@ build_binaries() {
 # Accepts zero or more trailing rr-specs and/or a --signer= flag, passed
 # through to the client binary as separate argv entries (no eval/string
 # concatenation, so rr-specs containing spaces/quotes are safe).
+# Transport is controlled by PROXY_PROTOCOL (see utils.sh; defaults to udp,
+# same udp-unless-told-otherwise mechanism as PROXY_ADDR/PROXY_PORT) --
+# every call site gets --tcp for free when PROXY_PROTOCOL=tcp, no call site
+# needs to pass it itself.
 run_client() {
     local operation="$1"
     local keyname="$2"
@@ -117,6 +121,9 @@ run_client() {
     local key_lease_seconds="$4"
     shift 4
     local extra=("$@")
+    if [ "$PROXY_PROTOCOL" = "tcp" ]; then
+        extra+=(--tcp)
+    fi
 
     log_file run_client "operation=$operation keyname=$keyname lease=$lease_seconds key_lease=$key_lease_seconds extra=${extra[*]:-}"
     echo "CLIENT_KEYSTORE_DIR=\"$CLIENT_KEYSTORE_DIR\" \"$CLIENT_BIN\" \"$PROXY_URL\" $operation \"$keyname\" $lease_seconds $key_lease_seconds ${extra[*]:-}"

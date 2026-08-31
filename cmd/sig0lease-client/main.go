@@ -106,17 +106,65 @@ func extractSignerLocationFlag(args []string) ([]string, string) {
 	return out, location
 }
 
+// keyRRFromClientKey builds a *dns.KEY RR from the already-loaded signing
+// key, so callers don't need to re-derive or re-type its RDATA by hand.
+func keyRRFromClientKey(clientKey *keyrec.LoadedKey, ttl uint32) *dns.KEY {
+	keyRR := new(dns.KEY)
+	keyRR.Hdr.Name = clientKey.KeyName()
+	keyRR.Hdr.Class = dns.ClassINET
+	keyRR.Hdr.TTL = ttl
+	keyRR.Flags = clientKey.PublicKey.Flags
+	keyRR.Protocol = clientKey.PublicKey.Protocol
+	keyRR.Algorithm = clientKey.PublicKey.Algorithm
+	keyRR.PublicKey = clientKey.PublicKey.PublicKey
+	return keyRR
+}
+
 func addSignerKeyToAdditional(msg *dns.Msg, clientKey *keyrec.LoadedKey, keyLeaseDuration uint32) {
-	signingKeyRR := new(dns.KEY)
-	signingKeyRR.Hdr.Name = clientKey.KeyName()
-	signingKeyRR.Hdr.Class = dns.ClassINET
-	signingKeyRR.Hdr.TTL = keyLeaseDuration
-	signingKeyRR.Flags = clientKey.PublicKey.Flags
-	signingKeyRR.Protocol = clientKey.PublicKey.Protocol
-	signingKeyRR.Algorithm = clientKey.PublicKey.Algorithm
-	signingKeyRR.PublicKey = clientKey.PublicKey.PublicKey
+	signingKeyRR := keyRRFromClientKey(clientKey, keyLeaseDuration)
 	msg.Extra = append(msg.Extra, signingKeyRR)
 	fmt.Printf("  ✓ Added signer KEY RR to Additional section: %s\n", signingKeyRR.String())
+}
+
+// extractSameKeyFlag pulls a bare --same-key token out of args, wherever it
+// appears, returning the remaining positional args and whether it was set.
+func extractSameKeyFlag(args []string) ([]string, bool) {
+	const flag = "--same-key"
+	sameKey := false
+	out := make([]string, 0, len(args))
+	for _, a := range args {
+		if a == flag {
+			sameKey = true
+			continue
+		}
+		out = append(out, a)
+	}
+	return out, sameKey
+}
+
+// extractTCPFlag pulls a bare --tcp token out of args, wherever it appears,
+// returning the remaining positional args and whether it was set. Absent,
+// the client uses UDP (client.New's own default).
+func extractTCPFlag(args []string) ([]string, bool) {
+	const flag = "--tcp"
+	useTCP := false
+	out := make([]string, 0, len(args))
+	for _, a := range args {
+		if a == flag {
+			useTCP = true
+			continue
+		}
+		out = append(out, a)
+	}
+	return out, useTCP
+}
+
+// queryProtocol maps --tcp's presence to the protocol string client.New expects.
+func queryProtocol(useTCP bool) string {
+	if useTCP {
+		return "tcp"
+	}
+	return "udp"
 }
 
 func cmdRegRefWithMode(proxyAddr string, args []string, operation string, tamper bool) {
@@ -127,9 +175,11 @@ func cmdRegRefWithMode(proxyAddr string, args []string, operation string, tamper
 		fmt.Fprintf(os.Stderr, "ERROR: invalid --signer=%s (expected update|additional|none)\n", signerLocation)
 		os.Exit(1)
 	}
+	args, sameKey := extractSameKeyFlag(args)
+	args, useTCP := extractTCPFlag(args)
 
 	if len(args) < 3 {
-		fmt.Fprintf(os.Stderr, "Usage: sig0lease-client <proxy> register|register-tamper|refresh <keyname> [lease] [key-lease] [rr-spec...] [--signer=update|additional|none]\n")
+		fmt.Fprintf(os.Stderr, "Usage: sig0lease-client <proxy> register|register-tamper|refresh <keyname> [lease] [key-lease] [rr-spec...] [--signer=update|additional|none] [--same-key] [--tcp]\n")
 		os.Exit(1)
 	}
 
@@ -184,6 +234,21 @@ func cmdRegRefWithMode(proxyAddr string, args []string, operation string, tamper
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "ERROR: Failed to load client key: %v\n", err)
 		os.Exit(1)
+	}
+
+	if sameKey {
+		for _, rr := range updateKeyRRs {
+			if strings.EqualFold(rr.Hdr.Name, clientKey.KeyName()) {
+				fmt.Fprintf(os.Stderr, "ERROR: --same-key conflicts with an explicit KEY rr-spec for %s already among the rr-spec arguments\n", clientKey.KeyName())
+				os.Exit(1)
+			}
+		}
+		if signerLocation == signerLocationNone {
+			fmt.Fprintf(os.Stderr, "ERROR: --same-key conflicts with --signer=none: the signing key must appear in the Update section\n")
+			os.Exit(1)
+		}
+		updateKeyRRs = append(updateKeyRRs, keyRRFromClientKey(clientKey, keyLeaseDuration))
+		fmt.Printf("  ✓ --same-key: reusing signing key %s as the Update-section lease payload\n", clientKey.KeyName())
 	}
 
 	fmt.Printf("=== sig0lease Client %s ===\n", operation)
@@ -319,7 +384,8 @@ func cmdRegRefWithMode(proxyAddr string, args []string, operation string, tamper
 	}
 
 	// Send to proxy
-	fmt.Printf("\nSending to proxy (%s)\n", proxyAddr)
+	protocol := queryProtocol(useTCP)
+	fmt.Printf("\nSending to proxy (%s) over %s\n", proxyAddr, protocol)
 
 	// Check message before packing
 	fmt.Printf("  Message structure before sending:\n")
@@ -333,7 +399,7 @@ func cmdRegRefWithMode(proxyAddr string, args []string, operation string, tamper
 	}
 	fmt.Printf("    Packed size: %d bytes\n", len(signedMsg.Data))
 
-	c := client.New(proxyAddr, "udp", 20*time.Second)
+	c := client.New(proxyAddr, protocol, 20*time.Second)
 	resp, err := c.Query(signedMsg)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "ERROR: Failed to send query: %v\n", err)
@@ -424,20 +490,23 @@ func flipOnePayloadBit(msg *dns.Msg) error {
 
 // cmdVerify checks if a key registration is active
 func cmdVerify(proxyAddr string, args []string) {
+	args, useTCP := extractTCPFlag(args)
 	if len(args) < 1 {
-		fmt.Fprintf(os.Stderr, "Usage: sig0lease-client <proxy> verify <keyname>\n")
+		fmt.Fprintf(os.Stderr, "Usage: sig0lease-client <proxy> verify <zone> [--tcp]\n")
 		os.Exit(1)
 	}
 
 	zone := args[0]
+	protocol := queryProtocol(useTCP)
 
 	fmt.Printf("=== Verifying Key Registration ===\n")
 	fmt.Printf("Proxy: %s\n", proxyAddr)
 	fmt.Printf("Zone: %s\n", zone)
+	fmt.Printf("Protocol: %s\n", protocol)
 
 	// Send a standard query for the key record
 	msg := dns.NewMsg(zone, dns.TypeKEY)
-	c := client.New(proxyAddr, "udp", 20*time.Second)
+	c := client.New(proxyAddr, protocol, 20*time.Second)
 	resp, err := c.Query(msg)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "ERROR: Query failed: %v\n", err)
@@ -504,7 +573,7 @@ Usage:
   sig0lease-client <proxy> <command> [args...]
 
 Commands:
-	register <keyname> [lease] [key-lease] [rr-spec...] [--signer=update|additional|none]
+	register <keyname> [lease] [key-lease] [rr-spec...] [--signer=update|additional|none] [--same-key] [--tcp]
 		Send a sig0lease UPDATE-LEASE registration request
 
 		keyname: filename of the key in the keystore (e.g., Ktest.dev.zenr.io.+015+05044)
@@ -513,42 +582,78 @@ Commands:
 			rr-spec: optional additional RR in DNS presentation format:
 				<owner> <ttl> <class> <type> <rdata...>
 			--signer: where the signer's KEY RR should appear in the request. Tests the
-				proxy's signer resolution: request-provided (update/additional) vs.
-				resolved server-side (lease store or authoritative DNS).
+				proxy's signer resolution: request-provided (--signer=update/additional) vs.
+				resolved server-side (lease store or authoritative DNS if --signer=none).
 					update:     signer's own KEY rr-spec must also be passed; no Additional copy
 					additional: signer KEY is placed in the Additional section (default when
 					            no matching KEY rr-spec is given)
 					none:       signer KEY is omitted entirely; proxy must resolve it from the
 					            lease store or authoritative DNS
+			--same-key: lease the same key used to sign the request, without retyping its
+				KEY rr-spec. Builds the KEY RR from the loaded signing key and adds it to
+				the Update section; conflicts with an explicit KEY rr-spec for the same
+				name and with --signer=none.
+			--tcp: send the request over TCP instead of the default UDP.
+
+		Note: the server dispatches on the LEASE/KEY-LEASE combination and
+		requires specific RR kinds to be present for each (handlers/opcode5_handle.go):
+			KEY-LEASE!=0 and LEASE!=0: requires >=1 KEY RR and >=1 non-KEY RR
+			KEY-LEASE=0  and LEASE!=0: requires >=1 non-KEY RR and 0 KEY RRs (signer must already be managed)
+			KEY-LEASE!=0 and LEASE=0:  requires >=1 KEY RR (KEY-only lease)
+		A duration with no matching RR present is rejected, not silently ignored.
 
 		Example:
-		// Key-only registration
-		sig0lease-client 127.0.0.1:8053 register Ktest.dev.zenr.io.+015+05044 300 0
-		// Key and other RRs registration
-		sig0lease-client 127.0.0.1:8053 register Ktest.dev.zenr.io.+015+05044 300 3600 "client.test.dev.zenr.io. 300 IN TXT \"hello\""
-		// Refresh signed by an already-managed or online-only key, key omitted from the request
-		sig0lease-client 127.0.0.1:8053 register Ktest.dev.zenr.io.+015+05044 300 3600 --signer=none
+		// Key-only registration: lease the signing key itself (LEASE=0, KEY-LEASE!=0);
+		// --same-key supplies the required KEY RR without retyping it
+		sig0lease-client 127.0.0.1:8053 register Ktest.dev.zenr.io.+015+05044 0 3600 --same-key
+		// Same, repeating the key (no --same-key): the KEY rr-spec must be typed
+		// out in full
+		sig0lease-client 127.0.0.1:8053 register Ktest.dev.zenr.io.+015+05044 0 3600 "test.dev.zenr.io. 3600 IN KEY 512 3 15 s1Uf18NtAIacuPDIgMdw2SJ//8fm+xjLb5MPWqwxqzQ="
+		// Key and other RRs registration (LEASE!=0 and KEY-LEASE!=0 requires both kinds present)
+		sig0lease-client 127.0.0.1:8053 register Ktest.dev.zenr.io.+015+05044 300 3600 --same-key "client.test.dev.zenr.io. 300 IN TXT \"hello\""
+		// Non-KEY-only registration signed by an already-managed key, key omitted from the request
+		sig0lease-client 127.0.0.1:8053 register Ktest.dev.zenr.io.+015+05044 300 0 --signer=none "client.test.dev.zenr.io. 300 IN TXT \"hello\""
+		// Register a different key than the one signing the request (delegation),
+		// without --same-key: only the other key is leased, and the signer's own
+		// KEY RR is added to Additional so the proxy can still verify it
+		sig0lease-client 127.0.0.1:8053 register Ktest.dev.zenr.io.+015+05044 0 3600 "client.test.dev.zenr.io. 3600 IN KEY 512 3 15 c2yGNXxlrWu1LX/n9AqrCp+rIbm9FWcotgnMomlrM2E="
+		// Same, but also register the signer's own key-lease in the same request via
+		// --same-key: both KEY RRs end up in the Update section, no Additional copy
+		sig0lease-client 127.0.0.1:8053 register Ktest.dev.zenr.io.+015+05044 0 3600 --same-key "client.test.dev.zenr.io. 3600 IN KEY 512 3 15 c2yGNXxlrWu1LX/n9AqrCp+rIbm9FWcotgnMomlrM2E="
+		// Same request over TCP instead of UDP
+		sig0lease-client 127.0.0.1:8053 register Ktest.dev.zenr.io.+015+05044 0 3600 --same-key --tcp
 
-	refresh <keyname> [lease] [key-lease] [rr-spec...] [--signer=update|additional|none]
+	refresh <keyname> [lease] [key-lease] [rr-spec...] [--signer=update|additional|none] [--same-key] [--tcp]
 		Send a sig0lease UPDATE-LEASE refresh request (8-byte variant)
 
 		keyname: filename of the key in the keystore (e.g., Ktest.dev.zenr.io.+015+05044)
 		lease: new lease duration in seconds
 		key-lease: key-lease duration in seconds
 		--signer: see register above
+		--same-key: see register above
+		--tcp: see register above
 
 		Example:
-		// Key-only refresh
-        sig0lease-client 127.0.0.1:8053 refresh Ktest.dev.zenr.io.+015+05044 300 0
-	    // Key and other RRs refresh
-        sig0lease-client 127.0.0.1:8053 refresh Ktest.dev.zenr.io.+015+05044 300 3600 "client.test.dev.zenr.io. 300 IN TXT \"hello\""
+		// Key-only refresh: renew the signing key's own lease (LEASE=0, KEY-LEASE!=0);
+		// --same-key supplies the required KEY RR without retyping it
+        sig0lease-client 127.0.0.1:8053 refresh Ktest.dev.zenr.io.+015+05044 0 3600 --same-key
+	    // Key and other RRs refresh (LEASE!=0 and KEY-LEASE!=0 requires both kinds present)
+        sig0lease-client 127.0.0.1:8053 refresh Ktest.dev.zenr.io.+015+05044 300 3600 --same-key "client.test.dev.zenr.io. 300 IN TXT \"hello\""
+
+		All the other register examples above (repetitive KEY rr-spec form,
+		non-KEY-only with --signer=none, registering a different key with and
+		without --same-key) apply the same way to refresh; just substitute the
+		command name.
 
 
-  verify <zone> <keyname>
+  verify <zone> [--tcp]
     Query if a key registration is active
-    
+
+    --tcp: send the query over TCP instead of the default UDP.
+
     Example:
-      sig0lease-client 127.0.0.1:8053 verify test.dev.zenr.io. client.test.dev.zenr.io.
+      sig0lease-client 127.0.0.1:8053 verify test.dev.zenr.io.
+      sig0lease-client 127.0.0.1:8053 verify test.dev.zenr.io. --tcp
 
   list-keys [keystore-dir]
     List available keys in keystore
