@@ -64,10 +64,9 @@ func waitReady(t *testing.T, addr, protocol string) {
 
 // TestUDPTCPTransportEquivalence drives the same inputs through serveUDP
 // and serveTCP -- via the real client package, which already supports both
-// protocols -- and asserts they're handled identically. This is a
-// regression test for the accept/reject policy (acceptMsg) that used to
-// exist only on the TCP path (inherited from the dns library's default)
-// and has since been made explicit and shared by both transports.
+// protocols -- and asserts they're handled identically. Both transports
+// run the same dns.Server accept policy (acceptMsg, wired as its
+// MsgAcceptFunc); this pins that they stay in lockstep.
 func TestUDPTCPTransportEquivalence(t *testing.T) {
 	udpAddr := reserveAddr(t, "udp")
 	tcpAddr := reserveAddr(t, "tcp")
@@ -223,18 +222,18 @@ func TestUDPTCPTransportEquivalence(t *testing.T) {
 	})
 }
 
-// TestServeTCPPreservesUpdateLeaseOption is a regression test for the bug
-// serveTCP's custom accept loop fixes: the dns library's own
-// (*dns.Server).serveDNS (used by ListenAndServe, which serveTCP previously
-// delegated to) sets Options = MsgOptionUnpack to request a full unpack
-// after MsgAcceptFunc runs, but never actually calls Unpack() a second time
-// before invoking the handler -- so Ns/Extra/Pseudo stayed empty for every
-// TCP-received message, and the UPDATE-LEASE EDNS option (or any other EDNS
-// option) silently vanished before it ever reached a handler, regardless of
-// what the client sent. TestUDPTCPTransportEquivalence above doesn't catch
-// this: none of its cases populate Ns/Extra/Pseudo, since acceptMsg only
-// looks at the header and Question. This test asserts the option actually
-// survives, identically, on both transports.
+// TestServeTCPPreservesUpdateLeaseOption asserts the UPDATE-LEASE EDNS
+// option reaches the handler intact over both transports.
+//
+// codeberg.org/miekg/dns hands a Handler a message decoded only through the
+// question section; the handler is expected to call r.Unpack() itself to
+// get Ns/Extra/Pseudo, and therefore any EDNS option (see the dns.Handler
+// interface docs). fullUnpackHandler in the server package does exactly
+// that on every dispatch path -- this test pins that wiring. Without it a
+// register/refresh over either transport would look like "UPDATE without
+// UPDATE-LEASE" to the update handler. TestUDPTCPTransportEquivalence above
+// doesn't cover it: none of its cases populate Ns/Extra/Pseudo, since
+// acceptMsg only looks at the header and Question.
 func TestServeTCPPreservesUpdateLeaseOption(t *testing.T) {
 	udpAddr := reserveAddr(t, "udp")
 	tcpAddr := reserveAddr(t, "tcp")
@@ -243,9 +242,17 @@ func TestServeTCPPreservesUpdateLeaseOption(t *testing.T) {
 	udpSrv := &Server{cfg: &config.Config{Server: config.ServerConfig{Address: udpAddr}}, logger: logger}
 	tcpSrv := &Server{cfg: &config.Config{Server: config.ServerConfig{Address: tcpAddr}}, logger: logger}
 
-	var gotLeaseOpt bool
+	// One handler serves both transports. It reports, per UPDATE, whether
+	// it saw the option; filtering on the opcode keeps the plain-A
+	// readiness probes waitReady sends off the channel, and the channel
+	// (rather than a shared bool) keeps the observation ordered with the
+	// test goroutine that reads it and race-free across handler goroutines.
+	sawLeaseOpt := make(chan bool, 1)
 	handler := dns.HandlerFunc(func(ctx context.Context, w dns.ResponseWriter, r *dns.Msg) {
-		_, gotLeaseOpt = lease.FindOption(r)
+		if r.Opcode == dns.OpcodeUpdate {
+			_, ok := lease.FindOption(r)
+			sawLeaseOpt <- ok
+		}
 		resp := &dns.Msg{MsgHeader: r.MsgHeader, Question: r.Question}
 		resp.Response = true
 		resp.Rcode = dns.RcodeSuccess
@@ -262,8 +269,6 @@ func TestServeTCPPreservesUpdateLeaseOption(t *testing.T) {
 
 	for _, proto := range []string{"udp", "tcp"} {
 		t.Run(proto, func(t *testing.T) {
-			gotLeaseOpt = false
-
 			msg, err := dnsmsg.NewLeaseUpdate("lease-test.example.", nil, nil, 0, 0)
 			if err != nil {
 				t.Fatalf("build lease update: %v", err)
@@ -281,8 +286,13 @@ func TestServeTCPPreservesUpdateLeaseOption(t *testing.T) {
 			if resp.Rcode != dns.RcodeSuccess {
 				t.Fatalf("got rcode=%d, want success", resp.Rcode)
 			}
-			if !gotLeaseOpt {
-				t.Fatalf("handler did not see the UPDATE-LEASE EDNS option -- it was lost in transit")
+			select {
+			case ok := <-sawLeaseOpt:
+				if !ok {
+					t.Fatalf("handler did not see the UPDATE-LEASE EDNS option -- it was lost in transit")
+				}
+			case <-time.After(time.Second):
+				t.Fatalf("handler was never invoked for the UPDATE")
 			}
 		})
 	}
