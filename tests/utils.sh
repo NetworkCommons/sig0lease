@@ -71,18 +71,6 @@ log_error() {
     echo -e "${RED}[FAIL] $1${NC}"
 }
 
-# Log levels for test script (independent from proxy logging).
-# DEBUG: detailed output (full dump, verbose traces).
-# INFO: summary output (high-level status, results).
-
-log_debug() {
-    echo -e "  [DEBUG] $1"
-}
-
-log_info() {
-    echo -e "  [INFO] $1"
-}
-
 log_file() {
     local function=$1
     local message="$2"

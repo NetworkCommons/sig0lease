@@ -40,7 +40,7 @@ KEY_LEASE_SECONDS="${KEY_LEASE_SECONDS:-$POLICY_MIN_KEY_LEASE_SECONDS}"
 # fixed defaults (3600s at the real policy min of 30s).
 LONG_KEY_LEASE_SECONDS="${LONG_KEY_LEASE_SECONDS:-$((POLICY_MIN_KEY_LEASE_SECONDS * 120))}"
 # Floored at 5s: below that, the gap between the two overlapping
-# registrations in case 4 stops leaving enough room for the first
+# registrations in test 5 stops leaving enough room for the first
 # registration's effects to be observed before the second one lands.
 OVERLAP_DELAY_SECONDS="${OVERLAP_DELAY_SECONDS:-$(( POLICY_MIN_RR_LEASE_SECONDS / 3 > 5 ? POLICY_MIN_RR_LEASE_SECONDS / 3 : 5 ))}"
 BUFFER=2
@@ -57,6 +57,8 @@ fi
 # Optional: limit matrix run to selected RR types, e.g. RR_TYPES="KEY TXT"
 # Supported types: KEY TXT A AAAA NULL NXNAME WALLET CLA IPN
 RR_TYPES="${RR_TYPES:-KEY TXT A AAAA NULL NXNAME WALLET CLA IPN}"
+
+PERFORMED_TESTS=""
 
 ################################
 # Utils
@@ -132,16 +134,6 @@ run_client() {
     CLIENT_KEYSTORE_DIR="$CLIENT_KEYSTORE_DIR" "$CLIENT_BIN" "$PROXY_URL" "$operation" "$keyname" "$lease_seconds" "$key_lease_seconds" "${extra[@]}"
 }
 
-# register_rr_type <key_name> <lease> <key_lease> <rr_spec...>
-register_rr_type() {
-    local key_name="$1"
-    local lease_seconds="$2"
-    local key_lease_seconds="$3"
-    shift 3
-    log_step "registering key=$key_name lease=$lease_seconds key_lease=$key_lease_seconds rr_specs=$*"
-    run_client register "$key_name" $lease_seconds $key_lease_seconds "$@"
-}
-
 assert_proxy_log_contains() {
     local pattern="$1"
     if grep -q "$pattern" "$LOG_FILE"; then
@@ -176,9 +168,9 @@ query_lease_dump() {
 
     # Use test script's own log levels (independent from proxy logging).
     if [ "$level" = "debug" ]; then
-        log_debug "[dig] @${PROXY_URL} ${query_domain} TXT (${dump_label})"
+        echo -e "  [DEBUG] [dig] @${PROXY_URL} ${query_domain} TXT (${dump_label})"
     else
-        log_info "[dig] @${PROXY_URL} ${query_domain} TXT (${dump_label})"
+        echo -e "  [INFO] [dig] @${PROXY_URL} ${query_domain} TXT (${dump_label})"
     fi
 
     if [ -n "$out" ]; then
@@ -389,7 +381,7 @@ proxy_consistent_with_authoritative() {
     # Proxy Lease-store consistency checks
     # TODO: Add checks that records in lease-store are actually at the DNS
     
-    log_info "Consistency check passed for $rr_type - $rr_rdata"
+    log_success "Consistency check passed for $rr_type - $rr_rdata"
 
 }
 ################################
@@ -456,7 +448,9 @@ test_blacklisted_type() {
 # so we use a small Go helper that constructs these records directly and sends them.
 
     local rr_type=$1
-    log_section "BLACKLISTED [$rr_type]: Proxy Rejects Blacklisted Type"
+    
+    local log_msg="TEST 4: Proxy Rejects Blacklisted Type ($rr_type)"
+    log_section "$log_msg"
 
     log_step "Registering lease with blacklisted type"
     local lease_start
@@ -500,12 +494,15 @@ test_blacklisted_type() {
     else
         log_success "Blacklisted type $rr_type rejected and no lease created"
     fi
-    return 0
+    
+    PERFORMED_TESTS="$PERFORMED_TESTS\n  [OK] $log_msg"
 }
 
 test_single_rr_register_expire_remove() {
     local rr_type="$1"
-    log_section "TEST 1 [$rr_type]: Register -> Expire -> Removed"
+
+    local log_msg="TEST 1: Register -> Expire -> Removed ($rr_type)"
+    log_section "$log_msg"
 
     local rr_spec lease lease_start expected_min
 
@@ -533,9 +530,9 @@ test_single_rr_register_expire_remove() {
     log_step "Registering lease "
     lease_start=$(date +%s)
     if [ "$rr_type" = "KEY" ]; then
-        register_rr_type $CLIENT_KEY_NAME $lease_time $key_lease_time "$rr_spec"
+        run_client register $CLIENT_KEY_NAME $lease_time $key_lease_time "$rr_spec"
     else
-        register_rr_type $CLIENT_KEY_NAME $lease_time $key_lease_time "${KEY_NONKEY_RRs[@]}"
+        run_client register $CLIENT_KEY_NAME $lease_time $key_lease_time "${KEY_NONKEY_RRs[@]}"
         wait_for_rr_state KEY "$CLIENT_KEY_RR" present
     fi
     wait_for_rr_state $rr_type "$rr_spec" present
@@ -545,7 +542,7 @@ test_single_rr_register_expire_remove() {
     query_lease_dump "debug"
 
     log_step "Waiting until lease expiry boundary"
-    wait_until_epoch $((lease_start + lease + $BUFFER))
+    wait_until_epoch $((lease_start + lease + BUFFER))
 
     # RR should be gone before we exercise post-expiry behavior.
     wait_for_rr_state "$rr_type" "$rr_spec" absent
@@ -584,15 +581,18 @@ test_single_rr_register_expire_remove() {
         assert_proxy_log_contains "signing key not found in lease store"
     fi
 
-    expected_min=$((lease + $BUFFER))
+    expected_min=$((lease + BUFFER))
 
     log_case_timing "case1-${rr_type}" "$lease_start" "$expected_min"
     log_success "Case 1 post-expiry behavior validated for $rr_type"
+    PERFORMED_TESTS="$PERFORMED_TESTS\n  [OK] $log_msg"
 }
 
 test_case_register_refresh_not_prematurely_removed() {
     local rr_type="$1"
-    log_section "TEST 2 [$rr_type]: Register -> Refresh -> Not Prematurely Removed (Case A)"
+
+    local log_msg="TEST 2: Register -> Refresh -> Not Prematurely Removed (Case A) ($rr_type)"
+    log_section "$log_msg"
 
     local lease_start refresh_start expected_min data_spec data_type
 
@@ -608,7 +608,7 @@ test_case_register_refresh_not_prematurely_removed() {
     fi
     log_step "Registering initial lease (LEASE=$LEASE_SECONDS, KEY-LEASE=$LONG_KEY_LEASE_SECONDS)"
     lease_start=$(date +%s)
-    register_rr_type "$CLIENT_KEY_NAME" $LEASE_SECONDS $LONG_KEY_LEASE_SECONDS "${KEY_NONKEY_RRs[@]}"
+    run_client register "$CLIENT_KEY_NAME" $LEASE_SECONDS $LONG_KEY_LEASE_SECONDS "${KEY_NONKEY_RRs[@]}"
     wait_for_rr_state KEY "$CLIENT_KEY_RR" present
     wait_for_rr_state "$data_type" "$data_spec" present
     proxy_consistent_with_authoritative "$data_type" "$data_spec" present
@@ -622,30 +622,47 @@ test_case_register_refresh_not_prematurely_removed() {
     refresh_start=$(date +%s)
     # Only the non-KEY RR in the payload
     run_client refresh "$CLIENT_KEY_NAME" $LEASE_SECONDS 0 "${KEY_NONKEY_RRs[1]}"
-    wait_for_rr_state KEY "$CLIENT_KEY_RR" present
-    wait_for_rr_state "$data_type" "$data_spec" present
+    if ! rr_at_authoritative KEY "$CLIENT_KEY_RR"; then
+        log_error "KEY not found after non-KEY refresh"
+        return 1
+    fi
+    if ! rr_at_authoritative "$data_type" "$data_spec"; then
+        log_error ""$data_type" not found after refresh"
+        return 1
+    fi
     proxy_consistent_with_authoritative "$data_type" "$data_spec" present
 
     log_step "Waiting past original expiry window"
-    wait_until_epoch $((lease_start + LEASE_SECONDS + $BUFFER))
-    wait_for_rr_state KEY "$CLIENT_KEY_RR" present
-    wait_for_rr_state "$data_type" "$data_spec" present
+    wait_until_epoch $((lease_start + LEASE_SECONDS + BUFFER))
+
+    if ! rr_at_authoritative KEY "$CLIENT_KEY_RR"; then
+        log_error "KEY not found after non-KEY lease time expiry"
+        return 1
+    fi
+    if ! rr_at_authoritative "$data_type" "$data_spec"; then
+        log_error ""$data_type" not found after initial lease time expiry (refresh ignored)"
+        return 1
+    fi
     proxy_consistent_with_authoritative "$data_type" "$data_spec" present
 
     log_step "Waiting for refreshed non-KEY lease window while key-lease remains active"
-    wait_until_epoch $((refresh_start + LEASE_SECONDS + $BUFFER))
+    wait_until_epoch $((refresh_start + LEASE_SECONDS + BUFFER))
     wait_for_rr_state KEY "$CLIENT_KEY_RR" present
     wait_for_rr_state "$data_type" "$data_spec" absent
     proxy_consistent_with_authoritative KEY "$CLIENT_KEY_RR" present
 
-    expected_min=$((LEASE_SECONDS * (1 + 2 / 3) + $BUFFER))
+    expected_min=$((LEASE_SECONDS * (1 + 2 / 3) + BUFFER))
 
     log_case_timing "case2-${rr_type}" "$lease_start" "$expected_min"
     log_success "Lease behavior validated after renewal for $rr_type"
+    
+    PERFORMED_TESTS="$PERFORMED_TESTS\n  [OK] $log_msg"
 }
 
-test_case_overlapping_registrations_issue17() {
-    log_section "CASE 4 [ISSUE-17]: Overlapping Registrations Must Not Leave Permanent RR"
+test_case_overlapping_registrations() {
+    
+    local log_msg="TEST 5: Overlapping Registrations Must Not Leave Permanent RR"
+    log_section "$log_msg"
 
     local first_start second_start expected_min
     local ts1
@@ -653,10 +670,10 @@ test_case_overlapping_registrations_issue17() {
 
     local rr1_a rr1_txt rr2_a rr2_txt
     rr1_a="${DOWNSTREAM_ZONE} ${LEASE_SECONDS} IN A 192.0.2.99"
-    rr1_txt="${DOWNSTREAM_ZONE} ${LEASE_SECONDS} IN TXT \"issue17-first-${ts1}_1\""
+    rr1_txt="${DOWNSTREAM_ZONE} ${LEASE_SECONDS} IN TXT \"overlapping_registrations-first-${ts1}_1\""
     sleep 1
     rr2_a="${DOWNSTREAM_ZONE} ${LEASE_SECONDS} IN A 192.0.2.100"
-    rr2_txt="${DOWNSTREAM_ZONE} ${LEASE_SECONDS} IN TXT \"issue17-second-${ts1}_2\""
+    rr2_txt="${DOWNSTREAM_ZONE} ${LEASE_SECONDS} IN TXT \"overlapping_registrations-second-${ts1}_2\""
 
     log_step "First registration (A+TXT set #1)"
     first_start=$(date +%s)
@@ -702,13 +719,17 @@ test_case_overlapping_registrations_issue17() {
     
     expected_min=$((OVERLAP_DELAY_SECONDS + LEASE_SECONDS + BUFFER))
 
-    log_case_timing "case4-issue17-overlap" "$first_start" "$expected_min"
-    log_success "Issue #17 regression check passed: overlapping RR sets were not forgotten/permanent"
+    log_case_timing "case4-overlap" "$first_start" "$expected_min"
+    log_success "Regression check passed: overlapping RR sets were not forgotten/permanent"
+
+    PERFORMED_TESTS="$PERFORMED_TESTS\n  [OK] $log_msg"
 }
 
 test_case_unauthorized_refresh_rejected_then_expires() {
     local rr_type="$1"
-    log_section "CASE 3 [$rr_type]: Unauthorized Refresh Rejected -> Lease Expires"
+    
+    local log_msg="TEST 3: Unauthorized Refresh Rejected -> Lease Expires ($rr_type)"
+    log_section "$log_msg"
 
     local lease_start expected_min data_spec data_type
 
@@ -723,7 +744,7 @@ test_case_unauthorized_refresh_rejected_then_expires() {
     fi
     log_step "Registering lease under authorized key ($CLIENT_KEY_NAME)"
     lease_start=$(date +%s)
-    register_rr_type "$CLIENT_KEY_NAME" $LEASE_SECONDS $KEY_LEASE_SECONDS "${KEY_NONKEY_RRs[@]}"
+    run_client register "$CLIENT_KEY_NAME" $LEASE_SECONDS $KEY_LEASE_SECONDS "${KEY_NONKEY_RRs[@]}"
     wait_for_rr_state KEY "$CLIENT_KEY_RR" present
     wait_for_rr_state "$data_type" "$data_spec" present
 
@@ -791,6 +812,8 @@ test_case_unauthorized_refresh_rejected_then_expires() {
 
     log_case_timing "case3-${rr_type}" "$lease_start" "$expected_min"
     log_success "Unauthorized refresh rejected and lease expired as expected for $rr_type"
+
+    PERFORMED_TESTS="$PERFORMED_TESTS\n  [OK] $log_msg"
 }
 
 # test_case_abcd_lease_policy_matrix walks deliberately through all four
@@ -804,7 +827,9 @@ test_case_unauthorized_refresh_rejected_then_expires() {
 #   C: KEY-LEASE=0,  LEASE=0  -- delete matrix: first a non-KEY-only delete
 #      (txt_b only), then a KEY delete that cascades and removes txt_a too
 test_case_abcd_lease_policy_matrix() {
-    log_section "CASE A/B/C/D: Explicit Lease-Policy Matrix"
+    
+    local log_msg="CASE A/B/C/D: Explicit Lease-Policy Matrix"
+    log_section "$log_msg"
 
     local case_start
     case_start=$(date +%s)
@@ -814,7 +839,7 @@ test_case_abcd_lease_policy_matrix() {
     txt_a="${DOWNSTREAM_ZONE} ${LEASE_SECONDS} IN TXT \"${needle_a}\""
 
     log_step "Case A (KEY-LEASE!=0, LEASE!=0): full registration of KEY+TXT"
-    register_rr_type "$CLIENT_KEY_NAME" $LEASE_SECONDS $LONG_KEY_LEASE_SECONDS "$(make_rr KEY $LONG_KEY_LEASE_SECONDS)" "$txt_a"
+    run_client register "$CLIENT_KEY_NAME" $LEASE_SECONDS $LONG_KEY_LEASE_SECONDS "$(make_rr KEY $LONG_KEY_LEASE_SECONDS)" "$txt_a"
     wait_for_rr_state KEY "$CLIENT_KEY_RR" present
     wait_for_rr_state TXT "$txt_a" present
 
@@ -824,7 +849,11 @@ test_case_abcd_lease_policy_matrix() {
 
     log_step "Case D (KEY-LEASE!=0, LEASE=0): key-only refresh must leave data untouched"
     run_client refresh "$CLIENT_KEY_NAME" 0 $LONG_KEY_LEASE_SECONDS "$(make_rr KEY $LONG_KEY_LEASE_SECONDS)"
-    wait_for_rr_state KEY "$CLIENT_KEY_RR" present
+
+    if ! rr_at_authoritative KEY "$CLIENT_KEY_RR"; then
+        log_error "Case D: key-only refresh but key absent at authoritative"
+        return 1
+    fi
     if ! rr_at_authoritative TXT "$txt_a"; then
         log_error "Case D: key-only refresh unexpectedly disturbed the Case A TXT record"
         return 1
@@ -876,6 +905,8 @@ test_case_abcd_lease_policy_matrix() {
 
     log_case_timing "case-abcd-matrix" "$case_start" 0
     log_success "Lease-policy Case A/B/C/D matrix (A -> D -> B -> C) validated end-to-end"
+
+    PERFORMED_TESTS="$PERFORMED_TESTS\n  [OK] $log_msg"
 }
 
 # test_case_signer_location_matrix exercises all four ways the proxy can
@@ -887,12 +918,15 @@ test_case_abcd_lease_policy_matrix() {
 #
 # Steps 1-3 reuse CLIENT_KEY_NAME across a self-registration (Update) and two
 # non-KEY-only refreshes (Additional, then lease-store), since Case B forbids a
-# KEY rr-spec in the Update section entirely -- the only way to prove
-# Additional/omitted signer resolution. Step 4 uses WRONG_CLIENT_KEY_NAME,
+# KEY rr-spec in the Update section entirely (KEY-LEASE == 0) -- a way to prove
+# Additional/omitted signer resolution (an alternative would have been case D - delete 
+# non-KEY RR, with no KEY in the Update section). Step 4 uses WRONG_CLIENT_KEY_NAME,
 # published directly at authoritative and never registered through the
 # proxy, to reach the authoritative-only fallback stage.
 test_case_signer_location_matrix() {
-    log_section "SIGNER LOCATION MATRIX: Update / Additional / Lease-Store / Online-Only"
+    
+    local log_msg="CASE SIGNER LOCATION MATRIX: Update / Additional / Lease-Store / Online-Only"
+    log_section "$log_msg"
 
     local case_start
     case_start=$(date +%s)
@@ -902,9 +936,9 @@ test_case_signer_location_matrix() {
     txt1="${DOWNSTREAM_ZONE} ${LEASE_SECONDS} IN TXT \"${needle1}\""
 
     log_step "Signer location 1/4: Update section (self-registration, Case A)"
-    register_rr_type "$CLIENT_KEY_NAME" $LEASE_SECONDS $LONG_KEY_LEASE_SECONDS "$(make_rr KEY $LONG_KEY_LEASE_SECONDS)" "$txt1" --signer=update
+    run_client register "$CLIENT_KEY_NAME" $LEASE_SECONDS $LONG_KEY_LEASE_SECONDS "$(make_rr KEY $LONG_KEY_LEASE_SECONDS)" "$txt1" --signer=update
     wait_for_rr_state KEY "$CLIENT_KEY_RR" present
-    if ! rr_at_auth_contains "$DOWNSTREAM_ZONE" TXT "$needle1"; then
+    if ! rr_at_authoritative TXT "$txt1"; then
         log_error "Signer-location[update]: expected TXT record not found"
         return 1
     fi
@@ -912,9 +946,10 @@ test_case_signer_location_matrix() {
 
     needle2="signerloc-additional-$(time_tag)"
     txt2="${DOWNSTREAM_ZONE} ${LEASE_SECONDS} IN TXT \"${needle2}\""
+    
     log_step "Signer location 2/4: Additional section (non-KEY-only refresh, Case B)"
-    run_client refresh "$CLIENT_KEY_NAME" $LEASE_SECONDS 0 "$txt2" --signer=additional
-    if ! rr_at_auth_contains "$DOWNSTREAM_ZONE" TXT "$needle2"; then
+    run_client register "$CLIENT_KEY_NAME" $LEASE_SECONDS 0 "$txt2" --signer=additional
+    if ! wait_for_rr_state TXT "$txt2" present; then
         log_error "Signer-location[additional]: expected TXT record not found"
         return 1
     fi
@@ -922,33 +957,36 @@ test_case_signer_location_matrix() {
 
     needle3="signerloc-leasestore-$(time_tag)"
     txt3="${DOWNSTREAM_ZONE} ${LEASE_SECONDS} IN TXT \"${needle3}\""
+    
     log_step "Signer location 3/4: omitted from request, resolved via lease store (Case B)"
-    run_client refresh "$CLIENT_KEY_NAME" $LEASE_SECONDS 0 "$txt3" --signer=none
-    if ! rr_at_auth_contains "$DOWNSTREAM_ZONE" TXT "$needle3"; then
+    run_client register "$CLIENT_KEY_NAME" $LEASE_SECONDS 0 "$txt3" --signer=none
+    if ! wait_for_rr_state TXT "$txt3" present; then
         log_error "Signer-location[lease-store]: expected TXT record not found"
         return 1
     fi
     log_success "Signer-location[lease-store]: signer KEY resolved from the lease store (omitted from request)"
 
     log_step "Signer location 4/4: omitted from request, resolved via authoritative DNS (online-only, never registered through the proxy)"
-    local wrong_key_payload probe_needle probe_txt probe_out
-    wrong_key_payload="$(cat "$CLIENT_KEYSTORE_DIR/${WRONG_CLIENT_KEY_NAME}.key" | sed 's/test.dev.zenr.io. IN \(.*\)/\1/g')"
+    local wrong_key_payload probe_needle probe_txt_rr probe_out
+    wrong_key_payload="$(echo  "${WRONG_CLIENT_KEY_RR}" | sed 's/test.dev.zenr.io. IN \(.*\)/\1/g')"
+    # Add the key directly to the Authoritative DNS
     add_rr "$wrong_key_payload" 60
+    
     probe_needle="signerloc-online-$(time_tag)"
-    probe_txt="${DOWNSTREAM_ZONE} 60 IN TXT \"${probe_needle}\""
+    probe_txt_rr="${DOWNSTREAM_ZONE} 60 IN TXT \"${probe_needle}\""
     # This is a Case C request (LEASE=0, KEY-LEASE=0) for a record the
     # online-only signer does not own, so it resolves to a harmless no-op
     # (Rcode=Success, "record not found for delete" note) once SIG(0)
     # authenticates -- it is not gated by AllowOnlineKeyRegistration, which
     # only applies to *new registrations* (Case A/D), not Case C deletes.
-    if ! probe_out=$(run_client refresh "$WRONG_CLIENT_KEY_NAME" 0 0 "$probe_txt" --signer=none 2>&1); then
+    if ! probe_out=$(run_client refresh "$WRONG_CLIENT_KEY_NAME" 0 0 "$probe_txt_rr" --signer=none 2>&1); then
         log_error "Signer-location[online-only]: request signed by an online-only, never-registered key was unexpectedly rejected"
         echo "$probe_out"
         delete_rr "$wrong_key_payload"
         return 1
     fi
     delete_rr "$wrong_key_payload"
-    if rr_at_auth_contains "$DOWNSTREAM_ZONE" TXT "$probe_needle"; then
+    if rr_at_authoritative TXT "$probe_txt_rr"; then
         log_error "Signer-location[online-only]: Case C no-op unexpectedly created a TXT record"
         return 1
     fi
@@ -956,6 +994,8 @@ test_case_signer_location_matrix() {
 
     log_case_timing "signer-location-matrix" "$case_start" 0
     log_success "Signer-location matrix validated: Update, Additional, lease-store, and online-only all resolve correctly"
+
+    PERFORMED_TESTS="$PERFORMED_TESTS\n  [OK] $log_msg"
 }
 
 # test_case_multi_rr_combination_registration registers several distinct
@@ -966,14 +1006,15 @@ test_case_signer_location_matrix() {
 # (blacklisted by this repo's config.yaml), leaving a combination of
 # distinct, constructible, non-blacklisted types.
 test_case_multi_rr_combination_registration() {
-    log_section "MULTI-RR: Register Several RR Types Together in One Update"
 
-    local case_start lease_start
-    case_start=$(date +%s)
+    local log_msg="CASE MULTI-RR: Register Several RR Types Together in One Update"
+    log_section "$log_msg"
+
+    local lease_start
 
     # Parallel indexed arrays (combo_types[i] <-> combo_specs[i]), not an
-    # associative array: this script's #!/bin/bash shebang resolves to
-    # macOS's bundled bash 3.2, which has no `declare -A` support.
+    # associative array for compatibility with older versions of /bin/bash
+    # which have no `declare -A` support.
     local combo_types=(TXT A AAAA WALLET)
     local combo_specs=() specs=() i t spec
     specs=("$(make_rr KEY $LONG_KEY_LEASE_SECONDS)")
@@ -985,7 +1026,7 @@ test_case_multi_rr_combination_registration() {
 
     log_step "Registering KEY + ${combo_types[*]} together in a single Update"
     lease_start=$(date +%s)
-    register_rr_type "$CLIENT_KEY_NAME" $LEASE_SECONDS $LONG_KEY_LEASE_SECONDS "${specs[@]}"
+    run_client register "$CLIENT_KEY_NAME" $LEASE_SECONDS $LONG_KEY_LEASE_SECONDS "${specs[@]}"
     wait_for_rr_state KEY "$CLIENT_KEY_RR" present
     for i in "${!combo_types[@]}"; do
         t="${combo_types[$i]}"
@@ -999,7 +1040,7 @@ test_case_multi_rr_combination_registration() {
     log_success "All ${#combo_types[@]} non-KEY types plus KEY landed correctly from a single Update"
 
     log_step "Waiting past LEASE boundary: non-KEY records should expire, KEY (longer key-lease) persists"
-    wait_until_epoch $((lease_start + LEASE_SECONDS + $BUFFER))
+    wait_until_epoch $((lease_start + LEASE_SECONDS + BUFFER))
     for i in "${!combo_types[@]}"; do
         t="${combo_types[$i]}"
         if ! wait_for_rr_state "$t" "${combo_specs[$i]}" absent; then
@@ -1007,10 +1048,16 @@ test_case_multi_rr_combination_registration() {
             return 1
         fi
     done
-    wait_for_rr_state KEY "$CLIENT_KEY_RR" present
 
-    log_case_timing "multi-rr-combination" "$case_start" "$((LEASE_SECONDS + $BUFFER))"
+    if ! rr_at_authoritative KEY "$CLIENT_KEY_RR"; then
+        log_error "Multi-RR: KEY expected present but absent at authoritative"
+        return 1
+    fi
+
+    log_case_timing "multi-rr-combination" "$lease_start" "$((LEASE_SECONDS + BUFFER))"
     log_success "Multi-RR combination registration validated: all types landed together and expired together"
+
+    PERFORMED_TESTS="$PERFORMED_TESTS\n  [OK] $log_msg"
 }
 
 # test_case_refresh_extends_nonkey_not_key_lease inspects actual lease
@@ -1018,19 +1065,21 @@ test_case_multi_rr_combination_registration() {
 # non-KEY-only refresh (Case B) advances the non-KEY record's ExpiresAt while
 # leaving the KEY's own ExpiresAt untouched.
 test_case_refresh_extends_nonkey_not_key_lease() {
-    log_section "REFRESH: Extends Non-KEY Lease Without Extending Key Lease"
+
+    local log_msg="CASE REFRESH: Extends Non-KEY Lease Without Extending Key Lease"
+    log_section "$log_msg"
 
     local case_start
     case_start=$(date +%s)
 
-    local needle txt_spec
+    local needle txt_spec_rr
     needle="refresh-lease-check-$(time_tag)"
-    txt_spec="${DOWNSTREAM_ZONE} ${LEASE_SECONDS} IN TXT \"${needle}\""
+    txt_spec_rr="${DOWNSTREAM_ZONE} ${LEASE_SECONDS} IN TXT \"${needle}\""
 
     log_step "Registering KEY (long key-lease) + TXT (short lease)"
-    register_rr_type "$CLIENT_KEY_NAME" $LEASE_SECONDS $LONG_KEY_LEASE_SECONDS "$(make_rr KEY $LONG_KEY_LEASE_SECONDS)" "$txt_spec"
+    run_client register "$CLIENT_KEY_NAME" $LEASE_SECONDS $LONG_KEY_LEASE_SECONDS "$(make_rr KEY $LONG_KEY_LEASE_SECONDS)" "$txt_spec_rr"
     wait_for_rr_state KEY "$CLIENT_KEY_RR" present
-    if ! rr_at_auth_contains "$DOWNSTREAM_ZONE" TXT "$needle"; then
+    if ! rr_at_authoritative TXT "$txt_spec_rr"; then
         log_error "Refresh-lease-check: TXT record not found after initial registration"
         return 1
     fi
@@ -1049,10 +1098,10 @@ test_case_refresh_extends_nonkey_not_key_lease() {
         return 1
     fi
 
-    sleep 3
+    sleep $BUFFER
 
     log_step "Refreshing non-KEY-only (Case B: KEY-LEASE=0), same TXT rdata, extending LEASE"
-    run_client refresh "$CLIENT_KEY_NAME" $LEASE_SECONDS 0 "$txt_spec"
+    run_client refresh "$CLIENT_KEY_NAME" $LEASE_SECONDS 0 "$txt_spec_rr"
 
     local dump_after key_expires_after nonkey_expires_after
     dump_after="$(unescape_dump_text "$(query_lease_dump "debug")")"
@@ -1072,8 +1121,10 @@ test_case_refresh_extends_nonkey_not_key_lease() {
         return 1
     fi
 
-    log_case_timing "refresh-lease-check" "$case_start" 3
+    log_case_timing "refresh-lease-check" "$case_start" $BUFFER
     log_success "Refresh extended the non-KEY lease ($nonkey_expires_before -> $nonkey_expires_after) without touching the key lease ($key_expires_before)"
+
+    PERFORMED_TESTS="$PERFORMED_TESTS\n  [OK] $log_msg"
 }
 
 # test_case_dump_vs_dig_consistency cross-checks the lease-store dump (both
@@ -1082,21 +1133,22 @@ test_case_refresh_extends_nonkey_not_key_lease() {
 # absent) -- proving the dump reflects real DNS state, not just internal
 # bookkeeping.
 test_case_dump_vs_dig_consistency() {
-    log_section "DUMP vs DIG: Lease-Store Dump Cross-Checked Against Authoritative"
 
-    local case_start lease_start
-    case_start=$(date +%s)
+    local log_msg="CASE DUMP vs DIG: Lease-Store Dump Cross-Checked Against Authoritative"
+    log_section "$log_msg"
+
+    local lease_start
 
     local needle txt_spec node_key
     needle="dumpcheck-$(time_tag)"
-    txt_spec="${DOWNSTREAM_ZONE} ${LEASE_SECONDS} IN TXT \"${needle}\""
-    node_key="${DOWNSTREAM_ZONE%.}.+015+05044"
+    txt_spec_rr="${DOWNSTREAM_ZONE} ${LEASE_SECONDS} IN TXT \"${needle}\""
+    node_key="${CLIENT_KEY_NAME#K}"
 
     log_step "Registering KEY + TXT for dump/dig cross-check"
     lease_start=$(date +%s)
-    register_rr_type "$CLIENT_KEY_NAME" $LEASE_SECONDS $KEY_LEASE_SECONDS "$(make_rr KEY $KEY_LEASE_SECONDS)" "$txt_spec"
+    run_client register "$CLIENT_KEY_NAME" $LEASE_SECONDS $KEY_LEASE_SECONDS "$(make_rr KEY $KEY_LEASE_SECONDS)" "$txt_spec_rr"
     wait_for_rr_state KEY "$CLIENT_KEY_RR" present
-    if ! rr_at_auth_contains "$DOWNSTREAM_ZONE" TXT "$needle"; then
+    if ! rr_at_authoritative TXT "$txt_spec_rr"; then
         log_error "Dump/dig check: TXT record not found at authoritative after registration"
         return 1
     fi
@@ -1125,8 +1177,8 @@ test_case_dump_vs_dig_consistency() {
     fi
 
     log_step "Waiting past LEASE expiry to cross-check absence in both dump and dig"
-    wait_until_epoch $((lease_start + LEASE_SECONDS + $BUFFER))
-    wait_for_rr_state TXT "$txt_spec" absent
+    wait_until_epoch $((lease_start + LEASE_SECONDS + BUFFER))
+    wait_for_rr_state TXT "$txt_spec_rr" absent
 
     info_dump="$(query_lease_dump info)"
     if echo "$info_dump" | grep "Key: ${node_key}" | grep -q "NonKEY=1"; then
@@ -1141,8 +1193,10 @@ test_case_dump_vs_dig_consistency() {
         return 1
     fi
 
-    log_case_timing "dump-vs-dig-consistency" "$case_start" "$((lease_start + LEASE_SECONDS + $BUFFER - case_start))"
+    log_case_timing "dump-vs-dig-consistency" "$lease_start" "$(( LEASE_SECONDS + BUFFER ))"
     log_success "Lease-store dump (INFO and DEBUG) stayed consistent with authoritative DNS through registration and expiry"
+
+    PERFORMED_TESTS="$PERFORMED_TESTS\n  [OK] $log_msg"
 }
 
 ################################
@@ -1154,7 +1208,7 @@ run_all_tests() {
     echo "  - real proxy process"
     echo "  - real client process"
     echo "  - real key files"
-    echo "  - real authoritative forwarding path for zenr.io"
+    echo "  - real authoritative forwarding path for $UPSTREAM_ZONE"
     echo ""
 
     trap cleanup EXIT
@@ -1165,9 +1219,10 @@ run_all_tests() {
     build_binaries
     verify_keystore
     log_success "Using authoritative server for KEY checks: $AUTH_SERVER, key: $CLIENT_KEY_NAME, lease: $LEASE_SECONDS, key-lease: $KEY_LEASE_SECONDS"
-    log_section "TESTING LIVE LEASE LIFECYCLE"
     test_list_keys
     start_proxy
+
+    log_section "TESTING LIVE LEASE LIFECYCLE"    
 
     local rr_types=($RR_TYPES)
     local blacklisted_rrs=$(awk '
@@ -1200,24 +1255,31 @@ run_all_tests() {
         else
             test_single_rr_register_expire_remove "$rr_type"
             ensure_rr_absent KEY "$CLIENT_KEY_RR"
+            
             test_case_register_refresh_not_prematurely_removed "$rr_type"
             ensure_rr_absent KEY "$CLIENT_KEY_RR"
+            
             test_case_unauthorized_refresh_rejected_then_expires "$rr_type"
+            ensure_rr_absent KEY "$CLIENT_KEY_RR"
         fi
     done
 
+    
+    test_case_overlapping_registrations
     ensure_rr_absent KEY "$CLIENT_KEY_RR"
-    test_case_overlapping_registrations_issue17
-
-    ensure_rr_absent KEY "$CLIENT_KEY_RR"
+    
     test_case_abcd_lease_policy_matrix
     ensure_rr_absent KEY "$CLIENT_KEY_RR"
+    
     test_case_signer_location_matrix
     ensure_rr_absent KEY "$CLIENT_KEY_RR"
+    
     test_case_multi_rr_combination_registration
     ensure_rr_absent KEY "$CLIENT_KEY_RR"
+    
     test_case_refresh_extends_nonkey_not_key_lease
     ensure_rr_absent KEY "$CLIENT_KEY_RR"
+    
     test_case_dump_vs_dig_consistency
     ensure_rr_absent KEY "$CLIENT_KEY_RR"
 
@@ -1225,17 +1287,7 @@ run_all_tests() {
     echo -e "${GREEN}All integration tests completed successfully!${NC}"
     echo ""
     echo "Summary of what was tested:"
-    echo "  [OK] Register -> expire -> removed (KEY/TXT/A/AAAA)"
-    echo "  [OK] Register -> refresh -> split lease behavior (KEY/TXT/A/AAAA)"
-    echo "  [OK] LEASE < KEY-LEASE -> non-KEY records expire while KEY remains"
-    echo "  [OK] Unauthorized refresh rejected, lease still expires (KEY/TXT/A/AAAA)"
-    echo "  [OK] Issue #17: overlapping registrations do not leave permanent stale RR"
-    echo "  [OK] Proxy consistency checks use refresh path"
-    echo "  [OK] Explicit Case A/B/C/D lease-policy matrix"
-    echo "  [OK] Signer-location matrix (Update/Additional/lease-store/online-only)"
-    echo "  [OK] Multi-RR combination registration in a single Update"
-    echo "  [OK] Refresh extends non-KEY lease without extending key lease (dump-verified)"
-    echo "  [OK] Lease-store dump (INFO/DEBUG) cross-checked against dig at authoritative"
+    echo -e "$PERFORMED_TESTS"
     echo ""
     echo "Proxy process was exercised at $PROXY_URL"
     echo "Logs: $LOG_FILE"
