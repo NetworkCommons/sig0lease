@@ -42,8 +42,6 @@ fi
 CLIENT_KEY_NAME="Ktest.dev.zenr.io.+015+05044"
 WRONG_CLIENT_KEY_NAME="Ktest.dev.zenr.io.+015+42176"
 
-
-
 # Color output
 RED='\033[0;31m'
 GREEN='\033[0;32m'

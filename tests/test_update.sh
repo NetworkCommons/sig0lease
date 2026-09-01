@@ -44,6 +44,12 @@ LONG_KEY_LEASE_SECONDS="${LONG_KEY_LEASE_SECONDS:-$((POLICY_MIN_KEY_LEASE_SECOND
 # registration's effects to be observed before the second one lands.
 OVERLAP_DELAY_SECONDS="${OVERLAP_DELAY_SECONDS:-$(( POLICY_MIN_RR_LEASE_SECONDS / 3 > 5 ? POLICY_MIN_RR_LEASE_SECONDS / 3 : 5 ))}"
 BUFFER=2
+# Grace window proxy_consistent_with_authoritative gives the internal lease
+# store to converge with authoritative DNS: the proxy publishes/reaps
+# asynchronously (local removal happens only after the upstream delete
+# succeeds), so a bare snapshot right after wait_for_rr_state can still be
+# mid-flight. Only actually waited out on the failure path.
+LEASE_STORE_SETTLE_SECONDS="${LEASE_STORE_SETTLE_SECONDS:-$(( POLICY_MIN_RR_LEASE_SECONDS / 2 < 5 ? POLICY_MIN_RR_LEASE_SECONDS / 2 : 5 ))}"
 
 # Keep protocol invariant for any defaults in this script: LEASE <= KEY-LEASE and non-zero.
 if [ "$KEY_LEASE_SECONDS" -eq 0 ] || [ "$LEASE_SECONDS" -eq 0 ]; then
@@ -144,58 +150,6 @@ assert_proxy_log_contains() {
     return 1
 }
 
-# Query the running proxy for lease store dump at the specified log level.
-# Usage: query_lease_dump <level>
-#   level: "debug" → full details via __dump.sig0lease.internal.debug.
-#          "info"  → summary via __dump.sig0lease.internal.
-# Returns the concatenated TXT dump text from the proxy.
-query_lease_dump() {
-    local level="${1:-info}"
-    local query_domain dump_label
-    case "$level" in
-        debug)
-            query_domain="__dump.sig0lease.internal.debug."
-            dump_label="DEBUG/full"
-            ;;
-        info|*)
-            query_domain="__dump.sig0lease.internal."
-            dump_label="INFO/summary"
-            ;;
-    esac
-
-    local out
-    out=$(dig_query_short "$PROXY_URL" "${query_domain}" TXT)
-
-    # Use test script's own log levels (independent from proxy logging).
-    if [ "$level" = "debug" ]; then
-        echo -e "  [DEBUG] [dig] @${PROXY_URL} ${query_domain} TXT (${dump_label})"
-    else
-        echo -e "  [INFO] [dig] @${PROXY_URL} ${query_domain} TXT (${dump_label})"
-    fi
-
-    if [ -n "$out" ]; then
-        echo "$out"
-    else
-        echo "(no dump response)"
-    fi
-    printf '%s\n' "$out"
-}
-
-# unescape_dump_text <raw> -- reconstructs a lease-store dump's real text
-# (newlines/tabs) from dig +short's DNS presentation-format output. dig
-# renders embedded control bytes as literal \DDD (decimal, per RFC 1035
-# <character-string> escaping) and splits a dump longer than one TXT string
-# across multiple RRs/output lines. Strips the per-line quoting, joins the
-# chunks back together, then decodes the \DDD escapes -- otherwise any
-# line-anchored parsing (awk /^.../) of query_lease_dump's output silently
-# matches nothing, since there are no real newlines in dig's raw output.
-# Uses printf (not echo) to feed input through, since some shells' builtin
-# echo reinterprets backslash escapes itself before sed/perl ever see them.
-unescape_dump_text() {
-    local raw="$1"
-    printf '%s\n' "$raw" | sed 's/^"//; s/"$//' | tr -d '\n' | perl -pe 's/\\(\d{3})/chr($1)/ge; s/\\"/"/g; s/\\\\/\\/g'
-}
-
 verify_keystore() {
     log_section "SETUP: Real Keystore"
 
@@ -228,6 +182,198 @@ test_list_keys() {
     log_step "Listing keys from real keystore"
     CLIENT_KEYSTORE_DIR="$CLIENT_KEYSTORE_DIR" "$CLIENT_BIN" dummy list-keys "$CLIENT_KEYSTORE_DIR"
     log_success "Key listing successful"
+}
+
+################################
+# Lease Dump functions
+################################
+
+# lease_dump <level> -- query the running proxy's internal lease-store dump
+# endpoint and print it as readable, line-oriented text.
+#
+# dig +short hands back the dump in DNS <character-string> presentation form --
+# embedded control bytes rendered as literal \DDD (decimal, per RFC 1035), and
+# a dump longer than one 240-byte TXT string split across several TXT RRs /
+# output lines. lease_dump strips the per-line quoting, rejoins the chunks, and
+# decodes the \DDD / \" / \\ escapes, so the result has real newlines and tabs
+# and can be printed as-is OR fed straight to grep/awk (and to the
+# lease_store_* helpers below).
+#
+#   level: "debug" -> full per-record dump via __dump.sig0lease.internal.debug.
+#          "info"  -> one-line-per-key summary via __dump.sig0lease.internal.
+#
+# The "[dig] @..." progress line goes to stderr, so stdout is pure dump text.
+# printf (not echo) feeds the pipeline, since some shells' builtin echo would
+# reinterpret the backslash escapes before sed/perl ever see them.
+lease_dump() {
+    local level="${1:-info}"
+    local query_domain dump_label
+    case "$level" in
+        debug)
+            query_domain="__dump.sig0lease.internal.debug."
+            dump_label="DEBUG/full"
+            ;;
+        info|*)
+            level="info"
+            query_domain="__dump.sig0lease.internal."
+            dump_label="INFO/summary"
+            ;;
+    esac
+
+    local raw
+    raw=$(dig_query_short "$PROXY_URL" "${query_domain}" TXT)
+
+    # Test script's own log level, independent from proxy logging; to stderr
+    # so a `foo="$(lease_dump ...)"` capture stays clean.
+    printf '  [%s] [dig] @%s %s TXT (%s)\n' \
+        "$(printf '%s' "$level" | tr '[:lower:]' '[:upper:]')" \
+        "$PROXY_URL" "$query_domain" "$dump_label" >&2
+
+    if [ -z "$raw" ]; then
+        echo "(no dump response)"
+        return 0
+    fi
+
+    printf '%s\n' "$raw" | sed 's/^"//; s/"$//' | tr -d '\n' \
+        | perl -pe 's/\\(\d{3})/chr($1)/ge; s/\\"/"/g; s/\\\\/\\/g'
+}
+
+# lease_store_has_rr <rr_type> <rr-spec> [debug-dump] -- succeeds (0) when the
+# proxy's INTERNAL lease store currently holds a live record matching
+# <rr-spec>, read from the DEBUG lease-store dump. This is the internal-state
+# counterpart to rr_at_authoritative (which checks the authoritative DNS).
+# Pass a pre-fetched `lease_dump debug` as the 3rd arg to avoid re-querying.
+#   KEY   -> matched on "KeyRR:" lines; a key block flagged "IsExpired: true"
+#            (expired but not yet reaped) counts as absent.
+#   other -> matched on the non-KEY "RR:" lines.
+# Echoes a one-line present/absent result (silence it with >/dev/null).
+lease_store_has_rr() {
+    local rr_type="$1" rr_spec="$2" dump="${3:-}"
+    [ -n "$dump" ] || dump="$(lease_dump debug)"
+
+    local disc norm present
+    disc="$(get_rdata "$rr_spec")"
+    norm="$(printf '%s\n' "$dump" | tr '\t' ' ' | sed -E 's/  +/ /g')"
+    present=1
+
+    if [ "$rr_type" = "KEY" ]; then
+        # `expd` not `exp` -- `exp` is an awk builtin (mawk rejects it as an lvalue).
+        printf '%s\n' "$norm" | awk -v disc="$disc" '
+            /^ *Key: /                    { if (m && !expd) f=1; m=0; expd=0 }
+            /KeyRR: / && index($0, disc)  { m=1 }
+            /IsExpired: true/             { expd=1 }
+            END { if (m && !expd) f=1; exit f ? 0 : 1 }
+        ' || present=0
+    else
+        printf '%s\n' "$norm" | grep -E '^ *RR: ' | grep -Fq -- " $disc" || present=0
+    fi
+
+    if [ "$present" -eq 1 ]; then
+        echo "lease-store: $rr_type present -- $disc"
+        return 0
+    fi
+    echo "lease-store: $rr_type absent -- $disc"
+    return 1
+}
+
+# lease_store_key_expires_at <key-rdata|""> [debug-dump] -- print the KEY
+# lease's ExpiresAt (RFC3339) from a DEBUG dump. Empty first arg -> the first
+# KEY block; otherwise the block whose KeyRR matches the given rdata/rr-spec.
+lease_store_key_expires_at() {
+    local want="$1" dump="${2:-}"
+    [ -n "$dump" ] || dump="$(lease_dump debug)"
+    local disc=""
+    [ -n "$want" ] && disc="$(get_rdata "$want")"
+    printf '%s\n' "$dump" | tr '\t' ' ' | sed -E 's/  +/ /g' | awk -v disc="$disc" '
+        /^ *Key: /                        { inkey = (disc == "") }
+        disc != "" && /KeyRR: / && index($0, disc) { inkey = 1 }
+        inkey && /ExpiresAt: /            { print $2; exit }
+    '
+}
+
+# lease_store_rr_expires_at <needle> [debug-dump] -- print the non-KEY
+# record's ExpiresAt (RFC3339) for the record whose "RR:" line contains
+# <needle>, from a DEBUG dump.
+lease_store_rr_expires_at() {
+    local needle="$1" dump="${2:-}"
+    [ -n "$dump" ] || dump="$(lease_dump debug)"
+    printf '%s\n' "$dump" | tr '\t' ' ' | sed -E 's/  +/ /g' | awk -v needle="$needle" '
+        /^ *RR: / && index($0, needle) { found = 1; next }
+        found && /ExpiresAt: /          { print $2; exit }
+    '
+}
+
+# lease_store_summary_line <node_key> [info-dump] -- the INFO-summary line for
+# <node_key> ("Key: <nodekey>  KEY=<..>  NonKEY=<n>  Status=<..>"), or empty.
+lease_store_summary_line() {
+    local node_key="$1" dump="${2:-}"
+    [ -n "$dump" ] || dump="$(lease_dump info)"
+    printf '%s\n' "$dump" | grep -F -- "Key: ${node_key} " || true
+}
+
+# proxy_consistent_with_authoritative <rr_type> <rr-spec> <expected_state>
+#   expected_state: present | absent
+#
+# Asserts that the record is in <expected_state> at BOTH the authoritative
+# DNS and the proxy's INTERNAL lease store -- and that the two agree with
+# each other. The lease store is read from the DEBUG dump via
+# lease_store_has_rr (the same reconstruction/matching the dump-inspection
+# tests use). Since the proxy publishes and reaps asynchronously (a record is
+# only dropped locally once its upstream delete has actually landed), the
+# lease-store side is polled for up to LEASE_STORE_SETTLE_SECONDS to converge
+# before the check is enforced -- so a call right after wait_for_rr_state
+# does not race the proxy's own bookkeeping.
+proxy_consistent_with_authoritative() {
+    local rr_type="$1"
+    local rr_rdata="$2"
+    local expected_state="$3"  # present|absent
+    local auth_present="$4"
+
+    log_file proxy_consistent_with_authoritative "rr_type=$rr_type, rr_rdata=$rr_rdata, expected_state=$expected_state."
+
+    local want_present=0
+    [ "$expected_state" = "present" ] && want_present=1
+
+    # # Authoritative DNS -- the source of truth these tests drive toward.
+    # local auth_present=0
+    # if rr_at_authoritative "$rr_type" "$rr_rdata" >/dev/null; then
+    #     auth_present=1
+    # fi
+
+    # Internal lease store, given a short window to catch up.
+    local store_present deadline
+    deadline=$(( $(date +%s) + LEASE_STORE_SETTLE_SECONDS ))
+    while :; do
+        store_present=0
+        if lease_store_has_rr "$rr_type" "$rr_rdata" >/dev/null; then
+            store_present=1
+        fi
+        [ "$store_present" -eq "$want_present" ] && break
+        [ "$(date +%s)" -ge "$deadline" ] && break
+        sleep 1
+    done
+
+    local ok=1
+    if [ "$auth_present" -ne "$want_present" ]; then
+        log_error "Consistency check: authoritative state ($auth_present) != expected $expected_state for $rr_type - $rr_rdata"
+        ok=0
+    fi
+    if [ "$store_present" -ne "$want_present" ]; then
+        log_error "Consistency check: internal lease store state ($store_present) != expected $expected_state for $rr_type - $rr_rdata"
+        ok=0
+    fi
+    if [ "$auth_present" -ne "$store_present" ]; then
+        log_error "Consistency check: internal lease store ($store_present) and authoritative ($auth_present) disagree for $rr_type - $rr_rdata"
+        ok=0
+    fi
+
+    if [ "$ok" -ne 1 ]; then
+        log_step "Lease-store DEBUG dump at failure:"
+        lease_dump debug || true
+        return 1
+    fi
+
+    log_success "Consistency check passed ($expected_state at authoritative and internal lease store) for $rr_type - $rr_rdata"
 }
 
 ################################
@@ -270,7 +416,7 @@ rr_at_auth_contains() {
     fi
     return 1
 }
-
+# Matches a specific rr-spec's rdata against a single-line dig answer
 rr_at_authoritative() {
     local rr_type=$1
     local rdata="$2"
@@ -280,7 +426,14 @@ rr_at_authoritative() {
     local dig_answer="$(dig_query_short $AUTH_SERVER $DOWNSTREAM_ZONE $rr_type)"
     
     if [ -n "$dig_answer" ]; then
-        answer="$(echo "$rdata" | grep "$dig_answer")"
+        # -F: match dig_answer's line(s) as literal fixed strings, not a
+        # regex. Each newline-separated line still acts as its own
+        # alternative to grep against $rdata (multi-record answers), but a
+        # "." in an A/AAAA answer can no longer wildcard-match, and a stray
+        # regex metachar in a TXT/WALLET/CLA payload (e.g. an unbalanced
+        # "[") can no longer make grep itself error out instead of just
+        # not matching.
+        answer="$(echo "$rdata" | grep -F -- "$dig_answer")"
         log_file rr_at_authoritative "rdata=$rdata, dig_answer=$dig_answer, answer=$answer."
     else
         answer=''
@@ -311,12 +464,14 @@ wait_for_rr_state() {
         if [ "$state" = "present" ]; then
             if rr_at_authoritative $rr_type "$rdata"; then
                 log_success "$rr_type present on $DOWNSTREAM_ZONE"
-                return 0
+                auth_present=1
+                break
             fi
         else
             if ! rr_at_authoritative $rr_type "$rdata"; then
                 log_success "$rr_type absent on $DOWNSTREAM_ZONE"
-                return 0
+                auth_present=0
+                break
             fi
         fi
 
@@ -327,6 +482,8 @@ wait_for_rr_state() {
 
         sleep 2
     done
+    
+    proxy_consistent_with_authoritative $rr_type "$rdata" "$state" $auth_present
 }
 
 ensure_rr_absent() {
@@ -357,36 +514,21 @@ ensure_rr_absent() {
     return 0
 }
 
-proxy_consistent_with_authoritative() {
-    local rr_type="$1"
-    local rr_rdata="$2"
-    local expected_state="$3"  # present|absent
-
-    local is_present=0
-    log_file proxy_consistent_with_authoritative "rr_type=$rr_type, rr_rdata=$rr_rdata, expected_state=$expected_state."
-
-    if rr_at_authoritative $rr_type "$rr_rdata"; then
-        is_present=1
-    fi
-
-    if [ "$expected_state" = "present" ] && [ "$is_present" -ne 1 ]; then
-        log_error "Consistency check failed: authoritative missing but expected present for $rr_type - $rr_rdata"
-        return 1
-    fi
-    if [ "$expected_state" = "absent" ] && [ "$is_present" -ne 0 ]; then
-        log_error "Consistency check failed: authoritative present but expected absent for $rr_type - $rr_rdata"
-        return 1
-    fi
-
-    # Proxy Lease-store consistency checks
-    # TODO: Add checks that records in lease-store are actually at the DNS
-    
-    log_success "Consistency check passed for $rr_type - $rr_rdata"
-
-}
 ################################
 # RR builder functions
 ################################
+# get_rdata <rr-spec> -- the rdata-bearing tail of an rr-spec, with
+# tabs and runs of spaces collapsed to single spaces: everything after
+# "<name> [ttl] IN ". This lets one rr-spec form (space-separated, TTL
+# optional -- what make_rr and the *.key files produce) be matched against a
+# lease-store dump line (dns.RR.String(), tab-separated) or a dig answer.
+#   "test.dev.zenr.io. IN KEY 256 3 15 AAA.."   -> 'KEY 256 3 15 AAA..'
+#   "test.dev.zenr.io. 30 IN TXT \"lease-x\""   -> 'TXT "lease-x"'
+get_rdata() {
+    printf '%s' "$1" | tr '\t' ' ' \
+        | sed -E 's/  +/ /g; s/^ +//; s/ +$//; s/^[^ ]+ ([0-9]+ )?IN //'
+}
+
 make_rr() {
     local rr_type="$1"
     local ttl="$2"
@@ -488,7 +630,7 @@ test_blacklisted_type() {
     fi
 
     # Verify no KEY RR was created (registration should be atomic - all or nothing).
-    if rr_at_authoritative KEY $CLIENT_KEY_NAME; then
+    if rr_at_authoritative KEY $CLIENT_KEY_RR; then
         log_error "Blacklisted type $rr_type rejected but key lease created"
         return 1
     else
@@ -539,20 +681,18 @@ test_single_rr_register_expire_remove() {
 
     # Verify lease store via dump query (INFO level summary).
     log_step "Verifying lease store state via dump query (DEBUG)"
-    query_lease_dump "debug"
+    lease_dump debug
 
     log_step "Waiting until lease expiry boundary"
     wait_until_epoch $((lease_start + lease + BUFFER))
 
     # RR should be gone before we exercise post-expiry behavior.
     wait_for_rr_state "$rr_type" "$rr_spec" absent
-    proxy_consistent_with_authoritative "$rr_type" "$rr_spec" absent
 
     if [ "$rr_type" = "KEY" ]; then
         log_step "Attempting refresh after expiry (KEY path: expected to re-register)"
         run_client refresh "$CLIENT_KEY_NAME" 0 $LEASE_SECONDS "$rr_spec"
         wait_for_rr_state KEY "$rr_spec" present
-        proxy_consistent_with_authoritative KEY "$rr_spec" present
         log_success "Expired KEY refresh succeeded via re-registration semantics"
     else
         # Both KEY and data expired together above, so the signer is no
@@ -574,7 +714,6 @@ test_single_rr_register_expire_remove() {
             return 1
         fi
         wait_for_rr_state $rr_type "$rr_spec" absent
-        proxy_consistent_with_authoritative $rr_type "$rr_spec" absent
         # "requires signing KEY to already be managed" is the *response*
         # message text (never passed to h.logger), not what actually lands
         # in the proxy's own log -- assert on the real logged reason instead.
@@ -611,11 +750,10 @@ test_case_register_refresh_not_prematurely_removed() {
     run_client register "$CLIENT_KEY_NAME" $LEASE_SECONDS $LONG_KEY_LEASE_SECONDS "${KEY_NONKEY_RRs[@]}"
     wait_for_rr_state KEY "$CLIENT_KEY_RR" present
     wait_for_rr_state "$data_type" "$data_spec" present
-    proxy_consistent_with_authoritative "$data_type" "$data_spec" present
 
     # Verify lease store via dump query (INFO level summary).
     log_step "Verifying lease store state via dump query (INFO) after initial registration"
-    query_lease_dump "info"
+    lease_dump info
 
     log_step "Waiting to near-expiry checkpoint then refreshing $data_type"
     wait_until_epoch $((lease_start + (LEASE_SECONDS * 2 / 3)))
@@ -630,7 +768,6 @@ test_case_register_refresh_not_prematurely_removed() {
         log_error ""$data_type" not found after refresh"
         return 1
     fi
-    proxy_consistent_with_authoritative "$data_type" "$data_spec" present
 
     log_step "Waiting past original expiry window"
     wait_until_epoch $((lease_start + LEASE_SECONDS + BUFFER))
@@ -643,13 +780,11 @@ test_case_register_refresh_not_prematurely_removed() {
         log_error ""$data_type" not found after initial lease time expiry (refresh ignored)"
         return 1
     fi
-    proxy_consistent_with_authoritative "$data_type" "$data_spec" present
 
     log_step "Waiting for refreshed non-KEY lease window while key-lease remains active"
     wait_until_epoch $((refresh_start + LEASE_SECONDS + BUFFER))
     wait_for_rr_state KEY "$CLIENT_KEY_RR" present
     wait_for_rr_state "$data_type" "$data_spec" absent
-    proxy_consistent_with_authoritative KEY "$CLIENT_KEY_RR" present
 
     expected_min=$((LEASE_SECONDS * (1 + 2 / 3) + BUFFER))
 
@@ -805,8 +940,6 @@ test_case_unauthorized_refresh_rejected_then_expires() {
     wait_for_rr_state KEY "$CLIENT_KEY_RR" absent
     wait_for_rr_state KEY "$WRONG_CLIENT_KEY_RR" absent
     wait_for_rr_state "$data_type" "$data_spec" absent
-
-    proxy_consistent_with_authoritative KEY "$CLIENT_KEY_RR" absent
     
     expected_min=$((KEY_LEASE_SECONDS + BUFFER))
 
@@ -843,8 +976,7 @@ test_case_abcd_lease_policy_matrix() {
     wait_for_rr_state KEY "$CLIENT_KEY_RR" present
     wait_for_rr_state TXT "$txt_a" present
 
-    proxy_consistent_with_authoritative KEY "$CLIENT_KEY_RR" present
-    query_lease_dump "info"
+    lease_dump info
     log_success "Case A: KEY+TXT registered together"
 
     log_step "Case D (KEY-LEASE!=0, LEASE=0): key-only refresh must leave data untouched"
@@ -873,7 +1005,7 @@ test_case_abcd_lease_policy_matrix() {
         log_error "Case B: original Case A TXT record disappeared"
         return 1
     fi
-    query_lease_dump "debug"
+    lease_dump debug
     log_success "Case B: non-KEY-only registration added a second TXT record alongside the first"
 
     log_step "Case C (KEY-LEASE=0, LEASE=0): non-KEY-only delete removes just txt_b"
@@ -968,7 +1100,7 @@ test_case_signer_location_matrix() {
 
     log_step "Signer location 4/4: omitted from request, resolved via authoritative DNS (online-only, never registered through the proxy)"
     local wrong_key_payload probe_needle probe_txt_rr probe_out
-    wrong_key_payload="$(echo  "${WRONG_CLIENT_KEY_RR}" | sed 's/test.dev.zenr.io. IN \(.*\)/\1/g')"
+    wrong_key_payload="$(get_rdata "${WRONG_CLIENT_KEY_RR}")"
     # Add the key directly to the Authoritative DNS
     add_rr "$wrong_key_payload" 60
     
@@ -1034,9 +1166,8 @@ test_case_multi_rr_combination_registration() {
             log_error "Multi-RR: $t record not present after combined registration"
             return 1
         fi
-        proxy_consistent_with_authoritative "$t" "${combo_specs[$i]}" present
     done
-    query_lease_dump "debug"
+    lease_dump debug
     log_success "All ${#combo_types[@]} non-KEY types plus KEY landed correctly from a single Update"
 
     log_step "Waiting past LEASE boundary: non-KEY records should expire, KEY (longer key-lease) persists"
@@ -1085,12 +1216,9 @@ test_case_refresh_extends_nonkey_not_key_lease() {
     fi
 
     local dump_before key_expires_before nonkey_expires_before
-    dump_before="$(unescape_dump_text "$(query_lease_dump "debug")")"
-    key_expires_before="$(printf '%s' "$dump_before" | awk '/^  Key: /{inkey=1} inkey && /ExpiresAt:/{print $2; exit}')"
-    nonkey_expires_before="$(printf '%s' "$dump_before" | awk -v needle="$needle" '
-        /RR:/ && index($0, needle) { found=1; next }
-        found && /ExpiresAt:/ { print $2; exit }
-    ')"
+    dump_before="$(lease_dump debug)"
+    key_expires_before="$(lease_store_key_expires_at "" "$dump_before")"
+    nonkey_expires_before="$(lease_store_rr_expires_at "$needle" "$dump_before")"
     log_step "Before refresh: KEY ExpiresAt=$key_expires_before  Non-KEY ExpiresAt=$nonkey_expires_before"
     if [ -z "$key_expires_before" ] || [ -z "$nonkey_expires_before" ]; then
         log_error "Refresh-lease-check: could not parse ExpiresAt values from debug dump"
@@ -1104,12 +1232,9 @@ test_case_refresh_extends_nonkey_not_key_lease() {
     run_client refresh "$CLIENT_KEY_NAME" $LEASE_SECONDS 0 "$txt_spec_rr"
 
     local dump_after key_expires_after nonkey_expires_after
-    dump_after="$(unescape_dump_text "$(query_lease_dump "debug")")"
-    key_expires_after="$(printf '%s' "$dump_after" | awk '/^  Key: /{inkey=1} inkey && /ExpiresAt:/{print $2; exit}')"
-    nonkey_expires_after="$(printf '%s' "$dump_after" | awk -v needle="$needle" '
-        /RR:/ && index($0, needle) { found=1; next }
-        found && /ExpiresAt:/ { print $2; exit }
-    ')"
+    dump_after="$(lease_dump debug)"
+    key_expires_after="$(lease_store_key_expires_at "" "$dump_after")"
+    nonkey_expires_after="$(lease_store_rr_expires_at "$needle" "$dump_after")"
     log_step "After refresh: KEY ExpiresAt=$key_expires_after  Non-KEY ExpiresAt=$nonkey_expires_after"
 
     if [ "$key_expires_after" != "$key_expires_before" ]; then
@@ -1153,24 +1278,25 @@ test_case_dump_vs_dig_consistency() {
         return 1
     fi
 
-    log_step "Cross-checking INFO dump against authoritative state (both present)"
-    local info_dump
-    info_dump="$(query_lease_dump info)"
-    if ! echo "$info_dump" | grep "Key: ${node_key}" | grep -q "KEY=active"; then
-        log_error "Dump/dig check: INFO dump does not show KEY=active for $node_key"
+    log_step "Cross-checking INFO summary line against authoritative state (both present)"
+    local info_dump summary_line
+    info_dump="$(lease_dump info)"
+    summary_line="$(lease_store_summary_line "$node_key" "$info_dump")"
+    if ! printf '%s\n' "$summary_line" | grep -q "KEY=active"; then
+        log_error "Dump/dig check: INFO summary does not show KEY=active for $node_key"
         echo "$info_dump"
         return 1
     fi
-    if ! echo "$info_dump" | grep "Key: ${node_key}" | grep -q "NonKEY=1"; then
-        log_error "Dump/dig check: INFO dump does not show NonKEY=1 for $node_key"
+    if ! printf '%s\n' "$summary_line" | grep -q "NonKEY=1"; then
+        log_error "Dump/dig check: INFO summary does not show NonKEY=1 for $node_key"
         echo "$info_dump"
         return 1
     fi
 
-    log_step "Cross-checking DEBUG dump contains the exact registered TXT rdata"
+    log_step "Cross-checking DEBUG dump holds the exact registered TXT rdata"
     local debug_dump
-    debug_dump="$(query_lease_dump debug)"
-    if ! echo "$debug_dump" | grep -q "$needle"; then
+    debug_dump="$(lease_dump debug)"
+    if ! lease_store_has_rr TXT "$txt_spec_rr" "$debug_dump"; then
         log_error "Dump/dig check: DEBUG dump does not contain the registered TXT record"
         echo "$debug_dump"
         return 1
@@ -1180,14 +1306,15 @@ test_case_dump_vs_dig_consistency() {
     wait_until_epoch $((lease_start + LEASE_SECONDS + BUFFER))
     wait_for_rr_state TXT "$txt_spec_rr" absent
 
-    info_dump="$(query_lease_dump info)"
-    if echo "$info_dump" | grep "Key: ${node_key}" | grep -q "NonKEY=1"; then
-        log_error "Dump/dig check: INFO dump still shows NonKEY=1 after authoritative TXT expired"
+    info_dump="$(lease_dump info)"
+    summary_line="$(lease_store_summary_line "$node_key" "$info_dump")"
+    if printf '%s\n' "$summary_line" | grep -q "NonKEY=1"; then
+        log_error "Dump/dig check: INFO summary still shows NonKEY=1 after authoritative TXT expired"
         echo "$info_dump"
         return 1
     fi
-    debug_dump="$(query_lease_dump debug)"
-    if echo "$debug_dump" | grep -q "$needle"; then
+    debug_dump="$(lease_dump debug)"
+    if lease_store_has_rr TXT "$txt_spec_rr" "$debug_dump"; then
         log_error "Dump/dig check: DEBUG dump still shows the expired TXT record"
         echo "$debug_dump"
         return 1
