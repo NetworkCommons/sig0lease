@@ -97,10 +97,10 @@ delete"), then:
 
 ## Explicitly out of scope for this bump
 
-The TCP `serveDNS` bug (a *different* library defect: `(*Server).serveDNS` in `server.go`
-sets `r.Options = MsgOptionUnpack` but never calls `r.Unpack()` a second time before invoking
-the handler, so `Ns`/`Extra`/`Pseudo` stay empty for every TCP-received message) is **not**
-fixed by this bump — confirmed identical in `serveDNS` across v0.6.82 through v0.6.104. That
-was fixed separately, in this repo, by replacing `serveTCP`'s use of `dns.Server` with a
-custom accept loop mirroring `serveUDP` (see `server/server.go`). The two changes are
-independent; don't conflate them.
+Handler-side unpacking: `codeberg.org/miekg/dns` hands the `Handler` a message decoded only
+through the question section and expects the handler to call `r.Unpack()` for the rest
+(`Ns`/`Extra`/`Pseudo`). This is the documented `dns.Handler` contract — unchanged across
+v0.6.82 through v0.6.104, and not something this bump touches. The repo already satisfies it
+in `server/server.go`: `fullUnpackHandler` completes the unpack before dispatch, on both
+transports, which are served by the library's own `dns.Server`. Independent of the
+dependency version; don't conflate the two.
