@@ -3,14 +3,9 @@ package server
 
 import (
 	"context"
-	"encoding/binary"
-	"errors"
 	"fmt"
-	"io"
-	"net"
 	"os/signal"
 	"syscall"
-	"time"
 
 	"golang.org/x/sync/errgroup"
 
@@ -111,28 +106,30 @@ func (s *Server) Serve() error {
 
 	s.logger.Infof("DNS Proxy ready to accept queries on %v", s.cfg.Server.Networks)
 
-	// g.Wait() blocks until:
-	// 1. Any listener returns an error (e.g. port bind failure or runtime crash)
-	// 2. An OS signal is received (causing ctx cancellation and listener exit)
-	if err := g.Wait(); err != nil && ctx.Err() == nil {
+	// g.Wait() blocks until every listener has returned, then yields the
+	// first non-nil error (if any). On an OS signal the shared ctx is
+	// canceled and every serveNetwork drains and returns nil, so Wait
+	// returns nil -- a clean shutdown. A non-nil result means a listener
+	// genuinely failed (bind error, unsupported network); errgroup has
+	// already canceled ctx and torn the others down, so just report it.
+	err := g.Wait()
+	s.shutdown()
+	if err != nil {
 		s.logger.Errorf("Listener failed: %v", err)
-		s.shutdown()
 		return err
 	}
 
 	s.logger.Infof("DNS Proxy shut down gracefully")
-	s.shutdown()
 	return nil
 }
 
-// acceptMsg applies the DNS library's standard accept policy (ignore
-// response-flagged messages, reject unrecognized opcodes with NOTIMP,
-// reject anything without exactly one question with FORMERR) to a parsed
-// message, logging any non-accept decision. It is wired explicitly into
-// both serveTCP (as dns.Server.MsgAcceptFunc, replacing the implicit
-// library default) and serveUDP (invoked by hand, since the raw UDP loop
-// bypasses the library's server entirely), so both transports enforce the
-// same policy instead of diverging by accident.
+// acceptMsg is the dns.Server MsgAcceptFunc for both transports. It applies
+// the library's standard accept policy -- ignore response-flagged messages,
+// reject an unrecognized opcode with NOTIMP, reject anything without
+// exactly one question with FORMERR -- to a message decoded only through
+// its header and question section, and logs any non-accept decision. The
+// library turns the returned action into the FORMERR/NOTIMP reply (or into
+// silence for the ignore case); this wrapper only adds the logging.
 func (s *Server) acceptMsg(m *dns.Msg) dns.MsgAcceptAction {
 	action := dns.DefaultMsgAcceptFunc(m)
 	switch action {
@@ -146,408 +143,100 @@ func (s *Server) acceptMsg(m *dns.Msg) dns.MsgAcceptAction {
 	return action
 }
 
-// invalidMsg logs a message that the dns library's TCP server could not
-// parse. Wired into dns.Server.MsgInvalidFunc so TCP unpack failures are
-// visible the same way serveUDP already logs its own Unpack() failures.
-// Unlike serveUDP, the library doesn't hand this callback the connection,
-// so the remote address isn't available here.
+// invalidMsg is the dns.Server MsgInvalidFunc for both transports. The
+// library calls it for a message it could not parse: a wire read error, a
+// failed header/question unpack, or -- via fullUnpackHandler -- the failed
+// full Unpack() this proxy performs before dispatch. The library does not
+// pass this callback the connection, so the remote address isn't available.
 func (s *Server) invalidMsg(m *dns.Msg, err error) {
-	s.logger.Errorf("Dropping malformed DNS/TCP message: unpack failed: %v", err)
+	s.logger.Errorf("Dropping malformed DNS message: unpack failed: %v", err)
 }
 
-// serveUDP starts a custom UDP listener that preserves EDNS options
+// udpMsgSize is the UDP read-buffer size handed to the dns library (its own
+// default is dns.MinMsgSize, 512, which truncates a SIG(0)-signed UPDATE on
+// read). 4096 comfortably covers a signed UPDATE carrying a KEY RR plus the
+// UPDATE-LEASE option; a client that needs more must use TCP.
+const udpMsgSize = 4096
+
+// serveUDP runs the dns library's UDP server for handler, blocking until
+// ctx is canceled.
 func (s *Server) serveUDP(ctx context.Context, handler dns.HandlerFunc) error {
-
-	// Listen on UDP with explicit IPv4. A port-only address (e.g. ":8053")
-	// resolves to the wildcard IP, so the listener binds on all interfaces --
-	// consistent with serveTCP.
-	udpAddr, err := net.ResolveUDPAddr("udp4", s.cfg.Server.Address)
-	if err != nil {
-		return fmt.Errorf("resolve UDP address: %w", err)
-	}
-
-	conn, err := net.ListenUDP("udp4", udpAddr)
-	if err != nil {
-		return fmt.Errorf("listen UDP: %w", err)
-	}
-	defer conn.Close()
-
-	// Goroutine to force unblock ReadFromUDP when ctx is canceled
-	go func() {
-		<-ctx.Done()
-		conn.Close() // Closing conn forces ReadFromUDP to unblock with an error
-	}()
-
-	// Set buffer sizes
-	conn.SetReadBuffer(65536)
-	conn.SetWriteBuffer(65536)
-
-	s.logger.Infof("UDP listener started on %s", conn.LocalAddr().String())
-
-	// Handle incoming packets
-	for {
-		buf := make([]byte, 4096)
-		n, remoteAddr, err := conn.ReadFromUDP(buf)
-		if err != nil {
-			// Check if error happened because ctx was canceled (graceful exit)
-			select {
-			case <-ctx.Done():
-				s.logger.Infof("UDP listener shutting down cleanly")
-				return nil
-			default:
-				s.logger.Errorf("UDP read error: %v", err)
-				continue
-			}
-		}
-
-		// Prevent processing new packets if shutdown signal arrived mid-read
-		select {
-		case <-ctx.Done():
-			return nil
-		default:
-		}
-
-		s.logger.Debugf("UDP: Received %d bytes from %s", n, remoteAddr.String())
-		rawData := buf[:n]
-
-		// Strict parsing: unpack raw wire message only.
-		msg := new(dns.Msg)
-		msg.Data = make([]byte, len(rawData))
-		copy(msg.Data, rawData)
-		if err := msg.Unpack(); err != nil {
-			s.logger.Errorf("Dropping malformed DNS packet from %s: unpack failed: %v", remoteAddr.String(), err)
-			continue
-		}
-
-		// Apply the same accept/reject policy the dns library enforces on
-		// TCP (see acceptMsg) so response-flagged messages, unrecognized
-		// opcodes, and malformed question counts are handled identically
-		// on both transports instead of UDP passing them straight to the
-		// handler.
-		switch action := s.acceptMsg(msg); action {
-		case dns.MsgIgnore:
-			continue
-		case dns.MsgReject, dns.MsgRejectNotImplemented:
-			msg.Rcode = dns.RcodeFormatError
-			if action == dns.MsgRejectNotImplemented {
-				msg.Rcode = dns.RcodeNotImplemented
-			}
-			msg.Response = true
-			msg.Authoritative = false
-			msg.Zero = false
-			msg.Reset()
-			if err := msg.Pack(); err != nil {
-				s.logger.Errorf("UDP: failed to pack reject response for %s: %v", remoteAddr.String(), err)
-				continue
-			}
-			if _, err := conn.WriteToUDP(msg.Data, remoteAddr); err != nil {
-				s.logger.Errorf("UDP: failed to write reject response to %s: %v", remoteAddr.String(), err)
-			}
-			continue
-		}
-
-		// Debug: Log message structure
-		s.logger.Debugf("After unpacking: Answer=%d, Ns=%d, Extra=%d, Pseudo=%d",
-			len(msg.Answer), len(msg.Ns), len(msg.Extra), len(msg.Pseudo))
-
-		// Debug: Show what's in Extra
-		for i, rr := range msg.Extra {
-			s.logger.Debugf("  Extra[%d]: %T (%s)", i, rr, rr.Header().String())
-		}
-
-		// Debug: Show what's in Pseudo
-		for i, rr := range msg.Pseudo {
-			s.logger.Debugf("  Pseudo[%d]: %T (%s)", i, rr, rr.Header().String())
-		}
-
-		// Create a custom response writer
-		w := &udpResponseWriter{
-			conn:       conn,
-			remoteAddr: remoteAddr,
-			logger:     s.logger,
-		}
-
-		// Call the handler with context
-		go handler(ctx, w, msg)
-	}
+	return s.serveNetwork(ctx, "udp", handler)
 }
 
-// udpResponseWriter implements dns.ResponseWriter for UDP
-type udpResponseWriter struct {
-	conn       *net.UDPConn
-	remoteAddr *net.UDPAddr
-	logger     *logging.Logger
-}
-
-func (w *udpResponseWriter) WriteMsg(m *dns.Msg) error {
-	if len(m.Data) == 0 {
-		if err := m.Pack(); err != nil {
-			return fmt.Errorf("pack error: %w", err)
-		}
-	}
-
-	n, err := w.conn.WriteToUDP(m.Data, w.remoteAddr)
-	if err != nil {
-		return fmt.Errorf("WriteToUDP error: %w", err)
-	}
-	if n == 0 {
-		return fmt.Errorf("WriteToUDP wrote 0 bytes")
-	}
-	return nil
-}
-
-func (w *udpResponseWriter) Write(data []byte) (int, error) {
-	if w.remoteAddr == nil {
-		w.logger.Errorf("UDP Write: remoteAddr is nil!")
-		return 0, fmt.Errorf("remoteAddr is nil")
-	}
-	w.logger.Debugf("UDP Write: Writing %d bytes to %s", len(data), w.remoteAddr.String())
-	n, err := w.conn.WriteToUDP(data, w.remoteAddr)
-	if err != nil {
-		w.logger.Errorf("UDP Write: WriteToUDP error: %v", err)
-	}
-	return n, err
-}
-
-func (w *udpResponseWriter) LocalAddr() net.Addr {
-	return w.conn.LocalAddr()
-}
-
-func (w *udpResponseWriter) RemoteAddr() net.Addr {
-	return w.remoteAddr
-}
-
-func (w *udpResponseWriter) SetReadDeadline(t time.Time) error {
-	return w.conn.SetReadDeadline(t)
-}
-
-func (w *udpResponseWriter) SetWriteDeadline(t time.Time) error {
-	return w.conn.SetWriteDeadline(t)
-}
-
-func (w *udpResponseWriter) Hijack() {
-	// Not implemented for UDP
-}
-
-func (w *udpResponseWriter) WriteCopy(m *dns.Msg) (int, error) {
-	msg := m.Copy()
-	return w.Write(msg.Data)
-}
-
-func (w *udpResponseWriter) WriteStringList(list []string) (int, error) {
-	return 0, fmt.Errorf("not implemented")
-}
-
-func (w *udpResponseWriter) Tsig(m *dns.Msg, algo string, mac string, timesigned uint64, fudge uint32) (int, error) {
-	return 0, fmt.Errorf("not implemented")
-}
-
-func (w *udpResponseWriter) Close() error {
-	return nil
-}
-
-func (w *udpResponseWriter) Conn() net.Conn {
-	return w.conn
-}
-
-func (w *udpResponseWriter) Session() *dns.Session {
-	// dns.Msg.WriteTo relies on this: since w.conn is the one shared,
-	// unconnected listening socket for every client (not a per-client
-	// connected UDPConn), WriteTo can't just call w.conn.Write -- it has
-	// no destination. Returning the per-request remote address here makes
-	// WriteTo route the reply with WriteMsgUDP(data, nil, Addr) instead,
-	// which correctly targets this request's client.
-	return &dns.Session{Addr: w.remoteAddr}
-}
-
-// tcpReadTimeout/tcpIdleTimeout mirror the dns library's own Server defaults
-// (ReadTimeout/IdleTimeout) for the TCP listener this replaces.
-const (
-	tcpReadTimeout = 2 * time.Second
-	tcpIdleTimeout = 8 * time.Second
-)
-
-// serveTCP starts a custom TCP listener that preserves EDNS options, the
-// same way serveUDP already does and for the same reason: the dns library's
-// own TCP server ((*dns.Server).ListenAndServe, used here previously) sets
-// Options = MsgOptionUnpack to request a full unpack after MsgAcceptFunc
-// runs, but never actually calls Unpack() a second time before invoking the
-// handler -- so Ns/Extra/Pseudo (and therefore any EDNS option, including
-// UPDATE-LEASE) stay empty for every TCP-received message, regardless of
-// what the client actually sent. A single, unconditional Unpack() call, as
-// serveUDP already does, sidesteps that bug entirely. Confirmed present
-// through the newest available release (v0.6.104) of
-// codeberg.org/miekg/dns; see docs/upgrade-miekg-dns.md.
+// serveTCP runs the dns library's TCP server for handler, blocking until
+// ctx is canceled.
 func (s *Server) serveTCP(ctx context.Context, handler dns.HandlerFunc) error {
-	// Listen on TCP with explicit IPv4, consistent with serveUDP.
-	tcpAddr, err := net.ResolveTCPAddr("tcp4", s.cfg.Server.Address)
-	if err != nil {
-		return fmt.Errorf("resolve TCP address: %w", err)
-	}
-
-	ln, err := net.ListenTCP("tcp4", tcpAddr)
-	if err != nil {
-		return fmt.Errorf("listen TCP: %w", err)
-	}
-	defer ln.Close()
-
-	// Goroutine to force unblock AcceptTCP when ctx is canceled, mirroring
-	// serveUDP's shutdown handling.
-	go func() {
-		<-ctx.Done()
-		ln.Close()
-	}()
-
-	s.logger.Infof("TCP listener started on %s", ln.Addr().String())
-
-	for {
-		conn, err := ln.AcceptTCP()
-		if err != nil {
-			select {
-			case <-ctx.Done():
-				s.logger.Infof("TCP listener shutting down cleanly")
-				return nil
-			default:
-				s.logger.Errorf("TCP accept error: %v", err)
-				continue
-			}
-		}
-		go s.serveTCPConn(ctx, conn, handler)
-	}
+	return s.serveNetwork(ctx, "tcp", handler)
 }
 
-// serveTCPConn reads and handles DNS-over-TCP-framed messages (RFC 1035
-// 4.2.2: each message prefixed by a 2-byte big-endian length) from a single
-// accepted connection, up to dns.MaxTCPQueries messages before closing.
-// Queries on the same connection are handled one at a time, not
-// concurrently: this project's own client only ever sends one query per TCP
-// connection, so serializing keeps this simple and avoids racing a
-// handler's response write against the connection close on shutdown.
-func (s *Server) serveTCPConn(ctx context.Context, conn *net.TCPConn, handler dns.HandlerFunc) {
-	defer conn.Close()
+// serveNetwork runs a dns.Server on the configured address for the given
+// network ("udp" or "tcp"). It blocks until ctx is canceled -- a clean
+// shutdown that drains in-flight queries and returns nil -- or until
+// ListenAndServe fails to start, which is returned. The listen address is
+// taken verbatim from config: a host-less ":port" binds every interface,
+// IPv4 and IPv6 alike.
+func (s *Server) serveNetwork(ctx context.Context, network string, handler dns.HandlerFunc) error {
+	srv := &dns.Server{
+		Addr:           s.cfg.Server.Address,
+		Net:            network,
+		UDPSize:        udpMsgSize,
+		Handler:        s.fullUnpackHandler(handler),
+		MsgAcceptFunc:  s.acceptMsg,
+		MsgInvalidFunc: s.invalidMsg,
+	}
 
-	readTimeout := tcpReadTimeout
-	for q := 0; q < dns.MaxTCPQueries; q++ {
-		conn.SetReadDeadline(time.Now().Add(readTimeout))
+	// NotifyStartedFunc fires once the socket is bound and the accept loop
+	// is running. Waiting for it before the shutdown path guarantees
+	// ListenAndServe has finished the server's internal init() before
+	// Shutdown() can touch it, and gives us an accurate "listener up" line.
+	started := make(chan struct{})
+	srv.NotifyStartedFunc = func(context.Context) {
+		addr := s.cfg.Server.Address
+		switch {
+		case srv.Listener != nil:
+			addr = srv.Listener.Addr().String()
+		case srv.PacketConn != nil:
+			addr = srv.PacketConn.LocalAddr().String()
+		}
+		s.logger.Infof("%s listener started on %s", network, addr)
+		close(started)
+	}
 
-		rawData, err := readTCPMsg(conn)
-		if err != nil {
-			if !isClosedOrTimeout(err) {
-				s.logger.Debugf("TCP: read error from %s: %v", conn.RemoteAddr().String(), err)
-			}
+	errCh := make(chan error, 1)
+	go func() { errCh <- srv.ListenAndServe() }()
+
+	select {
+	case <-started:
+	case err := <-errCh:
+		return fmt.Errorf("%s listener: %w", network, err)
+	}
+
+	<-ctx.Done()
+	srv.Shutdown(context.Background())
+	return <-errCh
+}
+
+// fullUnpackHandler wraps h so the message is fully unpacked before h runs.
+//
+// codeberg.org/miekg/dns hands a Handler a message decoded only through the
+// question section and expects the handler to call r.Unpack() itself if it
+// needs the rest -- Ns, Extra, and the Pseudo section that carries EDNS
+// options such as UPDATE-LEASE (see the dns.Handler interface docs). This
+// proxy always needs the whole message: SIG(0) validation reads the Update
+// section and the update handler reads the UPDATE-LEASE option, so every
+// dispatch path completes the unpack here, in one place. MsgAcceptFunc has
+// already run by now, so a failure here is a message with a valid header
+// and question but a malformed body: log it and drop, no reply.
+func (s *Server) fullUnpackHandler(h dns.HandlerFunc) dns.HandlerFunc {
+	return func(ctx context.Context, w dns.ResponseWriter, r *dns.Msg) {
+		if err := r.Unpack(); err != nil {
+			s.invalidMsg(r, err)
 			return
 		}
-
-		// Prevent processing new queries if shutdown signal arrived mid-read.
-		select {
-		case <-ctx.Done():
-			return
-		default:
-		}
-
-		s.logger.Debugf("TCP: Received %d bytes from %s", len(rawData), conn.RemoteAddr().String())
-
-		// Strict parsing: unpack raw wire message only, same as serveUDP.
-		msg := new(dns.Msg)
-		msg.Data = rawData
-		if err := msg.Unpack(); err != nil {
-			s.invalidMsg(msg, err)
-			continue
-		}
-
-		// Same accept/reject policy as serveUDP (see acceptMsg).
-		switch action := s.acceptMsg(msg); action {
-		case dns.MsgIgnore:
-			continue
-		case dns.MsgReject, dns.MsgRejectNotImplemented:
-			msg.Rcode = dns.RcodeFormatError
-			if action == dns.MsgRejectNotImplemented {
-				msg.Rcode = dns.RcodeNotImplemented
-			}
-			msg.Response = true
-			msg.Authoritative = false
-			msg.Zero = false
-			msg.Reset()
-			if err := msg.Pack(); err != nil {
-				s.logger.Errorf("TCP: failed to pack reject response for %s: %v", conn.RemoteAddr().String(), err)
-				continue
-			}
-			if err := writeTCPMsg(conn, msg.Data); err != nil {
-				s.logger.Errorf("TCP: failed to write reject response to %s: %v", conn.RemoteAddr().String(), err)
-			}
-			continue
-		}
-
-		s.logger.Debugf("After unpacking: Answer=%d, Ns=%d, Extra=%d, Pseudo=%d",
-			len(msg.Answer), len(msg.Ns), len(msg.Extra), len(msg.Pseudo))
-
-		w := &tcpResponseWriter{conn: conn}
-		handler(ctx, w, msg)
-
-		// The first read on a fresh connection uses the read timeout; any
-		// further pipelined queries on the same connection use the longer
-		// idle timeout, matching the library defaults this replaces.
-		readTimeout = tcpIdleTimeout
+		h(ctx, w, r)
 	}
 }
-
-// isClosedOrTimeout reports whether err is an expected/quiet reason for a
-// TCP read loop to stop (peer closed, listener closed during shutdown, or
-// the read/idle deadline simply elapsed) as opposed to a real error worth
-// logging.
-func isClosedOrTimeout(err error) bool {
-	if errors.Is(err, io.EOF) || errors.Is(err, net.ErrClosed) {
-		return true
-	}
-	var netErr net.Error
-	return errors.As(err, &netErr) && netErr.Timeout()
-}
-
-// readTCPMsg reads one length-prefixed DNS message from conn.
-func readTCPMsg(conn net.Conn) ([]byte, error) {
-	lenBuf := make([]byte, 2)
-	if _, err := io.ReadFull(conn, lenBuf); err != nil {
-		return nil, err
-	}
-	buf := make([]byte, binary.BigEndian.Uint16(lenBuf))
-	if _, err := io.ReadFull(conn, buf); err != nil {
-		return nil, err
-	}
-	return buf, nil
-}
-
-// writeTCPMsg writes one length-prefixed DNS message to conn.
-func writeTCPMsg(conn net.Conn, data []byte) error {
-	lenBuf := make([]byte, 2)
-	binary.BigEndian.PutUint16(lenBuf, uint16(len(data)))
-	if _, err := conn.Write(lenBuf); err != nil {
-		return err
-	}
-	_, err := conn.Write(data)
-	return err
-}
-
-// tcpResponseWriter implements dns.ResponseWriter for TCP.
-type tcpResponseWriter struct {
-	conn *net.TCPConn
-}
-
-// Write must stay a dumb passthrough -- do not add a length prefix here.
-// handleRequest sends responses via resp.WriteTo(w), and the library's own
-// Msg.WriteTo already adds the required 2-byte length prefix itself before
-// calling w.Write, for any ResponseWriter whose Conn() isn't a *net.UDPConn
-// (see codeberg.org/miekg/dns's msg.go, WriteTo). Framing again here would
-// double-prefix every response and corrupt it.
-func (w *tcpResponseWriter) Write(data []byte) (int, error) {
-	return w.conn.Write(data)
-}
-
-func (w *tcpResponseWriter) LocalAddr() net.Addr   { return w.conn.LocalAddr() }
-func (w *tcpResponseWriter) RemoteAddr() net.Addr  { return w.conn.RemoteAddr() }
-func (w *tcpResponseWriter) Conn() net.Conn        { return w.conn }
-func (w *tcpResponseWriter) Close() error          { return nil } // conn lifetime is owned by serveTCPConn
-func (w *tcpResponseWriter) Session() *dns.Session { return nil }
-func (w *tcpResponseWriter) Hijack()               {}
 
 // handleRequest is the main request handler that routes based on opcode.
 func (s *Server) handleRequest(ctx context.Context, w dns.ResponseWriter, r *dns.Msg) {
