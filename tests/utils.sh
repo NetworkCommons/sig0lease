@@ -17,6 +17,10 @@ PROXY_URL="$PROXY_ADDR:$PROXY_PORT"
 # instead (passes --tcp through to sig0lease-client).
 PROXY_PROTOCOL="${PROXY_PROTOCOL:-udp}"
 
+AUTH_SERVER="${AUTH_SERVER:-ns1.free2air.org}"
+PROXY_KEYSTORE_DIR="./keystore/server"
+PROXY_KEY_NAME="${PROXY_KEYSTORE_DIR}/Kdev.zenr.io.+015+35317.key"
+
 # Configuration
 TMP_CONFIG_FILE=""
 LEASE_CONFIG_FILE="$CONFIG_FILE"
@@ -26,9 +30,6 @@ REUSED_PROXY=false
 # prepare_lease_config() writes, so lease-cycle tests don't wait out the
 # real (production) policy minimums.
 TEST_MIN_LEASE_SECONDS="${TEST_MIN_LEASE_SECONDS:-10}"
-AUTH_SERVER="${AUTH_SERVER:-ns1.free2air.org}"
-PROXY_KEYSTORE_DIR="./keystore/server"
-PROXY_KEY_NAME="${PROXY_KEYSTORE_DIR}/Kdev.zenr.io.+015+35317.key"
 
 # Get keystore from environment
 CLIENT_KEYSTORE_DIR="${CLIENT_KEYSTORE_DIR:-}"
@@ -40,8 +41,6 @@ fi
 # Keys
 CLIENT_KEY_NAME="Ktest.dev.zenr.io.+015+05044"
 WRONG_CLIENT_KEY_NAME="Ktest.dev.zenr.io.+015+42176"
-
-
 
 # Color output
 RED='\033[0;31m'
@@ -70,24 +69,13 @@ log_error() {
     echo -e "${RED}[FAIL] $1${NC}"
 }
 
-# Log levels for test script (independent from proxy logging).
-# DEBUG: detailed output (full dump, verbose traces).
-# INFO: summary output (high-level status, results).
-
-log_debug() {
-    echo -e "  [DEBUG] $1"
-}
-
-log_info() {
-    echo -e "  [INFO] $1"
-}
-
 log_file() {
     local function=$1
     local message="$2"
 
     echo -e "$(date "+%Y-%m-%d %H:%M:%S") $function - $message" >> $CLIENT_LOG_FILE
 }
+
 yaml_get_lease_time() {
     local key="$1"
 
@@ -228,7 +216,7 @@ start_proxy() {
 
     if [ "${is_listening}" = false ]
     then
-        echo -e "${RED}ERROR: Proxy PID $PROXY_PID is not listening on port ${PROXY_PORT}${NC}"
+        log_error "Proxy PID $PROXY_PID is not listening on port ${PROXY_PORT}"
         kill "$PROXY_PID" 2>/dev/null || true
         exit 1
     fi
