@@ -1,79 +1,27 @@
-# !/usr/bin/env bash
+# tests/lib/proxy.sh -- build, start, stop, and inspect the proxy process
+# itself, plus the scratch-config machinery that lets a test run its own
+# proxy with lease-policy minimums floored for fast tests. See lib/common.sh
+# for the "no set -e, return not exit" rules this file follows.
 
-# Configuration
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-
-OS=$(uname -s | tr '[:upper:]' '[:lower:]')
-PROXY_BIN="${SCRIPT_DIR}/../bin/${OS}/sig0lease"
-CONFIG_FILE="${SCRIPT_DIR}/../config.yaml"
-LOG_FILE="/tmp/sig0lease_proxy.log"
-CLIENT_LOG_FILE="/tmp/sig0lease_client.log"
-
-PROXY_ADDR="${PROXY_ADDR:-127.0.0.1}"
-PROXY_PORT="${PROXY_PORT:-8053}"
-PROXY_URL="$PROXY_ADDR:$PROXY_PORT"
-# Transport run_client (tests/test_update.sh) uses to reach PROXY_URL.
-# Defaults to udp; set PROXY_PROTOCOL=tcp to run the whole suite over TCP
-# instead (passes --tcp through to sig0lease-client).
-PROXY_PROTOCOL="${PROXY_PROTOCOL:-udp}"
-
-AUTH_SERVER="${AUTH_SERVER:-ns1.free2air.org}"
-PROXY_KEYSTORE_DIR="./keystore/server"
-PROXY_KEY_NAME="${PROXY_KEYSTORE_DIR}/Kdev.zenr.io.+015+35317.key"
-
-# Configuration
-TMP_CONFIG_FILE=""
-LEASE_CONFIG_FILE="$CONFIG_FILE"
-LEASE_CONFIG_PREPARED=false
-REUSED_PROXY=false
-# Floor used for min_key_lease_sec/min_rr_lease_sec in the scratch config
-# prepare_lease_config() writes, so lease-cycle tests don't wait out the
-# real (production) policy minimums.
-TEST_MIN_LEASE_SECONDS="${TEST_MIN_LEASE_SECONDS:-10}"
-
-# Get keystore from environment
-CLIENT_KEYSTORE_DIR="${CLIENT_KEYSTORE_DIR:-}"
-if [ -z "$CLIENT_KEYSTORE_DIR" ]; then
-    echo "ERROR: CLIENT_KEYSTORE_DIR environment variable not set"
-    exit 1
+if [ -n "${_SIG0LEASE_LIB_PROXY_SOURCED:-}" ]; then
+    return 0 2>/dev/null || true
 fi
+_SIG0LEASE_LIB_PROXY_SOURCED=1
 
-# Keys
-CLIENT_KEY_NAME="Ktest.dev.zenr.io.+015+05044"
-WRONG_CLIENT_KEY_NAME="Ktest.dev.zenr.io.+015+42176"
+LIB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=./common.sh
+source "$LIB_DIR/common.sh"
 
-# Color output
-RED='\033[0;31m'
-GREEN='\033[0;32m'
-YELLOW='\033[1;33m'
-BLUE='\033[0;34m'
-NC='\033[0m' # No Color
+CLIENT_BIN="${TESTS_DIR}/../bin/${OS}/sig0lease-client"
+BLACKLISTED_TESTER_BIN="${TESTS_DIR}/../bin/${OS}/blacklisted_tester"
 
-PROXY_PID=""
-
-log_section() {
-    echo -e "\n${BLUE}===================================================${NC}"
-    echo -e "${BLUE}$1${NC}"
-    echo -e "${BLUE}===================================================${NC}\n"
-}
-
-log_step() {
-    echo -e "${YELLOW}→ $1${NC}"
-}
-
-log_success() {
-    echo -e "${GREEN}[OK] $1${NC}"
-}
-
-log_error() {
-    echo -e "${RED}[FAIL] $1${NC}"
-}
-
-log_file() {
-    local function=$1
-    local message="$2"
-
-    echo -e "$(date "+%Y-%m-%d %H:%M:%S") $function - $message" >> $CLIENT_LOG_FILE
+build_binaries() {
+    log_section "BUILD"
+    log_step "Building proxy and client binaries"
+    (cd "$TESTS_DIR/.." && go build -o "$PROXY_BIN" ./cmd/sig0lease)
+    (cd "$TESTS_DIR/.." && go build -o "$CLIENT_BIN" ./cmd/sig0lease-client)
+    (cd "$TESTS_DIR/.." && go build -o "$BLACKLISTED_TESTER_BIN" ./tests/blacklisted_tester.go)
+    log_success "Binaries built"
 }
 
 yaml_get_lease_time() {
@@ -84,15 +32,15 @@ yaml_get_lease_time() {
     if command -v yq >/dev/null 2>&1; then
         value="$(yq -r ".handlers.update.lease_policy.${key} // \"\"" "$LEASE_CONFIG_FILE" 2>/dev/null || true)"
     else
-        echo "please install jq!"
-        exit 1
+        echo "please install yq!"
+        return 1
     fi
 
     if [[ "$value" =~ ^[0-9]+$ ]]; then
         echo "$value"
     else
         echo "Invalid value for ${key}: $value"
-        exit 1
+        return 1
     fi
 }
 
@@ -166,7 +114,7 @@ start_proxy() {
 
     if ! [ -x "$PROXY_BIN" ]; then
         log_error "Proxy binary not found or not executable: $PROXY_BIN"
-        exit 1
+        return 1
     fi
 
     log_step "Starting proxy on $PROXY_URL with config: $TMP_CONFIG_FILE"
@@ -182,7 +130,7 @@ start_proxy() {
         if grep -q "address already in use" "$LOG_FILE"; then
             log_error "Port $PROXY_PORT is already in use. Re-run with a free port: PROXY_PORT=18053 tests/test_update.sh run"
         fi
-        exit 1
+        return 1
     fi
     # Verify our proxy PID owns at least one listener on the target port.
     is_listening=true
@@ -211,14 +159,14 @@ start_proxy() {
         fi
     else
         log_error "Cannot verify proxy listening: no lsof, ss, or /proc/net available"
-        exit 1
+        return 1
     fi
 
     if [ "${is_listening}" = false ]
     then
         log_error "Proxy PID $PROXY_PID is not listening on port ${PROXY_PORT}"
         kill "$PROXY_PID" 2>/dev/null || true
-        exit 1
+        return 1
     fi
 
 
@@ -241,60 +189,12 @@ restart_proxy() {
     start_proxy
 }
 
-delete_rr(){
-    local record="$1"
-    local payload
-
-    echo "Deleting $record"
-    if [ "$record" = "key" ]; then
-        # Read the secret string straight out of the private file
-        payload="$(cat $CLIENT_KEYSTORE_DIR/$CLIENT_KEY_NAME.key | sed 's/test.dev.zenr.io. IN \(.*\)/\1/g')"
-    else
-        payload="$record"
+assert_proxy_log_contains() {
+    local pattern="$1"
+    if grep -q "$pattern" "$LOG_FILE"; then
+        return 0
     fi
-    echo "payload is $payload"
-
-    cat <<EOF | nsupdate -k $PROXY_KEY_NAME
-    server $AUTH_SERVER
-    zone zenr.io
-    update delete test.dev.zenr.io $payload
-    send
-EOF
-}
-
-# add_rr publishes a record directly at the authoritative server, bypassing
-# the proxy entirely. Used to simulate a key or record that exists online but
-# was never registered through the proxy (e.g. an "online-only" signer, or a
-# pre-existing authoritative record for duplicate-registration tests).
-#
-# Usage: add_rr <record> [ttl]
-#   record: "key" for the well-known client test KEY, or an explicit
-#           "<TYPE> <rdata...>" payload (e.g. "TXT \"hello\"")
-#   ttl:    TTL in seconds for the added record (default 60)
-#
-# Requires a modern nsupdate with ED25519 SIG(0)/TSIG support (BIND 9.10.6,
-# the version macOS ships at /usr/bin/nsupdate, predates RFC 8080 and cannot
-# sign/verify this project's ED25519 keys correctly -- install a current
-# nsupdate via `brew install bind` and make sure /opt/homebrew/bin precedes
-# /usr/bin in PATH).
-add_rr(){
-    local record="$1"
-    local ttl="${2:-60}"
-    local payload
-
-    echo "Adding $record (ttl=$ttl)"
-    if [ "$record" = "key" ]; then
-        # Read the secret string straight out of the private file
-        payload="$(cat $CLIENT_KEYSTORE_DIR/$CLIENT_KEY_NAME.key | sed 's/test.dev.zenr.io. IN \(.*\)/\1/g')"
-    else
-        payload="$record"
-    fi
-    echo "payload is $payload"
-
-    cat <<EOF | nsupdate -k $PROXY_KEY_NAME
-    server $AUTH_SERVER
-    zone zenr.io
-    update add test.dev.zenr.io $ttl $payload
-    send
-EOF
+    log_error "Expected proxy log pattern not found: $pattern"
+    tail -n 120 "$LOG_FILE" || true
+    return 1
 }

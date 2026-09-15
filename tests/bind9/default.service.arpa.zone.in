@@ -1,0 +1,18 @@
+; Template for the local BIND 9 mDNSResponder-interop gate's default.service.arpa. zone
+; (tests/test_mdnsresponder_interop.sh). start_bind9 copies this into the scratch runtime
+; directory before starting named, same as srp.test.zone.in -- BIND rewrites its own working
+; copy (SOA serial bumps, dynamic-update journal replay) so the source tree's copy must
+; never be the one actually served.
+;
+; This exact zone name is not a free choice: both mDNSResponder/ServiceRegistration
+; binaries (srp-client.c, srp-mdns-proxy.c) hardcode "default.service.arpa." client-side, so
+; it's the only name that lets the real, unmodified binaries reach our registrar at all (see
+; the RFC 9665 plan's §13 Phase 5 entry). The apex KEY is
+; tests/keystore-srp-bind9-default-arpa/'s own key, granted zonesub update rights in
+; named.conf.in -- the proxy signs every forwarded UPDATE with this same key
+; (handlers.srp_handler's keystore_dir points at that directory in this test).
+$TTL 3600
+@       IN SOA  ns.default.service.arpa. admin.default.service.arpa. ( 1 3600 900 604800 3600 )
+        IN NS   ns.default.service.arpa.
+ns      IN A    127.0.0.1
+@       IN KEY  512 3 15 wAMRp/kb4l8hHXSCk2td5Qnt3f65LjmI/5DAWynaEU4=

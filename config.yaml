@@ -18,6 +18,16 @@ server:
   networks:
     - udp
     - tcp
+    # - tls   # DNS-over-TLS (RFC 7858); requires the "tls:" block below
+
+  # DNS-over-TLS listener config -- only read if "tls" appears in networks above.
+  # Its own address (conventionally 853, separate from plain DNS on the address above);
+  # opportunistic TLS only, no client-certificate authentication. Transport-level, so it
+  # benefits every handler (update_handler and srp_handler alike), not protocol-specific.
+  # tls:
+  #   address: ":853"
+  #   cert: "/path/to/cert.pem"
+  #   key: "/path/to/key.pem"
 
 upstreams:
   # Generic upstream resolvers used for non-processed opcodes.
@@ -83,12 +93,43 @@ handlers:
       path: "./data/lease_snapshot.json"   # required for type: file
       save_interval: "30s"                  # optional, default 30s
 
-# Processing rules map opcodes to module names
+# Processing rules map opcodes to an ORDERED list of module names (D2). The router tries
+# each module in turn until one returns "processed" or "error"; if every one declines
+# ("not relevant" -- e.g. an SRP-shaped update handled by srp_handler, or a plain UPDATE
+# without the UPDATE-LEASE option handled by update_handler), the opcode falls through to
+# plain upstream forwarding.
 processing_rules:
-  # Route opcode 5 (UPDATE) to an update handler module
-  # UPDATE queries are used for dynamic DNS updates (RFC 2136)
+  # Route opcode 5 (UPDATE) to the update handler module.
+  # UPDATE queries are used for dynamic DNS updates (RFC 2136).
+  #
+  # To also enable RFC 9665 SRP on a *different* zone from the same proxy process, add
+  # srp_handler ahead of update_handler and configure handlers.srp_handler below (one
+  # zone, one protocol per D10 -- don't point both handlers' upstream_zone at the same
+  # zone):
+  #   modules: ["srp_handler", "update_handler"]
   - opcode: 5
-    module: "update_handler"
+    modules: ["update_handler"]
+
+# handlers.srp_handler: RFC 9665 SRP config (only read if "srp_handler" appears in
+# processing_rules above). Same shape as handlers.update, plus:
+#   upstream:                     static "host:port" override (D4), skips SOA/NS discovery
+#   allow_udp:                    permit UDP for this zone (default false -- TCP required)
+#   refuse_on_foreign_data:       REFUSED when a name exists upstream with data but no KEY
+#                                 (default true)
+#   rewrite_default_service_arpa: accept default.service.arpa. (every real SRP client
+#                                 hardcodes it, having no other way to discover a zone) as
+#                                 an alias for upstream_zone, rewriting every name in the
+#                                 update before anything else sees it (default false)
+# handlers:
+#   srp_handler:
+#     upstream_zone: "srp.dev.zenr.io."
+#     keystore_dir: "./keystore/server"
+#     rewrite_default_service_arpa: true
+#     lease_policy:
+#       min_key_lease_sec: 30
+#       max_key_lease_sec: 1209600   # RFC 9665's usual 14-day KEY-LEASE
+#       min_rr_lease_sec: 30
+#       max_rr_lease_sec: 7200
 
 # Forwarding for opcodes not listed in processing_rules uses the upstreams list above.
 

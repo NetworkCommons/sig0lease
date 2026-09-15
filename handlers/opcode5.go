@@ -3,14 +3,11 @@ package handlers
 
 import (
 	"context"
-	"fmt"
-	"net"
 	"strings"
 	"sync"
 	"time"
 
 	"codeberg.org/miekg/dns"
-	"github.com/NetworkCommons/sig0lease/logging"
 	"github.com/NetworkCommons/sig0lease/pkg/keyrec"
 	leasepkg "github.com/NetworkCommons/sig0lease/pkg/lease"
 )
@@ -46,201 +43,14 @@ func NewInMemoryLeaseManager() *InMemoryLeaseManager {
 }
 
 // UpstreamCoordinator handles communication with the upstream authoritative server.
+// pkg/updatecore.Coordinator is the production implementation, constructed directly in
+// Setup (below) via updatecore.NewCoordinator -- this interface exists so tests and
+// operators can substitute their own (config's "upstream_coordinator" option, or a test
+// stub; see handlers/opcode5_sig0_validation_test.go's stubUpstreamCoordinator).
 type UpstreamCoordinator interface {
 	// SendUpdate sends a DNS UPDATE message to the upstream authoritative server.
 	// Returns the response message or an error.
 	SendUpdate(ctx context.Context, upstreamZone string, updateMsg *dns.Msg) (*dns.Msg, error)
-}
-
-// DefaultUpstreamCoordinator resolves authoritative NS for a zone
-// and sends UPDATE messages directly to that authoritative server.
-type DefaultUpstreamCoordinator struct {
-	logger *logging.Logger
-	// bootstrapResolvers are the resolvers used to look up SOA/NS records to
-	// find the authoritative server for a zone, before the actual UPDATE is
-	// forwarded there. Populated from the same "upstreams" config used for
-	// generic (non-UPDATE) forwarding (see cmd/sig0lease/main.go's
-	// withBootstrapResolvers), so the proxy has one operator-configured
-	// resolver pool instead of several independent, hardcoded ones.
-	bootstrapResolvers []string
-}
-
-// defaultBootstrapResolvers is used only when no bootstrap resolver list was
-// configured at all (see NewDefaultUpstreamCoordinator) -- the same pair
-// config.NewDefaultConfig uses for generic upstreams, so out-of-the-box
-// behavior for a caller that sets nothing is unchanged.
-var defaultBootstrapResolvers = []string{"8.8.8.8:53", "8.8.4.4:53"}
-
-func (u *DefaultUpstreamCoordinator) resolveSOAMasterServer(ctx context.Context, zone string) (string, string, error) {
-	zone = strings.TrimSuffix(zone, ".")
-	if zone == "" {
-		return "", "", fmt.Errorf("upstream zone is empty")
-	}
-
-	for candidate := zone; candidate != ""; candidate = parentZone(candidate) {
-		candidateFQDN := candidate + "."
-		req := dns.NewMsg(candidateFQDN, dns.TypeSOA)
-		if req == nil {
-			continue
-		}
-
-		for _, bootstrapServer := range u.bootstrapResolvers {
-			resp, err := dns.Exchange(ctx, req, "udp", bootstrapServer)
-			if err != nil || resp == nil || resp.Rcode != dns.RcodeSuccess {
-				continue
-			}
-
-			for _, rr := range resp.Answer {
-				soa, ok := rr.(*dns.SOA)
-				if !ok {
-					continue
-				}
-				mname := strings.TrimSuffix(soa.Ns, ".")
-				if mname == "" {
-					break
-				}
-				u.logger.Debugf("Selected SOA MNAME %s for effective zone %s (via bootstrap resolver %s)", mname, candidateFQDN, bootstrapServer)
-				return net.JoinHostPort(mname, "53"), candidateFQDN, nil
-			}
-		}
-	}
-
-	return "", "", fmt.Errorf("no SOA master server found for %q", zone)
-}
-
-// resolveAuthoritativeZone finds the zone cut (the name that actually has NS
-// records) for zone or one of its parents, using the same configured
-// bootstrap resolvers as resolveSOAMasterServer -- previously this used
-// net.DefaultResolver.LookupNS (the OS resolver, e.g. /etc/resolv.conf),
-// a third, independent resolution path that could disagree with
-// resolveSOAMasterServer's (then-hardcoded) answer for the same zone.
-func (u *DefaultUpstreamCoordinator) resolveAuthoritativeZone(ctx context.Context, zone string) (string, error) {
-	zone = strings.TrimSuffix(zone, ".")
-	if zone == "" {
-		return "", fmt.Errorf("upstream zone is empty")
-	}
-
-	for candidate := zone; candidate != ""; candidate = parentZone(candidate) {
-		candidateFQDN := candidate + "."
-		req := dns.NewMsg(candidateFQDN, dns.TypeNS)
-		if req == nil {
-			continue
-		}
-
-		for _, bootstrapServer := range u.bootstrapResolvers {
-			resp, err := dns.Exchange(ctx, req, "udp", bootstrapServer)
-			if err != nil || resp == nil || resp.Rcode != dns.RcodeSuccess {
-				continue
-			}
-			for _, rr := range resp.Answer {
-				if _, ok := rr.(*dns.NS); ok {
-					u.logger.Debugf("Selected authoritative zone %s via NS lookup (bootstrap resolver %s)", candidateFQDN, bootstrapServer)
-					return candidateFQDN, nil
-				}
-			}
-		}
-	}
-
-	return "", fmt.Errorf("no authoritative zone with NS records found for %q", zone)
-}
-
-func parentZone(zone string) string {
-	zone = strings.TrimSuffix(zone, ".")
-	if zone == "" {
-		return ""
-	}
-	idx := strings.Index(zone, ".")
-	if idx < 0 {
-		return ""
-	}
-	return zone[idx+1:]
-}
-
-func (h *UpdateHandler) findAuthorizedProxyKeyForZone(zone string) (*keyrec.LoadedKey, string, error) {
-	zone = strings.TrimSuffix(strings.ToLower(zone), ".")
-	if zone == "" {
-		return nil, "", fmt.Errorf("zone is empty")
-	}
-
-	for candidate := zone; candidate != ""; candidate = parentZone(candidate) {
-		keyNames, err := keyrec.FindKeysByZone(h.keystoreDir, candidate+".", h.logger)
-		if len(keyNames) == 0 {
-			continue
-		}
-		if len(keyNames) > 1 {
-			return nil, "", fmt.Errorf("More than one proxy authorization key found for zone %s", candidate)
-		}
-
-		k, err := keyrec.LoadKeyFromFile(h.keystoreDir, keyNames[0])
-		if err != nil {
-			return nil, "", fmt.Errorf("error loading proxy authorization key %s", keyNames[0])
-		}
-		return k, candidate + ".", nil
-	}
-
-	return nil, "", fmt.Errorf("no proxy authorization key found for zone %q or any parent", zone+".")
-}
-
-// NewDefaultUpstreamCoordinator creates a new upstream coordinator.
-// bootstrapResolvers are used to resolve SOA/NS records to find the
-// authoritative server for a zone; if empty, defaultBootstrapResolvers is
-// used.
-func NewDefaultUpstreamCoordinator(logger *logging.Logger, bootstrapResolvers []string) *DefaultUpstreamCoordinator {
-	resolvers := bootstrapResolvers
-	if len(resolvers) == 0 {
-		resolvers = defaultBootstrapResolvers
-	}
-	return &DefaultUpstreamCoordinator{
-		logger:             logger,
-		bootstrapResolvers: resolvers,
-	}
-}
-
-// SendUpdate sends an UPDATE message to the upstream server.
-func (u *DefaultUpstreamCoordinator) SendUpdate(ctx context.Context, upstreamZone string, updateMsg *dns.Msg) (*dns.Msg, error) {
-	if upstreamZone == "" {
-		return nil, fmt.Errorf("upstream zone is required")
-	}
-	if updateMsg == nil {
-		return nil, fmt.Errorf("update message is nil")
-	}
-	if len(updateMsg.Question) != 1 {
-		return nil, fmt.Errorf("update message must contain exactly one question")
-	}
-	msgZone := updateMsg.Question[0].Header().Name
-	u.logger.Debugf("Message zone: %s", msgZone)
-	// Compare canonically (case-insensitive, trailing-dot-insensitive):
-	// callers pass zone strings from several sources (config, resolved via
-	// live NS lookup with a trailing dot, or normalizeZone()'d lease-store
-	// values without one) that are the same zone but not byte-identical. A
-	// raw string comparison here rejects valid same-zone deletes whenever
-	// the caller couldn't re-resolve the FQDN form (e.g. resolveAuthoritativeZone
-	// failing/timing out), which silently orphans records at authoritative DNS.
-	if canonicalName(msgZone) != canonicalName(upstreamZone) {
-		return nil, fmt.Errorf("update zone mismatch: message zone %q, expected upstream zone %q", msgZone, upstreamZone)
-	}
-
-	// Resolve SOA MNAME for effective zone and send UPDATE only to that server.
-	soaServer, authZone, err := u.resolveSOAMasterServer(ctx, upstreamZone)
-	if err != nil {
-		return nil, fmt.Errorf("SOA master resolution failed for zone %q: %w", upstreamZone, err)
-	}
-	u.logger.Debugf("Resolved SOA master for zone %s (effective zone %s): %s", upstreamZone, authZone, soaServer)
-
-	resp, udpErr := dns.Exchange(ctx, updateMsg, "udp", soaServer)
-	if udpErr == nil {
-		u.logger.Debugf("Authoritative UPDATE over UDP succeeded: server=%s rcode=%d", soaServer, resp.Rcode)
-		return resp, nil
-	}
-
-	u.logger.Debugf("Authoritative UPDATE over UDP failed: server=%s err=%v; retrying TCP", soaServer, udpErr)
-	resp, tcpErr := dns.Exchange(ctx, updateMsg, "tcp", soaServer)
-	if tcpErr == nil {
-		u.logger.Debugf("Authoritative UPDATE over TCP succeeded: server=%s rcode=%d", soaServer, resp.Rcode)
-		return resp, nil
-	}
-
-	return nil, fmt.Errorf("authoritative update failed to SOA master %s (udp: %v, tcp: %v)", soaServer, udpErr, tcpErr)
 }
 
 // UpdateHandler handles DNS opcode 5 (UPDATE queries).
