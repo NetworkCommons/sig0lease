@@ -458,6 +458,36 @@ func TestValidate_Rejections(t *testing.T) {
 		}
 	})
 
+	t.Run("TTL inconsistency across a shared PTR RRset", func(t *testing.T) {
+		// Two different service instances of the same type share one PTR owner name
+		// (the service type) -- a TTL mismatch between their own PTR adds must be
+		// caught even though neither instance's SRV/TXT records share that owner name
+		// with the other's, so the mismatch can't be seen from either instance alone.
+		const host = "myhost.default.service.arpa."
+		const inst1 = "printer._ipps._tcp.default.service.arpa."
+		const inst2 = "scanner._ipps._tcp.default.service.arpa."
+		const svcType = "_ipps._tcp.default.service.arpa."
+		key := keyRR(host, dns.ECDSAP256SHA256, 0, appendixCPublicKey)
+
+		ptr1 := &dns.PTR{}
+		ptr1.Hdr = dns.Header{Name: svcType, Class: dns.ClassINET, TTL: 60}
+		ptr1.Ptr = inst1
+
+		ptr2 := &dns.PTR{}
+		ptr2.Hdr = dns.Header{Name: svcType, Class: dns.ClassINET, TTL: 120} // different TTL
+		ptr2.Ptr = inst2
+
+		msg := newUpdate("default.service.arpa.",
+			deleteAll(host), mustRR(t, host+" 3600 IN A 192.0.2.1"), key,
+			deleteAll(inst1), mustRR(t, inst1+" 60 IN SRV 0 0 631 "+host), mustRR(t, inst1+` 60 IN TXT ""`), ptr1,
+			deleteAll(inst2), mustRR(t, inst2+" 60 IN SRV 0 0 631 "+host), mustRR(t, inst2+` 60 IN TXT ""`), ptr2,
+		)
+		leaseOpt(t, msg, 60, 3600)
+		if _, err := Validate(msg); err == nil || !strings.Contains(err.Error(), "inconsistent TTLs") {
+			t.Fatalf("expected an inconsistent-TTLs error for the shared PTR RRset, got: %v", err)
+		}
+	})
+
 	t.Run("mismatched KEY RDATA", func(t *testing.T) {
 		msg := build()
 		// The Appendix C fixture omits the Service Description's KEY (S3.2.5.1: "MAY be

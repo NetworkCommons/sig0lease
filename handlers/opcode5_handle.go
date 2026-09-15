@@ -28,7 +28,7 @@ func (h *UpdateHandler) Handle(ctx context.Context, w dns.ResponseWriter, r *dns
 	h.logger.Debugf("UPDATE-LEASE EDNS option present, processing as sig0lease packet")
 
 	if len(r.Question) != 1 {
-		msg := h.makeErrorResponse(r, dns.RcodeFormatError, "exactly one question required")
+		msg := makeErrorResponse(r, dns.RcodeFormatError, "exactly one question required")
 		return NewErrorResult(msg, "invalid question count", fmt.Errorf("multiple questions"))
 	}
 
@@ -42,7 +42,7 @@ func (h *UpdateHandler) Handle(ctx context.Context, w dns.ResponseWriter, r *dns
 	leaseDuration, keyLeaseDuration, err := h.parseLease(r)
 	if err != nil {
 		h.logger.Debugf("Lease parsing failed: %v", err)
-		msg := h.makeErrorResponse(r, uint16(16), fmt.Sprintf("invalid lease: %v", err))
+		msg := makeErrorResponse(r, uint16(16), fmt.Sprintf("invalid lease: %v", err))
 		return NewErrorResult(msg, fmt.Sprintf("lease parsing failed: %v", err), err)
 	}
 
@@ -59,7 +59,7 @@ func (h *UpdateHandler) Handle(ctx context.Context, w dns.ResponseWriter, r *dns
 	updateKeyRRs, updateOtherRRs, err := extractUpdateRecords(r, h.blacklistedTypes)
 	if err != nil {
 		h.logger.Debugf("Invalid update records: %v", err)
-		msg := h.makeErrorResponse(r, dns.RcodeFormatError, err.Error())
+		msg := makeErrorResponse(r, dns.RcodeFormatError, err.Error())
 		return NewErrorResult(msg, err.Error(), err)
 	}
 
@@ -80,20 +80,20 @@ func (h *UpdateHandler) Handle(ctx context.Context, w dns.ResponseWriter, r *dns
 	additionalSigningKeys, err := extractAdditionalSigningKeys(r)
 	if err != nil {
 		h.logger.Debugf("Invalid Additional KEY records: %v", err)
-		msg := h.makeErrorResponse(r, dns.RcodeFormatError, err.Error())
+		msg := makeErrorResponse(r, dns.RcodeFormatError, err.Error())
 		return NewErrorResult(msg, err.Error(), err)
 	}
 
 	sigRR, signerKey, signerSource, err := h.extractAndValidateSig0(ctx, r, zone, additionalSigningKeys, updateKeyRRs)
 	if err != nil {
 		h.logger.Debugf("SIG(0) validation failed: %v", err)
-		msg := h.makeErrorResponse(r, dns.RcodeRefused, fmt.Sprintf("SIG(0) validation failed: %v", err))
+		msg := makeErrorResponse(r, dns.RcodeRefused, fmt.Sprintf("SIG(0) validation failed: %v", err))
 		return NewErrorResult(msg, fmt.Sprintf("SIG(0) validation failed: %v", err), err)
 	}
 
 	if err := h.validateSignerHierarchyForUpdateRecords(sigRR.SignerName, updateKeyRRs, updateOtherRRs); err != nil {
 		h.logger.Debugf("Update hierarchy validation failed: %v", err)
-		msg := h.makeErrorResponse(r, dns.RcodeRefused, fmt.Sprintf("hierarchy validation failed: %v", err))
+		msg := makeErrorResponse(r, dns.RcodeRefused, fmt.Sprintf("hierarchy validation failed: %v", err))
 		return NewErrorResult(msg, fmt.Sprintf("hierarchy validation failed: %v", err), err)
 	}
 
@@ -105,7 +105,7 @@ func (h *UpdateHandler) Handle(ctx context.Context, w dns.ResponseWriter, r *dns
 	updateOtherRRsByKeyOwner, err := groupOtherRecordsByTargetKey(signerID, updateKeyRRs, updateOtherRRs, false)
 	if err != nil {
 		h.logger.Debugf("Failed to map non-KEY records to KEY owners: %v", err)
-		msg := h.makeErrorResponse(r, dns.RcodeRefused, fmt.Sprintf("invalid mixed-owner update: %v", err))
+		msg := makeErrorResponse(r, dns.RcodeRefused, fmt.Sprintf("invalid mixed-owner update: %v", err))
 		return NewErrorResult(msg, fmt.Sprintf("invalid mixed-owner update: %v", err), err)
 	}
 
@@ -141,7 +141,7 @@ func (h *UpdateHandler) Handle(ctx context.Context, w dns.ResponseWriter, r *dns
 	if keyLeaseDuration != 0 && leaseDuration != 0 {
 		// Case A: full registration/refresh, requires at least one KEY and one non-KEY RR.
 		if len(updateKeyRRs) == 0 || len(updateOtherRRs) == 0 {
-			msg := h.makeErrorResponse(r, dns.RcodeFormatError,
+			msg := makeErrorResponse(r, dns.RcodeFormatError,
 				"KEY-LEASE!=0 and LEASE!=0 requires at least one KEY RR and one non-KEY RR")
 			return NewErrorResult(msg, "invalid update for register/refresh", fmt.Errorf("missing required KEY and/or non-KEY record"))
 		}
@@ -163,7 +163,7 @@ func (h *UpdateHandler) Handle(ctx context.Context, w dns.ResponseWriter, r *dns
 			}
 		}
 		if !h.signerAuthorizedForNewRegistration(signerManaged, signerInUpdate, signerSource) {
-			msg := h.makeErrorResponse(r, dns.RcodeRefused,
+			msg := makeErrorResponse(r, dns.RcodeRefused,
 				"signing key must be managed, present in the Update section, or (if allow_online_key_registration is enabled) an authorized online signer, to register new records")
 			return NewErrorResult(msg, "signer not authorized for new registration",
 				fmt.Errorf("signer %q is neither lease-managed, present in the Update section, nor an authorized online signer", sigRR.SignerName))
@@ -177,13 +177,13 @@ func (h *UpdateHandler) Handle(ctx context.Context, w dns.ResponseWriter, r *dns
 
 			if keyIsRefresh {
 				if err := h.authorizeKeyRefresh(keyRR, signerID); err != nil {
-					msg := h.makeErrorResponse(r, dns.RcodeRefused, err.Error())
+					msg := makeErrorResponse(r, dns.RcodeRefused, err.Error())
 					return NewErrorResult(msg, err.Error(), err)
 				}
 
 				effectiveKeyLease, keyAtFQDN, err := h.effectiveRefreshKeyLease(ctx, zone, keyRR, existingKey, keyLeaseDuration)
 				if err != nil {
-					msg := h.makeErrorResponse(r, dns.RcodeServerFailure, fmt.Sprintf("authoritative key lookup failed: %v", err))
+					msg := makeErrorResponse(r, dns.RcodeServerFailure, fmt.Sprintf("authoritative key lookup failed: %v", err))
 					return NewErrorResult(msg, "authoritative key lookup failed", err)
 				}
 				if !keyAtFQDN {
@@ -247,15 +247,14 @@ func (h *UpdateHandler) Handle(ctx context.Context, w dns.ResponseWriter, r *dns
 
 			// Normal path (not refresh): KEY-LEASE != 0 and LEASE != 0.
 			partialNotes := make([]string, 0)
-			registerKey := true
 			if h.leaseManager.LookupByKEY(keyRR) == nil {
 				exists, err := h.authoritativeHasRR(ctx, zone, keyRR)
 				if err != nil {
-					msg := h.makeErrorResponse(r, dns.RcodeServerFailure, fmt.Sprintf("authoritative duplicate check failed: %v", err))
+					msg := makeErrorResponse(r, dns.RcodeServerFailure, fmt.Sprintf("authoritative duplicate check failed: %v", err))
 					return NewErrorResult(msg, "authoritative duplicate check failed", err)
 				}
 				if exists {
-					msg := h.makeErrorResponse(r, dns.RcodeRefused, fmt.Sprintf("duplicate registration rejected: authoritative RR already exists for %s", keyRR.String()))
+					msg := makeErrorResponse(r, dns.RcodeRefused, fmt.Sprintf("duplicate registration rejected: authoritative RR already exists for %s", keyRR.String()))
 					return NewErrorResult(msg, "duplicate registration rejected", fmt.Errorf("authoritative RR already exists for %s", keyRR.String()))
 				}
 				// Signer authorization for new registrations was already
@@ -265,38 +264,34 @@ func (h *UpdateHandler) Handle(ctx context.Context, w dns.ResponseWriter, r *dns
 
 			acceptedRecords, notes, err := h.filterDuplicateRegistrations(ctx, leasepkg.NodeKey(keyRR), zone, scopedOtherRecords)
 			if err != nil {
-				msg := h.makeErrorResponse(r, dns.RcodeRefused, fmt.Sprintf("duplicate registration rejected: %v", err))
+				msg := makeErrorResponse(r, dns.RcodeRefused, fmt.Sprintf("duplicate registration rejected: %v", err))
 				return NewErrorResult(msg, "duplicate registration rejected", err)
 			}
 			partialNotes = append(partialNotes, notes...)
 
-			if registerKey {
-				pendingKeyRR := keyRR
-				pendingKeyName := keyName
-				pendingRecords := acceptedRecords
-				pendingMutations = append(pendingMutations, pendingLeaseMutation{
-					keyName: pendingKeyName,
-					apply: func() error {
-						if err := h.registerKeyLease(ctx, keyIDFromSIG(sigRR), pendingKeyRR, keyLeaseDuration, keyLeaseDuration); err != nil {
+			pendingKeyRR := keyRR
+			pendingKeyName := keyName
+			pendingRecords := acceptedRecords
+			pendingMutations = append(pendingMutations, pendingLeaseMutation{
+				keyName: pendingKeyName,
+				apply: func() error {
+					if err := h.registerKeyLease(ctx, keyIDFromSIG(sigRR), pendingKeyRR, keyLeaseDuration, keyLeaseDuration); err != nil {
+						return err
+					}
+					if len(pendingRecords) > 0 {
+						if err := h.leaseManager.UpsertNonKEYRecords(leasepkg.NodeKey(pendingKeyRR), pendingRecords, leaseDuration, h.upstreamZone); err != nil {
 							return err
 						}
-						if len(pendingRecords) > 0 {
-							if err := h.leaseManager.UpsertNonKEYRecords(leasepkg.NodeKey(pendingKeyRR), pendingRecords, leaseDuration, h.upstreamZone); err != nil {
-								return err
-							}
-						}
-						h.scheduleLeaseExpiry(leasepkg.NodeKey(pendingKeyRR))
-						return nil
-					},
-				})
-			}
+					}
+					h.scheduleLeaseExpiry(leasepkg.NodeKey(pendingKeyRR))
+					return nil
+				},
+			})
 
 			h.logger.Debugf("Lease processed for %s (lease=%d seconds, key-lease=%d seconds)", keyName, leaseDuration, keyLeaseDuration)
 
-			if registerKey {
-				responseKeys = append(responseKeys, keyRR)
-				upstreamKeys = append(upstreamKeys, keyRR)
-			}
+			responseKeys = append(responseKeys, keyRR)
+			upstreamKeys = append(upstreamKeys, keyRR)
 			acceptedRecordsForUpstream = append(acceptedRecordsForUpstream, acceptedRecords...)
 			allNotes = append(allNotes, partialNotes...)
 		}
@@ -315,7 +310,7 @@ func (h *UpdateHandler) Handle(ctx context.Context, w dns.ResponseWriter, r *dns
 				signerNodeKey := leasepkg.NodeKeyFromSIG(sigRR.SignerName, sigRR.Algorithm, sigRR.KeyTag)
 				acceptedRecords, notes, err := h.filterDuplicateRegistrations(ctx, signerNodeKey, zone, dataForSigner)
 				if err != nil {
-					msg := h.makeErrorResponse(r, dns.RcodeRefused, fmt.Sprintf("duplicate registration rejected: %v", err))
+					msg := makeErrorResponse(r, dns.RcodeRefused, fmt.Sprintf("duplicate registration rejected: %v", err))
 					return NewErrorResult(msg, "duplicate registration rejected", err)
 				}
 				pendingMutations = append(pendingMutations, pendingLeaseMutation{
@@ -335,19 +330,19 @@ func (h *UpdateHandler) Handle(ctx context.Context, w dns.ResponseWriter, r *dns
 	} else if keyLeaseDuration == 0 && leaseDuration != 0 {
 		// Case B: non-KEY-only registration/refresh.
 		if len(updateOtherRRs) == 0 {
-			msg := h.makeErrorResponse(r, dns.RcodeRefused,
+			msg := makeErrorResponse(r, dns.RcodeRefused,
 				"KEY-LEASE=0 and LEASE!=0 requires at least one non-KEY RR")
 			return NewErrorResult(msg, "invalid non-KEY-only lease request", fmt.Errorf("no non-KEY RR present"))
 		}
 		if len(updateKeyRRs) > 0 {
-			msg := h.makeErrorResponse(r, dns.RcodeRefused,
+			msg := makeErrorResponse(r, dns.RcodeRefused,
 				"KEY-LEASE=0 and LEASE!=0 does not allow KEY RRs in Update section")
 			return NewErrorResult(msg, "invalid non-KEY-only lease request", fmt.Errorf("unexpected KEY RR in non-KEY-only lease request"))
 		}
 
 		signerLease := h.leaseManager.LookupBySIG(sigRR.SignerName, sigRR.Algorithm, sigRR.KeyTag)
 		if signerLease == nil {
-			msg := h.makeErrorResponse(r, dns.RcodeRefused,
+			msg := makeErrorResponse(r, dns.RcodeRefused,
 				"KEY-LEASE=0 and LEASE!=0 requires signing KEY to already be managed")
 			return NewErrorResult(msg, "signing key not managed for non-KEY-only lease", fmt.Errorf("signing key not found in lease store"))
 		}
@@ -355,7 +350,7 @@ func (h *UpdateHandler) Handle(ctx context.Context, w dns.ResponseWriter, r *dns
 		signerOwnerKey := leasepkg.NodeKey(signerKey)
 		keyExists, err := h.authoritativeHasKeyAtName(ctx, zone, signerKey.Hdr.Name)
 		if err != nil {
-			msg := h.makeErrorResponse(r, dns.RcodeServerFailure, fmt.Sprintf("authoritative key lookup failed: %v", err))
+			msg := makeErrorResponse(r, dns.RcodeServerFailure, fmt.Sprintf("authoritative key lookup failed: %v", err))
 			return NewErrorResult(msg, "authoritative key lookup failed", err)
 		}
 		if !keyExists {
@@ -381,7 +376,7 @@ func (h *UpdateHandler) Handle(ctx context.Context, w dns.ResponseWriter, r *dns
 
 		acceptedRecords, notes, err := h.filterDuplicateRegistrations(ctx, signerOwnerKey, zone, updateOtherRRs)
 		if err != nil {
-			msg := h.makeErrorResponse(r, dns.RcodeRefused, fmt.Sprintf("duplicate registration rejected: %v", err))
+			msg := makeErrorResponse(r, dns.RcodeRefused, fmt.Sprintf("duplicate registration rejected: %v", err))
 			return NewErrorResult(msg, "duplicate registration rejected", err)
 		}
 		if len(acceptedRecords) > 0 {
@@ -413,7 +408,7 @@ func (h *UpdateHandler) Handle(ctx context.Context, w dns.ResponseWriter, r *dns
 		// itself register cannot delete it directly; it can only reach that
 		// data by deleting the record's actual parent, which cascades.
 		if len(updateKeyRRs) == 0 && len(updateOtherRRs) == 0 {
-			msg := h.makeErrorResponse(r, dns.RcodeFormatError,
+			msg := makeErrorResponse(r, dns.RcodeFormatError,
 				"KEY-LEASE=0 and LEASE=0 requires at least one KEY RR or one non-KEY RR")
 			return NewErrorResult(msg, "invalid delete request", fmt.Errorf("no records present for delete"))
 		}
@@ -449,30 +444,30 @@ func (h *UpdateHandler) Handle(ctx context.Context, w dns.ResponseWriter, r *dns
 
 		signingKey, effectiveUpstreamZone, err := h.resolveUpstreamSigningContext(ctx)
 		if err != nil {
-			msg := h.makeErrorResponse(r, dns.RcodeServerFailure, err.Error())
+			msg := makeErrorResponse(r, dns.RcodeServerFailure, err.Error())
 			return NewErrorResult(msg, err.Error(), err)
 		}
 
 		deleteMsg, err := h.constructUpstreamDeleteForKeysAndRecords(keysToDelete, recordsToDelete, signingKey, effectiveUpstreamZone)
 		if err != nil {
-			msg := h.makeErrorResponse(r, dns.RcodeServerFailure, fmt.Sprintf("upstream delete construction failed: %v", err))
+			msg := makeErrorResponse(r, dns.RcodeServerFailure, fmt.Sprintf("upstream delete construction failed: %v", err))
 			return NewErrorResult(msg, "upstream delete construction failed", err)
 		}
 		if h.upstreamCoordinator == nil {
-			msg := h.makeErrorResponse(r, dns.RcodeServerFailure, "upstream coordinator not configured")
+			msg := makeErrorResponse(r, dns.RcodeServerFailure, "upstream coordinator not configured")
 			return NewErrorResult(msg, "upstream coordinator not configured", fmt.Errorf("upstream coordinator is nil"))
 		}
 		upstreamResp, err := h.upstreamCoordinator.SendUpdate(ctx, effectiveUpstreamZone, deleteMsg)
 		if err != nil {
-			msg := h.makeErrorResponse(r, dns.RcodeServerFailure, fmt.Sprintf("upstream delete failed: %v", err))
+			msg := makeErrorResponse(r, dns.RcodeServerFailure, fmt.Sprintf("upstream delete failed: %v", err))
 			return NewErrorResult(msg, fmt.Sprintf("upstream delete failed: %v", err), err)
 		}
 		if upstreamResp == nil {
-			msg := h.makeErrorResponse(r, dns.RcodeServerFailure, "upstream delete returned nil response")
+			msg := makeErrorResponse(r, dns.RcodeServerFailure, "upstream delete returned nil response")
 			return NewErrorResult(msg, "upstream delete returned nil response", fmt.Errorf("nil upstream response"))
 		}
 		if upstreamResp.Rcode != dns.RcodeSuccess {
-			msg := h.makeErrorResponse(r, dns.RcodeServerFailure,
+			msg := makeErrorResponse(r, dns.RcodeServerFailure,
 				fmt.Sprintf("upstream rejected delete: rcode=%d (%s)", upstreamResp.Rcode, dns.RcodeToString[upstreamResp.Rcode]))
 			return NewErrorResult(msg,
 				fmt.Sprintf("upstream rejected delete: rcode=%d (%s)", upstreamResp.Rcode, dns.RcodeToString[upstreamResp.Rcode]), nil)
@@ -528,7 +523,7 @@ func (h *UpdateHandler) Handle(ctx context.Context, w dns.ResponseWriter, r *dns
 	} else if keyLeaseDuration != 0 && leaseDuration == 0 {
 		// Case D: KEY-only registration/refresh with optional non-KEY deletes.
 		if len(updateKeyRRs) == 0 {
-			msg := h.makeErrorResponse(r, dns.RcodeFormatError,
+			msg := makeErrorResponse(r, dns.RcodeFormatError,
 				"KEY-LEASE!=0 and LEASE=0 requires at least one KEY RR")
 			return NewErrorResult(msg, "invalid key-only lease request", fmt.Errorf("missing required KEY record"))
 		}
@@ -569,22 +564,22 @@ func (h *UpdateHandler) Handle(ctx context.Context, w dns.ResponseWriter, r *dns
 				// (protocol.md item 6 applies to every case, not just Case A).
 				exists, err := h.authoritativeHasRR(ctx, zone, keyRR)
 				if err != nil {
-					msg := h.makeErrorResponse(r, dns.RcodeServerFailure, fmt.Sprintf("authoritative duplicate check failed: %v", err))
+					msg := makeErrorResponse(r, dns.RcodeServerFailure, fmt.Sprintf("authoritative duplicate check failed: %v", err))
 					return NewErrorResult(msg, "authoritative duplicate check failed", err)
 				}
 				if exists {
-					msg := h.makeErrorResponse(r, dns.RcodeRefused, fmt.Sprintf("duplicate registration rejected: authoritative RR already exists for %s", keyRR.String()))
+					msg := makeErrorResponse(r, dns.RcodeRefused, fmt.Sprintf("duplicate registration rejected: authoritative RR already exists for %s", keyRR.String()))
 					return NewErrorResult(msg, "duplicate registration rejected", fmt.Errorf("authoritative RR already exists for %s", keyRR.String()))
 				}
 				if !h.signerAuthorizedForNewRegistration(signerManaged, signerInUpdate, signerSource) {
-					msg := h.makeErrorResponse(r, dns.RcodeRefused,
+					msg := makeErrorResponse(r, dns.RcodeRefused,
 						"signing key must be managed, present in the Update section, or (if allow_online_key_registration is enabled) an authorized online signer, to register a new KEY RR")
 					return NewErrorResult(msg, "signer not authorized for new registration",
 						fmt.Errorf("signer %q is neither lease-managed, present in the Update section, nor an authorized online signer", sigRR.SignerName))
 				}
 			} else {
 				if err := h.authorizeKeyRefresh(keyRR, signerID); err != nil {
-					msg := h.makeErrorResponse(r, dns.RcodeRefused, err.Error())
+					msg := makeErrorResponse(r, dns.RcodeRefused, err.Error())
 					return NewErrorResult(msg, err.Error(), err)
 				}
 				// Key is managed locally but missing at the DNS server: put it
@@ -592,7 +587,7 @@ func (h *UpdateHandler) Handle(ctx context.Context, w dns.ResponseWriter, r *dns
 				// the full newly-requested duration.
 				lease, _, err := h.effectiveRefreshKeyLease(ctx, zone, keyRR, existingKey, keyLeaseDuration)
 				if err != nil {
-					msg := h.makeErrorResponse(r, dns.RcodeServerFailure, fmt.Sprintf("authoritative key lookup failed: %v", err))
+					msg := makeErrorResponse(r, dns.RcodeServerFailure, fmt.Sprintf("authoritative key lookup failed: %v", err))
 					return NewErrorResult(msg, "authoritative key lookup failed", err)
 				}
 				effectiveKeyLease = lease
@@ -653,14 +648,14 @@ func (h *UpdateHandler) Handle(ctx context.Context, w dns.ResponseWriter, r *dns
 	if len(upstreamKeys) > 0 || len(acceptedRecordsForUpstream) > 0 || len(recordsToDeleteForUpstream) > 0 {
 		signingKey, effectiveUpstreamZone, err := h.resolveUpstreamSigningContext(ctx)
 		if err != nil {
-			msg := h.makeErrorResponse(r, dns.RcodeServerFailure, err.Error())
+			msg := makeErrorResponse(r, dns.RcodeServerFailure, err.Error())
 			return NewErrorResult(msg, err.Error(), err)
 		}
 
 		upstreamUpdate, err := h.constructUpstreamUpdate(upstreamKeys, acceptedRecordsForUpstream, recordsToDeleteForUpstream, signingKey, effectiveUpstreamZone)
 		if err != nil {
 			h.logger.Debugf("Failed to construct upstream UPDATE: %v", err)
-			msg := h.makeErrorResponse(r, dns.RcodeServerFailure, fmt.Sprintf("upstream construction failed: %v", err))
+			msg := makeErrorResponse(r, dns.RcodeServerFailure, fmt.Sprintf("upstream construction failed: %v", err))
 			return NewErrorResult(msg, fmt.Sprintf("upstream construction failed: %v", err), err)
 		}
 		if len(upstreamUpdate.Ns) == 0 {
@@ -670,7 +665,7 @@ func (h *UpdateHandler) Handle(ctx context.Context, w dns.ResponseWriter, r *dns
 
 		// Send UPDATE to upstream and fail-closed if upstream does not accept it.
 		if h.upstreamCoordinator == nil {
-			msg := h.makeErrorResponse(r, dns.RcodeServerFailure, "upstream coordinator not configured")
+			msg := makeErrorResponse(r, dns.RcodeServerFailure, "upstream coordinator not configured")
 			return NewErrorResult(msg, "upstream coordinator not configured", fmt.Errorf("upstream coordinator is nil"))
 		}
 
@@ -680,13 +675,13 @@ func (h *UpdateHandler) Handle(ctx context.Context, w dns.ResponseWriter, r *dns
 		if err != nil {
 			h.logger.Debugf("Upstream UPDATE transport/processing error for zone=%s keys=%d: %v",
 				h.upstreamZone, len(upstreamKeys), err)
-			msg := h.makeErrorResponse(r, dns.RcodeServerFailure, fmt.Sprintf("upstream update failed: %v", err))
+			msg := makeErrorResponse(r, dns.RcodeServerFailure, fmt.Sprintf("upstream update failed: %v", err))
 			return NewErrorResult(msg, fmt.Sprintf("upstream update failed: %v", err), err)
 		}
 		if upstreamResp == nil {
 			h.logger.Debugf("Upstream UPDATE returned nil response for zone=%s keys=%d",
 				h.upstreamZone, len(upstreamKeys))
-			msg := h.makeErrorResponse(r, dns.RcodeServerFailure, "upstream update returned nil response")
+			msg := makeErrorResponse(r, dns.RcodeServerFailure, "upstream update returned nil response")
 			return NewErrorResult(msg, "upstream update returned nil response", fmt.Errorf("nil upstream response"))
 		}
 
@@ -694,7 +689,7 @@ func (h *UpdateHandler) Handle(ctx context.Context, w dns.ResponseWriter, r *dns
 			upstreamResp.Rcode, dns.RcodeToString[upstreamResp.Rcode],
 			len(upstreamResp.Answer), len(upstreamResp.Ns), len(upstreamResp.Extra))
 		if upstreamResp.Rcode != dns.RcodeSuccess {
-			msg := h.makeErrorResponse(r, dns.RcodeServerFailure,
+			msg := makeErrorResponse(r, dns.RcodeServerFailure,
 				fmt.Sprintf("upstream rejected update: rcode=%d (%s)",
 					upstreamResp.Rcode, dns.RcodeToString[upstreamResp.Rcode]))
 			return NewErrorResult(msg,
@@ -706,7 +701,7 @@ func (h *UpdateHandler) Handle(ctx context.Context, w dns.ResponseWriter, r *dns
 	for _, mutation := range pendingMutations {
 		if err := mutation.apply(); err != nil {
 			h.logger.Debugf("post-upstream lease-store update failed for %s: %v", mutation.keyName, err)
-			msg := h.makeErrorResponse(r, dns.RcodeServerFailure, fmt.Sprintf("lease-store update failed for %s: %v", mutation.keyName, err))
+			msg := makeErrorResponse(r, dns.RcodeServerFailure, fmt.Sprintf("lease-store update failed for %s: %v", mutation.keyName, err))
 			return NewErrorResult(msg, fmt.Sprintf("lease-store update failed for %s", mutation.keyName), err)
 		}
 	}
@@ -744,22 +739,6 @@ func (h *UpdateHandler) buildSuccessResponse(r *dns.Msg, zone string, notes []st
 		h.logger.Debugf("failed to encode response lease option: %v", err)
 	}
 	resp.Extra = append(resp.Extra, opt)
-
-	return resp
-}
-
-func (h *UpdateHandler) makeErrorResponse(req *dns.Msg, rcode uint16, msg string) *dns.Msg {
-	resp := &dns.Msg{
-		MsgHeader: req.MsgHeader,
-		Question:  req.Question,
-	}
-
-	resp.Response = true
-	resp.Rcode = rcode
-
-	// Note: we don't include detailed error messages in the response.
-	// Errors are logged locally but responses use standard DNS rcodes.
-	// In future versions, we can add extended error EDNS options.
 
 	return resp
 }

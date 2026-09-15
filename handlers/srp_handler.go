@@ -33,6 +33,14 @@ type SRPHandler struct {
 	leaseManager LeaseManager
 	coordinator  srpCoordinator
 
+	// upstreamKeyRecord is the proxy's own SIG(0) signing key for upstreamZone, resolved
+	// once by Setup and cached for the handler's lifetime (see resolveUpstreamSigningContext)
+	// rather than re-read from keystoreDir on every request and every lease-expiry tick.
+	// upstreamKeyZone is the zone it was actually found at (upstreamZone itself, or a
+	// parent -- FindAuthorizedProxyKey walks up), cached alongside it purely for logging.
+	upstreamKeyRecord *keyrec.LoadedKey
+	upstreamKeyZone   string
+
 	allowUDP                  bool // plan S7: TCP required unless the zone is flagged allow_udp
 	refuseOnForeignData       bool // plan S3.3 table; RFC 9665 S3.3.3. Default true.
 	rewriteDefaultServiceARPA bool // plan S4.3 step 6 / D5: accept default.service.arpa. as an alias for upstreamZone
@@ -125,18 +133,33 @@ func rewriteDefaultServiceARPA(msg *dns.Msg, realZone string) {
 
 // rewriteZoneSuffix replaces a trailing default.service.arpa. (case-insensitive) on name
 // with realZone, leaving every label before it untouched; a name that doesn't carry that
-// suffix passes through unchanged (defensive -- every name reaching this function should
-// already carry it, since rewriteDefaultServiceARPA is only called once zoneEnabled has
-// confirmed the request's own Zone Section is exactly default.service.arpa.).
+// suffix -- or whose suffix match doesn't fall on a label boundary, e.g.
+// "evildefault.service.arpa." (a plain byte-suffix match on the trailing bytes, but not
+// actually a subdomain of default.service.arpa. -- its first label is "evildefault", not
+// "default") -- passes through unchanged rather than being corrupted by concatenating
+// realZone onto a leftover partial label with no separating dot. Defensive: every name
+// reaching this function should already legitimately carry the suffix, since
+// rewriteDefaultServiceARPA is only called once zoneEnabled has confirmed the request's own
+// Zone Section is exactly default.service.arpa. -- but a record's owner/target name is
+// client-controlled data, not re-derived from the (trusted) Zone Section, so it must be
+// checked on its own rather than assumed safe by association.
 func rewriteZoneSuffix(name, realZone string) string {
 	if len(name) < len(defaultServiceARPA) {
 		return name
 	}
-	tail := name[len(name)-len(defaultServiceARPA):]
+	cut := len(name) - len(defaultServiceARPA)
+	tail := name[cut:]
 	if !strings.EqualFold(tail, defaultServiceARPA) {
 		return name
 	}
-	return name[:len(name)-len(defaultServiceARPA)] + realZone
+	if cut > 0 && name[cut-1] != '.' {
+		// The match doesn't start on a label boundary (no preceding dot, and this
+		// isn't an exact match cut==0 either) -- e.g. "evildefault.service.arpa." only
+		// matches "default.service.arpa." on its trailing bytes, not as a real
+		// subdomain.
+		return name
+	}
+	return name[:cut] + realZone
 }
 
 // Handle implements the plan's S4.3 ten-step happy path. Every early-return before step 7
@@ -168,13 +191,13 @@ func (h *SRPHandler) Handle(ctx context.Context, w dns.ResponseWriter, r *dns.Ms
 	h.logger.Infof("SRP UPDATE for zone %s: host=%s instances=%d discovery=%d",
 		zone, cu.Host.Name, len(cu.Instances), len(cu.Discovery))
 
-	// Step 2: structural validation (Validate wraps Classify; re-running it is cheap --
-	// pure in-memory work, no I/O -- and keeps Handle from having to thread two
-	// differently-shaped results through the rest of the function).
-	cu, err = srp.Validate(r)
-	if err != nil {
+	// Step 2: structural validation. ValidateClassified runs every check Validate does
+	// beyond Classify itself, reusing step 1's own cu rather than re-classifying the
+	// identical message a second time (a real, measurable cost per request -- Classify
+	// walks the whole Update section, not a cheap length check).
+	if err := srp.ValidateClassified(r, cu); err != nil {
 		h.logger.Debugf("SRP handler: structural validation failed: %v", err)
-		msg := h.makeErrorResponse(r, dns.RcodeRefused, err.Error())
+		msg := makeErrorResponse(r, dns.RcodeRefused, err.Error())
 		return NewErrorResult(msg, err.Error(), err)
 	}
 
@@ -184,7 +207,7 @@ func (h *SRPHandler) Handle(ctx context.Context, w dns.ResponseWriter, r *dns.Ms
 	if !h.allowUDP {
 		if _, isUDP := w.RemoteAddr().(*net.UDPAddr); isUDP {
 			h.logger.Debugf("SRP handler: rejecting UDP request for zone %s (allow_udp not set)", zone)
-			msg := h.makeErrorResponse(r, dns.RcodeRefused, "TCP required for SRP on this zone")
+			msg := makeErrorResponse(r, dns.RcodeRefused, "TCP required for SRP on this zone")
 			return NewErrorResult(msg, "TCP required, got UDP", fmt.Errorf("UDP rejected: allow_udp not set for zone %s", zone))
 		}
 	}
@@ -199,17 +222,17 @@ func (h *SRPHandler) Handle(ctx context.Context, w dns.ResponseWriter, r *dns.Ms
 	// before FCFS reads names that need to already be in their final (rewritten) form.
 	sigRR, err := extractSig0(r)
 	if err != nil {
-		msg := h.makeErrorResponse(r, dns.RcodeRefused, "missing SIG(0)")
+		msg := makeErrorResponse(r, dns.RcodeRefused, "missing SIG(0)")
 		return NewErrorResult(msg, err.Error(), err)
 	}
 	if canonicalName(sigRR.SignerName) != canonicalName(cu.Host.Name) {
 		err := fmt.Errorf("SIG(0) signer %q does not match Host Description name %q", sigRR.SignerName, cu.Host.Name)
-		msg := h.makeErrorResponse(r, dns.RcodeRefused, "signer does not match host")
+		msg := makeErrorResponse(r, dns.RcodeRefused, "signer does not match host")
 		return NewErrorResult(msg, err.Error(), err)
 	}
 	if err := sig0.VerifySignature(r, cu.Host.Key); err != nil {
 		h.logger.Infof("SRP handler: SIG(0) verification failed for %s: %v", cu.Host.Name, err)
-		msg := h.makeErrorResponse(r, dns.RcodeRefused, "SIG(0) verification failed")
+		msg := makeErrorResponse(r, dns.RcodeRefused, "SIG(0) verification failed")
 		return NewErrorResult(msg, err.Error(), err)
 	}
 
@@ -240,7 +263,7 @@ func (h *SRPHandler) Handle(ctx context.Context, w dns.ResponseWriter, r *dns.Ms
 			// error rather than a client one -- but fail closed rather than proceed
 			// with a stale cu.
 			h.logger.Errorf("SRP handler: re-validation after default.service.arpa. rewrite failed: %v", err)
-			msg := h.makeErrorResponse(r, dns.RcodeServerFailure, "internal error")
+			msg := makeErrorResponse(r, dns.RcodeServerFailure, "internal error")
 			return NewErrorResult(msg, err.Error(), err)
 		}
 	}
@@ -249,24 +272,35 @@ func (h *SRPHandler) Handle(ctx context.Context, w dns.ResponseWriter, r *dns.Ms
 	// only (srp.Names) -- SRV/TXT/PTR owner names are never independently checked
 	// (plan S4.4/S4.5: authorized transitively through their instance). cu's names are
 	// under h.upstreamZone unconditionally by this point (step 5 above).
+	//
+	// Evaluate's own check here and the actual forward in step 7 below are two separate
+	// round trips with a window between them -- collecting each name's prerequisite RR
+	// (nil for most; see Evaluate's doc comment) and attaching them to the step-7
+	// UPDATE closes that window by having the authoritative server itself re-check, and
+	// enforce, the same FCFS condition atomically at write time, rather than trusting
+	// how long ago this loop's own query ran.
 	view := leaseStoreView{store: h.leaseManager}
+	prereqs := make([]dns.RR, 0, len(cu.Instances)+1)
 	for _, name := range srp.Names(cu) {
 		key := srp.KeyFor(cu, name)
-		result, err := srp.Evaluate(ctx, view, h.coordinator.QueryKeyAtName, h.upstreamZone, name, key, h.refuseOnForeignData)
+		result, prereq, err := srp.Evaluate(ctx, view, h.coordinator.QueryKeyAtName, h.upstreamZone, name, key, h.refuseOnForeignData)
 		if err != nil {
 			h.logger.Errorf("SRP handler: FCFS evaluation failed for %s: %v", name, err)
-			msg := h.makeErrorResponse(r, dns.RcodeServerFailure, "FCFS evaluation failed")
+			msg := makeErrorResponse(r, dns.RcodeServerFailure, "FCFS evaluation failed")
 			return NewErrorResult(msg, err.Error(), err)
 		}
 		switch result {
 		case srp.FCFSConflict:
 			h.logger.Infof("SRP handler: FCFS conflict for %s -- name held by a different key", name)
-			msg := h.makeErrorResponse(r, dns.RcodeYXDomain, "name held by a different key")
+			msg := makeErrorResponse(r, dns.RcodeYXDomain, "name held by a different key")
 			return NewErrorResult(msg, fmt.Sprintf("FCFS conflict for %s", name), fmt.Errorf("YXDOMAIN"))
 		case srp.FCFSForeignData:
 			h.logger.Infof("SRP handler: FCFS refused for %s -- foreign data present, no KEY", name)
-			msg := h.makeErrorResponse(r, dns.RcodeRefused, "name occupied by non-SRP data")
+			msg := makeErrorResponse(r, dns.RcodeRefused, "name occupied by non-SRP data")
 			return NewErrorResult(msg, fmt.Sprintf("foreign data at %s", name), fmt.Errorf("REFUSED"))
+		}
+		if prereq != nil {
+			prereqs = append(prereqs, prereq)
 		}
 	}
 
@@ -288,21 +322,21 @@ func (h *SRPHandler) Handle(ctx context.Context, w dns.ResponseWriter, r *dns.Ms
 	signingKey, effectiveZone, err := h.resolveUpstreamSigningContext(ctx)
 	if err != nil {
 		h.logger.Errorf("SRP handler: failed to resolve upstream signing context: %v", err)
-		msg := h.makeErrorResponse(r, dns.RcodeServerFailure, "upstream signing key resolution failed")
+		msg := makeErrorResponse(r, dns.RcodeServerFailure, "upstream signing key resolution failed")
 		return NewErrorResult(msg, err.Error(), err)
 	}
 
-	upstreamMsg, err := updatecore.BuildAndSign(effectiveZone, forwardRecords, signingKey)
+	upstreamMsg, err := updatecore.BuildAndSign(effectiveZone, prereqs, forwardRecords, signingKey)
 	if err != nil {
 		h.logger.Errorf("SRP handler: failed to build upstream UPDATE: %v", err)
-		msg := h.makeErrorResponse(r, dns.RcodeServerFailure, "failed to build upstream UPDATE")
+		msg := makeErrorResponse(r, dns.RcodeServerFailure, "failed to build upstream UPDATE")
 		return NewErrorResult(msg, err.Error(), err)
 	}
 
 	upstreamResp, err := h.coordinator.SendUpdate(ctx, effectiveZone, upstreamMsg)
 	if err != nil {
 		h.logger.Errorf("SRP handler: upstream UPDATE failed for zone %s: %v", effectiveZone, err)
-		msg := h.makeErrorResponse(r, dns.RcodeServerFailure, "upstream UPDATE failed")
+		msg := makeErrorResponse(r, dns.RcodeServerFailure, "upstream UPDATE failed")
 		return NewErrorResult(msg, err.Error(), err)
 	}
 	if upstreamResp == nil || upstreamResp.Rcode != dns.RcodeSuccess {
@@ -311,7 +345,17 @@ func (h *SRPHandler) Handle(ctx context.Context, w dns.ResponseWriter, r *dns.Ms
 			rcodeDesc = fmt.Sprintf("rcode=%d", upstreamResp.Rcode)
 		}
 		h.logger.Errorf("SRP handler: upstream UPDATE rejected for zone %s: %s", effectiveZone, rcodeDesc)
-		msg := h.makeErrorResponse(r, dns.RcodeServerFailure, "upstream UPDATE rejected")
+		if upstreamResp != nil && (upstreamResp.Rcode == dns.RcodeYXRrset || upstreamResp.Rcode == dns.RcodeNXRrset) {
+			// One of step 6's FCFS prerequisites, satisfied when this handler checked
+			// it, no longer held by the time the authoritative server itself evaluated
+			// it: a concurrent registration for one of these names landed in between.
+			// This is a genuine FCFS conflict caught atomically by the authoritative
+			// server rather than this handler's own (unavoidably TOCTOU) pre-forward
+			// check -- report it exactly like the pre-forward conflict case above.
+			msg := makeErrorResponse(r, dns.RcodeYXDomain, "name held by a different key")
+			return NewErrorResult(msg, fmt.Sprintf("FCFS conflict detected atomically by upstream prerequisite: %s", rcodeDesc), fmt.Errorf("YXDOMAIN"))
+		}
+		msg := makeErrorResponse(r, dns.RcodeServerFailure, "upstream UPDATE rejected")
 		return NewErrorResult(msg, fmt.Sprintf("upstream %s", rcodeDesc), fmt.Errorf("upstream rejected the update"))
 	}
 
@@ -327,7 +371,7 @@ func (h *SRPHandler) Handle(ctx context.Context, w dns.ResponseWriter, r *dns.Ms
 		// a client one, but fail closed rather than mutate the store with zero
 		// values.
 		h.logger.Errorf("SRP handler: lease option re-parse failed after upstream success: %v", err)
-		msg := h.makeErrorResponse(r, dns.RcodeServerFailure, "internal error")
+		msg := makeErrorResponse(r, dns.RcodeServerFailure, "internal error")
 		return NewErrorResult(msg, err.Error(), err)
 	}
 	lease, keyLease = h.clampLease(lease, keyLease)
@@ -412,7 +456,8 @@ func (h *SRPHandler) applyLocalMutations(ctx context.Context, cu *srp.Classified
 	}
 
 	hostNodeKey := leasepkg.NodeKey(cu.Host.Key)
-	note(h.registerOrRenew(ctx, "", cu.Host.Key, keyLease, upstreamZone))
+	hostErr := h.registerOrRenew(ctx, "", cu.Host.Key, keyLease, upstreamZone)
+	note(hostErr)
 	touched = append(touched, hostNodeKey)
 
 	h.leaseManager.RemoveNonKEYRecords(hostNodeKey)
@@ -420,10 +465,25 @@ func (h *SRPHandler) applyLocalMutations(ctx context.Context, cu *srp.Classified
 		note(h.leaseManager.UpsertNonKEYRecords(hostNodeKey, cu.Host.Addresses, lease, upstreamZone))
 	}
 
+	// If the host's own node failed to register/renew locally (upstream already
+	// succeeded regardless -- see this function's own doc comment), parenting instances
+	// under hostNodeKey below would give them a ParentKeyName pointing at a node that
+	// doesn't actually exist in the store: unreachable via the host's subtree for
+	// cascade-expiry/deletion, and never itself corrected since nothing else revisits
+	// ParentKeyName after registration. Register them as their own roots instead --
+	// still tracked, still get their own expiry timer -- accepting the lesser cost of
+	// losing cascade-with-host semantics for this cycle, corrected on the next
+	// successful refresh (S3.2's "restate everything" already re-runs this whole
+	// function).
+	instanceParentKey := hostNodeKey
+	if hostErr != nil {
+		instanceParentKey = ""
+	}
+
 	for _, inst := range cu.Instances {
 		key := srp.KeyFor(cu, inst.Name)
 		instNodeKey := leasepkg.NodeKey(key)
-		note(h.registerOrRenew(ctx, hostNodeKey, key, keyLease, upstreamZone))
+		note(h.registerOrRenew(ctx, instanceParentKey, key, keyLease, upstreamZone))
 		touched = append(touched, instNodeKey)
 
 		if inst.SRV == nil {
@@ -470,14 +530,18 @@ func (h *SRPHandler) registerOrRenew(ctx context.Context, parentNodeKey string, 
 // resolveUpstreamSigningContext resolves the proxy's own signing key and the effective
 // (post-SOA-resolution, or static-override) upstream zone -- the SRP-handler equivalent
 // of UpdateHandler.resolveUpstreamSigningContext, written separately rather than shared
-// because that one is a method on *UpdateHandler; both are thin now that the actual
-// resolution logic lives in pkg/updatecore.
+// because that one is a method on *UpdateHandler and type-asserts down to
+// *updatecore.Coordinator for its zone-resolution fallback, where srpCoordinator declares
+// ResolveAuthoritativeZone directly; both are thin now that the actual resolution logic
+// lives in pkg/updatecore. The signing key itself is Setup's own upstreamKeyRecord, cached
+// once there rather than re-read from keystoreDir on every call -- see that field's doc
+// comment.
 func (h *SRPHandler) resolveUpstreamSigningContext(ctx context.Context) (*keyrec.LoadedKey, string, error) {
-	signingKey, matchedKeyZone, err := updatecore.FindAuthorizedProxyKey(h.keystoreDir, h.upstreamZone, h.logger)
-	if err != nil {
-		return nil, "", fmt.Errorf("upstream signing key resolution failed: %w", err)
+	if h.upstreamKeyRecord == nil {
+		return nil, "", fmt.Errorf("upstream signing key resolution failed: no key cached (Setup did not run or did not succeed)")
 	}
-	h.logger.Debugf("Resolved proxy authorization key for upstream zone %s from key zone %s", h.upstreamZone, matchedKeyZone)
+	signingKey := h.upstreamKeyRecord
+	h.logger.Debugf("Using cached proxy authorization key for upstream zone %s (found at key zone %s)", h.upstreamZone, h.upstreamKeyZone)
 
 	effectiveZone, err := h.coordinator.ResolveAuthoritativeZone(ctx, h.upstreamZone)
 	if err != nil {
@@ -513,13 +577,6 @@ func (h *SRPHandler) parseLease(msg *dns.Msg) (uint32, uint32, error) {
 func (h *SRPHandler) clampLease(lease, keyLease uint32) (uint32, uint32) {
 	return clampTTL(lease, h.LeasePolicy.MinRRLease, h.LeasePolicy.MaxRRLease),
 		clampTTL(keyLease, h.LeasePolicy.MinKeyLease, h.LeasePolicy.MaxKeyLease)
-}
-
-func (h *SRPHandler) makeErrorResponse(req *dns.Msg, rcode uint16, _ string) *dns.Msg {
-	resp := &dns.Msg{MsgHeader: req.MsgHeader, Question: req.Question}
-	resp.Response = true
-	resp.Rcode = rcode
-	return resp
 }
 
 func (h *SRPHandler) buildSuccessResponse(r *dns.Msg, lease, keyLease uint32) *dns.Msg {
@@ -623,7 +680,7 @@ func (h *SRPHandler) processExpiredNode(ctx context.Context, nodeKey string) {
 		h.logger.Errorf("SRP handler: expiry of %s: failed to resolve signing context: %v", nodeKey, err)
 		return
 	}
-	upstreamMsg, err := updatecore.BuildAndSign(effectiveZone, deletes, signingKey)
+	upstreamMsg, err := updatecore.BuildAndSign(effectiveZone, nil, deletes, signingKey)
 	if err != nil {
 		h.logger.Errorf("SRP handler: expiry of %s: failed to build upstream delete: %v", nodeKey, err)
 		return

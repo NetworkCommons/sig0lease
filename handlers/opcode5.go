@@ -62,8 +62,14 @@ type UpstreamCoordinator interface {
 //   - Future SRP support
 type UpdateHandler struct {
 	BaseHandler
-	upstreamZone        string            // Upstream authoritative zone (e.g., "dev.zenr.io.")
-	upstreamKeyRecord   *keyrec.LoadedKey // Key for signing upstream UPDATE (Upstream key)
+	upstreamZone      string            // Upstream authoritative zone (e.g., "dev.zenr.io.")
+	upstreamKeyRecord *keyrec.LoadedKey // Key for signing upstream UPDATE (Upstream key)
+	// upstreamKeyZone is the zone upstreamKeyRecord was actually found at (upstreamZone
+	// itself, or a parent of it -- FindAuthorizedProxyKey walks up). Cached alongside
+	// upstreamKeyRecord purely for the debug log resolveUpstreamSigningContext used to
+	// emit on every call before the key itself was cached at Setup() and reused for the
+	// life of the handler instead of being re-read from disk on every request/expiry.
+	upstreamKeyZone     string
 	leaseManager        LeaseManager
 	upstreamCoordinator UpstreamCoordinator
 	keystoreDir         string

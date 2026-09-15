@@ -21,9 +21,12 @@ func TestRefreshDelay_WithinRFC9664S52Bounds(t *testing.T) {
 }
 
 func TestRefreshDelay_ZeroLease(t *testing.T) {
+	// A 0 (or near-0) granted lease must not drive Client.Run into a zero-delay
+	// re-registration busy-loop: refreshDelay floors at minRefreshDelay instead of
+	// returning 0.
 	rng := rand.New(rand.NewSource(1))
-	if got := refreshDelay(rng, 0); got != 0 {
-		t.Fatalf("refreshDelay(0) = %v, want 0", got)
+	if got := refreshDelay(rng, 0); got != minRefreshDelay {
+		t.Fatalf("refreshDelay(0) = %v, want %v (the floor)", got, minRefreshDelay)
 	}
 }
 

@@ -83,50 +83,77 @@ func (r FCFSResult) String() string {
 // it is the source of truth for what this proxy already manages (see
 // handlers.filterDuplicateRegistrations's doc comment for the base handler's identical
 // reasoning) -- a live query only runs for a name the store has no opinion on.
-func Evaluate(ctx context.Context, view StoreView, query AuthoritativeKeyQuery, zoneHint, name string, updateKey *dns.KEY, refuseOnForeignData bool) (FCFSResult, error) {
+//
+// The second return value is an RFC 2136 prerequisite RR the caller should attach to the
+// upstream UPDATE it forwards for an FCFSProceed name (nil for a Conflict/ForeignData
+// result, and also nil for a store-trusted refresh -- see below), or nil if none is needed.
+// This closes the gap between this function's own check and the caller's later, separate
+// upstream write: without it, two concurrent first-time registrations of the same
+// never-before-seen name can both observe AuthNXDomain here (neither has forwarded its own
+// UPDATE yet) and both go on to be accepted upstream, breaking the FCFS guarantee this
+// function exists to provide. Attaching a "Name is not in use" prerequisite (RFC 2136
+// S2.4.4) to the forwarded UPDATE makes the authoritative server itself re-check, and
+// enforce, the same condition atomically at write time -- which a second, separate
+// pre-forward query from this function can never fully guarantee no matter how recently it
+// ran. Deliberately narrow in scope: only the AuthNXDomain case gets a prerequisite (the
+// one the concurrent-first-registration race above actually needs); a store-trusted
+// "already ours" refresh gets none, preserving this store's pre-existing behavior of
+// silently re-establishing a record that disappeared from authoritative DNS while still
+// locally unexpired.
+func Evaluate(ctx context.Context, view StoreView, query AuthoritativeKeyQuery, zoneHint, name string, updateKey *dns.KEY, refuseOnForeignData bool) (FCFSResult, dns.RR, error) {
 	if view == nil {
-		return 0, fmt.Errorf("srp: FCFS Evaluate called with a nil StoreView")
+		return 0, nil, fmt.Errorf("srp: FCFS Evaluate called with a nil StoreView")
 	}
 	if updateKey == nil {
-		return 0, fmt.Errorf("srp: FCFS Evaluate called with a nil updateKey")
+		return 0, nil, fmt.Errorf("srp: FCFS Evaluate called with a nil updateKey")
 	}
 
 	if key, ok := view.KeyAtName(name); ok {
 		if keysIdentical(key, updateKey) {
-			return FCFSProceed, nil
+			return FCFSProceed, nil, nil
 		}
-		return FCFSConflict, nil
+		return FCFSConflict, nil, nil
 	}
 
 	if query == nil {
-		return 0, fmt.Errorf("srp: FCFS Evaluate: no local record for %s and no AuthoritativeKeyQuery provided", name)
+		return 0, nil, fmt.Errorf("srp: FCFS Evaluate: no local record for %s and no AuthoritativeKeyQuery provided", name)
 	}
 	state, keys, err := query(ctx, zoneHint, name)
 	if err != nil {
-		return 0, fmt.Errorf("srp: FCFS authoritative query for %s: %w", name, err)
+		return 0, nil, fmt.Errorf("srp: FCFS authoritative query for %s: %w", name, err)
 	}
 
 	switch state {
 	case AuthNXDomain:
-		return FCFSProceed, nil
+		return FCFSProceed, nameNotInUsePrerequisite(name), nil
 
 	case AuthNoKey:
 		if refuseOnForeignData {
-			return FCFSForeignData, nil
+			return FCFSForeignData, nil, nil
 		}
-		return FCFSProceed, nil
+		return FCFSProceed, nil, nil
 
 	case AuthKeyPresent:
 		for _, k := range keys {
 			if keysIdentical(k, updateKey) {
-				return FCFSProceed, nil
+				return FCFSProceed, nil, nil
 			}
 		}
-		return FCFSConflict, nil
+		return FCFSConflict, nil, nil
 
 	default:
-		return 0, fmt.Errorf("srp: FCFS authoritative query for %s returned unknown state %d", name, state)
+		return 0, nil, fmt.Errorf("srp: FCFS authoritative query for %s returned unknown state %d", name, state)
 	}
+}
+
+// nameNotInUsePrerequisite builds an RFC 2136 S2.4.4 "Name is not in use" prerequisite RR
+// for name: TYPE=ANY, CLASS=NONE, RDLENGTH=0. dns.ANY carries no RDATA fields of its own
+// (unlike, say, dns.KEY, which always wire-encodes its flags/protocol/algorithm/public-key
+// fields even when zero-valued), so this is the one prerequisite shape this package can
+// build with confidence that it reliably wire-encodes with an empty RDATA section as RFC
+// 2136 requires -- see Evaluate's doc comment for why only the AuthNXDomain case gets one.
+func nameNotInUsePrerequisite(name string) dns.RR {
+	return &dns.ANY{Hdr: dns.Header{Name: name, Class: dns.ClassNONE, TTL: 0}}
 }
 
 // Names returns every name Evaluate must be called for to authorize cu (S3.3's "the

@@ -40,19 +40,46 @@ func Validate(msg *dns.Msg) (*ClassifiedUpdate, error) {
 		return nil, err
 	}
 
-	if err := validateLeaseOption(msg); err != nil {
-		return nil, err
-	}
-
-	if err := validateTTLConsistency(cu); err != nil {
-		return nil, err
-	}
-
-	if err := validateKeys(cu); err != nil {
+	if err := validatePostClassify(msg, cu); err != nil {
 		return nil, err
 	}
 
 	return cu, nil
+}
+
+// ValidateClassified runs every check Validate performs beyond Classify itself, against a
+// ClassifiedUpdate the caller has already computed -- for a caller that has already run
+// Classify once (e.g. handlers/srp_handler.go's Handle, which classifies in its own step 1
+// to decide relevance before Validate would otherwise redundantly classify the identical
+// message a second time in step 2). cu must be Classify(msg)'s own result for msg;
+// behavior is undefined otherwise.
+func ValidateClassified(msg *dns.Msg, cu *ClassifiedUpdate) error {
+	if msg == nil {
+		return fmt.Errorf("srp: nil message")
+	}
+	if len(msg.Question) != 1 {
+		return fmt.Errorf("srp: expected exactly one Zone Section entry, got %d", len(msg.Question))
+	}
+	if len(msg.Answer) != 0 {
+		return fmt.Errorf("srp: update contains %d prerequisite(s) -- not an SRP update", len(msg.Answer))
+	}
+	return validatePostClassify(msg, cu)
+}
+
+// validatePostClassify is every S3.3.2 check that needs a ClassifiedUpdate but not
+// Classify() itself -- shared by Validate (which just computed cu) and ValidateClassified
+// (whose caller already had one).
+func validatePostClassify(msg *dns.Msg, cu *ClassifiedUpdate) error {
+	if err := validateLeaseOption(msg); err != nil {
+		return err
+	}
+	if err := validateTTLConsistency(cu); err != nil {
+		return err
+	}
+	if err := validateKeys(cu); err != nil {
+		return err
+	}
+	return nil
 }
 
 // validateLeaseOption implements S3.3.2's "MUST include an EDNS(0) Update Lease option
@@ -76,9 +103,15 @@ func validateLeaseOption(msg *dns.Msg) error {
 // validateTTLConsistency implements S4's TTL-consistency MUST for the SRP path: reject
 // rather than normalize (contrast pkg/updatecore.NormalizeTTLs, used by the base RFC 9664
 // handler). Runs across every add RR gathered during classification -- Host Description
-// addresses and every Service Instance's SRV/TXT -- KEY adds are checked as their own
-// RRset too, even though S3.2.5.1 already requires them to be byte-identical (which
-// implies but doesn't by itself guarantee equal TTLs).
+// addresses, every Service Instance's SRV/TXT, and every Service Discovery PTR add -- KEY
+// adds are checked as their own RRset too, even though S3.2.5.1 already requires them to be
+// byte-identical (which implies but doesn't by itself guarantee equal TTLs).
+//
+// Service Discovery PTR adds matter here specifically because their owner name (a service
+// type) is shared across every instance of that type: two different instances registering
+// under the same type with different TTLs on their PTR adds would otherwise land at the
+// same PTR RRset with inconsistent TTLs and go undetected, since neither instance's own
+// SRV/TXT records share that owner name.
 func validateTTLConsistency(cu *ClassifiedUpdate) error {
 	var all []dns.RR
 	all = append(all, cu.Host.Addresses...)
@@ -94,6 +127,11 @@ func validateTTLConsistency(cu *ClassifiedUpdate) error {
 		}
 		if inst.Key != nil {
 			all = append(all, inst.Key)
+		}
+	}
+	for _, d := range cu.Discovery {
+		if d.IsAdd {
+			all = append(all, d.RR)
 		}
 	}
 	if err := updatecore.CheckConsistentTTLs(all); err != nil {

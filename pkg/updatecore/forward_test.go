@@ -43,9 +43,13 @@ func TestBuildAndSign_ProducesVerifiableMessage(t *testing.T) {
 		t.Fatalf("dns.New: %v", err)
 	}
 
-	msg, err := BuildAndSign("dev.zenr.io.", []dns.RR{del, add}, signingKey)
+	prereq := &dns.ANY{Hdr: dns.Header{Name: "myhost.dev.zenr.io.", Class: dns.ClassNONE, TTL: 0}}
+	msg, err := BuildAndSign("dev.zenr.io.", []dns.RR{prereq}, []dns.RR{del, add}, signingKey)
 	if err != nil {
 		t.Fatalf("BuildAndSign: %v", err)
+	}
+	if len(msg.Answer) != 1 {
+		t.Fatalf("expected 1 record in the Prerequisite section, got %d", len(msg.Answer))
 	}
 	if len(msg.Ns) != 2 {
 		t.Fatalf("expected 2 records in the Update section, got %d", len(msg.Ns))
@@ -70,7 +74,7 @@ func TestBuildAndSign_ProducesVerifiableMessage(t *testing.T) {
 }
 
 func TestBuildAndSign_NilSigningKey(t *testing.T) {
-	if _, err := BuildAndSign("dev.zenr.io.", nil, nil); err == nil {
+	if _, err := BuildAndSign("dev.zenr.io.", nil, nil, nil); err == nil {
 		t.Fatal("expected an error for a nil signing key")
 	}
 }

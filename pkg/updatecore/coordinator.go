@@ -230,12 +230,20 @@ func (c *Coordinator) QueryKeyAtName(ctx context.Context, zoneHint, name string)
 	}
 	req.RecursionDesired = false
 
+	// A truncated UDP answer must not be trusted as-is: an empty (or partial) Answer
+	// section on a TC=1 response would otherwise be read as AuthNoKey/AuthNXDomain --
+	// letting FCFS treat an already-owned name as free -- even though the name really
+	// does have KEY data, just more than fit in the UDP response. This fork's
+	// dns.Exchange does not retry or fall back to TCP on truncation on its own (see its
+	// own doc comment), so that fallback has to happen here, same as SendUpdate already
+	// does for a transport-level UDP failure.
 	resp, udpErr := dns.Exchange(ctx, req, "udp", soaServer)
-	if udpErr != nil {
-		resp, err = dns.Exchange(ctx, req, "tcp", soaServer)
-		if err != nil {
-			return 0, nil, fmt.Errorf("KEY query for %s failed (udp: %v, tcp: %v)", name, udpErr, err)
+	if udpErr != nil || (resp != nil && resp.Truncated) {
+		tcpResp, tcpErr := dns.Exchange(ctx, req, "tcp", soaServer)
+		if tcpErr != nil {
+			return 0, nil, fmt.Errorf("KEY query for %s failed (udp: %v, tcp: %v)", name, udpErr, tcpErr)
 		}
+		resp = tcpResp
 	}
 	if resp == nil {
 		return 0, nil, fmt.Errorf("KEY query for %s returned a nil response", name)

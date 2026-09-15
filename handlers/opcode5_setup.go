@@ -7,7 +7,6 @@ import (
 	"time"
 
 	"codeberg.org/miekg/dns"
-	leasepkg "github.com/NetworkCommons/sig0lease/pkg/lease"
 	"github.com/NetworkCommons/sig0lease/pkg/updatecore"
 )
 
@@ -125,6 +124,7 @@ func (h *UpdateHandler) Setup(cfg map[string]any) error {
 		return fmt.Errorf("failed to resolve upstream signing key for zone %s: %w", h.upstreamZone, err)
 	}
 	h.upstreamKeyRecord = upstreamKey
+	h.upstreamKeyZone = matchedZone
 	h.logger.Debugf("Loaded upstream key for configured zone %s from key zone %s: %s", h.upstreamZone, matchedZone, upstreamKey)
 
 	// Optional: exactly one of "lease_manager" (Go-embedding only) or
@@ -153,7 +153,7 @@ func (h *UpdateHandler) Setup(cfg map[string]any) error {
 		if !ok {
 			return fmt.Errorf("update handler config: \"storage\" must be a map, got %T", rawStorage)
 		}
-		lm, err := h.buildLeaseManagerFromConfig(storageCfg)
+		lm, err := buildLeaseManagerFromConfig(storageCfg, h.logger)
 		if err != nil {
 			return fmt.Errorf("update handler config: storage: %w", err)
 		}
@@ -264,52 +264,4 @@ func (h *UpdateHandler) Setup(cfg map[string]any) error {
 	h.startLeaseReconciliation(30 * time.Second)
 
 	return nil
-}
-
-// buildLeaseManagerFromConfig builds a LeaseStorage backend from the
-// handlers.update.storage config block. "memory" (or an omitted "type") is
-// the same zero-persistence in-memory store NewUpdateHandler() already
-// defaults to; "file" additionally loads/saves a human-readable JSON
-// snapshot at "path". Any unrecognized "type", or a "file" type missing
-// "path", is a hard error -- never a silent fallback to the default.
-func (h *UpdateHandler) buildLeaseManagerFromConfig(storageCfg map[string]any) (leasepkg.LeaseStorage, error) {
-	storageType := "memory"
-	if raw, ok := storageCfg["type"]; ok {
-		s, ok := raw.(string)
-		if !ok || strings.TrimSpace(s) == "" {
-			return nil, fmt.Errorf("\"type\" must be a non-empty string, got %T", raw)
-		}
-		storageType = strings.ToLower(strings.TrimSpace(s))
-	}
-
-	switch storageType {
-	case "memory":
-		return leasepkg.NewInMemoryManager(), nil
-
-	case "file":
-		path, ok := storageCfg["path"].(string)
-		if !ok || strings.TrimSpace(path) == "" {
-			return nil, fmt.Errorf("\"path\" is required when \"type\" is \"file\"")
-		}
-
-		interval := 30 * time.Second
-		if raw, ok := storageCfg["save_interval"]; ok {
-			s, ok := raw.(string)
-			if !ok {
-				return nil, fmt.Errorf("\"save_interval\" must be a duration string (e.g. \"30s\"), got %T", raw)
-			}
-			d, err := time.ParseDuration(s)
-			if err != nil {
-				return nil, fmt.Errorf("\"save_interval\" %q is not a valid duration: %w", s, err)
-			}
-			interval = d
-		}
-
-		return leasepkg.NewFileLeaseStore(path, interval, func(err error) {
-			h.logger.Errorf("%v", err)
-		})
-
-	default:
-		return nil, fmt.Errorf("unrecognized \"type\" %q (expected \"memory\" or \"file\")", storageType)
-	}
 }
