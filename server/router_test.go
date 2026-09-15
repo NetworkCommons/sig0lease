@@ -26,7 +26,7 @@ func (s *stubHandler) Shutdown() { *s.shutdownHits++ }
 
 func TestRouter_Shutdown_CallsShutdownOnEveryRegisteredHandler(t *testing.T) {
 	logger := logging.NewLogger("debug")
-	router, err := NewRouter(map[uint8]string{}, logger, nil)
+	router, err := NewRouter(map[uint8][]string{}, logger, nil)
 	if err != nil {
 		t.Fatalf("NewRouter: %v", err)
 	}

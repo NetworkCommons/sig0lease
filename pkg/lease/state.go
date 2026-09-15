@@ -119,7 +119,6 @@ type LeaseStorage interface {
 	Get(nodeKey string) *Record
 	// Delete removes the subtree rooted at the composite nodeKey.
 	Delete(nodeKey string) error
-	ListExpiring(within time.Duration) []*Record
 	ListAll() []*Record
 	SetPersistenceHook(hook func(ctx context.Context, op string, record *Record) error)
 
@@ -231,7 +230,6 @@ type InMemoryLeaseStore struct {
 	nonKeyRecords   map[string]*NonKEYRecord       // RecordKey(rr) → NonKEYRecord (non-KEY nodes)
 	nameIdx         map[string][]string            // DNS name → []NodeKey (KEY nodes only)
 	children        map[string]map[string]struct{} // node identity → set of child identities (KEY or non-KEY)
-	rootsByZone     map[string]map[string]struct{} // KEY nodes with no parent, by zone
 	persistenceHook func(ctx context.Context, op string, record *Record) error
 }
 
@@ -244,7 +242,6 @@ func NewInMemoryManager() *InMemoryLeaseStore {
 		nonKeyRecords: make(map[string]*NonKEYRecord),
 		nameIdx:       make(map[string][]string),
 		children:      make(map[string]map[string]struct{}),
-		rootsByZone:   make(map[string]map[string]struct{}),
 	}
 }
 
@@ -295,12 +292,12 @@ func (m *InMemoryLeaseStore) RegisterWithParent(ctx context.Context, parentNodeK
 	}
 
 	if existing, ok := m.leases[nodeKey]; ok {
-		m.detachNodeLocked(nodeKey, existing.ParentKeyName, existing.UpstreamZone)
+		m.detachNodeLocked(nodeKey, existing.ParentKeyName)
 	} else {
 		m.nameIdx[dnsName] = append(m.nameIdx[dnsName], nodeKey)
 	}
 	m.leases[nodeKey] = record
-	m.attachNodeLocked(nodeKey, parentNodeKey, upstreamZone)
+	m.attachNodeLocked(nodeKey, parentNodeKey)
 
 	if m.persistenceHook != nil {
 		_ = m.persistenceHook(ctx, "register", cloneRecord(record))
@@ -445,20 +442,6 @@ func (m *InMemoryLeaseStore) ListSubtreeKeys(nodeKey string) []string {
 	return all
 }
 
-func (m *InMemoryLeaseStore) ListExpiring(within time.Duration) []*Record {
-	m.mu.RLock()
-	defer m.mu.RUnlock()
-
-	var expiring []*Record
-	cutoff := time.Now().Add(within)
-	for _, record := range m.leases {
-		if !record.IsExpired() && record.ExpiresAt.Before(cutoff) {
-			expiring = append(expiring, cloneRecord(record))
-		}
-	}
-	return expiring
-}
-
 func (m *InMemoryLeaseStore) ListAll() []*Record {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
@@ -531,7 +514,7 @@ func (m *InMemoryLeaseStore) UpsertNonKEYRecords(ownerNodeKey string, records []
 				RRKey: c.id,
 			}
 			m.nonKeyRecords[c.id] = entry
-			m.attachNodeLocked(c.id, ownerNodeKey, "")
+			m.attachNodeLocked(c.id, ownerNodeKey)
 		}
 		entry.RR = c.rr.Clone()
 		entry.RRType = dns.RRToType(c.rr)
@@ -798,27 +781,19 @@ func (m *InMemoryLeaseStore) ImportSnapshot(snapshot *LeaseTreeSnapshot) error {
 	}
 
 	// Rebuild the tree/name indices from ParentKeyName now that every node
-	// is known -- children/rootsByZone/nameIdx are all derived, not persisted.
+	// is known -- children/nameIdx are all derived, not persisted.
 	newChildren := make(map[string]map[string]struct{})
-	newRootsByZone := make(map[string]map[string]struct{})
 	newNameIdx := make(map[string][]string)
 
 	for nodeID, rec := range newLeases {
 		newNameIdx[rec.KeyName] = append(newNameIdx[rec.KeyName], nodeID)
-		if rec.ParentKeyName != "" {
-			if newChildren[rec.ParentKeyName] == nil {
-				newChildren[rec.ParentKeyName] = make(map[string]struct{})
-			}
-			newChildren[rec.ParentKeyName][nodeID] = struct{}{}
+		if rec.ParentKeyName == "" {
 			continue
 		}
-		if rec.UpstreamZone == "" {
-			continue
+		if newChildren[rec.ParentKeyName] == nil {
+			newChildren[rec.ParentKeyName] = make(map[string]struct{})
 		}
-		if newRootsByZone[rec.UpstreamZone] == nil {
-			newRootsByZone[rec.UpstreamZone] = make(map[string]struct{})
-		}
-		newRootsByZone[rec.UpstreamZone][nodeID] = struct{}{}
+		newChildren[rec.ParentKeyName][nodeID] = struct{}{}
 	}
 	for nodeID, rec := range newNonKeyRecords {
 		if newChildren[rec.ParentKeyName] == nil {
@@ -833,7 +808,6 @@ func (m *InMemoryLeaseStore) ImportSnapshot(snapshot *LeaseTreeSnapshot) error {
 	m.nonKeyRecords = newNonKeyRecords
 	m.nameIdx = newNameIdx
 	m.children = newChildren
-	m.rootsByZone = newRootsByZone
 	return nil
 }
 
@@ -954,40 +928,28 @@ func RecordKey(rr dns.RR) string {
 	}
 }
 
-func (m *InMemoryLeaseStore) attachNodeLocked(nodeKey, parentNodeKey, zone string) {
-	if parentNodeKey != "" {
-		if _, ok := m.children[parentNodeKey]; !ok {
-			m.children[parentNodeKey] = make(map[string]struct{})
-		}
-		m.children[parentNodeKey][nodeKey] = struct{}{}
+// attachNodeLocked records nodeKey as a child of parentNodeKey. A root node (no parent --
+// e.g. a self-registered KEY) needs no entry here at all: children only ever tracks
+// parent->child edges, and ChildrenOf/ListSubtreeKeys/deleteSubtreeLocked all walk down
+// from a known starting node rather than needing to enumerate every root.
+func (m *InMemoryLeaseStore) attachNodeLocked(nodeKey, parentNodeKey string) {
+	if parentNodeKey == "" {
 		return
 	}
-	if zone == "" {
-		return
+	if _, ok := m.children[parentNodeKey]; !ok {
+		m.children[parentNodeKey] = make(map[string]struct{})
 	}
-	if _, ok := m.rootsByZone[zone]; !ok {
-		m.rootsByZone[zone] = make(map[string]struct{})
-	}
-	m.rootsByZone[zone][nodeKey] = struct{}{}
+	m.children[parentNodeKey][nodeKey] = struct{}{}
 }
 
-func (m *InMemoryLeaseStore) detachNodeLocked(nodeKey, parentNodeKey, zone string) {
-	if parentNodeKey != "" {
-		if kids, ok := m.children[parentNodeKey]; ok {
-			delete(kids, nodeKey)
-			if len(kids) == 0 {
-				delete(m.children, parentNodeKey)
-			}
-		}
+func (m *InMemoryLeaseStore) detachNodeLocked(nodeKey, parentNodeKey string) {
+	if parentNodeKey == "" {
 		return
 	}
-	if zone == "" {
-		return
-	}
-	if roots, ok := m.rootsByZone[zone]; ok {
-		delete(roots, nodeKey)
-		if len(roots) == 0 {
-			delete(m.rootsByZone, zone)
+	if kids, ok := m.children[parentNodeKey]; ok {
+		delete(kids, nodeKey)
+		if len(kids) == 0 {
+			delete(m.children, parentNodeKey)
 		}
 	}
 }
@@ -1020,7 +982,7 @@ func (m *InMemoryLeaseStore) deleteSubtreeLocked(ctx context.Context, rootKey st
 
 	for _, key := range keys {
 		if rec, ok := m.leases[key]; ok {
-			m.detachNodeLocked(key, rec.ParentKeyName, rec.UpstreamZone)
+			m.detachNodeLocked(key, rec.ParentKeyName)
 			if m.persistenceHook != nil {
 				_ = m.persistenceHook(ctx, "delete", cloneRecord(rec))
 			}
@@ -1040,7 +1002,7 @@ func (m *InMemoryLeaseStore) deleteSubtreeLocked(ctx context.Context, rootKey st
 				}
 			}
 		} else if nkRec, ok := m.nonKeyRecords[key]; ok {
-			m.detachNodeLocked(key, nkRec.ParentKeyName, "")
+			m.detachNodeLocked(key, nkRec.ParentKeyName)
 			delete(m.nonKeyRecords, key)
 		}
 		delete(m.children, key)

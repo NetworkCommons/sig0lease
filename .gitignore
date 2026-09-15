@@ -8,3 +8,4 @@ coverage.out
 __debug_bin*
 .vscode
 data
+.DS_Store

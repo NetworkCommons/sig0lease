@@ -1,0 +1,51 @@
+// Template for the local BIND 9 CI gate (plan S14 Option C). lib/bind9.sh's start_bind9
+// copies this into a scratch runtime directory, substituting @RUNDIR@, before starting
+// named -- so the source tree's own copy (and the zone file template next to it) never
+// gets rewritten by BIND's own dynamic-update journal/zone-dump machinery.
+options {
+    directory "@RUNDIR@";
+    listen-on port 5300 { 127.0.0.1; };
+    listen-on-v6 { none; };
+    recursion no;
+    dnssec-validation no;
+    allow-query { any; };
+    allow-transfer { none; };
+    pid-file "@RUNDIR@/named.pid";
+};
+
+logging {
+    channel test_log {
+        file "@RUNDIR@/named.log" versions 1 size 10m;
+        severity info;
+        print-time yes;
+    };
+    category default { test_log; };
+    category update { test_log; };
+    category update-security { test_log; };
+    category security { test_log; };
+};
+
+// SIG(0) dynamic-update authorization: srp.test.'s own apex KEY (published in the zone
+// file below) is granted update rights over the whole zone -- the same self-signing model
+// already proven against the real dev.zenr.io. zone at ns1.free2air.org (the proxy's own
+// keystore key, owned at the zone apex it updates).
+zone "srp.test." {
+    type primary;
+    file "@RUNDIR@/srp.test.zone";
+    update-policy {
+        grant srp.test. zonesub ANY;
+    };
+};
+
+// default.service.arpa. -- tests/test_mdnsresponder_interop.sh's zone. Same self-signing
+// model, different apex key (tests/keystore-srp-bind9-default-arpa/): this name is forced
+// by mDNSResponder's own hardcoded client-side zone string, not a free choice (see
+// default.service.arpa.zone.in's own doc comment). Served by the same named instance/port
+// as srp.test. -- BIND routes purely by zone name, so one process/port covers both.
+zone "default.service.arpa." {
+    type primary;
+    file "@RUNDIR@/default.service.arpa.zone";
+    update-policy {
+        grant default.service.arpa. zonesub ANY;
+    };
+};

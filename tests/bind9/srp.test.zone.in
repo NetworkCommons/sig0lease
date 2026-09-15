@@ -1,0 +1,21 @@
+; Template for the local BIND 9 CI gate's srp.test. zone (plan S14 Option C). start_bind9
+; copies this into the scratch runtime directory before starting named -- BIND rewrites its
+; own working copy (SOA serial bumps, dynamic-update journal replay) so the source tree's
+; copy must never be the one actually served.
+;
+; The apex KEY is the SRP test keystore's own key (tests/keystore-srp-bind9/), granted
+; zonesub update rights in named.conf.in -- the proxy signs every forwarded UPDATE with this
+; same key (handlers.srp_handler's keystore_dir points at that directory in test_srp.sh).
+$TTL 3600
+@       IN SOA  ns.srp.test. admin.srp.test. ( 1 3600 900 604800 3600 )
+        IN NS   ns.srp.test.
+ns      IN A    127.0.0.1
+@       IN KEY  512 3 15 FNZq5ao1LH+zGRNOz0yeZvMVjlSwG+OYRCpz33kdeBg=
+
+; RFC 9665's own discovery convention (client/srp.Discover, plan S14's Appendix C zone
+; skeleton): a real requester finds its registrar via a plain SRV lookup for this name.
+; Port matches test_srp.sh's own SRP_PROXY_PORT default (8159) -- illustrative/for the
+; client/srp live discovery test, not consumed by test_srp.sh itself (which always passes
+; an explicit -server, matching D8's "dev/test tool" framing).
+_dnssd-srp._tcp IN SRV 0 0 8159 proxy.srp.test.
+proxy   IN A    127.0.0.1
