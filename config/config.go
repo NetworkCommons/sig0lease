@@ -14,8 +14,13 @@ import (
 type ProcessingConfig struct {
 	// Opcode is the DNS opcode to match (0=QUERY, 1=IQUERY, 2=STATUS, etc.)
 	Opcode uint8 `yaml:"opcode"`
-	// Module is the name of the processing module to handle this opcode
-	Module string `yaml:"module"`
+	// Modules is the ordered list of processing module names to try for this opcode
+	// (D2, main/docs/rfc9665-srp-implementation-plan.md S4.2): the router calls each
+	// in turn until one returns Processed or Error; if every one declines (NotRelevant),
+	// the opcode falls through to plain upstream forwarding. A single-module list (the
+	// common case today, e.g. just "update_handler") behaves exactly as the old
+	// single-"module" field did.
+	Modules []string `yaml:"modules"`
 }
 
 // UpstreamConfig holds upstream resolver configuration.
@@ -32,8 +37,26 @@ type UpstreamConfig struct {
 type ServerConfig struct {
 	// Address is the address to listen on (e.g., ":53")
 	Address string `yaml:"address"`
-	// Networks are the network protocols to enable ("udp", "tcp")
+	// Networks are the network protocols to enable ("udp", "tcp", "tls")
 	Networks []string `yaml:"networks"`
+	// TLS configures the "tls" network (DNS-over-TLS, RFC 7858, plan S7/Phase 7):
+	// opportunistic only, no client-certificate/key-pinning auth -- transport-level, so it
+	// benefits every handler (base RFC 9664, SRP, plain forwarding alike), not just one
+	// protocol. Required when "tls" appears in Networks; ignored otherwise.
+	TLS *TLSConfig `yaml:"tls,omitempty"`
+}
+
+// TLSConfig holds the DNS-over-TLS listener's own address and certificate. A separate
+// Address (rather than reusing ServerConfig.Address) because DoT conventionally listens on
+// its own port (853, RFC 7858) alongside plain DNS on 53 -- binding both to one address
+// would collide, since they're two independent net.Listeners either way.
+type TLSConfig struct {
+	// Address is the DoT listener's own address (e.g., ":853").
+	Address string `yaml:"address"`
+	// Cert is the path to a PEM-encoded certificate (or certificate chain).
+	Cert string `yaml:"cert"`
+	// Key is the path to the PEM-encoded private key matching Cert.
+	Key string `yaml:"key"`
 }
 
 // Config is the top-level configuration structure.
@@ -88,12 +111,36 @@ func (c *Config) Validate() error {
 		return fmt.Errorf("at least one upstream must be configured")
 	}
 
+	for _, network := range c.Server.Networks {
+		if network != "tls" {
+			continue
+		}
+		if c.Server.TLS == nil {
+			return fmt.Errorf(`server.networks includes "tls" but server.tls is not configured`)
+		}
+		if c.Server.TLS.Address == "" {
+			return fmt.Errorf("server.tls.address cannot be empty")
+		}
+		if _, _, err := net.SplitHostPort(c.Server.TLS.Address); err != nil {
+			return fmt.Errorf("invalid server.tls.address %q: %w", c.Server.TLS.Address, err)
+		}
+		if c.Server.TLS.Cert == "" || c.Server.TLS.Key == "" {
+			return fmt.Errorf("server.tls.cert and server.tls.key are both required")
+		}
+		break
+	}
+
 	for i, rule := range c.ProcessingRules {
 		if rule.Opcode > 15 {
 			return fmt.Errorf("processing_rule %d: opcode must be between 0-15", i)
 		}
-		if rule.Module == "" {
-			return fmt.Errorf("processing_rule %d: module name cannot be empty", i)
+		if len(rule.Modules) == 0 {
+			return fmt.Errorf("processing_rule %d: modules list cannot be empty", i)
+		}
+		for j, name := range rule.Modules {
+			if name == "" {
+				return fmt.Errorf("processing_rule %d: modules[%d] name cannot be empty", i, j)
+			}
 		}
 	}
 
@@ -132,11 +179,11 @@ func LoadConfig(path string) (*Config, error) {
 	return cfg, cfg.Validate()
 }
 
-// GetOpcodeMap creates a map from opcode to module name for fast lookup.
-func (c *Config) GetOpcodeMap() map[uint8]string {
-	opcodeMap := make(map[uint8]string)
+// GetOpcodeMap creates a map from opcode to its ordered module list for fast lookup (D2).
+func (c *Config) GetOpcodeMap() map[uint8][]string {
+	opcodeMap := make(map[uint8][]string)
 	for _, rule := range c.ProcessingRules {
-		opcodeMap[rule.Opcode] = rule.Module
+		opcodeMap[rule.Opcode] = rule.Modules
 	}
 	return opcodeMap
 }

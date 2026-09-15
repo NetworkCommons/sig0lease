@@ -5,22 +5,32 @@
 
 set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-source "$SCRIPT_DIR/utils.sh"
+source "$SCRIPT_DIR/lib/common.sh"
+source "$SCRIPT_DIR/lib/proxy.sh"
 
-cd "$(dirname "$0")/." || exit 1
+# Pre-existing bug fixed here: this used to `cd "$(dirname "$0")/."`, which
+# lands in tests/ (wherever this script file lives) -- but config.yaml's
+# keystore_dir is "./keystore/server", relative to main/, so a proxy started
+# from tests/ silently failed to find its signing key ("no proxy
+# authorization key found for zone ... or any parent"). $TESTS_DIR/.. (from
+# lib/common.sh) is the robust equivalent of test_update.sh's convention of
+# not cd'ing at all and relying on being invoked from main/ -- this makes
+# test_forward.sh work the same way regardless of invocation cwd.
+cd "$TESTS_DIR/.." || exit 1
 
 DOWNSTREAM_ZONE="test.dev.zenr.io."
 
 log_section "DNS Proxy forward functionality test"
 
-# Build the binaries if they don't exist
-if [ ! -f "../bin/${OS}/sig0lease" ]; then
+# Build the binaries if they don't exist. Relative to main/ (this script's
+# cwd as of the fix above), matching $PROXY_BIN/$CLIENT_BIN from lib/*.sh.
+if [ ! -f "bin/${OS}/sig0lease" ]; then
     log_step "Building proxy binaries..."
-    go build -o "../bin/${OS}/sig0lease" ../cmd/sig0lease
+    go build -o "bin/${OS}/sig0lease" ./cmd/sig0lease
 fi
 
 log_step "Building client binaries..."
-go build -o "../bin/${OS}/sig0lease-client" ../cmd/sig0lease-client
+go build -o "bin/${OS}/sig0lease-client" ./cmd/sig0lease-client
 
 # Start proxy in background
 start_proxy

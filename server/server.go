@@ -3,6 +3,7 @@ package server
 
 import (
 	"context"
+	"crypto/tls"
 	"fmt"
 	"os/signal"
 	"syscall"
@@ -98,6 +99,8 @@ func (s *Server) Serve() error {
 				return s.serveUDP(ctx, router)
 			case "tcp":
 				return s.serveTCP(ctx, router)
+			case "tls":
+				return s.serveDoT(ctx, router)
 			default:
 				return fmt.Errorf("unsupported network: %s", net)
 			}
@@ -161,25 +164,27 @@ const udpMsgSize = 4096
 // serveUDP runs the dns library's UDP server for handler, blocking until
 // ctx is canceled.
 func (s *Server) serveUDP(ctx context.Context, handler dns.HandlerFunc) error {
-	return s.serveNetwork(ctx, "udp", handler)
+	return s.serveNetwork(ctx, "udp", s.cfg.Server.Address, nil, handler)
 }
 
 // serveTCP runs the dns library's TCP server for handler, blocking until
 // ctx is canceled.
 func (s *Server) serveTCP(ctx context.Context, handler dns.HandlerFunc) error {
-	return s.serveNetwork(ctx, "tcp", handler)
+	return s.serveNetwork(ctx, "tcp", s.cfg.Server.Address, nil, handler)
 }
 
-// serveNetwork runs a dns.Server on the configured address for the given
-// network ("udp" or "tcp"). It blocks until ctx is canceled -- a clean
-// shutdown that drains in-flight queries and returns nil -- or until
-// ListenAndServe fails to start, which is returned. The listen address is
-// taken verbatim from config: a host-less ":port" binds every interface,
-// IPv4 and IPv6 alike.
-func (s *Server) serveNetwork(ctx context.Context, network string, handler dns.HandlerFunc) error {
+// serveNetwork runs a dns.Server on addr for the given network ("udp" or "tcp" -- "tls" is
+// not itself a network the underlying dns.Server understands, see serveDoT). It blocks until
+// ctx is canceled -- a clean shutdown that drains in-flight queries and returns nil -- or
+// until ListenAndServe fails to start, which is returned. addr is taken verbatim from
+// config: a host-less ":port" binds every interface, IPv4 and IPv6 alike. tlsConfig is nil
+// for plain udp/tcp; serveDoT passes a non-nil one, which the underlying library wraps the
+// listener in (network must be "tcp" in that case -- DoT is DNS-over-TCP-over-TLS).
+func (s *Server) serveNetwork(ctx context.Context, network, addr string, tlsConfig *tls.Config, handler dns.HandlerFunc) error {
 	srv := &dns.Server{
-		Addr:           s.cfg.Server.Address,
+		Addr:           addr,
 		Net:            network,
+		TLSConfig:      tlsConfig,
 		UDPSize:        udpMsgSize,
 		Handler:        s.fullUnpackHandler(handler),
 		MsgAcceptFunc:  s.acceptMsg,
@@ -192,14 +197,14 @@ func (s *Server) serveNetwork(ctx context.Context, network string, handler dns.H
 	// Shutdown() can touch it, and gives us an accurate "listener up" line.
 	started := make(chan struct{})
 	srv.NotifyStartedFunc = func(context.Context) {
-		addr := s.cfg.Server.Address
+		startedAddr := addr
 		switch {
 		case srv.Listener != nil:
-			addr = srv.Listener.Addr().String()
+			startedAddr = srv.Listener.Addr().String()
 		case srv.PacketConn != nil:
-			addr = srv.PacketConn.LocalAddr().String()
+			startedAddr = srv.PacketConn.LocalAddr().String()
 		}
-		s.logger.Infof("%s listener started on %s", network, addr)
+		s.logger.Infof("%s listener started on %s", network, startedAddr)
 		close(started)
 	}
 

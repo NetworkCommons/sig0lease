@@ -7,6 +7,7 @@ import (
 
 	"codeberg.org/miekg/dns"
 	leasepkg "github.com/NetworkCommons/sig0lease/pkg/lease"
+	"github.com/NetworkCommons/sig0lease/pkg/updatecore"
 )
 
 func (h *UpdateHandler) Handle(ctx context.Context, w dns.ResponseWriter, r *dns.Msg) *HandlerResult {
@@ -61,6 +62,18 @@ func (h *UpdateHandler) Handle(ctx context.Context, w dns.ResponseWriter, r *dns
 		msg := h.makeErrorResponse(r, dns.RcodeFormatError, err.Error())
 		return NewErrorResult(msg, err.Error(), err)
 	}
+
+	// RFC 2181 S5.2 (erratum-corrected): an RRset with inconsistent TTLs is treated as if
+	// every RR in it carried the lowest TTL present. Normalize here, before anything else
+	// reads these TTLs -- in particular before LeasePolicy clamping (S6) and the
+	// duplicate/authoritative-RR comparisons later in this function, both of which must
+	// see the already-uniform value. This is a base-handler correctness fix independent of
+	// SRP (see docs/rfc9665-srp-implementation-plan.md S6); the SRP path uses the same
+	// helper's CheckConsistentTTLs instead, which rejects rather than rewrites.
+	if changed := updatecore.NormalizeTTLs(updateOtherRRs); changed > 0 {
+		h.logger.Debugf("Normalized TTLs to their RRset minimum for %d RRset(s)", changed)
+	}
+
 	h.logger.Infof("UPDATE request for zone %s: LEASE=%d KEY-LEASE=%d RRs=%s",
 		zone, leaseDuration, keyLeaseDuration, summarizeRRTypes(updateKeyRRs, updateOtherRRs))
 

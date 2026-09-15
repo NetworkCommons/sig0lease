@@ -8,6 +8,7 @@ import (
 
 	"codeberg.org/miekg/dns"
 	leasepkg "github.com/NetworkCommons/sig0lease/pkg/lease"
+	"github.com/NetworkCommons/sig0lease/pkg/updatecore"
 )
 
 func toUint32(v any) (uint32, bool) {
@@ -119,7 +120,7 @@ func (h *UpdateHandler) Setup(cfg map[string]any) error {
 
 	// Load proxy authorization key used for signing forwarded upstream UPDATEs.
 	// The key can live at the configured zone or any parent zone.
-	upstreamKey, matchedZone, err := h.findAuthorizedProxyKeyForZone(h.upstreamZone)
+	upstreamKey, matchedZone, err := updatecore.FindAuthorizedProxyKey(h.keystoreDir, h.upstreamZone, h.logger)
 	if err != nil {
 		return fmt.Errorf("failed to resolve upstream signing key for zone %s: %w", h.upstreamZone, err)
 	}
@@ -202,7 +203,7 @@ func (h *UpdateHandler) Setup(cfg map[string]any) error {
 		h.logger.Debugf("Custom upstream coordinator configured")
 	} else {
 		bootstrapResolvers := parseStringSlice(cfg["bootstrap_resolvers"])
-		h.upstreamCoordinator = NewDefaultUpstreamCoordinator(h.logger, bootstrapResolvers)
+		h.upstreamCoordinator = updatecore.NewCoordinator(h.logger, bootstrapResolvers, nil)
 		if len(bootstrapResolvers) > 0 {
 			h.logger.Debugf("Default upstream coordinator configured with bootstrap resolvers: %v", bootstrapResolvers)
 		} else {

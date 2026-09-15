@@ -199,22 +199,92 @@ Two backends are selectable via `handlers.update.storage` in `config.yaml` (see 
 
 The update handler uses the configured zone to discover the authoritative server for the effective zone, then sends the rewritten UPDATE there.
 
+## SRP (RFC 9665)
+
+Alongside the RFC 9664 lease flow above, the proxy implements [RFC 9665](https://datatracker.ietf.org/doc/rfc9665/) (DNS-SD Service Registration Protocol) — a tightly constrained profile of DNS UPDATE for devices registering their own services (host address + one or more service instances) on a "First Come, First Served" basis, authenticated by SIG(0). It's a **sibling** request path to the RFC 9664 handler above, not a mode on it: SRP's message shape and authorization model are different enough (FCFS by name rather than a signer-hierarchy walk, mandatory delete-all-then-add, no lightweight refresh) that it has its own handler, `handlers/srp_handler.go`, sharing only the genuinely common plumbing (`pkg/lease`, `pkg/sig0`, `pkg/updatecore`'s upstream-forward/re-sign path).
+
+### Enabling it
+
+Add an `srp_handler` block under `handlers:` and route opcode 5 (UPDATE) to it in `processing_rules` (see `config.yaml` for a worked example). Key options:
+
+- `upstream_zone` (required) — the one zone this handler instance serves (one zone, one protocol per handler instance; run a second handler instance for a second zone).
+- `keystore_dir` (required) — this proxy's own SIG(0) signing key for the zone, resolved the same way the RFC 9664 handler's is.
+- `upstream` (optional) — a static `host:port` override, skipping SOA/NS discovery for this zone entirely; needed for any zone (like `default.service.arpa.`, see below) that isn't really delegated.
+- `allow_udp` (optional, default `false`) — SRP requires TCP by default; set this for zones expecting constrained (CNN) devices that can't reliably do TCP.
+- `rewrite_default_service_arpa` (optional, default `false`) — real SRP client implementations (Apple's `srp-client`, OpenThread's SRP client) hardcode `default.service.arpa.` as their zone, having no other way to discover one. With this on, the handler additionally accepts requests addressed to `default.service.arpa.` and rewrites every name in the update to `upstream_zone` before doing anything else with it (FCFS, the local lease-store tree, and the upstream forward all end up working with exactly one real name per host, regardless of which zone the client actually addressed) — the response still echoes back `default.service.arpa.`, exactly what the client sent.
+- `refuse_on_foreign_data` (optional, default `true`) — RFC 9665 §3.3.3's NOERROR-no-KEY case: refuse (rather than clobber) a name that already has non-SRP data at the authoritative server.
+- `lease_policy` — same shape as the RFC 9664 handler's (`min_key_lease_sec`/`max_key_lease_sec`/`min_rr_lease_sec`/`max_rr_lease_sec`).
+- `lease_manager` / `storage` — same mutually-exclusive lease-store backend selection as the RFC 9664 handler.
+
+### The SRP requester
+
+`client/srp` is the actual client-side deliverable: discovery (`_dnssd-srp._tcp.<domain>.` SRV lookup), the RFC 9664 §5.2 refresh clock (80% of the granted lease, jittered), automatic rename-retry on a `YXDOMAIN` conflict, and now `Deregister` (withdraws a whole identity — host address data and every configured instance — in one message, requesting `LEASE=0`). `cmd/sig0lease-srp` is a thin CLI over it for development/testing, not a shipped product (there's deliberately no `make build-srp` target) — run it directly:
+
+```bash
+go run ./cmd/sig0lease-srp -domain=srp.example.com. -host=myhost -addr=192.0.2.1 \
+  -instance=Widget:_http._tcp:8080 -txt=Widget:path=/ -server=127.0.0.1:8159 -once
+```
+
+`go run ./cmd/sig0lease-srp -h` lists every flag, including `-deregister` and the full-lifecycle (no `-once`) mode that runs the refresh clock unattended.
+
+### Testing it
+
+`make test-srp` runs the full register/refresh/conflict/remove/expiry suite against a real, disposable local BIND 9 (no external dependency). `make test-mdnsresponder-interop` runs the same registrar and client against the real, unmodified Apple `mDNSResponder/ServiceRegistration` binaries — a sibling checkout, not vendored; see `tests/README.md` for how to set it up, including the exact commit this was last validated against.
+
+## DNS-over-TLS
+
+The server can offer DNS-over-TLS ([RFC 7858](https://datatracker.ietf.org/doc/rfc7858/)) as a third listener alongside plain UDP/TCP — transport-level, so it benefits every handler above (RFC 9664, RFC 9665 SRP, and plain forwarding alike), not something protocol-specific. Opportunistic only: no client-certificate authentication.
+
+Add `"tls"` to `server.networks` and a `server.tls` block:
+
+```yaml
+server:
+  address: ":53"
+  networks: [udp, tcp, tls]
+  tls:
+    address: ":853"   # DoT's own port -- conventionally separate from plain DNS on 53
+    cert: /path/to/cert.pem
+    key: /path/to/key.pem
+```
+
 ## Project Layout
 
 - `cmd/sig0lease/` - proxy entrypoint
-- `cmd/sig0lease-client/` - client entrypoint
+- `cmd/sig0lease-client/` - client entrypoint (RFC 9664 lease flow)
+- `cmd/sig0lease-srp/` - thin dev/test CLI over `client/srp` (RFC 9665 SRP requester) — not a
+  shipped product; see the "SRP (RFC 9665)" section below
+- `client/srp/` - the RFC 9665 SRP requester library (`Client`, discovery, RFC 9664 S5.2
+  refresh scheduler, `YXDOMAIN` rename-retry) — this is the actual SRP client deliverable,
+  `cmd/sig0lease-srp` just exercises it
 - `config/` - YAML config loading and validation
 - `forward/` - upstream forwarding logic
-- `handlers/` - opcode handlers and result types
-- `pkg/keyrec/` - keystore loading helpers (`LoadedKey`, `LoadKeyFromFile`, `FindKeysByZone`)
-- `pkg/lease/` - lease store, tree model, and UPDATE-LEASE option encoding/decoding
+- `handlers/` - opcode handlers and result types, including `srp_handler.go` (the RFC 9665
+  SRP registrar path, a sibling to the RFC 9664 update handler, never a mode on it)
+- `pkg/keyrec/` - keystore loading helpers (`LoadedKey`, `LoadKeyFromFile`, `FindKeysByZone`,
+  `GenerateKey`)
+- `pkg/lease/` - lease store, tree model, and UPDATE-LEASE option encoding/decoding (shared
+  by both the RFC 9664 and RFC 9665 paths)
 - `pkg/sig0/` - SIG(0) signing and verification helpers
-- `server/` - UDP/TCP listener and request dispatch
+- `pkg/srp/` - RFC 9665 message classification/validation (`Classify`, `Validate`), FCFS
+  (`Evaluate`), and the requester-side message builder/response interpreter (`BuildUpdate`,
+  `InterpretResponse`) — pure logic, no network I/O
+- `pkg/updatecore/` - upstream forward/re-sign plumbing shared by both the RFC 9664 and
+  RFC 9665 (SRP) handlers (SOA/NS resolution, per-zone static `upstream` override, TTL
+  consistency checks)
+- `server/` - UDP/TCP/TLS (DNS-over-TLS, RFC 7858) listener and request dispatch
+
+See `docs/rfc9665-srp-implementation-plan.md` for the full RFC 9665 design writeup (locked
+architectural decisions, worked examples, and a phase-by-phase revision history covering
+every real bug found and fixed along the way) — it's the source of truth for anything SRP
+that isn't covered below.
 
 ## Validation
 (requires client key, see this [README](./keystore/README.md))
 ```bash
-CLIENT_KEYSTORE_DIR=${PWD}/keystore/client make test-full
+CLIENT_KEYSTORE_DIR=${PWD}/keystore/client make test-unit
+CLIENT_KEYSTORE_DIR=${PWD}/keystore/client make test-update   # RFC 9664 lease flow, live against a real BIND 9
+make test-srp                                                  # RFC 9665 SRP flow, live against a real BIND 9
+make test-mdnsresponder-interop                                 # RFC 9665 SRP, live against real independent mDNSResponder binaries
 make build
 ```
 
@@ -267,6 +337,26 @@ This is a deliberate API contract in the fork, not a defect, so there is nothing
 
 `server/server.go` serves both transports with the library's own `dns.Server` (`serveUDP`/`serveTCP` are thin wrappers around it) and wraps every dispatch path in `fullUnpackHandler`, which calls `r.Unpack()` once -- completing the parse the server started -- before the request reaches the router. The update handler therefore always receives a fully-decoded message. `server/transport_equivalence_test.go`'s `TestServeTCPPreservesUpdateLeaseOption` pins that the option survives to the handler over both transports.
 
+### SIG(0) hashes the full SIG RR instead of RDATA-only (RFC 2931 non-compliance)
+
+`dns.CryptoSIG0.Sign`/`Verify` (`sig0_signer.go`) compute the SIG(0) hash input as the SIG RR's *full wire encoding* -- owner name (1 byte, always root) + TYPE (2) + CLASS (2) + TTL (4) + RDLENGTH (2) = an 11-byte envelope, followed by RDATA -- via `sbuf := make([]byte, s.Len()); packRR(s, sbuf, 0, nil)`, then hashes `sbuf || message`.
+
+RFC 2931 S3 is explicit that this is wrong:
+
+> data = RDATA | request - SIG(0)
+>
+> where "|" is concatenation and RDATA is the RDATA of the SIG(0) being calculated less the signature itself.
+
+RDATA-only means no owner name, TYPE, CLASS, or RDLENGTH -- just TypeCovered/Algorithm/Labels/OrigTTL/Expiration/Inception/KeyTag/SignerName. The library's extra 11-byte envelope means it computes a different hash than any RFC-compliant implementation, silently. This project's own `pkg/sig0` had already accidentally routed around it for ED25519 (algorithm 15) -- `sig0SignerImpl`'s ED25519 case has never called `dns.CryptoSIG0.Sign`/`Verify` at all (they have no ED25519 case; `AlgorithmToHash` has no entry for it), so it always built its own RDATA-only prefix by hand for unrelated reasons. Every other algorithm silently inherited the bug, undetected because nothing in this project's test suite had ever driven a non-ED25519 signature through a real, independent verifier -- until the RFC 9665 SRP work needed ECDSAP256SHA256 (algorithm 13) and captured a real signature from `mDNSResponder`'s `srp-client` (an independent implementation) to test against. That verification failed with `dns: bad signature`; instrumenting a local copy of the library (a temporary `replace` directive, reverted after) pinned the exact hash-input bytes, and trimming the library's 11-byte envelope off made the real signature verify. Independently confirmed against `mDNSResponder`'s own C source: `ServiceRegistration/towire.c`'s `dns_sig0_signature_to_wire_` calls `srp_sign(output, max, message, msglen, rr, rdlen, key)` where `rr`/`rdlen` point at the RDATA fields only (`start`/`txn->p - start`, both set *after* the 11-byte envelope is written) -- and `sign-mbedtls.c`'s `srp_sign` hashes exactly `rr[:rdlen] | message[:msglen]`, i.e. RDATA-only, matching the RFC.
+
+### Applied patch
+
+`pkg/sig0/signer.go` no longer delegates to `dns.CryptoSIG0.Sign`/`Verify` for ED25519 (as before), ECDSAP256SHA256, or ECDSAP384SHA384. A shared `rdataOnlyPrefix(sig *dns.SIG) []byte` helper builds the correct RFC-2931 hash-input prefix once; each of those three algorithms hashes/signs/verifies against it directly (ECDSA via `crypto/ecdsa` with raw `r||s` output per RFC 6605 S4, never ASN.1 DER). `pkg/sig0/ecdsa_test.go` covers both algorithms with a generate-sign-wire-round-trip-verify test, a tampered-message-is-rejected test, and a known-answer test pinned to the actual captured `mDNSResponder` message (`TestECDSAP256KnownAnswerFromMDNSResponder`) so a regression here fails a test, not just a future interop attempt.
+
+RSA algorithms (RSAMD5/RSASHA1/RSASHA256/RSASHA512) still delegate to `dns.CryptoSIG0` and so still carry the same bug -- nothing in this codebase uses or tests them, and no RSA test keys or vectors exist here to validate a from-scratch implementation against, so extending the same fix to RSA was deliberately deferred rather than shipped unverified. If RSA SIG(0) is ever needed, apply the identical `rdataOnlyPrefix` treatment, validated against a real RSA key and, ideally, another independent implementation's signature the way the ECDSA fix was.
+
+This bug was not reported upstream to `codeberg.org/miekg/dns` (deliberate choice, not an oversight) -- this section is written to make that easy to do later: the RFC 2931 S3 quote above, the exact library code path (`sig0_signer.go`'s `CryptoSIG0.Verify`, the `sbuf := packRR(s, sbuf, 0, nil)` line), and a reproducible known-answer case (`pkg/sig0/ecdsa_test.go`'s `TestECDSAP256KnownAnswerFromMDNSResponder`, or the raw captured bytes noted in that test) are everything an upstream issue would need.
+
 ## Applied Compatibility Patches
 
 The following project-side patches are currently in place:
@@ -276,6 +366,7 @@ The following project-side patches are currently in place:
 3. `cmd/sig0lease-client/main.go` imports the same compatibility package so client-side pack/unpack behavior stays consistent.
 4. `pkg/lease.FindOption` recognizes UPDATE-LEASE whether it arrives as a direct `ERFC3597` record or under an `OPT` wrapper, for both request and response parsing.
 5. `server/server.go` wraps the handler chain in `fullUnpackHandler`, which calls `r.Unpack()` before dispatch so every request (UDP and TCP) reaches the router fully decoded, per the `dns.Handler` contract (see above).
+6. `pkg/sig0/signer.go` replaces `dns.CryptoSIG0.Sign`/`Verify` for ED25519, ECDSAP256SHA256, and ECDSAP384SHA384 with an RFC-2931-correct, RDATA-only hash-input implementation (`rdataOnlyPrefix`), fixing a library bug that hashes the full SIG RR wire encoding instead.
 
 # Implementation Status
 
