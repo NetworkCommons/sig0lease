@@ -26,22 +26,28 @@ func TestFCFS_StoreHit(t *testing.T) {
 	store := fakeStoreView{"myhost.example.": updateKey}
 
 	t.Run("matching key: proceed", func(t *testing.T) {
-		got, err := Evaluate(context.Background(), store, nil, "example.", "myhost.example.", fcfsTestKey("AAAA"), true)
+		got, prereq, err := Evaluate(context.Background(), store, nil, "example.", "myhost.example.", fcfsTestKey("AAAA"), true)
 		if err != nil {
 			t.Fatalf("Evaluate: %v", err)
 		}
 		if got != FCFSProceed {
 			t.Fatalf("got %s, want proceed", got)
 		}
+		if prereq != nil {
+			t.Fatalf("expected no prerequisite for a store-trusted refresh, got %v", prereq)
+		}
 	})
 
 	t.Run("mismatched key: conflict", func(t *testing.T) {
-		got, err := Evaluate(context.Background(), store, nil, "example.", "myhost.example.", fcfsTestKey("BBBB"), true)
+		got, prereq, err := Evaluate(context.Background(), store, nil, "example.", "myhost.example.", fcfsTestKey("BBBB"), true)
 		if err != nil {
 			t.Fatalf("Evaluate: %v", err)
 		}
 		if got != FCFSConflict {
 			t.Fatalf("got %s, want conflict", got)
+		}
+		if prereq != nil {
+			t.Fatalf("expected no prerequisite for a conflict, got %v", prereq)
 		}
 	})
 }
@@ -56,8 +62,14 @@ func TestFCFS_LiveQueryTriState(t *testing.T) {
 		keys                []*dns.KEY
 		refuseOnForeignData bool
 		want                FCFSResult
+		wantPrereq          bool
 	}{
-		{name: "NXDOMAIN: first come", state: AuthNXDomain, want: FCFSProceed},
+		// NXDOMAIN is the "never-before-seen name" case a live query alone can't
+		// atomically protect: it gets a "Name is not in use" prerequisite attached to
+		// the caller's later upstream forward, so a second concurrent registration
+		// racing this same query is still caught -- by the authoritative server itself,
+		// atomically -- even though both requests observed NXDOMAIN here.
+		{name: "NXDOMAIN: first come", state: AuthNXDomain, want: FCFSProceed, wantPrereq: true},
 		{name: "NOERROR no KEY, refuse=true: foreign data", state: AuthNoKey, refuseOnForeignData: true, want: FCFSForeignData},
 		{name: "NOERROR no KEY, refuse=false: proceed (clobber)", state: AuthNoKey, refuseOnForeignData: false, want: FCFSProceed},
 		{name: "NOERROR KEY matches: proceed", state: AuthKeyPresent, keys: []*dns.KEY{fcfsTestKey("AAAA")}, want: FCFSProceed},
@@ -69,19 +81,28 @@ func TestFCFS_LiveQueryTriState(t *testing.T) {
 			query := func(ctx context.Context, zoneHint, name string) (AuthoritativeKeyState, []*dns.KEY, error) {
 				return tc.state, tc.keys, nil
 			}
-			got, err := Evaluate(context.Background(), emptyStore, query, "example.", "myhost.example.", updateKey, tc.refuseOnForeignData)
+			got, prereq, err := Evaluate(context.Background(), emptyStore, query, "example.", "myhost.example.", updateKey, tc.refuseOnForeignData)
 			if err != nil {
 				t.Fatalf("Evaluate: %v", err)
 			}
 			if got != tc.want {
 				t.Fatalf("got %s, want %s", got, tc.want)
 			}
+			if gotPrereq := prereq != nil; gotPrereq != tc.wantPrereq {
+				t.Fatalf("prereq != nil = %v, want %v (prereq=%v)", gotPrereq, tc.wantPrereq, prereq)
+			}
+			if tc.wantPrereq {
+				hdr := prereq.Header()
+				if hdr.Name != "myhost.example." || hdr.Class != dns.ClassNONE || dns.RRToType(prereq) != dns.TypeANY {
+					t.Fatalf("unexpected prerequisite shape: %+v", prereq)
+				}
+			}
 		})
 	}
 }
 
 func TestFCFS_NoStoreEntryAndNoQuery_Errors(t *testing.T) {
-	_, err := Evaluate(context.Background(), fakeStoreView{}, nil, "example.", "myhost.example.", fcfsTestKey("AAAA"), true)
+	_, _, err := Evaluate(context.Background(), fakeStoreView{}, nil, "example.", "myhost.example.", fcfsTestKey("AAAA"), true)
 	if err == nil {
 		t.Fatal("expected an error when there's no store entry and no query function")
 	}
@@ -92,7 +113,7 @@ func TestFCFS_QueryErrorPropagates(t *testing.T) {
 	query := func(ctx context.Context, zoneHint, name string) (AuthoritativeKeyState, []*dns.KEY, error) {
 		return 0, nil, wantErr
 	}
-	_, err := Evaluate(context.Background(), fakeStoreView{}, query, "example.", "myhost.example.", fcfsTestKey("AAAA"), true)
+	_, _, err := Evaluate(context.Background(), fakeStoreView{}, query, "example.", "myhost.example.", fcfsTestKey("AAAA"), true)
 	if err == nil || !errors.Is(err, wantErr) {
 		t.Fatalf("expected the query error to propagate, got: %v", err)
 	}

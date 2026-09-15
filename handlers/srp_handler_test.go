@@ -17,6 +17,7 @@ import (
 	leasepkg "github.com/NetworkCommons/sig0lease/pkg/lease"
 	"github.com/NetworkCommons/sig0lease/pkg/sig0"
 	"github.com/NetworkCommons/sig0lease/pkg/srp"
+	"github.com/NetworkCommons/sig0lease/pkg/updatecore"
 )
 
 // --- fakes ---------------------------------------------------------------------------
@@ -207,6 +208,17 @@ func newSRPTestHandler(t *testing.T) (*SRPHandler, *fakeSRPCoordinator) {
 	h.upstreamZone = srpTestZone
 	h.keystoreDir = keystoreDir
 	h.refuseOnForeignData = true
+
+	// This harness constructs the handler's fields directly rather than calling Setup
+	// (which would also need a real/fake coordinator's ResolveAuthoritativeZone wired up
+	// before it returns), so it has to populate the signing-key cache Setup would
+	// otherwise populate itself -- resolveUpstreamSigningContext relies on it being set.
+	upstreamKey, matchedZone, err := updatecore.FindAuthorizedProxyKey(keystoreDir, srpTestZone, h.logger)
+	if err != nil {
+		t.Fatalf("resolve test upstream signing key: %v", err)
+	}
+	h.upstreamKeyRecord = upstreamKey
+	h.upstreamKeyZone = matchedZone
 
 	coord := &fakeSRPCoordinator{
 		keyState: srp.AuthNXDomain,
@@ -425,6 +437,73 @@ func TestSRPHandle_UpstreamRejection_NoLocalMutation(t *testing.T) {
 	}
 }
 
+// TestSRPHandle_FreshRegistration_CarriesNameNotInUsePrerequisite pins the fix for a real
+// FCFS TOCTOU race: this handler's own pre-forward FCFS check (step 6) and the actual
+// upstream forward (step 7) are two separate round trips with a window between them, so
+// two concurrent first-time registrations of the same never-before-seen name could
+// previously both observe "no local record, live NXDOMAIN" and both be forwarded with
+// nothing tying the check to the write -- the authoritative server could accept both,
+// breaking FCFS. Attaching an RFC 2136 "Name is not in use" prerequisite (CLASS=NONE,
+// TYPE=ANY) to the forwarded UPDATE makes the authoritative server itself re-enforce the
+// same condition atomically at write time.
+func TestSRPHandle_FreshRegistration_CarriesNameNotInUsePrerequisite(t *testing.T) {
+	h, coord := newSRPTestHandler(t)
+	coord.keyState = srp.AuthNXDomain // "never seen this name before" -- the FCFS race case
+	id := newSRPTestIdentity(t)
+	const host = "srptest6b.dev.zenr.io."
+	const inst = "widget._http._tcp.dev.zenr.io." // Classify canonicalizes (lower-cases) names
+
+	msg := buildSRPUpdate(t, srpTestZone, id, host, []string{"192.0.2.1"}, oneWidgetInstance(), 30, 1209600, host)
+	if res := h.Handle(context.Background(), stubTCPResponseWriter{}, msg); res.Status != StatusProcessed {
+		t.Fatalf("expected Processed, got %s: %v", res.Status, res.Error)
+	}
+
+	if len(coord.sent) != 1 {
+		t.Fatalf("expected exactly 1 upstream UPDATE, got %d", len(coord.sent))
+	}
+	prereqs := coord.sent[0].Answer
+	wantNames := map[string]bool{host: false, inst: false}
+	for _, rr := range prereqs {
+		hdr := rr.Header()
+		if _, ok := wantNames[hdr.Name]; !ok {
+			continue
+		}
+		if hdr.Class != dns.ClassNONE || dns.RRToType(rr) != dns.TypeANY {
+			t.Fatalf("prerequisite for %s has unexpected shape: class=%v type=%v", hdr.Name, hdr.Class, dns.RRToType(rr))
+		}
+		wantNames[hdr.Name] = true
+	}
+	for name, found := range wantNames {
+		if !found {
+			t.Fatalf("expected a \"Name is not in use\" prerequisite for %s in the forwarded UPDATE's Prerequisite section, got: %+v", name, prereqs)
+		}
+	}
+}
+
+// TestSRPHandle_UpstreamYXRRSet_MapsToYXDomainConflict pins the other half of the same
+// fix: when a step-6 prerequisite no longer holds by the time the authoritative server
+// itself evaluates it (a genuine race lost), the server rejects the UPDATE with
+// YXRRSET/NXRRSET -- this must be reported to the client as a normal FCFS conflict
+// (YXDOMAIN), the same as a conflict caught locally, not as a generic SERVFAIL, and must
+// not mutate local state (the deferred-mutation pattern: nothing is written locally until
+// after an upstream success).
+func TestSRPHandle_UpstreamYXRRSet_MapsToYXDomainConflict(t *testing.T) {
+	h, coord := newSRPTestHandler(t)
+	coord.keyState = srp.AuthNXDomain
+	coord.sendResp = &dns.Msg{MsgHeader: dns.MsgHeader{Rcode: dns.RcodeYXRrset}}
+	id := newSRPTestIdentity(t)
+	const host = "srptest6c.dev.zenr.io."
+
+	msg := buildSRPUpdate(t, srpTestZone, id, host, []string{"192.0.2.1"}, oneWidgetInstance(), 30, 1209600, host)
+	res := h.Handle(context.Background(), stubTCPResponseWriter{}, msg)
+	if res.Status != StatusError || res.Message == nil || res.Message.Rcode != dns.RcodeYXDomain {
+		t.Fatalf("expected YXDOMAIN (FCFS conflict caught atomically by upstream), got status=%s message=%+v", res.Status, res.Message)
+	}
+	if rec := h.leaseManager.Get(leasepkg.NodeKey(id.keyAt(host))); rec != nil {
+		t.Fatalf("deferred-mutation violated: local store was written despite the upstream UPDATE being rejected: %+v", rec)
+	}
+}
+
 // --- transport hardening ---------------------------------------------------------------
 
 func TestSRPHandle_RejectsUDPWhenNotAllowed(t *testing.T) {
@@ -609,6 +688,11 @@ func TestRewriteZoneSuffix(t *testing.T) {
 		{"MyHost.DEFAULT.SERVICE.ARPA.", "dev.zenr.io.", "MyHost.dev.zenr.io."}, // case-insensitive match, prefix case preserved
 		{"myhost.example.com.", "dev.zenr.io.", "myhost.example.com."},          // no matching suffix: unchanged
 		{"default.service.arpa.", "dev.zenr.io.", "dev.zenr.io."},               // the suffix alone
+		// A trailing-byte match that isn't a real subdomain (its first label is
+		// "evildefault", not "default") must pass through unchanged, not be corrupted
+		// by concatenating realZone onto the leftover "evil" prefix with no separating
+		// dot.
+		{"evildefault.service.arpa.", "dev.zenr.io.", "evildefault.service.arpa."},
 	}
 	for _, c := range cases {
 		if got := rewriteZoneSuffix(c.name, c.realZone); got != c.want {

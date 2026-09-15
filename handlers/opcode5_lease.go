@@ -527,12 +527,9 @@ func (h *UpdateHandler) processExpiredLease(ctx context.Context, nodeKey string)
 
 		var signingKey *keyrec.LoadedKey
 		if h.upstreamCoordinator != nil {
-			resolvedKey, matchedKeyZone, err := updatecore.FindAuthorizedProxyKey(h.keystoreDir, nonKeyLease.UpstreamZone, h.logger)
-			if err != nil {
-				h.logger.Debugf("Failed to resolve proxy authorization key for non-KEY lease-expiry deletes in zone %s: %v", nonKeyLease.UpstreamZone, err)
-			} else {
-				signingKey = resolvedKey
-				h.logger.Debugf("Resolved proxy authorization key for non-KEY lease-expiry deletes in zone %s from key zone %s", nonKeyLease.UpstreamZone, matchedKeyZone)
+			signingKey = h.upstreamKeyRecord
+			if signingKey == nil {
+				h.logger.Debugf("No proxy authorization key cached for non-KEY lease-expiry deletes in zone %s", nonKeyLease.UpstreamZone)
 			}
 		}
 
@@ -544,8 +541,11 @@ func (h *UpdateHandler) processExpiredLease(ctx context.Context, nodeKey string)
 					if err != nil {
 						h.logger.Warnf("Failed to construct upstream non-KEY lease-expiry delete for %s record %s: %v (will retry)", nodeKey, key, err)
 						upstreamDeleted = false
-					} else if _, err := h.upstreamCoordinator.SendUpdate(ctx, effectiveZone, deleteMsg); err != nil {
+					} else if resp, err := h.upstreamCoordinator.SendUpdate(ctx, effectiveZone, deleteMsg); err != nil {
 						h.logger.Warnf("Upstream non-KEY lease-expiry delete failed for %s record %s: %v (will retry)", nodeKey, key, err)
+						upstreamDeleted = false
+					} else if resp == nil || resp.Rcode != dns.RcodeSuccess {
+						h.logger.Warnf("Upstream non-KEY lease-expiry delete rejected for %s record %s: %s (will retry)", nodeKey, key, rcodeDescription(resp))
 						upstreamDeleted = false
 					}
 				}
@@ -585,11 +585,9 @@ func (h *UpdateHandler) processExpiredLease(ctx context.Context, nodeKey string)
 		}
 		var catchupSigningKey *keyrec.LoadedKey
 		if h.upstreamCoordinator != nil {
-			resolvedKey, _, err := updatecore.FindAuthorizedProxyKey(h.keystoreDir, nonKeyLease.UpstreamZone, h.logger)
-			if err != nil {
-				h.logger.Warnf("Failed to resolve proxy authorization key for non-KEY lease-expiry deletes on KEY expiry in zone %s: %v (will retry)", nonKeyLease.UpstreamZone, err)
-			} else {
-				catchupSigningKey = resolvedKey
+			catchupSigningKey = h.upstreamKeyRecord
+			if catchupSigningKey == nil {
+				h.logger.Warnf("No proxy authorization key cached for non-KEY lease-expiry deletes on KEY expiry in zone %s (will retry)", nonKeyLease.UpstreamZone)
 			}
 		}
 		for key, entry := range nonKeyLease.Records {
@@ -599,8 +597,11 @@ func (h *UpdateHandler) processExpiredLease(ctx context.Context, nodeKey string)
 				if err != nil {
 					h.logger.Warnf("Failed to construct upstream delete for %s record %s on KEY expiry: %v (will retry)", nodeKey, key, err)
 					upstreamDeleted = false
-				} else if _, err := h.upstreamCoordinator.SendUpdate(ctx, effectiveNonKeyZone, deleteMsg); err != nil {
+				} else if resp, err := h.upstreamCoordinator.SendUpdate(ctx, effectiveNonKeyZone, deleteMsg); err != nil {
 					h.logger.Warnf("Upstream delete failed for %s record %s on KEY expiry: %v (will retry)", nodeKey, key, err)
+					upstreamDeleted = false
+				} else if resp == nil || resp.Rcode != dns.RcodeSuccess {
+					h.logger.Warnf("Upstream delete rejected for %s record %s on KEY expiry: %s (will retry)", nodeKey, key, rcodeDescription(resp))
 					upstreamDeleted = false
 				}
 			} else if h.upstreamCoordinator != nil && catchupSigningKey == nil {
@@ -626,21 +627,16 @@ func (h *UpdateHandler) processExpiredLease(ctx context.Context, nodeKey string)
 
 	keyUpstreamDeleted := true
 	if h.upstreamCoordinator != nil && record.KeyRR != nil {
-		signingKey, matchedKeyZone, err := updatecore.FindAuthorizedProxyKey(h.keystoreDir, record.UpstreamZone, h.logger)
-		if err != nil {
-			h.logger.Warnf("Failed to resolve proxy authorization key for key lease-expiry delete in zone %s: %v (will retry)", record.UpstreamZone, err)
-		} else {
-			h.logger.Debugf("Resolved proxy authorization key for key lease-expiry delete in zone %s from key zone %s", record.UpstreamZone, matchedKeyZone)
-		}
-		deleteMsg, err := h.constructUpstreamDelete(record.KeyRR, signingKey, effectiveUpstreamZone)
+		deleteMsg, err := h.constructUpstreamDelete(record.KeyRR, h.upstreamKeyRecord, effectiveUpstreamZone)
 		if err != nil {
 			h.logger.Warnf("Failed to construct upstream lease-expiry delete for %s: %v (will retry)", nodeKey, err)
 			keyUpstreamDeleted = false
-		} else {
-			if _, err := h.upstreamCoordinator.SendUpdate(ctx, effectiveUpstreamZone, deleteMsg); err != nil {
-				h.logger.Warnf("Upstream lease-expiry delete failed for %s: %v (will retry)", nodeKey, err)
-				keyUpstreamDeleted = false
-			}
+		} else if resp, err := h.upstreamCoordinator.SendUpdate(ctx, effectiveUpstreamZone, deleteMsg); err != nil {
+			h.logger.Warnf("Upstream lease-expiry delete failed for %s: %v (will retry)", nodeKey, err)
+			keyUpstreamDeleted = false
+		} else if resp == nil || resp.Rcode != dns.RcodeSuccess {
+			h.logger.Warnf("Upstream lease-expiry delete rejected for %s: %s (will retry)", nodeKey, rcodeDescription(resp))
+			keyUpstreamDeleted = false
 		}
 	}
 
@@ -687,9 +683,9 @@ func (h *UpdateHandler) deleteNodeNonKeyUpstream(ctx context.Context, nodeKey st
 	if h.upstreamCoordinator == nil {
 		return
 	}
-	signingKey, _, err := updatecore.FindAuthorizedProxyKey(h.keystoreDir, nonKeyLease.UpstreamZone, h.logger)
-	if err != nil {
-		h.logger.Warnf("Failed to resolve proxy authorization key for %s non-KEY deletes in zone %s: %v (local state will still be forgotten)", nodeKey, nonKeyLease.UpstreamZone, err)
+	signingKey := h.upstreamKeyRecord
+	if signingKey == nil {
+		h.logger.Warnf("No proxy authorization key cached for %s non-KEY deletes in zone %s (local state will still be forgotten)", nodeKey, nonKeyLease.UpstreamZone)
 		return
 	}
 	for key, entry := range nonKeyLease.Records {
@@ -722,9 +718,9 @@ func (h *UpdateHandler) deleteNodeUpstream(ctx context.Context, nodeKey string) 
 				effectiveZone = resolved
 			}
 		}
-		signingKey, _, err := updatecore.FindAuthorizedProxyKey(h.keystoreDir, record.UpstreamZone, h.logger)
-		if err != nil {
-			h.logger.Warnf("Failed to resolve proxy authorization key for descendant %s KEY delete in zone %s: %v (local state will still be forgotten)", nodeKey, record.UpstreamZone, err)
+		signingKey := h.upstreamKeyRecord
+		if signingKey == nil {
+			h.logger.Warnf("No proxy authorization key cached for descendant %s KEY delete in zone %s (local state will still be forgotten)", nodeKey, record.UpstreamZone)
 		} else {
 			deleteMsg, err := h.constructUpstreamDelete(record.KeyRR, signingKey, effectiveZone)
 			if err != nil {

@@ -2,10 +2,8 @@ package handlers
 
 import (
 	"fmt"
-	"strings"
 	"time"
 
-	leasepkg "github.com/NetworkCommons/sig0lease/pkg/lease"
 	"github.com/NetworkCommons/sig0lease/pkg/updatecore"
 )
 
@@ -51,12 +49,16 @@ func (h *SRPHandler) Setup(cfg map[string]any) error {
 	h.keystoreDir = keystoreDir
 
 	// Fail fast (matching UpdateHandler.Setup) rather than discovering a missing
-	// signing key on the first real request.
-	if _, matchedZone, err := updatecore.FindAuthorizedProxyKey(h.keystoreDir, h.upstreamZone, h.logger); err != nil {
+	// signing key on the first real request, and cache the result for the life of the
+	// handler instead of re-reading it from the keystore directory on every request and
+	// every lease-expiry tick (see resolveUpstreamSigningContext).
+	upstreamKey, matchedZone, err := updatecore.FindAuthorizedProxyKey(h.keystoreDir, h.upstreamZone, h.logger)
+	if err != nil {
 		return fmt.Errorf("failed to resolve upstream signing key for zone %s: %w", h.upstreamZone, err)
-	} else {
-		h.logger.Debugf("Loaded upstream key for configured zone %s from key zone %s", h.upstreamZone, matchedZone)
 	}
+	h.upstreamKeyRecord = upstreamKey
+	h.upstreamKeyZone = matchedZone
+	h.logger.Debugf("Loaded upstream key for configured zone %s from key zone %s", h.upstreamZone, matchedZone)
 
 	staticUpstream := map[string]string{}
 	if addr, ok := cfg["upstream"].(string); ok && addr != "" {
@@ -127,7 +129,7 @@ func (h *SRPHandler) Setup(cfg map[string]any) error {
 		if !ok {
 			return fmt.Errorf("srp handler config: \"storage\" must be a map, got %T", rawStorage)
 		}
-		lm, err := h.buildLeaseManagerFromConfig(storageCfg)
+		lm, err := buildLeaseManagerFromConfig(storageCfg, h.logger)
 		if err != nil {
 			return fmt.Errorf("srp handler config: storage: %w", err)
 		}
@@ -137,47 +139,4 @@ func (h *SRPHandler) Setup(cfg map[string]any) error {
 	h.startLeaseReconciliation(30 * time.Second)
 
 	return nil
-}
-
-// buildLeaseManagerFromConfig mirrors (*UpdateHandler).buildLeaseManagerFromConfig --
-// duplicated rather than shared since that one takes an *UpdateHandler receiver purely
-// for its logger, and the two error-message prefixes intentionally differ.
-func (h *SRPHandler) buildLeaseManagerFromConfig(storageCfg map[string]any) (leasepkg.LeaseStorage, error) {
-	storageType := "memory"
-	if raw, ok := storageCfg["type"]; ok {
-		s, ok := raw.(string)
-		if !ok || strings.TrimSpace(s) == "" {
-			return nil, fmt.Errorf("\"type\" must be a non-empty string, got %T", raw)
-		}
-		storageType = strings.ToLower(strings.TrimSpace(s))
-	}
-
-	switch storageType {
-	case "memory":
-		return leasepkg.NewInMemoryManager(), nil
-
-	case "file":
-		path, ok := storageCfg["path"].(string)
-		if !ok || strings.TrimSpace(path) == "" {
-			return nil, fmt.Errorf("\"path\" is required when \"type\" is \"file\"")
-		}
-		interval := 30 * time.Second
-		if raw, ok := storageCfg["save_interval"]; ok {
-			s, ok := raw.(string)
-			if !ok {
-				return nil, fmt.Errorf("\"save_interval\" must be a duration string (e.g. \"30s\"), got %T", raw)
-			}
-			d, err := time.ParseDuration(s)
-			if err != nil {
-				return nil, fmt.Errorf("\"save_interval\" %q is not a valid duration: %w", s, err)
-			}
-			interval = d
-		}
-		return leasepkg.NewFileLeaseStore(path, interval, func(err error) {
-			h.logger.Errorf("%v", err)
-		})
-
-	default:
-		return nil, fmt.Errorf("unrecognized \"type\" %q (expected \"memory\" or \"file\")", storageType)
-	}
 }

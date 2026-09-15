@@ -301,16 +301,89 @@ func TestClient_Run_SleepsInitialDelayThenRefreshesOnGrantedLease(t *testing.T) 
 	}
 }
 
-func TestClient_Run_StopsOnDiscoveryFailure(t *testing.T) {
-	transport := &fakeTransport{}
+// TestClient_Run_BackoffDoublesOnConsecutiveFailuresThenResets pins the shape of Run's
+// retry backoff: it starts at minRegisterRetryBackoff, doubles on each consecutive
+// failure, and resets back to the minimum the moment a cycle succeeds -- so the steady
+// -state refresh clock after a recovery is the normal S5.2 clock, not a leftover
+// multi-minute backoff from the outage that just ended.
+func TestClient_Run_BackoffDoublesOnConsecutiveFailuresThenResets(t *testing.T) {
+	transport := &fakeTransport{responses: []*dns.Msg{
+		rcodeResp(dns.RcodeServerFailure),
+		rcodeResp(dns.RcodeServerFailure),
+		successResp(30, 1209600),
+	}}
 	cfg := testConfig(t, transport)
-	cfg.RegistrarAddr = ""
-	cfg.Query = func(ctx context.Context, name string) ([]*dns.SRV, error) { return nil, nil }
+
+	var sleeps []time.Duration
+	callCount := 0
+	cfg.Sleep = func(ctx context.Context, d time.Duration) error {
+		sleeps = append(sleeps, d)
+		callCount++
+		if callCount >= 4 { // initial delay + 2 backoffs + 1 post-success refresh sleep
+			return context.Canceled
+		}
+		return nil
+	}
+	var gotErrs []error
+	cfg.OnError = func(err error) { gotErrs = append(gotErrs, err) }
+
 	c, err := NewClient(cfg)
 	if err != nil {
 		t.Fatalf("NewClient: %v", err)
 	}
-	if err := c.Run(context.Background()); err == nil {
-		t.Fatal("expected Run to return an error when discovery finds nothing")
+	if err := c.Run(context.Background()); !errors.Is(err, context.Canceled) {
+		t.Fatalf("expected Run to stop via Sleep/ctx cancellation, got: %v", err)
+	}
+	if len(gotErrs) != 2 {
+		t.Fatalf("expected exactly 2 OnError calls (for the 2 failed cycles), got %d: %v", len(gotErrs), gotErrs)
+	}
+	if len(sleeps) < 4 {
+		t.Fatalf("expected at least 4 sleeps (initial, 2 backoffs, 1 refresh), got %d: %v", len(sleeps), sleeps)
+	}
+	if sleeps[1] != minRegisterRetryBackoff {
+		t.Fatalf("first retry backoff = %v, want %v (the floor)", sleeps[1], minRegisterRetryBackoff)
+	}
+	if sleeps[2] != minRegisterRetryBackoff*2 {
+		t.Fatalf("second retry backoff = %v, want %v (doubled)", sleeps[2], minRegisterRetryBackoff*2)
+	}
+	wantRefreshMin := 30 * time.Second * 80 / 100
+	if sleeps[3] < wantRefreshMin {
+		t.Fatalf("post-success sleep = %v, want >= %v (the reset refresh clock, not another backoff)", sleeps[3], wantRefreshMin)
+	}
+}
+
+// TestClient_Run_RetriesOnDiscoveryFailure pins Run's fixed behavior: a failed
+// registration cycle (discovery finding nothing, here -- but the same holds for any other
+// registerWithRenameRetry error) no longer stops Run permanently. It's reported via
+// Config.OnError and retried after a backoff instead, so a long-running daemon self-heals
+// once discovery starts working again rather than needing an external restart. Only ctx
+// (via the injected Sleep returning its cancellation) stops Run.
+func TestClient_Run_RetriesOnDiscoveryFailure(t *testing.T) {
+	transport := &fakeTransport{}
+	cfg := testConfig(t, transport)
+	cfg.RegistrarAddr = ""
+	cfg.Query = func(ctx context.Context, name string) ([]*dns.SRV, error) { return nil, nil }
+
+	var gotErrs []error
+	cfg.OnError = func(err error) { gotErrs = append(gotErrs, err) }
+
+	callCount := 0
+	cfg.Sleep = func(ctx context.Context, d time.Duration) error {
+		callCount++
+		if callCount >= 3 { // initial delay + a couple of retry backoffs is enough to observe retrying
+			return context.Canceled
+		}
+		return nil
+	}
+
+	c, err := NewClient(cfg)
+	if err != nil {
+		t.Fatalf("NewClient: %v", err)
+	}
+	if err := c.Run(context.Background()); !errors.Is(err, context.Canceled) {
+		t.Fatalf("expected Run to keep retrying and only stop via Sleep/ctx cancellation, got: %v", err)
+	}
+	if len(gotErrs) == 0 {
+		t.Fatal("expected OnError to be called for the failed discovery attempts")
 	}
 }

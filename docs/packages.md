@@ -108,9 +108,20 @@ func (c *Client) Run(ctx context.Context) error
     delay (plan roadmap), then registers (with rename-retry on conflict),
     then sleeps for the RFC 9664 S5.2 refresh clock (80% of the granted lease +
     0-5% jitter) and re-registers -- restating the full registration every time,
-    per S3.2's "no lightweight refresh." Blocks until ctx is canceled or a
-    non-recoverable error occurs (discovery failure, rename attempts exhausted,
-    a registrar rejection Register can't interpret as a conflict).
+    per S3.2's "no lightweight refresh." Blocks until ctx is canceled (via Sleep
+    returning ctx.Err()); that is the only thing that stops Run.
+
+    A failed registration cycle -- a transient network/DNS error, a registrar
+    rejection, rename attempts exhausted against a persistent conflict --
+    does not stop Run: Config.OnError (if set) is called with the error,
+    and the cycle is retried after an exponentially increasing backoff (see
+    minRegisterRetryBackoff/maxRegisterRetryBackoff), reset back to the minimum
+    after any success. Earlier versions of this method returned immediately on
+    any such error, meaning a single transient blip during a routine refresh --
+    one UDP timeout, one SERVFAIL -- permanently stopped a long-running daemon's
+    registration with no automatic recovery; self-healing from that class of
+    failure is the whole point of a background Run loop rather than a one-shot
+    Register call.
 
 type Config struct {
 	Domain    string // registration domain (Zone Section name); trailing dot optional
@@ -140,6 +151,13 @@ type Config struct {
 	Send  Transport                                  // default liveTransport(Timeout)
 	Rng   *rand.Rand                                 // default a fresh per-Client source (see timing.go's doc comments)
 	Sleep func(context.Context, time.Duration) error // default ctxSleep
+
+	// OnError, if set, is called from Run with every error a registration cycle hits
+	// (transient network/DNS failure, a registrar rejection, rename attempts exhausted).
+	// Run itself never stops because of one -- see Run's own doc comment -- so this is
+	// the caller's only hook for surfacing/logging those failures as they happen; nil is
+	// a valid no-op default.
+	OnError func(error)
 }
     Config configures a Client. See NewClient's doc comment for defaults.
 
@@ -973,8 +991,6 @@ func (m *InMemoryLeaseStore) ImportSnapshot(snapshot *LeaseTreeSnapshot) error
 
 func (m *InMemoryLeaseStore) ListAll() []*Record
 
-func (m *InMemoryLeaseStore) ListExpiring(within time.Duration) []*Record
-
 func (m *InMemoryLeaseStore) ListSubtreeKeys(nodeKey string) []string
     ListSubtreeKeys returns composite node keys of all descendants (KEY and
     non-KEY alike) of nodeKey, deepest first.
@@ -1099,7 +1115,6 @@ type LeaseStorage interface {
 	Get(nodeKey string) *Record
 	// Delete removes the subtree rooted at the composite nodeKey.
 	Delete(nodeKey string) error
-	ListExpiring(within time.Duration) []*Record
 	ListAll() []*Record
 	SetPersistenceHook(hook func(ctx context.Context, op string, record *Record) error)
 
@@ -1366,6 +1381,15 @@ func Names(cu *ClassifiedUpdate) []string
     instruction is authorized transitively through its target instance's own
     check.
 
+func ValidateClassified(msg *dns.Msg, cu *ClassifiedUpdate) error
+    ValidateClassified runs every check Validate performs beyond Classify
+    itself, against a ClassifiedUpdate the caller has already computed -- for a
+    caller that has already run Classify once (e.g. handlers/srp_handler.go's
+    Handle, which classifies in its own step 1 to decide relevance before
+    Validate would otherwise redundantly classify the identical message a second
+    time in step 2). cu must be Classify(msg)'s own result for msg; behavior is
+    undefined otherwise.
+
 
 TYPES
 
@@ -1437,7 +1461,7 @@ const (
 	// srp.refuse_on_foreign_data is true (the default) -- REFUSED.
 	FCFSForeignData
 )
-func Evaluate(ctx context.Context, view StoreView, query AuthoritativeKeyQuery, zoneHint, name string, updateKey *dns.KEY, refuseOnForeignData bool) (FCFSResult, error)
+func Evaluate(ctx context.Context, view StoreView, query AuthoritativeKeyQuery, zoneHint, name string, updateKey *dns.KEY, refuseOnForeignData bool) (FCFSResult, dns.RR, error)
     Evaluate implements RFC 9665 S3.3.3 FCFS for a single name -- the Host
     Description name, or one Service Description name -- against updateKey, the
     KEY that governs it (the Host Description's KEY, or a Service Description's
@@ -1459,6 +1483,25 @@ func Evaluate(ctx context.Context, view StoreView, query AuthoritativeKeyQuery, 
     (see handlers.filterDuplicateRegistrations's doc comment for the base
     handler's identical reasoning) -- a live query only runs for a name the
     store has no opinion on.
+
+    The second return value is an RFC 2136 prerequisite RR the caller should
+    attach to the upstream UPDATE it forwards for an FCFSProceed name (nil for
+    a Conflict/ForeignData result, and also nil for a store-trusted refresh
+    -- see below), or nil if none is needed. This closes the gap between this
+    function's own check and the caller's later, separate upstream write:
+    without it, two concurrent first-time registrations of the same
+    never-before-seen name can both observe AuthNXDomain here (neither has
+    forwarded its own UPDATE yet) and both go on to be accepted upstream,
+    breaking the FCFS guarantee this function exists to provide. Attaching a
+    "Name is not in use" prerequisite (RFC 2136 S2.4.4) to the forwarded UPDATE
+    makes the authoritative server itself re-check, and enforce, the same
+    condition atomically at write time -- which a second, separate pre-forward
+    query from this function can never fully guarantee no matter how recently
+    it ran. Deliberately narrow in scope: only the AuthNXDomain case gets a
+    prerequisite (the one the concurrent-first-registration race above actually
+    needs); a store-trusted "already ours" refresh gets none, preserving this
+    store's pre-existing behavior of silently re-establishing a record that
+    disappeared from authoritative DNS while still locally unexpired.
 
 func (r FCFSResult) String() string
 
@@ -1620,10 +1663,11 @@ func AsDelete(rr dns.RR) dns.RR
     delete targets is carried by NAME+TYPE+RDATA, same as any other RR identity
     in this codebase -- pkg/lease.RecordKey uses the identical convention).
 
-func BuildAndSign(upstreamZone string, records []dns.RR, signingKey *keyrec.LoadedKey) (*dns.Msg, error)
+func BuildAndSign(upstreamZone string, prereqs, records []dns.RR, signingKey *keyrec.LoadedKey) (*dns.Msg, error)
     BuildAndSign constructs a new UPDATE message for upstreamZone containing
-    exactly records (in the given order) as the Update section, and signs it
-    with signingKey.
+    prereqs (in the given order) as the Prerequisite section and records (in
+    the given order) as the Update section, and signs it with signingKey.
+    prereqs may be nil/empty -- most callers have none.
 
     Unlike the base RFC 9664 handler's constructUpstreamUpdate (handlers/
     opcode5_update_helpers.go), this does no per-record-type branching or TTL

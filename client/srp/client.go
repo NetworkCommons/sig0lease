@@ -67,6 +67,13 @@ type Config struct {
 	Send  Transport                                  // default liveTransport(Timeout)
 	Rng   *rand.Rand                                 // default a fresh per-Client source (see timing.go's doc comments)
 	Sleep func(context.Context, time.Duration) error // default ctxSleep
+
+	// OnError, if set, is called from Run with every error a registration cycle hits
+	// (transient network/DNS failure, a registrar rejection, rename attempts exhausted).
+	// Run itself never stops because of one -- see Run's own doc comment -- so this is
+	// the caller's only hook for surfacing/logging those failures as they happen; nil is
+	// a valid no-op default.
+	OnError func(error)
 }
 
 // Client is one SRP identity's registration lifecycle: build, sign, send, and (via Run)
@@ -278,22 +285,52 @@ func (c *Client) registerWithRenameRetry(ctx context.Context) (*dns.Msg, error) 
 	return nil, fmt.Errorf("srp/client: gave up after %d rename attempts, still conflicting", c.cfg.MaxRenames)
 }
 
+// minRegisterRetryBackoff/maxRegisterRetryBackoff bound Run's retry-on-error backoff: it
+// starts at minRegisterRetryBackoff, doubles after every consecutive failure up to
+// maxRegisterRetryBackoff, and resets to minRegisterRetryBackoff after any success -- the
+// same "don't hammer a struggling registrar, but don't wait an hour to notice it's back
+// either" shape refreshDelay's own jitter serves for the steady-state clock.
+const (
+	minRegisterRetryBackoff = 5 * time.Second
+	maxRegisterRetryBackoff = 5 * time.Minute
+)
+
 // Run performs the full RFC 9665 requester lifecycle: an initial 0-3s random delay (plan
 // roadmap), then registers (with rename-retry on conflict), then sleeps for the RFC 9664
 // S5.2 refresh clock (80% of the granted lease + 0-5% jitter) and re-registers -- restating
 // the full registration every time, per S3.2's "no lightweight refresh." Blocks until ctx
-// is canceled or a non-recoverable error occurs (discovery failure, rename attempts
-// exhausted, a registrar rejection Register can't interpret as a conflict).
+// is canceled (via Sleep returning ctx.Err()); that is the only thing that stops Run.
+//
+// A failed registration cycle -- a transient network/DNS error, a registrar rejection,
+// rename attempts exhausted against a persistent conflict -- does not stop Run: Config.OnError
+// (if set) is called with the error, and the cycle is retried after an exponentially
+// increasing backoff (see minRegisterRetryBackoff/maxRegisterRetryBackoff), reset back to
+// the minimum after any success. Earlier versions of this method returned immediately on
+// any such error, meaning a single transient blip during a routine refresh -- one UDP
+// timeout, one SERVFAIL -- permanently stopped a long-running daemon's registration with
+// no automatic recovery; self-healing from that class of failure is the whole point of a
+// background Run loop rather than a one-shot Register call.
 func (c *Client) Run(ctx context.Context) error {
 	if err := c.cfg.Sleep(ctx, initialDelay(c.cfg.Rng)); err != nil {
 		return err
 	}
 
+	backoff := minRegisterRetryBackoff
 	for {
 		resp, err := c.registerWithRenameRetry(ctx)
 		if err != nil {
-			return err
+			if c.cfg.OnError != nil {
+				c.cfg.OnError(err)
+			}
+			if sleepErr := c.cfg.Sleep(ctx, backoff); sleepErr != nil {
+				return sleepErr
+			}
+			if backoff *= 2; backoff > maxRegisterRetryBackoff {
+				backoff = maxRegisterRetryBackoff
+			}
+			continue
 		}
+		backoff = minRegisterRetryBackoff
 
 		lease, _, ok := pkgsrp.GrantedLease(resp)
 		if !ok {
