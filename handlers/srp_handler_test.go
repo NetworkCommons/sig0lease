@@ -43,6 +43,15 @@ type fakeSRPCoordinator struct {
 	// trip was in flight" (a real concurrent request in production; here, deliberately
 	// simulated in a single goroutine so the test stays deterministic).
 	onSendUpdate func()
+
+	// ptrExists/ptrExistsErr back QueryPTRExists (RFC 6763 S9's "is anything else still
+	// providing this type" check). Defaulting to (false, nil) matches every existing
+	// test's isolated-single-proxy world -- nothing else could possibly still be
+	// providing a type this process's own store has lost track of -- so a type dropping
+	// out of the local store still gets deleted from the enumeration record exactly as
+	// before, without any test needing to configure this explicitly.
+	ptrExists    bool
+	ptrExistsErr error
 }
 
 func (f *fakeSRPCoordinator) QueryKeyAtName(ctx context.Context, zoneHint, name string) (srp.AuthoritativeKeyState, []*dns.KEY, error) {
@@ -59,6 +68,10 @@ func (f *fakeSRPCoordinator) SendUpdate(ctx context.Context, upstreamZone string
 
 func (f *fakeSRPCoordinator) ResolveAuthoritativeZone(ctx context.Context, zone string) (string, error) {
 	return zone, nil
+}
+
+func (f *fakeSRPCoordinator) QueryPTRExists(ctx context.Context, zoneHint, name string) (bool, error) {
+	return f.ptrExists, f.ptrExistsErr
 }
 
 // stubTCPResponseWriter presents as a TCP peer -- the default test harness's response
@@ -258,8 +271,8 @@ func TestSRPHandle_FreshRegistration_InstanceKeyInheritsHostMaterialAtItsOwnName
 	if res.Message == nil || res.Message.Rcode != dns.RcodeSuccess {
 		t.Fatalf("expected NOERROR, got: %+v", res.Message)
 	}
-	if len(coord.sent) != 1 {
-		t.Fatalf("expected exactly 1 upstream UPDATE sent, got %d", len(coord.sent))
+	if len(coord.sent) != 2 {
+		t.Fatalf("expected 2 upstream sends (registration + RFC 6763 S9 enumeration reconcile), got %d", len(coord.sent))
 	}
 
 	hostNodeKey := leasepkg.NodeKey(id.keyAt(host))
@@ -278,6 +291,88 @@ func TestSRPHandle_FreshRegistration_InstanceKeyInheritsHostMaterialAtItsOwnName
 	instSet := h.leaseManager.GetNonKEYRecordSet(instNodeKey)
 	if instSet == nil || len(instSet.Records) != 3 { // SRV + TXT + PTR
 		t.Fatalf("expected the instance node to hold SRV+TXT+PTR (3 records), got: %+v", instSet)
+	}
+}
+
+// TestSRPHandle_ForwardsSynthesizedKEYForInstanceThatOmittedIt pins RFC 9665 S3.3.3's own
+// MUST: "After the SRP Update has been applied, every Service Description that is updated
+// MUST have a KEY RR". buildSRPUpdate (like this project's own client/srp requester) never
+// includes an explicit KEY in the Service Description -- Handle()'s step 7 must still forward
+// one, synthesized from the Host Description's key material at the instance's own name, or
+// that MUST is silently violated (and a later live FCFS query for the instance name, e.g.
+// after a proxy restart, can never find one -- see synthesizeOmittedInstanceKeys's own doc
+// comment for the full chain).
+func TestSRPHandle_ForwardsSynthesizedKEYForInstanceThatOmittedIt(t *testing.T) {
+	h, coord := newSRPTestHandler(t)
+	id := newSRPTestIdentity(t)
+	const host = "srptest1b.dev.zenr.io."
+	inst := oneWidgetInstance()[0].name
+
+	msg := buildSRPUpdate(t, srpTestZone, id, host, []string{"192.0.2.1"}, oneWidgetInstance(), 30, 1209600, host)
+	if res := h.Handle(context.Background(), stubTCPResponseWriter{}, msg); res.Status != StatusProcessed {
+		t.Fatalf("expected Processed, got %s: %v", res.Status, res.Error)
+	}
+
+	want := id.keyAt(inst)
+	found := false
+	for _, rr := range coord.sent[0].Ns {
+		key, ok := rr.(*dns.KEY)
+		if !ok || key.Hdr.Class == dns.ClassNONE {
+			continue
+		}
+		if canonicalName(key.Hdr.Name) == canonicalName(inst) &&
+			key.Algorithm == want.Algorithm && key.Protocol == want.Protocol && key.PublicKey == want.PublicKey {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("expected a synthesized KEY add at the instance's own name (%s) matching the host's key material, got Ns: %+v", inst, coord.sent[0].Ns)
+	}
+}
+
+// TestSRPHandle_RestartRefreshSucceeds_WhenUpstreamHasSynthesizedInstanceKey pins the actual
+// end-to-end fix for the restart-refuses-refresh bug this project found live, mechanically
+// linked rather than independently asserted: a first handler registers the instance and its
+// forwarded KEY is extracted directly from what it actually sent upstream (not hand-built),
+// then fed into a SECOND, entirely fresh handler (empty local lease store, simulating a proxy
+// restart) as that second handler's simulated upstream state. If synthesizeOmittedInstanceKeys
+// were removed, phase 1 would forward no instance KEY, phase 2's simulated upstream would have
+// none to find, and this test would fail exactly the way the real bug did (REFUSED).
+func TestSRPHandle_RestartRefreshSucceeds_WhenUpstreamHasSynthesizedInstanceKey(t *testing.T) {
+	id := newSRPTestIdentity(t)
+	const host = "srptest1c.dev.zenr.io."
+	inst := oneWidgetInstance()[0].name
+
+	// Phase 1: register through a first handler, then pull the instance's KEY straight out
+	// of what it actually forwarded upstream.
+	h1, coord1 := newSRPTestHandler(t)
+	msg := buildSRPUpdate(t, srpTestZone, id, host, []string{"192.0.2.1"}, oneWidgetInstance(), 30, 1209600, host)
+	if res := h1.Handle(context.Background(), stubTCPResponseWriter{}, msg); res.Status != StatusProcessed {
+		t.Fatalf("phase 1 registration: expected Processed, got %s: %v", res.Status, res.Error)
+	}
+	var forwardedInstKey *dns.KEY
+	for _, rr := range coord1.sent[0].Ns {
+		if key, ok := rr.(*dns.KEY); ok && key.Hdr.Class != dns.ClassNONE && canonicalName(key.Hdr.Name) == canonicalName(inst) {
+			forwardedInstKey = key
+		}
+	}
+	if forwardedInstKey == nil {
+		t.Fatalf("phase 1: no instance KEY was forwarded upstream at all -- can't simulate a restart finding it, got Ns: %+v", coord1.sent[0].Ns)
+	}
+
+	// Phase 2: a brand new handler (nothing shared with h1 -- simulates a real proxy
+	// restart) whose simulated upstream state is exactly what phase 1 actually forwarded.
+	h2, coord2 := newSRPTestHandler(t)
+	coord2.keyState = srp.AuthKeyPresent
+	coord2.keys = []*dns.KEY{forwardedInstKey}
+
+	// A fresh message, not the same *dns.Msg phase 1 already processed -- Handle()
+	// consumes/strips the SIG(0) signature from the message it verifies, so reusing the
+	// same pointer here would fail signature verification, not FCFS.
+	msg2 := buildSRPUpdate(t, srpTestZone, id, host, []string{"192.0.2.1"}, oneWidgetInstance(), 30, 1209600, host)
+	res := h2.Handle(context.Background(), stubTCPResponseWriter{}, msg2)
+	if res.Status != StatusProcessed {
+		t.Fatalf("phase 2 (post-restart refresh): expected Processed given the upstream has phase 1's own forwarded KEY, got %s (%s): %v", res.Status, res.Reason, res.Error)
 	}
 }
 
@@ -300,8 +395,8 @@ func TestSRPHandle_RefreshSameKey(t *testing.T) {
 	if res.Status != StatusProcessed || res.Message == nil || res.Message.Rcode != dns.RcodeSuccess {
 		t.Fatalf("refresh: expected NOERROR, got status=%s message=%+v err=%v", res.Status, res.Message, res.Error)
 	}
-	if len(coord.sent) != 2 {
-		t.Fatalf("expected 2 upstream sends (fresh + refresh), got %d", len(coord.sent))
+	if len(coord.sent) != 3 {
+		t.Fatalf("expected 3 upstream sends (fresh forward + its enumeration add, refresh forward -- refresh's own enumeration reconcile is a no-op and sends nothing, since the service type set is unchanged), got %d", len(coord.sent))
 	}
 }
 
@@ -458,8 +553,8 @@ func TestSRPHandle_FreshRegistration_CarriesNameNotInUsePrerequisite(t *testing.
 		t.Fatalf("expected Processed, got %s: %v", res.Status, res.Error)
 	}
 
-	if len(coord.sent) != 1 {
-		t.Fatalf("expected exactly 1 upstream UPDATE, got %d", len(coord.sent))
+	if len(coord.sent) != 2 {
+		t.Fatalf("expected 2 upstream sends (registration + RFC 6763 S9 enumeration reconcile), got %d", len(coord.sent))
 	}
 	prereqs := coord.sent[0].Answer
 	wantNames := map[string]bool{host: false, inst: false}
@@ -613,8 +708,8 @@ func TestSRPHandle_DefaultServiceARPA_RewrittenToUpstreamZone(t *testing.T) {
 
 	// The upstream forward must carry the REWRITTEN names -- default.service.arpa. must not
 	// appear anywhere in what actually reaches the authoritative server.
-	if len(coord.sent) != 1 {
-		t.Fatalf("expected exactly 1 upstream UPDATE sent, got %d", len(coord.sent))
+	if len(coord.sent) != 2 {
+		t.Fatalf("expected 2 upstream sends (registration + RFC 6763 S9 enumeration reconcile), got %d", len(coord.sent))
 	}
 	sawRealHost, sawRealInstance := false, false
 	for _, rr := range coord.sent[0].Ns {
@@ -807,11 +902,13 @@ func TestSRPHandle_RemoveOneInstance(t *testing.T) {
 		t.Fatalf("expected the instance's non-KEY records to be cleared after removal, got: %+v", set.Records)
 	}
 
-	if len(coord.sent) != 2 {
-		t.Fatalf("expected 2 upstream sends, got %d", len(coord.sent))
+	if len(coord.sent) != 4 {
+		t.Fatalf("expected 4 upstream sends (registration + its enumeration reconcile, removal + its enumeration reconcile), got %d", len(coord.sent))
 	}
+	// sent[0]=registration forward, sent[1]=its RFC 6763 S9 enumeration reconcile,
+	// sent[2]=removal forward (checked below), sent[3]=its own enumeration reconcile.
 	var foundDeleteAll, foundPTRDelete bool
-	for _, rr := range coord.sent[1].Ns {
+	for _, rr := range coord.sent[2].Ns {
 		if any, ok := rr.(*dns.ANY); ok && canonicalName(any.Hdr.Name) == canonicalName(inst) {
 			foundDeleteAll = true
 		}
@@ -827,10 +924,240 @@ func TestSRPHandle_RemoveOneInstance(t *testing.T) {
 		}
 	}
 	if !foundDeleteAll {
-		t.Fatalf("expected the removal update forwarded upstream to include the instance's own Delete All RRsets, got Ns: %+v", coord.sent[1].Ns)
+		t.Fatalf("expected the removal update forwarded upstream to include the instance's own Delete All RRsets, got Ns: %+v", coord.sent[2].Ns)
 	}
 	if !foundPTRDelete {
-		t.Fatalf("expected the removal update forwarded upstream to include an explicit PTR delete at the shared service-type name, got Ns: %+v", coord.sent[1].Ns)
+		t.Fatalf("expected the removal update forwarded upstream to include an explicit PTR delete at the shared service-type name, got Ns: %+v", coord.sent[2].Ns)
+	}
+
+	// sent[3] is the removal's own RFC 6763 S9 enumeration reconcile: with no other
+	// registrant providing _http._tcp (the fake's default QueryPTRExists = false), it must
+	// actually delete the now-unused type from the enumeration record.
+	enumOwner := "_services._dns-sd._udp." + srpTestZone
+	foundEnumDelete := false
+	for _, rr := range coord.sent[3].Ns {
+		if ptr, ok := rr.(*dns.PTR); ok && ptr.Hdr.Class == dns.ClassNONE && canonicalName(ptr.Hdr.Name) == canonicalName(enumOwner) {
+			foundEnumDelete = true
+		}
+	}
+	if !foundEnumDelete {
+		t.Fatalf("expected the removal's own enumeration reconcile to delete the now-unused type, got Ns: %+v", coord.sent[3].Ns)
+	}
+}
+
+// TestSRPHandle_ServiceEnumeration_KeepsListedWhenAnotherRegistrantStillProvidesType pins
+// the real bug this design was built to avoid, caught live against the real, shared
+// dev.zenr.io. zone: a second, independent proxy process (or a restart of the same one)
+// has no local knowledge of a type a DIFFERENT/earlier registrant provided, so removing the
+// one instance THIS process does know about must not blindly delete the shared enumeration
+// entry out from under that other, still-live registrant. QueryPTRExists standing in for
+// "yes, something else still answers a real browse for this type" is exactly the live check
+// reconcileServiceEnumeration performs before ever emitting a delete.
+func TestSRPHandle_ServiceEnumeration_KeepsListedWhenAnotherRegistrantStillProvidesType(t *testing.T) {
+	h, coord := newSRPTestHandler(t)
+	id := newSRPTestIdentity(t)
+	const host = "srptest12b.dev.zenr.io."
+	inst := oneWidgetInstance()[0].name
+
+	first := buildSRPUpdate(t, srpTestZone, id, host, []string{"192.0.2.1"}, oneWidgetInstance(), 30, 1209600, host)
+	if res := h.Handle(context.Background(), stubTCPResponseWriter{}, first); res.Status != StatusProcessed {
+		t.Fatalf("fresh registration: expected Processed, got %s: %v", res.Status, res.Error)
+	}
+
+	// Another registrant this process doesn't manage still answers a browse for the type.
+	coord.ptrExists = true
+
+	removal := []srpInstanceSpec{{name: inst, removalShaped: true}}
+	second := buildSRPUpdate(t, srpTestZone, id, host, []string{"192.0.2.1"}, removal, 30, 1209600, host)
+	if res := h.Handle(context.Background(), stubTCPResponseWriter{}, second); res.Status != StatusProcessed {
+		t.Fatalf("removal: expected Processed, got %s: %v", res.Status, res.Error)
+	}
+
+	// Only the removal's own instance-forward should have been sent -- its enumeration
+	// reconcile must see nothing to change (the type is neither newly present nor safe to
+	// delete) and send nothing at all.
+	if len(coord.sent) != 3 {
+		t.Fatalf("expected 3 upstream sends (registration forward, its enumeration add, removal forward -- no enumeration send for the removal, since the type is still live elsewhere), got %d", len(coord.sent))
+	}
+	// The removal forward (sent[2]) legitimately includes its own, unrelated PTR delete
+	// (ptrDeleteDiff, the per-type browsing PTR pointing at this specific instance) -- only
+	// the RFC 6763 S9 enumeration owner name is what must never appear as a delete here.
+	enumOwner := "_services._dns-sd._udp." + srpTestZone
+	for _, msg := range coord.sent {
+		for _, rr := range msg.Ns {
+			if ptr, ok := rr.(*dns.PTR); ok && ptr.Hdr.Class == dns.ClassNONE && canonicalName(ptr.Hdr.Name) == canonicalName(enumOwner) {
+				t.Fatalf("expected no enumeration-record delete while another registrant still provides the type, got: %s", ptr.String())
+			}
+		}
+	}
+}
+
+// alwaysOnDomainEnumPrefixes are the three RFC 6763 S11 prefixes reconcileServiceEnumeration
+// publishes whenever at least one service type is live, with no config opt-in required --
+// "r"/"dr" (registration domains) are separately gated behind advertiseRegistrationDomain and
+// covered by their own tests below.
+var alwaysOnDomainEnumPrefixes = []string{"b", "db", "lb"}
+
+// TestSRPHandle_BrowseDomains_AddedOnRegistrationRemovedWhenZoneEmpties exercises the three
+// always-on RFC 6763 S11 domain-enumeration PTRs (b/db/lb, all self-pointing at the zone)
+// reconcileServiceEnumeration now also maintains alongside the S9 type-enumeration record: a
+// domain-enumeration browse tool (e.g. a "browse everything" inspector) queries one of these
+// FIRST, before it ever asks for the S9 type list -- without them, a zone with perfectly
+// correct S9/S4.1 data is still invisible to such a tool. This pins all three appearing
+// together on the first registration and disappearing together once the zone's only
+// registration is removed (mirroring the S9 type record's own add-then-delete shape, bundled
+// into the same upstream messages).
+func TestSRPHandle_BrowseDomains_AddedOnRegistrationRemovedWhenZoneEmpties(t *testing.T) {
+	h, coord := newSRPTestHandler(t)
+	id := newSRPTestIdentity(t)
+	const host = "srptest12c.dev.zenr.io."
+	inst := oneWidgetInstance()[0].name
+
+	first := buildSRPUpdate(t, srpTestZone, id, host, []string{"192.0.2.1"}, oneWidgetInstance(), 30, 1209600, host)
+	if res := h.Handle(context.Background(), stubTCPResponseWriter{}, first); res.Status != StatusProcessed {
+		t.Fatalf("fresh registration: expected Processed, got %s: %v", res.Status, res.Error)
+	}
+
+	// sent[0]=registration forward, sent[1]=its RFC 6763 S9/S11 enumeration reconcile.
+	for _, prefix := range alwaysOnDomainEnumPrefixes {
+		owner := prefix + "._dns-sd._udp." + srpTestZone
+		found := false
+		for _, rr := range coord.sent[1].Ns {
+			if ptr, ok := rr.(*dns.PTR); ok && ptr.Hdr.Class == dns.ClassINET && canonicalName(ptr.Hdr.Name) == canonicalName(owner) {
+				if canonicalName(ptr.Ptr) != canonicalName(srpTestZone) {
+					t.Fatalf("%s: expected the domain-enumeration PTR to point at the zone itself, got %q", prefix, ptr.Ptr)
+				}
+				found = true
+			}
+		}
+		if !found {
+			t.Fatalf("expected the registration's own enumeration reconcile to add the %q domain-enumeration PTR, got Ns: %+v", prefix, coord.sent[1].Ns)
+		}
+	}
+
+	removal := []srpInstanceSpec{{name: inst, removalShaped: true}}
+	second := buildSRPUpdate(t, srpTestZone, id, host, []string{"192.0.2.1"}, removal, 30, 1209600, host)
+	if res := h.Handle(context.Background(), stubTCPResponseWriter{}, second); res.Status != StatusProcessed {
+		t.Fatalf("removal: expected Processed, got %s: %v", res.Status, res.Error)
+	}
+
+	// sent[2]=removal forward, sent[3]=its own enumeration reconcile.
+	for _, prefix := range alwaysOnDomainEnumPrefixes {
+		owner := prefix + "._dns-sd._udp." + srpTestZone
+		found := false
+		for _, rr := range coord.sent[3].Ns {
+			if ptr, ok := rr.(*dns.PTR); ok && ptr.Hdr.Class == dns.ClassNONE && canonicalName(ptr.Hdr.Name) == canonicalName(owner) {
+				found = true
+			}
+		}
+		if !found {
+			t.Fatalf("expected the removal's own enumeration reconcile to delete the now-unused %q domain-enumeration PTR, got Ns: %+v", prefix, coord.sent[3].Ns)
+		}
+	}
+}
+
+// TestSRPHandle_BrowseDomains_KeptWhenAnotherRegistrantStillProvidesAType mirrors
+// TestSRPHandle_ServiceEnumeration_KeepsListedWhenAnotherRegistrantStillProvidesType for the
+// always-on S11 domain-enumeration PTRs: removing the only instance THIS process knows about
+// must not delete b/db/lb out from under a different, still-live registrant elsewhere in the
+// same shared zone.
+func TestSRPHandle_BrowseDomains_KeptWhenAnotherRegistrantStillProvidesAType(t *testing.T) {
+	h, coord := newSRPTestHandler(t)
+	id := newSRPTestIdentity(t)
+	const host = "srptest12d.dev.zenr.io."
+	inst := oneWidgetInstance()[0].name
+
+	first := buildSRPUpdate(t, srpTestZone, id, host, []string{"192.0.2.1"}, oneWidgetInstance(), 30, 1209600, host)
+	if res := h.Handle(context.Background(), stubTCPResponseWriter{}, first); res.Status != StatusProcessed {
+		t.Fatalf("fresh registration: expected Processed, got %s: %v", res.Status, res.Error)
+	}
+
+	// Another registrant this process doesn't manage still answers a browse for the type.
+	coord.ptrExists = true
+
+	removal := []srpInstanceSpec{{name: inst, removalShaped: true}}
+	second := buildSRPUpdate(t, srpTestZone, id, host, []string{"192.0.2.1"}, removal, 30, 1209600, host)
+	if res := h.Handle(context.Background(), stubTCPResponseWriter{}, second); res.Status != StatusProcessed {
+		t.Fatalf("removal: expected Processed, got %s: %v", res.Status, res.Error)
+	}
+
+	// Same as the S9 type-enumeration analogue: with the type still live elsewhere, none of
+	// these records has anything to change, so the removal's own enumeration reconcile sends
+	// nothing at all -- only the removal forward itself (sent[2]) is expected.
+	if len(coord.sent) != 3 {
+		t.Fatalf("expected 3 upstream sends (registration forward, its enumeration add, removal forward -- no enumeration send for the removal), got %d", len(coord.sent))
+	}
+	for _, msg := range coord.sent {
+		for _, rr := range msg.Ns {
+			ptr, ok := rr.(*dns.PTR)
+			if !ok || ptr.Hdr.Class != dns.ClassNONE {
+				continue
+			}
+			for _, prefix := range alwaysOnDomainEnumPrefixes {
+				owner := prefix + "._dns-sd._udp." + srpTestZone
+				if canonicalName(ptr.Hdr.Name) == canonicalName(owner) {
+					t.Fatalf("expected no %q domain-enumeration PTR delete while another registrant still provides a service type, got: %s", prefix, ptr.String())
+				}
+			}
+		}
+	}
+}
+
+// TestSRPHandle_RegistrationDomains_OffByDefault confirms "r"/"dr" (RFC 6763 S11's
+// registration-domain records) are never published unless the operator opts in via
+// advertise_registration_domain -- unlike b/db/lb, advertising this zone as an open target
+// for direct RFC 2136 Dynamic Update registration is a deployment policy choice, not implied
+// by SRP working here.
+func TestSRPHandle_RegistrationDomains_OffByDefault(t *testing.T) {
+	h, coord := newSRPTestHandler(t)
+	id := newSRPTestIdentity(t)
+	const host = "srptest12e.dev.zenr.io."
+
+	msg := buildSRPUpdate(t, srpTestZone, id, host, []string{"192.0.2.1"}, oneWidgetInstance(), 30, 1209600, host)
+	if res := h.Handle(context.Background(), stubTCPResponseWriter{}, msg); res.Status != StatusProcessed {
+		t.Fatalf("fresh registration: expected Processed, got %s: %v", res.Status, res.Error)
+	}
+
+	for _, prefix := range []string{"r", "dr"} {
+		owner := prefix + "._dns-sd._udp." + srpTestZone
+		for _, sent := range coord.sent {
+			for _, rr := range sent.Ns {
+				if ptr, ok := rr.(*dns.PTR); ok && canonicalName(ptr.Hdr.Name) == canonicalName(owner) {
+					t.Fatalf("expected no %q record without advertise_registration_domain, got: %s", prefix, ptr.String())
+				}
+			}
+		}
+	}
+}
+
+// TestSRPHandle_RegistrationDomains_PublishedWhenOptedIn confirms "r"/"dr" appear, self-
+// pointing at the zone exactly like b/db/lb, once advertiseRegistrationDomain is set.
+func TestSRPHandle_RegistrationDomains_PublishedWhenOptedIn(t *testing.T) {
+	h, coord := newSRPTestHandler(t)
+	h.advertiseRegistrationDomain = true
+	id := newSRPTestIdentity(t)
+	const host = "srptest12f.dev.zenr.io."
+
+	msg := buildSRPUpdate(t, srpTestZone, id, host, []string{"192.0.2.1"}, oneWidgetInstance(), 30, 1209600, host)
+	if res := h.Handle(context.Background(), stubTCPResponseWriter{}, msg); res.Status != StatusProcessed {
+		t.Fatalf("fresh registration: expected Processed, got %s: %v", res.Status, res.Error)
+	}
+
+	// sent[1] is the registration's own enumeration reconcile.
+	for _, prefix := range []string{"r", "dr"} {
+		owner := prefix + "._dns-sd._udp." + srpTestZone
+		found := false
+		for _, rr := range coord.sent[1].Ns {
+			if ptr, ok := rr.(*dns.PTR); ok && ptr.Hdr.Class == dns.ClassINET && canonicalName(ptr.Hdr.Name) == canonicalName(owner) {
+				if canonicalName(ptr.Ptr) != canonicalName(srpTestZone) {
+					t.Fatalf("%s: expected the registration-domain PTR to point at the zone itself, got %q", prefix, ptr.Ptr)
+				}
+				found = true
+			}
+		}
+		if !found {
+			t.Fatalf("expected the enumeration reconcile to add the %q registration-domain PTR when opted in, got Ns: %+v", prefix, coord.sent[1].Ns)
+		}
 	}
 }
 
@@ -859,12 +1186,15 @@ func TestSRPHandle_PTRDiff_DropsSubtypeOnUpdate(t *testing.T) {
 	if res.Status != StatusProcessed {
 		t.Fatalf("drop-subtype update: expected Processed, got %s: %v", res.Status, res.Error)
 	}
-	if len(coord.sent) != 2 {
-		t.Fatalf("expected 2 upstream sends, got %d", len(coord.sent))
+	if len(coord.sent) != 3 {
+		t.Fatalf("expected 3 upstream sends (fresh forward + its enumeration add, drop-subtype forward -- its own enumeration reconcile is a no-op and sends nothing, since the service type set is unchanged), got %d", len(coord.sent))
 	}
 
+	// sent[0]=fresh forward, sent[1]=its RFC 6763 S9 enumeration add, sent[2]=the
+	// drop-subtype update's own forward (checked below; no enumeration reconcile follows
+	// it, since dropping a subtype doesn't change the service type set).
 	foundDeleteForSubtype := false
-	for _, rr := range coord.sent[1].Ns {
+	for _, rr := range coord.sent[2].Ns {
 		ptr, ok := rr.(*dns.PTR)
 		if !ok || ptr.Hdr.Class != dns.ClassNONE {
 			continue
@@ -874,7 +1204,7 @@ func TestSRPHandle_PTRDiff_DropsSubtypeOnUpdate(t *testing.T) {
 		}
 	}
 	if !foundDeleteForSubtype {
-		t.Fatalf("expected an explicit PTR delete for the dropped subtype %s in the forwarded upstream message, got Ns: %+v", subtype, coord.sent[1].Ns)
+		t.Fatalf("expected an explicit PTR delete for the dropped subtype %s in the forwarded upstream message, got Ns: %+v", subtype, coord.sent[2].Ns)
 	}
 }
 
@@ -904,8 +1234,15 @@ func TestSRPHandle_ExpiryDeletesUpstreamThenLocally(t *testing.T) {
 		t.Fatalf("fresh registration: expected Processed, got %s: %v", res.Status, res.Error)
 	}
 
+	// Disarm BOTH nodes' auto-armed timers, not just the host's: the instance shares the
+	// same ~1s keyLease, so its own timer would otherwise race this test's manual call
+	// (DeleteSubtree cascades either way, but with it racing, which goroutine's own
+	// reconcileServiceEnumeration call observes/updates h.serviceTypes first becomes
+	// nondeterministic -- see TestSRPHandle_ExpiryCoversWholeSubtree's identical reasoning).
 	hostNodeKey := leasepkg.NodeKey(id.keyAt(host))
+	instNodeKey := leasepkg.NodeKey(id.keyAt(oneWidgetInstance()[0].name))
 	disarmAutoExpiry(h, hostNodeKey)
+	disarmAutoExpiry(h, instNodeKey)
 	time.Sleep(1100 * time.Millisecond)
 	rec := h.leaseManager.Get(hostNodeKey)
 	if rec == nil || !rec.IsExpired() {
@@ -915,10 +1252,12 @@ func TestSRPHandle_ExpiryDeletesUpstreamThenLocally(t *testing.T) {
 	sentBefore := len(coord.sent)
 	h.processExpiredNode(context.Background(), hostNodeKey)
 
-	if len(coord.sent) != sentBefore+1 {
-		t.Fatalf("expected exactly one additional upstream delete sent on expiry, got %d -> %d", sentBefore, len(coord.sent))
+	if len(coord.sent) != sentBefore+2 {
+		t.Fatalf("expected exactly two additional upstream sends on expiry (the delete + its RFC 6763 S9 enumeration reconcile), got %d -> %d", sentBefore, len(coord.sent))
 	}
-	lastSent := coord.sent[len(coord.sent)-1]
+	// The reconcile that follows the expiry delete is last; the delete itself is
+	// second-to-last.
+	lastSent := coord.sent[len(coord.sent)-2]
 	foundDeleteAll := false
 	for _, rr := range lastSent.Ns {
 		// processExpiredNode sends a Delete All RRsets (class ANY) at the node's own name,
@@ -965,7 +1304,9 @@ func TestSRPHandle_ExpiryPTRCleanup(t *testing.T) {
 
 	h.processExpiredNode(context.Background(), instNodeKey)
 
-	lastSent := coord.sent[len(coord.sent)-1]
+	// The expiry delete is followed by one more upstream call (reconcileServiceEnumeration,
+	// RFC 6763 S9), so it's second-to-last, not last.
+	lastSent := coord.sent[len(coord.sent)-2]
 	var foundDeleteAll, foundPTRDelete bool
 	for _, rr := range lastSent.Ns {
 		if any, ok := rr.(*dns.ANY); ok && canonicalName(any.Hdr.Name) == canonicalName(inst) {
@@ -1018,7 +1359,11 @@ func TestSRPHandle_ExpiryCoversWholeSubtree(t *testing.T) {
 	// simulating "child's independent attempt hasn't happened yet."
 	h.processExpiredNode(context.Background(), hostNodeKey)
 
-	lastSent := coord.sent[len(coord.sent)-1]
+	// processExpiredNode's own upstream delete is followed by one more upstream call
+	// (reconcileServiceEnumeration, RFC 6763 S9 -- the now-empty zone's enumeration record
+	// is republished after the subtree is gone), so the delete itself is second-to-last,
+	// not last.
+	lastSent := coord.sent[len(coord.sent)-2]
 	var foundHostDelete, foundInstDelete, foundPTRDelete bool
 	for _, rr := range lastSent.Ns {
 		if any, ok := rr.(*dns.ANY); ok {
@@ -1108,8 +1453,17 @@ func TestSRPHandle_ExpiryConcurrentRefreshRace_StillDeletesLocally(t *testing.T)
 	fake := h.coordinator.(*fakeSRPCoordinator)
 	// Simulate a concurrent client refresh landing (and being locally applied) WHILE this
 	// expiry's own upstream delete is in flight -- exactly the window Handle()'s own
-	// upstream-then-local ordering leaves open to a completely independent goroutine.
+	// upstream-then-local ordering leaves open to a completely independent goroutine. Fires
+	// once only: processExpiredNode's own upstream delete is followed by a second upstream
+	// call (reconcileServiceEnumeration, RFC 6763 S9), by which point DeleteSubtree has
+	// already run and there is no longer a lease to renew -- this callback simulates the
+	// race during the expiry delete specifically, not every subsequent upstream call.
+	var fired bool
 	fake.onSendUpdate = func() {
+		if fired {
+			return
+		}
+		fired = true
 		if err := h.leaseManager.RenewLease(context.Background(), id.keyAt(host), 3600, 3600); err != nil {
 			t.Fatalf("simulated concurrent refresh: RenewLease: %v", err)
 		}

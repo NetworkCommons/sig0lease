@@ -15,7 +15,7 @@
 # evidence), a real bug/limitation in srp-client's own reconnect-on-second-message logic, not
 # something this test suite can route around.
 #
-# Direction 2: OUR client (client/srp, via cmd/sig0lease-srp) against the real
+# Direction 2: OUR client (client/srp, via cmd/sig0lease-srp-client) against the real
 # srp-mdns-proxy -- both Register and, importantly, Deregister (this project's own new
 # removal capability, added specifically to extend interop coverage past plain registration).
 # srp-mdns-proxy's own log line (srp_evaluate: ... validates) is the actual interop signal
@@ -38,7 +38,7 @@ D1_PROXY_URL="${D1_PROXY_ADDR}:${D1_PROXY_PORT}"
 D1_KEYSTORE_DIR="${TESTS_DIR}/keystore-srp-bind9-default-arpa"
 
 D1_PROXY_BIN="${TESTS_DIR}/../bin/${OS}/sig0lease"
-D2_CLIENT_BIN="${TESTS_DIR}/../bin/${OS}/sig0lease-srp"
+D2_CLIENT_BIN="${TESTS_DIR}/../bin/${OS}/sig0lease-srp-client"
 D1_PROXY_LOG="/tmp/sig0lease_d1_proxy.log"
 D1_TMP_CONFIG=""
 D1_PROXY_PID=""
@@ -53,7 +53,7 @@ PERFORMED_TESTS=""
 build_interop_binaries() {
     log_section "BUILD"
     (cd "$TESTS_DIR/.." && go build -o "$D1_PROXY_BIN" ./cmd/sig0lease)
-    (cd "$TESTS_DIR/.." && go build -o "$D2_CLIENT_BIN" ./cmd/sig0lease-srp)
+    (cd "$TESTS_DIR/.." && go build -o "$D2_CLIENT_BIN" ./cmd/sig0lease-srp-client)
     build_mdnsresponder
     log_success "Binaries ready"
 }
@@ -330,10 +330,13 @@ test_d2_register() {
     # || true: the CLI itself exits 1 on a non-Success outcome, and SERVFAIL (not Success) is
     # the expected result here -- see the comment below. The real pass/fail signal is
     # srp-mdns-proxy's own log line, checked next.
+    # -k=13 generates this identity's key on first use (sig0lease-srp-client no longer
+    # auto-generates a missing key by default -- see the -k flag doc); the deregister
+    # call below reuses the same key without needing -k again.
     local out
     out="$("$D2_CLIENT_BIN" -domain=default.service.arpa. -host=d2-register -addr=192.0.2.111 -udp \
         -server="127.0.0.1:${D2_MDNS_PROXY_PORT}" -instance=Gizmo:_http._tcp:8080 -once \
-        -keystore="${D2_KEY_DIR}/d2-register" 2>&1 || true)"
+        -keystore="${D2_KEY_DIR}/d2-register" -k=13 2>&1 || true)"
     echo "$out"
 
     # SERVFAIL here is expected and NOT a failure: it's srp-mdns-proxy's own last step

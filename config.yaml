@@ -74,15 +74,35 @@ handlers:
   #                                 hardcodes it, having no other way to discover a zone) as
   #                                 an alias for upstream_zone, rewriting every name in the
   #                                 update before anything else sees it (default false)
+  #   advertise_registration_domain: also publish the RFC 6763 S11 "r"/"dr" registration-
+  #                                 domain records (self-pointing at upstream_zone), alongside
+  #                                 the always-on "b"/"db"/"lb" browsing-domain records, once
+  #                                 at least one service type is live. Off by default --
+  #                                 advertising this zone as an open target for direct RFC
+  #                                 2136 registration (not just SRP) is a deployment choice.
   srp_handler:
     upstream_zone: "srp.dev.zenr.io."
     keystore_dir: "./keystore/server"
     rewrite_default_service_arpa: true
+    # advertise_registration_domain: false
     lease_policy:
       min_key_lease_sec: 30
       max_key_lease_sec: 1209600   # RFC 9665's usual 14-day KEY-LEASE
       min_rr_lease_sec: 30
       max_rr_lease_sec: 7200
+
+    # Lease storage backend -- same "storage"/"lease_manager" option as handlers.update below
+    # (both go through the identical file-backed LeaseStorage implementation, pkg/lease's
+    # FileLeaseStore -- neither handler gets special treatment). Optional; when omitted,
+    # leases are kept in-memory only and are lost on a crash or restart, silently -- there is
+    # no warning at startup if this is left unset. Must NOT reuse handlers.update's own path:
+    # these are two independent lease-store instances (different zones, different tree
+    # shapes), and pointing both at the same file would have each one clobber the other's
+    # snapshot on save.
+    storage:
+      type: file
+      path: "./data/srp_lease_snapshot.json"   # required for type: file
+      save_interval: "30s"                      # optional, default 30s
   update:
     # Upstream zone used to discover authoritative nameserver for UPDATE forwarding.
     # Proxy resolves NS for this zone and sends UPDATE to that authoritative server.

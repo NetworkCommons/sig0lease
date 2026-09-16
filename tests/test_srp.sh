@@ -5,7 +5,7 @@
 # Runs the real proxy process (srp_handler only) against a real, disposable local BIND 9
 # instance authoritative for srp.test. -- register -> dig -> refresh -> conflict (YXDOMAIN)
 # -> remove-one -> remove-all -> expiry. Uses tests/srp_client_tester (a minimal Go test
-# client -- client/srp and cmd/sig0lease-srp are Phase 4, not built yet), not stubs/mocks.
+# client -- client/srp and cmd/sig0lease-srp-client are Phase 4, not built yet), not stubs/mocks.
 
 set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -42,7 +42,7 @@ build_srp_binaries() {
 }
 
 prepare_srp_config() {
-    SRP_TMP_CONFIG="$(mktemp /tmp/sig0lease-srp-config.XXXXXX.yaml)"
+    SRP_TMP_CONFIG="$(mktemp /tmp/sig0lease-srp-client-config.XXXXXX.yaml)"
     cat > "$SRP_TMP_CONFIG" <<EOF
 server:
   address: ":${SRP_PROXY_PORT}"
@@ -158,7 +158,14 @@ test_register_and_dig() {
     [ -n "$(dig_srp Widget._http._tcp.srp.test. SRV)" ] || { log_error "instance SRV not found at authoritative"; return 1; }
     [ -n "$(dig_srp _http._tcp.srp.test. PTR)" ] || { log_error "PTR not found at authoritative"; return 1; }
 
-    log_success "Register landed at authoritative: host A/KEY, instance SRV/TXT, PTR all present"
+    # RFC 6763 S9: the proxy must also maintain the Service Type Enumeration record so
+    # "browse everything" tools (which query this name first, not a specific type's own
+    # browsing PTR) can find what's registered -- see reconcileServiceEnumeration.
+    wait_for_srp_state _services._dns-sd._udp.srp.test. PTR present 10 || { log_error "S9 enumeration record not found at authoritative"; return 1; }
+    dig_srp _services._dns-sd._udp.srp.test. PTR | grep -qi "_http._tcp.srp.test." \
+        || { log_error "S9 enumeration record does not list _http._tcp.srp.test."; return 1; }
+
+    log_success "Register landed at authoritative: host A/KEY, instance SRV/TXT, PTR, and S9 enumeration all present"
     PERFORMED_TESTS="$PERFORMED_TESTS\n  [OK] $log_msg"
 }
 
@@ -208,7 +215,12 @@ test_remove_one_instance() {
     wait_for_srp_state Widget._http._tcp.srp.test. SRV absent 10 || return 1
     [ -n "$(dig_srp host1.srp.test. A)" ] || { log_error "host A record disappeared after removing just the instance"; return 1; }
 
-    log_success "Service instance removed; host registration untouched"
+    # RFC 6763 S9: Widget was the only _http._tcp instance registered so far, so removing it
+    # must clear the type out of the enumeration record too, not just leave it stale.
+    wait_for_srp_state _services._dns-sd._udp.srp.test. PTR absent 10 \
+        || { log_error "S9 enumeration record still lists a type with no live instances"; return 1; }
+
+    log_success "Service instance removed; host registration untouched; S9 enumeration record cleared"
     PERFORMED_TESTS="$PERFORMED_TESTS\n  [OK] $log_msg"
 }
 
@@ -246,13 +258,24 @@ test_expiry() {
     echo "$out" | grep -q "Status: NOERROR (Rcode=0)" || { log_error "fresh registration for expiry test did not return NOERROR"; return 1; }
     [ -n "$(dig_srp host3.srp.test. A)" ] || { log_error "host A record not found right after registration"; return 1; }
 
+    # RFC 6763 S9: Sprocket is a fresh _http._tcp instance (the type dropped out of the
+    # enumeration record when TEST 4 removed the last one) -- registering it must bring the
+    # type back.
+    wait_for_srp_state _services._dns-sd._udp.srp.test. PTR present 10 \
+        || { log_error "S9 enumeration record did not pick the type back up after a fresh registration"; return 1; }
+
     log_step "Waiting up to ${SRP_EXPIRY_TIMEOUT}s for upstream expiry cleanup (self-heals via the 30s reconciliation pass if a delete is transiently rejected -- see processExpiredNode's RCODE check)"
     wait_for_srp_state host3.srp.test. A absent "$SRP_EXPIRY_TIMEOUT" || return 1
     wait_for_srp_state host3.srp.test. KEY absent "$SRP_EXPIRY_TIMEOUT" || return 1
     wait_for_srp_state Sprocket._http._tcp.srp.test. SRV absent "$SRP_EXPIRY_TIMEOUT" || return 1
     wait_for_srp_state _http._tcp.srp.test. PTR absent "$SRP_EXPIRY_TIMEOUT" || return 1
 
-    log_success "Expiry cleaned up host A/KEY, instance SRV, and the shared-type PTR at authoritative"
+    # Sprocket was again the only live _http._tcp instance, so its expiry must clear the
+    # enumeration record one more time.
+    wait_for_srp_state _services._dns-sd._udp.srp.test. PTR absent "$SRP_EXPIRY_TIMEOUT" \
+        || { log_error "S9 enumeration record still lists a type with no live instances after expiry"; return 1; }
+
+    log_success "Expiry cleaned up host A/KEY, instance SRV, the shared-type PTR, and the S9 enumeration record at authoritative"
     PERFORMED_TESTS="$PERFORMED_TESTS\n  [OK] $log_msg"
 }
 
@@ -271,7 +294,7 @@ run_all_tests() {
     require_command named
     require_command go
 
-    SRP_KEY_DIR="$(mktemp -d /tmp/sig0lease-srp-identities.XXXXXX)"
+    SRP_KEY_DIR="$(mktemp -d /tmp/sig0lease-srp-client-identities.XXXXXX)"
 
     build_srp_binaries
     start_bind9

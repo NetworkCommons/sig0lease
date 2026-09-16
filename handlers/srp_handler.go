@@ -10,12 +10,20 @@ import (
 	"time"
 
 	"codeberg.org/miekg/dns"
+	"github.com/NetworkCommons/sig0lease/pkg/dnssd"
 	"github.com/NetworkCommons/sig0lease/pkg/keyrec"
 	leasepkg "github.com/NetworkCommons/sig0lease/pkg/lease"
 	"github.com/NetworkCommons/sig0lease/pkg/sig0"
 	"github.com/NetworkCommons/sig0lease/pkg/srp"
 	"github.com/NetworkCommons/sig0lease/pkg/updatecore"
 )
+
+// serviceEnumerationTTL is the TTL used for the RFC 6763 S9 Service Type Enumeration PTR and
+// S11 Browse Domain PTR records this handler maintains (reconcileServiceEnumeration). These
+// are proxy-maintained infrastructure records with no single client lease to derive a TTL
+// from, unlike every other record this handler writes, which take their TTL from a specific
+// client's granted LEASE.
+const serviceEnumerationTTL = 3600
 
 // SRPHandler implements handlers.Handler for opcode 5 (UPDATE), the RFC 9665 SRP path --
 // a sibling to UpdateHandler (D1), never a branch inside it: SRP's message shape and
@@ -46,6 +54,35 @@ type SRPHandler struct {
 	rewriteDefaultServiceARPA bool // plan S4.3 step 6 / D5: accept default.service.arpa. as an alias for upstreamZone
 	LeasePolicy               LeasePolicy
 
+	// serviceTypesMu guards serviceTypes, this process's own tracked view of the RFC 6763
+	// S9 enumeration record's contents -- see reconcileServiceEnumeration. Starts nil/empty
+	// on every process start, deliberately: it is NOT reconstructed from a live upstream
+	// read, so a freshly started (or restarted) process only ever ADDS types it newly
+	// discovers in its own lease store on its own account -- it never blindly deletes a
+	// type it simply hasn't relearned about. A type that drops out of this process's own
+	// local knowledge is only actually removed from the upstream record after a live
+	// QueryPTRExists confirms no other registrant (a different process, or an earlier run
+	// of this same one) still provides it.
+	serviceTypesMu sync.Mutex
+	serviceTypes   map[string]bool
+
+	// domainEnumPresent is this process's own last-confirmed-written presence state for each
+	// RFC 6763 S11 domain-enumeration prefix (dnssd.BrowseDomainPrefix and friends) -- see
+	// reconcileServiceEnumeration. Guarded by serviceTypesMu alongside serviceTypes since both
+	// are only ever read/written together, inside the same reconcile pass. Starts nil (every
+	// lookup then defaults to false) on every process start, for the same restart-safety
+	// reason serviceTypes starts nil: a prefix is only removed once a live QueryPTRExists
+	// confirms no service type remains anywhere in the zone, not just gone from this
+	// process's own local view.
+	domainEnumPresent map[string]bool
+
+	// advertiseRegistrationDomain gates the "r"/"dr" prefixes (RFC 6763 S11's registration-
+	// domain records) specifically -- unlike "b"/"db"/"lb" (always published once at least
+	// one service type is live), advertising this zone as an open target for direct RFC 2136
+	// Dynamic Update registration (not just SRP) is a deployment policy choice, not implied
+	// by SRP working here. Default false (config: srp_handler.advertise_registration_domain).
+	advertiseRegistrationDomain bool
+
 	leaseTimersMu sync.Mutex
 	leaseTimers   map[string]*time.Timer
 }
@@ -60,6 +97,11 @@ type srpCoordinator interface {
 	QueryKeyAtName(ctx context.Context, zoneHint, name string) (srp.AuthoritativeKeyState, []*dns.KEY, error)
 	SendUpdate(ctx context.Context, upstreamZone string, updateMsg *dns.Msg) (*dns.Msg, error)
 	ResolveAuthoritativeZone(ctx context.Context, zone string) (string, error)
+	// QueryPTRExists reports whether at least one PTR record currently exists live at
+	// name -- used by reconcileServiceEnumeration (RFC 6763 S9) to confirm a type is truly
+	// gone everywhere before removing it from the enumeration record, not just gone from
+	// this process's own local lease-store view.
+	QueryPTRExists(ctx context.Context, zoneHint, name string) (bool, error)
 }
 
 // NewSRPHandler creates a new handler for opcode 5 (UPDATE), RFC 9665 SRP path.
@@ -312,12 +354,17 @@ func (h *SRPHandler) Handle(ctx context.Context, w dns.ResponseWriter, r *dns.Ms
 	// delete for any PTR this update's Service Discovery instructions drop (plan
 	// S4.4/S4.5: upstream never delete-alls a PTR's owner name, so dropping a subtype
 	// needs its own instruction; the local store, by contrast, wipes the whole service
-	// subtree uniformly in step 8).
+	// subtree uniformly in step 8) -- plus a synthesized KEY add for any live instance
+	// whose own Service Description omitted its KEY (RFC 9665 S3.3.3's own MUST: every
+	// Service Description that's updated must end up with a KEY RR published, regardless
+	// of whether the requester's message included one -- see
+	// synthesizeOmittedInstanceKeys's own doc comment).
 	forwardRecords := make([]dns.RR, 0, len(r.Ns))
 	for _, rr := range r.Ns {
 		forwardRecords = append(forwardRecords, rr)
 	}
 	forwardRecords = append(forwardRecords, h.ptrDeleteDiff(cu)...)
+	forwardRecords = append(forwardRecords, synthesizeOmittedInstanceKeys(cu)...)
 
 	signingKey, effectiveZone, err := h.resolveUpstreamSigningContext(ctx)
 	if err != nil {
@@ -391,9 +438,247 @@ func (h *SRPHandler) Handle(ctx context.Context, w dns.ResponseWriter, r *dns.Ms
 		h.scheduleLeaseExpiry(nodeKey)
 	}
 
+	// RFC 6763 S9, not one of the S4.3 ten steps above (those are RFC 9665's own protocol
+	// flow): recompute and republish this zone's Service Type Enumeration record so this
+	// registration is visible to "browse everything" tools, not just a targeted per-type
+	// browse. Best-effort -- a rejected/failed write here doesn't fail the client's own
+	// already-successful registration; the periodic reconciliation (startLeaseReconciliation)
+	// retries it on the next tick regardless.
+	h.reconcileServiceEnumeration(ctx)
+
 	// Step 10: NOERROR + echo the granted LEASE/KEY-LEASE.
 	resp := h.buildSuccessResponse(r, lease, keyLease)
 	return NewProcessedResult(resp)
+}
+
+// collectLiveServiceTypes scans the lease store for every currently-registered, unexpired
+// service instance (a KEY node whose non-KEY children include an SRV record) and returns the
+// RFC 6763 two-label service type of each -- the input reconcileServiceEnumeration needs to
+// recompute this zone's Service Type Enumeration record (S9) from scratch. Duplicates are
+// expected and fine: BuildEnumerationRecords dedupes.
+func (h *SRPHandler) collectLiveServiceTypes() []string {
+	var types []string
+	for _, rec := range h.leaseManager.ListAll() {
+		if rec == nil || rec.KeyRR == nil || rec.IsExpired() {
+			continue
+		}
+		set := h.leaseManager.GetNonKEYRecordSet(leasepkg.NodeKey(rec.KeyRR))
+		if set == nil {
+			continue
+		}
+		for _, nkRec := range set.Records {
+			srv, ok := nkRec.RR.(*dns.SRV)
+			if !ok {
+				continue
+			}
+			if svcType, ok := dnssd.ServiceTypeFromInstanceName(srv.Hdr.Name); ok {
+				types = append(types, svcType)
+			}
+			break // one SRV per instance node -- no need to keep scanning this node's set
+		}
+	}
+	return types
+}
+
+// reconcileServiceEnumeration brings this zone's RFC 6763 S9 Service Type Enumeration record
+// (_services._dns-sd._udp.<zone>) in line with the live lease store, via a targeted diff
+// against this process's own last-confirmed-written view (h.serviceTypes) -- see
+// dnssd.DiffEnumerationRecords's doc comment for why a full delete-all-then-reinsert is
+// unsafe here (it would erase another process's still-live entries) and h.serviceTypes's own
+// doc comment for why that view starts empty on every process start rather than being seeded
+// from a live upstream read.
+//
+// A type this process's own local knowledge no longer has an instance of is NOT deleted
+// outright: it's confirmed missing everywhere first, via a live QueryPTRExists at its
+// per-type browsing name (RFC 6763 S4.1 -- the exact name a real browse would query, so this
+// is asking the same question a real client would get a real answer to). This closes a gap a
+// local-store-only view can't see on its own: a shared real zone can have more than one
+// independent registrant (or registrar process, across a restart) providing the SAME type --
+// observed live against the real dev.zenr.io. shared environment, where a second proxy
+// process's own empty local view, reconciled naively, deleted a still-live type a first,
+// already-gone process had registered. A type the live check still finds elsewhere is kept
+// in the tracked state (so a later reconcile re-checks it, rather than forgetting it was ever
+// a candidate) and simply isn't included in this round's delete. A query that itself fails
+// fails safe the same way -- keep, don't delete, log, and let the next reconcile retry.
+//
+// Alongside the S9 type set, this also maintains all five S11 domain-enumeration PTRs
+// (dnssd.DiffSelfPointingDomainRecord): "b"/"db"/"lb" present whenever at least one service
+// type is known live in the zone (by this process's own local knowledge OR confirmed still
+// live elsewhere via the same survivors check the type diff already performs), absent
+// otherwise; "r"/"dr" the same, additionally gated on h.advertiseRegistrationDomain (off by
+// default -- advertising this zone as an open target for direct RFC 2136 registration, not
+// just SRP, is a deployment policy choice). A domain-enumeration browse tool queries one or
+// more of these FIRST, before ever asking for the S9 type list -- without them, a zone with
+// perfectly correct S9/S4.1 records is still invisible to such a tool, since it never gets
+// that far. Reusing the type diff's own survivors safety check here means the same
+// protection applies to all five: this process only ever removes one once it has
+// independently confirmed, via a live query, that no service type remains anywhere in the
+// zone -- not just gone from its own local view.
+//
+// A no-op diff (nothing left to add or delete after this) sends no upstream UPDATE at all.
+// Called both synchronously after a successful Handle()/expiry (prompt visibility for a
+// genuine change) and periodically from startLeaseReconciliation (self-heals a type this
+// process's own local store has picked up, or confirmed gone, since the last tick).
+func (h *SRPHandler) reconcileServiceEnumeration(ctx context.Context) {
+	current := h.collectLiveServiceTypes()
+	currentSet := make(map[string]bool, len(current))
+	for _, t := range current {
+		currentSet[strings.ToLower(t)] = true
+	}
+
+	h.serviceTypesMu.Lock()
+	previous := make([]string, 0, len(h.serviceTypes))
+	for t := range h.serviceTypes {
+		previous = append(previous, t)
+	}
+	wasDomainEnumPresent := make(map[string]bool, len(h.domainEnumPresent))
+	for prefix, present := range h.domainEnumPresent {
+		wasDomainEnumPresent[prefix] = present
+	}
+	h.serviceTypesMu.Unlock()
+
+	// previousForDiff feeds DiffEnumerationRecords: it must still include a type this
+	// process has confirmed is gone everywhere, so the diff (which deletes whatever's in
+	// "previous" but not "current") actually emits that delete -- survivors are excluded
+	// instead, so the diff leaves their still-valid upstream entry untouched. survivors is
+	// tracked separately so it can be folded back into h.serviceTypes below (kept for a
+	// later reconcile to re-check, without generating any upstream instruction now).
+	previousForDiff := make([]string, 0, len(previous))
+	var survivors []string
+	for _, t := range previous {
+		if currentSet[strings.ToLower(t)] {
+			previousForDiff = append(previousForDiff, t) // still known locally too -- unaffected
+			continue
+		}
+		stillLive, err := h.coordinator.QueryPTRExists(ctx, h.upstreamZone, dnssd.BrowsingOwnerName(t, h.upstreamZone))
+		switch {
+		case err != nil:
+			h.logger.Errorf("SRP handler: service-type enumeration: failed to confirm %s has no other live instances, leaving it listed: %v", t, err)
+			survivors = append(survivors, t)
+		case stillLive:
+			h.logger.Debugf("SRP handler: service-type enumeration: %s still has a live instance this process doesn't manage, leaving it listed", t)
+			survivors = append(survivors, t)
+		default:
+			previousForDiff = append(previousForDiff, t) // confirmed gone everywhere -- the diff below deletes it
+		}
+	}
+
+	// anyLive is true once at least one service type is known live in the zone, whether
+	// from this process's own local knowledge (currentSet) or confirmed still live
+	// elsewhere via the survivors check above -- exactly the same fact the type-enumeration
+	// record itself would end up expressing ("is the S9 record non-empty"), just as a
+	// boolean rather than a set. Reusing survivors here means a domain-enumeration record is
+	// never removed just because this process's own local view emptied out; it needs the
+	// same live confirmation a type's own removal does.
+	anyLive := len(currentSet) > 0 || len(survivors) > 0
+	// registrationOptedIn additionally gates "r"/"dr" on h.advertiseRegistrationDomain -- if
+	// it's (or becomes) false while one of them was previously published, this naturally
+	// emits a delete for it below, exactly like anyLive turning false does for the other
+	// three. A fixed-order slice, not a map, so the resulting upstream instructions have a
+	// deterministic order (map iteration order doesn't, and DiffEnumerationRecords's own
+	// output is already sorted for the same reason).
+	registrationOptedIn := anyLive && h.advertiseRegistrationDomain
+	wantedDomainEnum := []struct {
+		prefix    string
+		isPresent bool
+	}{
+		{dnssd.BrowseDomainPrefix, anyLive},
+		{dnssd.DefaultBrowseDomainPrefix, anyLive},
+		{dnssd.LegacyBrowseDomainPrefix, anyLive},
+		{dnssd.RegistrationDomainPrefix, registrationOptedIn},
+		{dnssd.DefaultRegistrationDomainPrefix, registrationOptedIn},
+	}
+	var domainEnumRecords []dns.RR
+	newDomainEnumPresent := make(map[string]bool, len(wantedDomainEnum))
+	for _, w := range wantedDomainEnum {
+		domainEnumRecords = append(domainEnumRecords, dnssd.DiffSelfPointingDomainRecord(w.prefix, h.upstreamZone, wasDomainEnumPresent[w.prefix], w.isPresent, serviceEnumerationTTL)...)
+		newDomainEnumPresent[w.prefix] = w.isPresent
+	}
+
+	records := dnssd.DiffEnumerationRecords(h.upstreamZone, previousForDiff, current, serviceEnumerationTTL)
+	records = append(records, domainEnumRecords...)
+	newState := func() map[string]bool {
+		state := make(map[string]bool, len(currentSet)+len(survivors))
+		for t := range currentSet {
+			state[t] = true
+		}
+		for _, t := range survivors {
+			state[strings.ToLower(t)] = true
+		}
+		return state
+	}
+	if len(records) == 0 {
+		h.serviceTypesMu.Lock()
+		h.serviceTypes = newState()
+		h.domainEnumPresent = newDomainEnumPresent
+		h.serviceTypesMu.Unlock()
+		return
+	}
+
+	signingKey, effectiveZone, err := h.resolveUpstreamSigningContext(ctx)
+	if err != nil {
+		h.logger.Errorf("SRP handler: service-type enumeration: failed to resolve signing context: %v", err)
+		return
+	}
+	upstreamMsg, err := updatecore.BuildAndSign(effectiveZone, nil, records, signingKey)
+	if err != nil {
+		h.logger.Errorf("SRP handler: service-type enumeration: failed to build upstream UPDATE: %v", err)
+		return
+	}
+	upstreamResp, err := h.coordinator.SendUpdate(ctx, effectiveZone, upstreamMsg)
+	if err != nil {
+		h.logger.Errorf("SRP handler: service-type enumeration: upstream UPDATE failed: %v", err)
+		return
+	}
+	if upstreamResp == nil || upstreamResp.Rcode != dns.RcodeSuccess {
+		rcodeDesc := "no response"
+		if upstreamResp != nil {
+			rcodeDesc = fmt.Sprintf("rcode=%d (%s)", upstreamResp.Rcode, dns.RcodeToString[upstreamResp.Rcode])
+		}
+		h.logger.Errorf("SRP handler: service-type enumeration: upstream UPDATE rejected: %s", rcodeDesc)
+		return
+	}
+
+	h.serviceTypesMu.Lock()
+	h.serviceTypes = newState()
+	h.domainEnumPresent = newDomainEnumPresent
+	h.serviceTypesMu.Unlock()
+
+	h.logger.Debugf("SRP handler: service-type enumeration reconciled for zone %s (%d change(s))", h.upstreamZone, len(records))
+}
+
+// synthesizeOmittedInstanceKeys returns an explicit "Add To An RRSet" KEY instruction (RFC
+// 2136 S2.5.1) for every live (SRV-present) service instance in cu whose own Service
+// Description Instruction omitted its KEY. RFC 9665 S3.2.5.1 lets a requester omit it "for
+// brevity" -- client/srp, this project's own requester, always takes that option -- but
+// S3.3.3 is unconditional on the other side of that trade: "After the SRP Update has been
+// applied, every Service Description that is updated MUST have a KEY RR, which MUST have the
+// same value as the KEY RR ... in the Host Description." That's a requirement on the
+// resulting zone state, not just registrar-internal bookkeeping -- the requester omitting the
+// KEY from the wire message doesn't relieve the registrar of making sure one ends up
+// published. Without this, a live instance registered by a client that omitted its KEY has
+// none published upstream at all, which -- independent of anything else -- makes a live FCFS
+// query for that name after any local lease-store amnesia (most commonly a proxy restart)
+// indistinguishable from genuinely foreign, unowned data (see pkg/srp.Evaluate's own doc
+// comment on the AuthNoKey case).
+//
+// srp.KeyFor already computes exactly the right value for this (same algorithm/protocol/
+// public-key/TTL as the Host Description's own KEY, owner name rewritten to the instance) --
+// it's reused here as-is for the local lease store's own bookkeeping; this function is the
+// one place that also forwards it upstream. A removal-shaped instance (SRV == nil) is
+// excluded: its Delete All RRsets already removes whatever KEY might exist there, and there
+// is no live Service Description left afterward for the MUST to apply to. An instance whose
+// Service Description DID include an explicit KEY is also excluded -- it's already part of
+// r.Ns, forwarded verbatim, and synthesizing a second copy would be redundant.
+func synthesizeOmittedInstanceKeys(cu *srp.ClassifiedUpdate) []dns.RR {
+	var records []dns.RR
+	for _, inst := range cu.Instances {
+		if inst.SRV == nil || inst.Key != nil {
+			continue
+		}
+		records = append(records, srp.KeyFor(cu, inst.Name))
+	}
+	return records
 }
 
 // ptrDeleteDiff implements the one piece of genuinely new logic plan S4.4/S4.5
@@ -726,6 +1011,11 @@ func (h *SRPHandler) processExpiredNode(ctx context.Context, nodeKey string) {
 		return
 	}
 	h.logger.Infof("SRP handler: expiry of %s: upstream delete confirmed, local subtree removed", nodeKey)
+
+	// RFC 6763 S9: an expired node may have been the last live instance of its service
+	// type -- recompute the enumeration record so it stops listing a type nothing still
+	// provides. Same best-effort reasoning as the call in Handle().
+	h.reconcileServiceEnumeration(ctx)
 }
 
 // deleteAllRR builds a raw RFC 2136 S2.5.3 "Delete All RRsets From A Name" (class ANY) --
@@ -756,6 +1046,12 @@ func (h *SRPHandler) startLeaseReconciliation(interval time.Duration) {
 					h.scheduleLeaseExpiry(nodeKey)
 				}
 			}
+			// RFC 6763 S9 self-heal: recompute the enumeration record from current
+			// store state on every tick regardless of whether anything above changed,
+			// catching anything a missed/raced incremental call (Handle(),
+			// processExpiredNode) left stale -- see reconcileServiceEnumeration's own
+			// doc comment.
+			h.reconcileServiceEnumeration(context.Background())
 		}
 	}()
 }

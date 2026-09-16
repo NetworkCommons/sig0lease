@@ -270,6 +270,54 @@ func (c *Coordinator) QueryKeyAtName(ctx context.Context, zoneHint, name string)
 	}
 }
 
+// QueryPTRExists reports whether at least one PTR record currently exists live at name
+// (typically a per-type browsing name "<type>.<zone>", RFC 6763 S4.1) against zoneHint's
+// resolved authoritative server -- same query/fallback shape as QueryKeyAtName, but a
+// simple presence check rather than a tri-state result, since the only question here is
+// "does anything else still provide this type." Used by
+// handlers.SRPHandler.reconcileServiceEnumeration immediately before removing a type from
+// the RFC 6763 S9 enumeration record, to confirm no OTHER registrant this process's own
+// local lease store doesn't know about still provides it -- see that function's doc comment
+// for why a local-only view can't safely decide this alone.
+func (c *Coordinator) QueryPTRExists(ctx context.Context, zoneHint, name string) (bool, error) {
+	soaServer, _, err := c.ResolveSOAMasterServer(ctx, zoneHint)
+	if err != nil {
+		return false, fmt.Errorf("failed to resolve authoritative server for %s: %w", zoneHint, err)
+	}
+
+	req := dns.NewMsg(name, dns.TypePTR)
+	if req == nil {
+		return false, fmt.Errorf("failed to build PTR query for %s", name)
+	}
+	req.RecursionDesired = false
+
+	resp, udpErr := dns.Exchange(ctx, req, "udp", soaServer)
+	if udpErr != nil || (resp != nil && resp.Truncated) {
+		tcpResp, tcpErr := dns.Exchange(ctx, req, "tcp", soaServer)
+		if tcpErr != nil {
+			return false, fmt.Errorf("PTR query for %s failed (udp: %v, tcp: %v)", name, udpErr, tcpErr)
+		}
+		resp = tcpResp
+	}
+	if resp == nil {
+		return false, fmt.Errorf("PTR query for %s returned a nil response", name)
+	}
+
+	switch resp.Rcode {
+	case dns.RcodeNameError:
+		return false, nil
+	case dns.RcodeSuccess:
+		for _, rr := range resp.Answer {
+			if _, ok := rr.(*dns.PTR); ok {
+				return true, nil
+			}
+		}
+		return false, nil
+	default:
+		return false, fmt.Errorf("PTR query for %s returned unexpected rcode %d (%s)", name, resp.Rcode, dns.RcodeToString[resp.Rcode])
+	}
+}
+
 // FindAuthorizedProxyKey loads the proxy's own SIG(0) signing key for zone from
 // keystoreDir, walking up to parent zones if the exact zone has no key -- extracted from
 // what was previously (*handlers.UpdateHandler).findAuthorizedProxyKeyForZone, now a
