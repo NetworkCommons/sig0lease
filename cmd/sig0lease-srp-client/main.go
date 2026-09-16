@@ -1,5 +1,5 @@
-// Package main implements sig0lease-srp-client, a thin CLI over client/srp -- a dev/test tool
-// (plan D8), not a shipped product. The library is the deliverable; this just exercises it.
+// Package main implements sig0lease-srp-client, a thin CLI over client/srp -- a dev/test tool,
+// not a shipped product. The library is the deliverable; this just exercises it.
 package main
 
 import (

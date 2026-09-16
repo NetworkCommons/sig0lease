@@ -1,8 +1,9 @@
 // Package main implements a minimal RFC 9665 SRP UPDATE test client, used only by
 // tests/test_srp.sh. This mirrors tests/blacklisted_tester.go's precedent: a small Go
 // helper for something the shell alone can't do (build, sign, and send a real SRP UPDATE)
-// and no existing binary does yet -- client/srp and cmd/sig0lease-srp are Phase 4, not
-// built yet. This is deliberately NOT that client: no discovery, no refresh scheduler, no
+// and no existing binary did yet at the time this was written -- client/srp and
+// cmd/sig0lease-srp-client were not built yet. This is deliberately NOT that client: no
+// discovery, no refresh scheduler, no
 // YXDOMAIN rename-retry -- just enough to drive test_srp.sh's scenarios.
 //
 // Identity is a P-256 (ECDSAP256SHA256) key pair persisted as a raw private-key file at

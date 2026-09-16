@@ -16,7 +16,7 @@ import (
 // assignment rather than a nested struct literal (see pkg/sig0/ecdsa_test.go, which hits
 // the same fork quirk). deleteAll builds a raw RFC 2136 S2.5.3 "Delete All RRsets From A
 // Name" -- a *dns.ANY with class ANY -- which this fork's presentation-format parser
-// cannot produce (see the plan's S10 item 1), so it's built directly.
+// cannot produce, so it's built directly.
 
 func mustRR(t *testing.T, spec string) dns.RR {
 	t.Helper()
@@ -144,10 +144,10 @@ func TestValidate_RFC9665AppendixCExample(t *testing.T) {
 	}
 }
 
-// --- real mDNSResponder srp-client capture (Phase 0, S10 item 1 / S12.3) -----------
+// --- real mDNSResponder srp-client capture -----------
 //
-// Captured live from the mDNSResponder srp-client reference binary during this plan's
-// Phase 0 spike -- the same fixture pkg/sig0/ecdsa_test.go's known-answer test uses.
+// Captured live from the mDNSResponder srp-client reference binary -- the same fixture
+// pkg/sig0/ecdsa_test.go's known-answer test uses.
 // Confirms this package's classifier accepts a real independent implementation's message
 // shape, not just synthetic fixtures built to match this package's own assumptions.
 const capturedSRPClientHex = "f704280000010000000700020764656661756c74077365727669636504617270610000060001097370696b6574657374c00c00ff00ff000000000000c0260001000100000e100004ac110003c0260019000100000e1000440201030d92dafbafc4b54cd32d0e325d0b89b8edb415cc84a74acece9374f12a4c4ade2f6bd189dc5230a6e91e38827e8a6937c63111bfef5ff44883ae1bd7162baf80ad055f69707073045f746370c00c000c000100000e1000100d5370696b65496e7374616e6365c09cc0b300ff00ff000000000000c0b30021000100000e1000080000000022b8c026c0b30010000100000e1000020130000029058200008000000c000200080000006400093a8000001800ff00000000005400000d00000000006aa3e4286aa3e1d08b87c026a17cbcff761a5ee8f9c47b367ffc6874b3cb0c5405bd670aa047bb108e007a5b4cac816479b61238124a2b551e7a3351b11b607d973edb980910c0d77d208790"

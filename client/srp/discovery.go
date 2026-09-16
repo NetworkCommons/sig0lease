@@ -60,11 +60,11 @@ func LiveSRVQuery(resolvers []string) SRVQuery {
 
 // Discover finds the SRP registrar for domain via a `_dnssd-srp._tcp.<domain>.` SRV lookup
 // -- ordinary DNS-SD service discovery (RFC 6763), applied to bootstrap SRP itself, per RFC
-// 9665's own discovery convention (see the plan's Appendix C zone skeleton's optional
+// 9665's own discovery convention (see RFC 9665 Appendix C's zone skeleton's optional
 // `_dnssd-srp._tcp` SRV record). Returns "host:port" for the best (lowest-priority,
 // highest-weight-among-ties) answer. A caller with an explicit registrar address configured
 // should skip this entirely (see Config.RegistrarAddr) -- discovery is the fallback, not the
-// only path, matching D8's "dev/test tool" framing for cmd/sig0lease-srp.
+// only path, matching cmd/sig0lease-srp-client's own "dev/test tool" framing.
 func Discover(ctx context.Context, query SRVQuery, domain string) (string, error) {
 	if query == nil {
 		return "", fmt.Errorf("srp/client: Discover called with a nil SRVQuery")

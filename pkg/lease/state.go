@@ -147,7 +147,7 @@ type LeaseStorage interface {
 	// Fails outright, applying none of the given records, if any of them
 	// already exists in the store under a different owner -- this is the
 	// store's own enforcement of "two different keys cannot register the
-	// identical RR" (protocol.md), not merely a caller-side convention.
+	// identical RR" (docs/siglease_rfc9664.md), not merely a caller-side convention.
 	UpsertNonKEYRecords(ownerNodeKey string, records []dns.RR, leaseDuration uint32, upstreamZone string) error
 	RemoveNonKEYRecords(ownerNodeKey string)
 	// RemoveSingleNonKEYRecord removes the record identified by rrKey.
@@ -470,7 +470,7 @@ func (m *InMemoryLeaseStore) SetPersistenceHook(hook func(ctx context.Context, o
 // applied: if any of the given records already exists in the store under a
 // different owner, the entire call fails and nothing is written -- the same
 // "fail the parts that would otherwise succeed" policy used for duplicate
-// KEY/RR registration elsewhere (protocol.md item 6), because partially
+// KEY/RR registration elsewhere (docs/siglease_rfc9664.md item 6), because partially
 // applying a batch here would leave the store's consistency unguaranteed.
 func (m *InMemoryLeaseStore) UpsertNonKEYRecords(ownerNodeKey string, records []dns.RR, leaseDuration uint32, upstreamZone string) error {
 	m.mu.Lock()

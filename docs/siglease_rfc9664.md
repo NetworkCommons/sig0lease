@@ -1,13 +1,22 @@
-# Proxy
+# Proxy (RFC 9664 lease-UPDATE)
 
-Proxy is a DNS proxy for SIG(0)-authenticated UPDATE-LEASE registration flows, according to [RFC 9664](https://datatracker.ietf.org/doc/rfc9664/) and [RFC 2931](https://datatracker.ietf.org/doc/rfc2931/). It accepts DNS UPDATE packets, validates the downstream SIG(0) signature, applies the lease/update policy, and forwards the resulting UPDATE to the authoritative server selected for the zone.
+Proxy is a DNS proxy for SIG(0)-authenticated UPDATE-LEASE registration flows, according to
+[RFC 9664](https://datatracker.ietf.org/doc/rfc9664/) and [RFC 2931](https://datatracker.ietf.org/doc/rfc2931/).
+It accepts DNS UPDATE packets, validates the downstream SIG(0) signature, applies the
+lease/update policy, and forwards the resulting UPDATE to the authoritative server selected for
+the zone. The code also supports standard DNS routing for packets that are not relevant to this
+flow.
 
-The code also supports standard DNS routing for packets that are not relevant to this flow.
-
+The proxy also implements [RFC 9665](https://datatracker.ietf.org/doc/rfc9665/) (DNS-SD Service
+Registration Protocol, SRP) as a **sibling** request path, sharing this document's SIG(0)
+signing, lease store, upstream forward/re-sign, and DNS-over-TLS transport, but with its own,
+more constrained message shape and authorization model — see `docs/siglease_rfc9665.md` for
+that protocol. Everywhere below, a callout marks the parts genuinely shared between the two.
 
 ## What It Does
 
-The project is intended to provide a light, explicit control point for lease registration traffic:
+The project is intended to provide a light, explicit control point for lease registration
+traffic:
 
 - Receive DNS queries over UDP and TCP.
 - Route the registration opcode to the update handler and forward unrelated traffic upstream.
@@ -15,6 +24,10 @@ The project is intended to provide a light, explicit control point for lease reg
 - Verify downstream SIG(0) signatures before the proxy accepts the request.
 - Re-sign the upstream UPDATE with the proxy's zone key before forwarding.
 - Forward unhandled opcodes to the configured upstream resolver path.
+
+*(Shared with RFC 9665 SRP: SIG(0) verification/re-signing and upstream forwarding follow the
+same pattern described in "Upstream Forwarding and Write Ordering" below; SRP's message shape
+and authorization are different, see `docs/siglease_rfc9665.md`.)*
 
 ## Main Commands
 
@@ -43,10 +56,25 @@ Run the client against a proxy:
 make run-client ADDR=127.0.0.1:8053 CMD="register test.dev.zenr.io. test.dev.zenr.io."
 ```
 
-The client requires an explicit keystore directory:
+The client requires an explicit keystore directory, either via `--keystore=<dir>` or the
+`CLIENT_KEYSTORE_DIR` environment variable (an explicit flag wins if both are given;
+`sig0lease-srp-client`'s `-keystore` flag follows the identical convention):
 
 ```bash
+./bin/<your OS>/sig0lease-client 127.0.0.1:8053 register test.dev.zenr.io. test.dev.zenr.io. --keystore=/path/to/keystore
+# or
 CLIENT_KEYSTORE_DIR=/path/to/keystore ./bin/<your OS>/sig0lease-client 127.0.0.1:8053 register test.dev.zenr.io. test.dev.zenr.io.
+```
+
+By default a key must already exist under that keyname in the keystore
+(`register`/`refresh`/`register-tamper` all error out rather than creating one). Pass
+`--k=13` (ECDSAP256SHA256) or `--k=15` (ED25519) to generate one on first use instead — when
+`--k` is given, the keyname argument is read as an owner name (e.g. `test.dev.zenr.io.`) rather
+than an exact key filename, and any existing key for that name is reused regardless of its
+algorithm:
+
+```bash
+./bin/<your OS>/sig0lease-client 127.0.0.1:8053 register test.dev.zenr.io. 300 3600 --same-key --k=13 --keystore=/path/to/keystore
 ```
 
 Useful end-to-end commands:
@@ -72,7 +100,7 @@ Examples:
 sig0lease-client 127.0.0.1:8053 register test.dev.zenr.io. test.dev.zenr.io. 300 3600
 sig0lease-client 127.0.0.1:8053 register-tamper test.dev.zenr.io. test.dev.zenr.io. 300 3600
 sig0lease-client 127.0.0.1:8053 verify test.dev.zenr.io. test.dev.zenr.io.
-sig0lease-client 127.0.0.1:8053 list-keys /path/to/keystore
+sig0lease-client 127.0.0.1:8053 list-keys --keystore=/path/to/keystore
 ```
 
 ## Proxy Use Cases
@@ -82,18 +110,16 @@ The proxy is designed to support two practical scenarios:
 - Registration: a client submits an authenticated UPDATE-LEASE request and the proxy forwards a signed UPDATE to the authoritative server.
 - Pass-through routing: non-registration traffic is forwarded according to the configured opcode routing and upstream settings.
 
-## Protocol Behavior
+## UPDATE-LEASE Case Matrix
 
-This section describes how the proxy interprets UPDATE-LEASE packets. It reflects the current implementation; `protocol.md` in the repository root is kept as a more granular, spec-style reference for the same rules and is not duplicated in full here.
-
-### UPDATE-LEASE EDNS Option Encoding
-
-Clients include an UPDATE-LEASE option (EDNS option code 2) in their UPDATE packets. Two encodings are supported:
+Clients include an UPDATE-LEASE option (EDNS option code 2) in their UPDATE packets. Two
+encodings are supported:
 
 - **8-byte variant (default):** 4 bytes encode the LEASE value (lease duration for non-KEY RRs), followed by 4 bytes encoding the KEY-LEASE value (lease duration for KEY RRs). Both are big-endian `uint32` values.
 - **4-byte variant (legacy):** 4 bytes encode a single LEASE value used for both KEY and non-KEY RRs. Off by default; enabled per handler via `prefer_4byte_variant`.
 
-LEASE and KEY-LEASE together select one of four behavioral cases:
+LEASE and KEY-LEASE together select one of four behavioral cases, detailed rule-by-rule in
+"Behavior Specification" below:
 
 | Case | KEY-LEASE | LEASE | Behavior |
 |---|---|---|---|
@@ -103,6 +129,78 @@ LEASE and KEY-LEASE together select one of four behavioral cases:
 | D | Non-zero | 0 | KEY-only registration/refresh, with optional deletion of accompanying non-KEY RRs. |
 
 Both the request-side decoding (`handlers/opcode5_lease_option.go`) and the response/client-side decoding (`client/lease_response.go`) share one low-level decoder (`pkg/lease.FindOption` + `pkg/lease.DecodeOption`/`FindAndDecode`) so there is a single place that knows how to locate and parse the option, whether it appears as a bare `ERFC3597` RR or nested inside an `OPT` record's options.
+
+## Behavior Specification
+
+This is the exact rule set the update handler implements — the numbered items below are cited
+by number elsewhere in this codebase (e.g. a code comment reading "item 6" or "5.1.4" refers to
+the corresponding entry here), so the numbering is kept stable.
+
+### Behavior Specifications
+
+1. Signature verification
+   1. UPDATE requests must carry a valid SIG(0).
+   2. An UPDATE request contains RRs to be updated. The name of those records determines the FQDN. The signer key must be at or above this FQDN. In the following we say that a key is "at-FQDN" when it is registered at or above that FQDN.
+   3. The key can be present in the request as KEY RR, either in the Update section, or in the Additional section.
+   4. If the key is not present in the request, lease-store key material is used as fallback.
+   5. If lease-store does not contain the key, verification uses authoritative DNS as the last source for signer key resolution.
+   6. If authoritative DNS is reachable but returns no matching signer KEY, the request fails.
+      6.a. If the authoritative DNS cannot be reached for signer-key lookup, the request fails. This is because we are modifying records for a DNS that does not respond.
+   7. According to RFC 2136, the Update Section contains RRs to be added to or deleted from the zone. Thus if a KEY RR is not been registered or refreshed, it should not be in the Authority/Update section of a signed lease-update request.
+   8. Multiple KEY RRs can be present in a request in the Update section.
+2. When a signed registration comes in, the proxy first needs to verify the signature. This can be done either because the signing RR KEY is in the message (either in the Update or Additional section), or because the KEY is online (its name is already present at the FQDN or above of the records contained in the lease update request), or because the KEY is in the LeaseStore. Any of this can be used to verify the signature.
+3. You can sign a lease-update request with a key, but the request is to register or refresh a different RR KEY (which is not a signing KEY in this context). In this case only the latter is in the Update section.
+4. If verification is passed, it means that we could find the signing key. We found it either:
+   1. In-LeaseStore AND at-FQDN -> this is a key we are managing
+   2. In-LeaseStore AND NOT at-FQDN -> we assume the key has been removed externally from our proxy, so we need to register it with the remaining lease time from the lease-store. This implies that we need to add this KEY RR to the RRs to be registered.
+   3. NOT In-LeaseStore AND at-FQDN -> the key is already registered, but we assume this has happened outside the lease mechanism (permanent update) and not under our control
+   4. NOT In-LeaseStore AND NOT at-FQDN -> the key must be in the request (either Update or Additional section), otherwise we would never get here since we would not have had any KEY to verify the signature.
+5. From now on we look at the Update section and the RR records it contains. If the Update section contains a KEY RR, this does not need to be the key that signed the request. Looking at the request lease-times:
+   1. KEY-LEASE != 0, LEASE != 0: This is a registration or a refresh of KEY and non-KEY RRs.
+      1. The KEY RR and non-KEY RRs (at least one) must be present in the request, otherwise this is an error
+      2. If the KEY RR is already present in the LeaseStore, this is a refresh of the KEY, otherwise a registration
+      3. For any of the non-KEY RRs that is present in the LeaseStore, this is a refresh
+      4. If a non-KEY RRs is not present in the LeaseStore, it needs to be recorded together with the key that registers it, because we need to remove it when that key expires. In this case, the key that registers it is the key that signed the request.
+      5. This key must either be in the LeaseStore, or if not in the LeaseStore it must be in the Update section. It cannot be only in the Additional section, because the user intention must be to register a key, and not just use it to sign a request, so it must be part of the Update section.
+      6. There might be more than one KEY RRs in the Update section, so it is important to determine which KEY RR is the signing key.
+   2. KEY-LEASE == 0, LEASE != 0: this is a registration/refresh of non-KEY RRs
+      1. non-KEY RRs (at least one) must be present in the request, otherwise this is an error
+      2. For any of the non-KEY RRs that are not present in the LeaseStore, this is a registration, otherwise a refresh
+      3. Signing KEY must already exist in the LeaseStore, and must not be present in the Update section (given KEY-LEASE == 0, this is not a registration of the key, the key must already be registered). If it is not already at the FQDN at the authoritative DNS, it needs to be registered again (see 4.2).
+   3. KEY-LEASE == 0, LEASE == 0:
+      1. If KEY RR present -> delete KEY
+      2. If non-KEY RRs present -> delete non-KEY RRs
+      3. Both present -> delete both
+      4. Neither present -> error
+      5. Authorization for delete is ownership, not just at-FQDN: a KEY or non-KEY RR may only be deleted by its immediate parent (the KEY that registered it), or, for a KEY RR, by itself if it has no parent (self-registered/root). A signer that is at-FQDN but not the immediate parent cannot delete the record directly, even though it could sign the request; the record is treated the same as if it did not exist, and no error results.
+   4. KEY-LEASE != 0, LEASE == 0:
+      1. KEY RR must be present -> register or refresh KEY
+      2. If non-KEY RRs present -> delete non-KEY RRs
+6. If the proxy attemps to register a record that already exists at the DNS server, the request must fail also in the parts that would be successful if performed alone, because the consistency of the LeaseStore cannot be guaranteed, especially in case of already existing KEY RR.
+   1. This implies that the proxy needs to verify whether in case of a registration, an identical record is already at the FQDN.
+7. For all attempts of deleting records, if the record does not exist in the lease-store, we assume the record is either outside our control, or it has been removed after expiry. The request does not fail but the user needs to be informed about this. If the record exists in the lease-store but not at the DNS, do not fail the request but signal the situation. Missing local records do not force whole-request failure.
+
+### Storage Model
+
+1. KEY lease storage
+- KEY lease state is tracked per canonical key name in the lease manager.
+- Given keys can be registered by other keys, a key can be linked to the key that registered it.
+
+2. Non-KEY lease storage
+- Non-KEY records are tracked individually and are linked to their key owner.
+- This link is used to clear each records registered with a particular key when this key expires.
+- Record identity is as defined in comparison rules in RFC 2136 Section 1.1 (NAME, CLASS, TYPE, RDLENGTH, RDATA equal; TTL excluded), with SOA and CNAME further narrowed to NAME+CLASS+TYPE per that same section, since only one such RR can exist at a name.
+  - Exception: WKS records are compared on the full RDATA string, including the services bitmask, because the underlying DNS library has no WKS RDATA parser to split ADDRESS+PROTOCOL from the mask as the RFC specifies. This is a known, narrow deviation (see `RecordKey` in `pkg/lease/state.go` and `rrEqual` in `handlers/opcode5_update_helpers.go`), not a design choice -- WKS is effectively obsolete in current DNS use, so the practical impact is minimal.
+- It is not possible for 2 different keys to register identical RRs.
+- Records that differ in any field are treated as distinct records.
+
+When a key expires, it can trigger a chain deletion, for example in the case key A registered key B that registered records C,D,E and key A expires. A,B,C,D and E are all deleted.
+
+## Implementation Notes
+
+The rules above are what the handler enforces; this section covers how, in terms of the actual
+code — file/function references, config keys, and detail (storage backends, TTL clamping, the
+deferred-mutation write ordering) that goes beyond the rule statement itself.
 
 ### Signer Resolution (Three-Stage Fallback)
 
@@ -114,18 +212,21 @@ Before processing the case matrix, the proxy validates the SIG(0) signature on t
 
 The first candidate that cryptographically verifies the signature is used. If verification succeeds via stage 3 only (not request-provided, not lease-managed), the signer is "online-only" — its material was neither proven fresh in this request nor already under lease management.
 
+*(SRP does not use this three-stage resolution — it always verifies against the Host
+Description KEY, always present in the request. See `docs/siglease_rfc9665.md` §5.)*
+
 ### Online-Only Signers and `allow_online_key_registration`
 
 An online-only signer can always be used to authenticate a request — SIG(0) verification does not depend on the flag. What the signer is subsequently *allowed to do* does:
 
-- **Deletes (Case C)** are ownership-based, independent of this flag: a record (KEY or non-KEY) may only be deleted by its immediate parent — the KEY that registered it — or, for a self-registered (root) KEY with no parent of its own, by itself. Hierarchy alone is not enough: a signer that is merely at or above a record's name by DNS naming, but is not the record's actual `ParentKeyName`, cannot delete it directly. Such a signer can still remove the data, but only indirectly, by deleting the record's true parent, which cascades (see "Upstream Forwarding and Write Ordering" below).
+- **Deletes (Case C)** are ownership-based, independent of this flag (see Behavior Specification item 5.3.5 above). Such a signer can still remove the data, but only indirectly, by deleting the record's true parent, which cascades (see "Upstream Forwarding and Write Ordering" below).
 - **Authoring new lease-store state** — a new KEY RR, or non-KEY RRs owned by the signer — requires the signer to be either already lease-managed, itself present in the Update section (a normal self-registration), or, if `allow_online_key_registration: true` is configured for the handler, an online-only signer. This is one policy (`UpdateHandler.signerAuthorizedForNewRegistration`) applied identically to KEY and non-KEY registration in Case A and Case D; it is not KEY-RR-specific. Default is `false` (fail closed).
 
 When an online-only signer registers a *different* KEY RR than itself (e.g. delegating a new child key it will never itself be lease-managed under), any non-KEY RRs in the same request are still attached to the **signer's own node** per the rule below — including when that node has no backing KEY record (a signer that is deliberately never self-registered). The lease store permits this "phantom owner" for non-KEY records the same way it already permits a KEY RR's `ParentKeyName` to reference a node that has no record of its own.
 
 ### Non-KEY RR Ownership
 
-Non-KEY RRs registered in Case A always belong to the signer of the request — never to some other KEY RR that happens to be registered in the same packet — regardless of whether the signer is itself present in the Update section. If the signer is present, this happens naturally as part of that KEY's own registration/refresh; if not (the signer is only authorizing a different KEY's registration), the data is attached to the signer's node in a separate step after the per-KEY loop.
+Non-KEY RRs registered in Case A always belong to the signer of the request (Behavior Specification item 5.1.4) — never to some other KEY RR that happens to be registered in the same packet — regardless of whether the signer is itself present in the Update section. If the signer is present, this happens naturally as part of that KEY's own registration/refresh; if not (the signer is only authorizing a different KEY's registration), the data is attached to the signer's node in a separate step after the per-KEY loop.
 
 Additional rules:
 
@@ -138,10 +239,13 @@ Additional rules:
 
 - **Refresh ownership check:** before treating a KEY RR as a refresh of an existing lease, `UpdateHandler.validateRefreshOwnership` compares the *actual* stored KEY RDATA (flags, protocol, algorithm, public key) against the one in the request. The lease store's node key is a composite of name + algorithm + key tag, which is not collision-free (the key tag is a 16-bit checksum); this check is what makes ownership verification exact rather than relying on the composite key alone.
 - **Missing-at-FQDN recovery:** if a signer's managed KEY is found to be missing at the authoritative DNS (Cases A, B, D), the proxy re-registers it with whatever lease time remains in the local store, rather than granting a fresh full-duration lease or failing the request outright.
-- **Duplicate registration rejection:** before treating a KEY or non-KEY RR as a *new* registration, the proxy checks whether an identical record already exists at the authoritative DNS. If so, the request fails — this applies uniformly to every case that can register something new (Cases A and D for KEY RRs; Cases A and B for non-KEY RRs), not only to the KEY-RR path.
-- **Delete semantics (Case C):** for each named KEY or non-KEY RR, if it is not found in the local lease store *or* the signer is not its immediate parent (nor, for a KEY RR, the record itself), the request does not fail — a note identical to the not-found case ("... not found for delete") is returned informing the client, and that record is excluded from both the local delete and the upstream delete. This deliberately does not distinguish "doesn't exist" from "exists but you don't own it," so a delete attempt cannot be used to probe for the existence of records outside the signer's own subtree. Only records the signer is actually authorized to delete are included in the upstream delete request.
+- **Duplicate registration rejection** (Behavior Specification item 6): applies uniformly to every case that can register something new — Cases A and D for KEY RRs, Cases A and B for non-KEY RRs.
+- **Delete semantics** (Behavior Specification items 5.3.5 and 7): a delete attempt deliberately doesn't distinguish "doesn't exist" from "exists but you don't own it," so it cannot be used to probe for the existence of records outside the signer's own subtree. Only records the signer is actually authorized to delete are included in the upstream delete request.
 
 ### Upstream Forwarding and Write Ordering
+
+*(Shared mechanism: RFC 9665 SRP uses this same forward/re-sign/deferred-mutation path — see
+`docs/siglease_rfc9665.md` §5 for what's different about how SRP gets there.)*
 
 The proxy never mutates the local lease store before the corresponding upstream UPDATE has been confirmed successful:
 
@@ -156,20 +260,27 @@ This means the local lease store's view of the world and the authoritative DNS s
 
 Before forwarding, the proxy clamps LEASE and KEY-LEASE (and, correspondingly, RR/KEY TTLs) to `LeasePolicy` bounds (`min_key_lease_sec`/`max_key_lease_sec`/`min_rr_lease_sec`/`max_rr_lease_sec`). The *actual* durations used after clamping — not the client's originally-requested values — are echoed back to the client in the response's UPDATE-LEASE option, so the client can detect when the proxy granted less than what was requested. `client.EffectiveLeaseDuration(resp, requestedLease, requestedKeyLease)` returns both the effective LEASE and KEY-LEASE from a response.
 
+A related, shared TTL rule lives in `pkg/updatecore/ttl.go`: any RRset with inconsistent TTLs is
+normalized to its lowest TTL (RFC 2181 §5.2), run before `LeasePolicy` clamping. When adding to
+an already-existing RRset at the authoritative server, the new RR's TTL is forced to match the
+existing RRset's TTL. *(RFC 9665 SRP uses the same helper in a stricter mode: an inconsistent
+RRset is rejected outright rather than normalized, since RFC 9665 §4 makes consistency a MUST —
+see `docs/siglease_rfc9665.md` §4.)*
+
 ### Blacklisted RR Types
 
 The proxy maintains a configurable list of blacklisted RR types (`handlers.update.blacklisted_types` in `config.yaml`). Any UPDATE packet attempting to register one of these RR types is rejected outright.
 
-### Storage Model and Expiry
+### Storage Backends and Expiry
 
-The lease store is a tree rooted at each configured zone. Children of a root must be KEY nodes; a KEY node can itself be the parent of other KEY nodes (registered by it) or non-KEY nodes (data it owns). Expiry of a KEY node cascades to its entire subtree.
+Building on the "Storage Model" rules above: the lease store is a tree rooted at each configured zone. Children of a root must be KEY nodes; a KEY node can itself be the parent of other KEY nodes (registered by it) or non-KEY nodes (data it owns). Expiry of a KEY node cascades to its entire subtree.
 
 - `BaseRecord` fields (type, expiry, lease duration, registration time, parent) are shared by KEY (`Record`) and non-KEY (`NonKEYRecord`) nodes.
 - **Deletion is always physical, never a soft flag.** A record is either present in the store (active) or absent (gone) — there is no intermediate "marked deleted" state to track or eventually reap.
 - **Expiry is handler-driven, not store-driven.** `UpdateHandler.processExpiredLease` — triggered by a per-node `time.AfterFunc` timer (`scheduleLeaseExpiry`, re-armed after every mutation and after every expiry event) — is the only code path that removes an expired KEY or non-KEY record, and it always attempts the corresponding upstream delete first. The store itself never deletes anything on its own initiative, because it has no way to also notify the authoritative server.
 - **Reconciliation backstop:** `UpdateHandler.startLeaseReconciliation` runs every 30 seconds and ensures every KEY node in the store has a live expiry timer, scheduling one via the same `scheduleLeaseExpiry` for any node that lacks one (for example, a node populated by a future snapshot-restore path that doesn't itself arm a timer). For an already-expired node this routes it through the same `processExpiredLease` almost immediately — there is exactly one deletion implementation, not a second one that might skip the upstream call.
 
-**Storage backend abstraction.** All of the above is defined against a single interface, `lease.LeaseStorage` (`pkg/lease/state.go`) — KEY lifecycle, tree/hierarchy, non-KEY record sets, and snapshot import/export/persistence all live on this one interface, and every backend must implement all of it. There is no narrower interface for a partial implementation to fall back to, and the handler never type-asserts down to a subset: a backend either supports the full feature set or `Setup()` fails to configure it at all.
+**Storage backend abstraction.** All of the above is defined against a single interface, `lease.LeaseStorage` (`pkg/lease/state.go`) — KEY lifecycle, tree/hierarchy, non-KEY record sets, and snapshot import/export/persistence all live on this one interface, and every backend must implement all of it. There is no narrower interface for a partial implementation to fall back to, and the handler never type-asserts down to a subset: a backend either supports the full feature set or `Setup()` fails to configure it at all. *(This same interface, and both backends below, are reused as-is by the RFC 9665 SRP handler, confirmed generic across both handlers' differently-shaped KEY trees with zero production-code changes needed.)*
 
 Two backends are selectable via `handlers.update.storage` in `config.yaml` (see the Configuration section below):
 
@@ -194,46 +305,18 @@ Two backends are selectable via `handlers.update.storage` in `config.yaml` (see 
 
 - listening address and enabled transport networks;
 - default upstream resolvers;
-- handler-specific settings such as the upstream zone, keystore directory, lease policy bounds, blacklisted RR types, `allow_online_key_registration`, and the lease storage backend (`storage.type: memory|file`, see "Storage Model and Expiry" above) for the update handler;
-- opcode-to-module routing.
+- handler-specific settings such as the upstream zone, keystore directory, lease policy bounds, blacklisted RR types, `allow_online_key_registration`, and the lease storage backend (`storage.type: memory|file`, see "Storage Backends and Expiry" above) for the update handler;
+- opcode-to-module routing (an ordered list per opcode — see `docs/siglease_rfc9665.md` §3 for
+  how SRP's handler fits into the same list).
 
 The update handler uses the configured zone to discover the authoritative server for the effective zone, then sends the rewritten UPDATE there.
 
-## SRP (RFC 9665)
-
-Alongside the RFC 9664 lease flow above, the proxy implements [RFC 9665](https://datatracker.ietf.org/doc/rfc9665/) (DNS-SD Service Registration Protocol) — a tightly constrained profile of DNS UPDATE for devices registering their own services (host address + one or more service instances) on a "First Come, First Served" basis, authenticated by SIG(0). It's a **sibling** request path to the RFC 9664 handler above, not a mode on it: SRP's message shape and authorization model are different enough (FCFS by name rather than a signer-hierarchy walk, mandatory delete-all-then-add, no lightweight refresh) that it has its own handler, `handlers/srp_handler.go`, sharing only the genuinely common plumbing (`pkg/lease`, `pkg/sig0`, `pkg/updatecore`'s upstream-forward/re-sign path).
-
-### Enabling it
-
-Add an `srp_handler` block under `handlers:` and route opcode 5 (UPDATE) to it in `processing_rules` (see `config.yaml` for a worked example). Key options:
-
-- `upstream_zone` (required) — the one zone this handler instance serves (one zone, one protocol per handler instance; run a second handler instance for a second zone).
-- `keystore_dir` (required) — this proxy's own SIG(0) signing key for the zone, resolved the same way the RFC 9664 handler's is.
-- `upstream` (optional) — a static `host:port` override, skipping SOA/NS discovery for this zone entirely; needed for any zone (like `default.service.arpa.`, see below) that isn't really delegated.
-- `allow_udp` (optional, default `false`) — SRP requires TCP by default; set this for zones expecting constrained (CNN) devices that can't reliably do TCP.
-- `rewrite_default_service_arpa` (optional, default `false`) — real SRP client implementations (Apple's `srp-client`, OpenThread's SRP client) hardcode `default.service.arpa.` as their zone, having no other way to discover one. With this on, the handler additionally accepts requests addressed to `default.service.arpa.` and rewrites every name in the update to `upstream_zone` before doing anything else with it (FCFS, the local lease-store tree, and the upstream forward all end up working with exactly one real name per host, regardless of which zone the client actually addressed) — the response still echoes back `default.service.arpa.`, exactly what the client sent.
-- `refuse_on_foreign_data` (optional, default `true`) — RFC 9665 §3.3.3's NOERROR-no-KEY case: refuse (rather than clobber) a name that already has non-SRP data at the authoritative server.
-- `lease_policy` — same shape as the RFC 9664 handler's (`min_key_lease_sec`/`max_key_lease_sec`/`min_rr_lease_sec`/`max_rr_lease_sec`).
-- `lease_manager` / `storage` — same mutually-exclusive lease-store backend selection as the RFC 9664 handler.
-
-### The SRP requester
-
-`client/srp` is the actual client-side deliverable: discovery (`_dnssd-srp._tcp.<domain>.` SRV lookup), the RFC 9664 §5.2 refresh clock (80% of the granted lease, jittered), automatic rename-retry on a `YXDOMAIN` conflict, and now `Deregister` (withdraws a whole identity — host address data and every configured instance — in one message, requesting `LEASE=0`). `cmd/sig0lease-srp` is a thin CLI over it for development/testing, not a shipped product (there's deliberately no `make build-srp` target) — run it directly:
-
-```bash
-go run ./cmd/sig0lease-srp -domain=srp.example.com. -host=myhost -addr=192.0.2.1 \
-  -instance=Widget:_http._tcp:8080 -txt=Widget:path=/ -server=127.0.0.1:8159 -once
-```
-
-`go run ./cmd/sig0lease-srp -h` lists every flag, including `-deregister` and the full-lifecycle (no `-once`) mode that runs the refresh clock unattended.
-
-### Testing it
-
-`make test-srp` runs the full register/refresh/conflict/remove/expiry suite against a real, disposable local BIND 9 (no external dependency). `make test-mdnsresponder-interop` runs the same registrar and client against the real, unmodified Apple `mDNSResponder/ServiceRegistration` binaries — a sibling checkout, not vendored; see `tests/README.md` for how to set it up, including the exact commit this was last validated against.
-
 ## DNS-over-TLS
 
-The server can offer DNS-over-TLS ([RFC 7858](https://datatracker.ietf.org/doc/rfc7858/)) as a third listener alongside plain UDP/TCP — transport-level, so it benefits every handler above (RFC 9664, RFC 9665 SRP, and plain forwarding alike), not something protocol-specific. Opportunistic only: no client-certificate authentication.
+The server can offer DNS-over-TLS ([RFC 7858](https://datatracker.ietf.org/doc/rfc7858/)) as a
+third listener alongside plain UDP/TCP — transport-level, so it benefits every handler
+(RFC 9664, RFC 9665 SRP, and plain forwarding alike), not something protocol-specific.
+Opportunistic only: no client-certificate authentication.
 
 Add `"tls"` to `server.networks` and a `server.tls` block:
 
@@ -251,45 +334,37 @@ server:
 
 - `cmd/sig0lease/` - proxy entrypoint
 - `cmd/sig0lease-client/` - client entrypoint (RFC 9664 lease flow)
-- `cmd/sig0lease-srp/` - thin dev/test CLI over `client/srp` (RFC 9665 SRP requester) — not a
-  shipped product; see the "SRP (RFC 9665)" section below
-- `client/srp/` - the RFC 9665 SRP requester library (`Client`, discovery, RFC 9664 S5.2
-  refresh scheduler, `YXDOMAIN` rename-retry) — this is the actual SRP client deliverable,
-  `cmd/sig0lease-srp` just exercises it
+- `client/` - the RFC 9664 client library
 - `config/` - YAML config loading and validation
 - `forward/` - upstream forwarding logic
 - `handlers/` - opcode handlers and result types, including `srp_handler.go` (the RFC 9665
-  SRP registrar path, a sibling to the RFC 9664 update handler, never a mode on it)
+  SRP registrar path, a sibling to the RFC 9664 update handler, never a mode on it — see
+  `docs/siglease_rfc9665.md`)
 - `pkg/keyrec/` - keystore loading helpers (`LoadedKey`, `LoadKeyFromFile`, `FindKeysByZone`,
   `GenerateKey`)
 - `pkg/lease/` - lease store, tree model, and UPDATE-LEASE option encoding/decoding (shared
   by both the RFC 9664 and RFC 9665 paths)
-- `pkg/sig0/` - SIG(0) signing and verification helpers
-- `pkg/srp/` - RFC 9665 message classification/validation (`Classify`, `Validate`), FCFS
-  (`Evaluate`), and the requester-side message builder/response interpreter (`BuildUpdate`,
-  `InterpretResponse`) — pure logic, no network I/O
+- `pkg/sig0/` - SIG(0) signing and verification helpers (shared by both paths)
 - `pkg/updatecore/` - upstream forward/re-sign plumbing shared by both the RFC 9664 and
   RFC 9665 (SRP) handlers (SOA/NS resolution, per-zone static `upstream` override, TTL
   consistency checks)
 - `server/` - UDP/TCP/TLS (DNS-over-TLS, RFC 7858) listener and request dispatch
 
-See `docs/rfc9665-srp-implementation-plan.md` for the full RFC 9665 design writeup (locked
-architectural decisions, worked examples, and a phase-by-phase revision history covering
-every real bug found and fixed along the way) — it's the source of truth for anything SRP
-that isn't covered below.
+See `docs/siglease_rfc9665.md` for the full RFC 9665 SRP design (package layout, client
+library/CLI, config, and known limitations) — it's the source of truth for anything SRP that
+isn't covered above.
 
 ## Validation
 (requires client key, see this [README](./keystore/README.md))
 ```bash
 CLIENT_KEYSTORE_DIR=${PWD}/keystore/client make test-unit
 CLIENT_KEYSTORE_DIR=${PWD}/keystore/client make test-update   # RFC 9664 lease flow, live against a real BIND 9
-make test-srp                                                  # RFC 9665 SRP flow, live against a real BIND 9
-make test-mdnsresponder-interop                                 # RFC 9665 SRP, live against real independent mDNSResponder binaries
+make test-srp                                                  # RFC 9665 SRP flow, see docs/siglease_rfc9665.md
+make test-mdnsresponder-interop                                 # RFC 9665 SRP interop, see docs/siglease_rfc9665.md
 make build
 ```
 
 For a complete behavior check, run the registration and tamper flows against a live proxy instance.
-
 
 ## miekg/dns Shortcomings
 

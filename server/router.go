@@ -14,7 +14,7 @@ import (
 
 // Router routes DNS requests based on opcode to appropriate handlers or forwarder.
 type Router struct {
-	// opcodeMap holds, per opcode, the ordered list of module names to try (D2):
+	// opcodeMap holds, per opcode, the ordered list of module names to try:
 	// Route calls each in turn until one returns Processed or Error; if every one
 	// declines (NotRelevant), the opcode falls through to plain upstream forwarding.
 	opcodeMap map[uint8][]string
@@ -49,7 +49,7 @@ func (r *Router) Shutdown() {
 // Flow:
 //  1. Check for internal dump query (admin/debug endpoint)
 //  2. Check if opcode has any registered handlers
-//  3. Try each configured handler for the opcode in order (D2):
+//  3. Try each configured handler for the opcode in order:
 //     - StatusProcessed: Return response to client, stop
 //     - StatusNotRelevant: Try the next handler in the list
 //     - StatusError: Return error response to client, stop
@@ -91,8 +91,8 @@ func (r *Router) Route(ctx context.Context, w dns.ResponseWriter, rMsg *dns.Msg)
 			return result.Message
 
 		case handlers.StatusNotRelevant:
-			// Not relevant to this handler -- try the next one in the ordered list
-			// (D2), e.g. an SRP-shaped update tried by srp_handler first, then a
+			// Not relevant to this handler -- try the next one in the ordered list,
+			// e.g. an SRP-shaped update tried by srp_handler first, then a
 			// plain lease update falling through to update_handler.
 			r.logger.Debugf("Handler %s declined packet (not relevant), trying next", moduleName)
 			continue

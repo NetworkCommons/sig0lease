@@ -10,8 +10,8 @@ import (
 // busy-loop -- 80% of a 0-second lease is 0, with no jitter to save it.
 const minRefreshDelay = 1 * time.Second
 
-// refreshDelay implements RFC 9664 S5.2's baseline refresh clock (a MUST, reused by SRP per
-// plan S3.4): 80% of the granted lease, plus a 0-5% random offset -- "the requester computes
+// refreshDelay implements RFC 9664 S5.2's baseline refresh clock (a MUST, reused by SRP):
+// 80% of the granted lease, plus a 0-5% random offset -- "the requester computes
 // expiry from send time," so this is meant to be added to the moment the request that
 // granted leaseSeconds was sent, not to "now" if some processing time has already elapsed.
 // rng must be non-nil and must not be shared across goroutines (see Client.rng's doc

@@ -1,6 +1,6 @@
 // Package updatecore holds forwarding plumbing shared by the RFC 9664 update-lease
-// handler and the RFC 9665 SRP handler (see main/docs/rfc9665-srp-implementation-plan.md
-// S4.1, D1/D8). It is a public package, not internal/, matching this repo's convention.
+// handler and the RFC 9665 SRP handler (see docs/siglease_rfc9665.md's upstream forward
+// section). It is a public package, not internal/, matching this repo's convention.
 package updatecore
 
 import (
@@ -15,7 +15,7 @@ import (
 )
 
 // Coordinator resolves the authoritative server for a zone (SOA MNAME, or a configured
-// per-zone static override, D4) and performs the two things both handlers need against
+// per-zone static override) and performs the two things both handlers need against
 // it: sending a signed UPDATE, and a live KEY-at-name query (S3.3.3 FCFS).
 //
 // This is the extraction of what was previously handlers.DefaultUpstreamCoordinator's
@@ -27,7 +27,7 @@ type Coordinator struct {
 	// authoritative server for a zone not covered by staticUpstream.
 	bootstrapResolvers []string
 	// staticUpstream maps a normalized (lower-cased, no trailing dot) zone name to a
-	// static "host:port" override (D4): when a zone matches (exactly -- no parent-zone
+	// static "host:port" override: when a zone matches (exactly -- no parent-zone
 	// fallback, unlike SOA/NS resolution), both SOA and NS discovery are skipped
 	// entirely for it. nil or a zone with no entry falls through to normal resolution.
 	staticUpstream map[string]string
@@ -63,7 +63,7 @@ func normalizeZone(zone string) string {
 
 // ResolveSOAMasterServer returns the "host:port" of zone's SOA MNAME (walking up to
 // parent zones if the exact name has none) and the effective zone that answered, or --
-// if zone exactly matches a configured static upstream (D4) -- that override address
+// if zone exactly matches a configured static upstream -- that override address
 // with zone itself as the effective zone, skipping the lookup entirely.
 func (c *Coordinator) ResolveSOAMasterServer(ctx context.Context, zone string) (server, effectiveZone string, err error) {
 	if addr, ok := c.staticUpstream[normalizeZone(zone)]; ok {
@@ -107,8 +107,8 @@ func (c *Coordinator) ResolveSOAMasterServer(ctx context.Context, zone string) (
 }
 
 // ResolveAuthoritativeZone finds the zone cut (the name that actually has NS records)
-// for zone or one of its parents -- or, for a zone matching a static upstream override
-// (D4), zone itself, with no NS lookup at all (the operator has already asserted the
+// for zone or one of its parents -- or, for a zone matching a static upstream override,
+// zone itself, with no NS lookup at all (the operator has already asserted the
 // zone cut by configuring the override).
 func (c *Coordinator) ResolveAuthoritativeZone(ctx context.Context, zone string) (string, error) {
 	if _, ok := c.staticUpstream[normalizeZone(zone)]; ok {
@@ -169,7 +169,7 @@ func canonicalName(name string) string {
 }
 
 // SendUpdate sends updateMsg (already built and signed) to upstreamZone's authoritative
-// server, resolved via ResolveSOAMasterServer (so a static override, D4, is honored),
+// server, resolved via ResolveSOAMasterServer (so a static override is honored),
 // trying UDP then falling back to TCP.
 func (c *Coordinator) SendUpdate(ctx context.Context, upstreamZone string, updateMsg *dns.Msg) (*dns.Msg, error) {
 	if upstreamZone == "" {

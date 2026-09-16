@@ -1,8 +1,8 @@
 // update.go builds an unsigned RFC 9665 SRP UPDATE message from a declarative spec -- the
 // requester-side counterpart to Classify/Validate. Pure logic: no network I/O, no crypto
-// beyond shaping the KEY RR from already-generated key material (see plan S4.1 for why
-// pkg/srp stays network-free; client/srp, Phase 4, owns key generation, discovery,
-// scheduling, and actually sending the result).
+// beyond shaping the KEY RR from already-generated key material -- pkg/srp stays
+// network-free; client/srp owns key generation, discovery,
+// scheduling, and actually sending the result.
 package srp
 
 import (
@@ -163,7 +163,7 @@ func ptrAdd(owner, target string, ttl uint32) *dns.PTR {
 }
 
 // deleteAllRR builds a raw RFC 2136 S2.5.3 "Delete All RRsets From A Name" (class ANY) --
-// this fork's presentation-format parser can't produce this shape (plan S10 item 1). Named
+// this fork's presentation-format parser can't produce this shape. Named
 // distinctly from srp_test.go's own (test-only, so unusable from this production file)
 // deleteAll helper of the same shape.
 func deleteAllRR(name string) *dns.ANY {

@@ -26,17 +26,16 @@ import (
 const serviceEnumerationTTL = 3600
 
 // SRPHandler implements handlers.Handler for opcode 5 (UPDATE), the RFC 9665 SRP path --
-// a sibling to UpdateHandler (D1), never a branch inside it: SRP's message shape and
+// a sibling to UpdateHandler, never a branch inside it: SRP's message shape and
 // authorization model (FCFS, delete-all-then-add, no per-record parent/key walk)
 // contradict two of UpdateHandler's own checks (validateSignerHierarchyForUpdateRecords,
 // filterDuplicateRegistrations), so it needs its own Handle() rather than a mode flag on
-// the existing one. See main/docs/rfc9665-srp-implementation-plan.md S4 for the design
-// this implements; comments below cite it as "S<n>" for RFC 9665 sections and "plan S<n>"
-// for the plan document's own sections.
+// the existing one. See docs/siglease_rfc9665.md for the design
+// this implements; comments below cite RFC 9665 sections as "S<n>".
 type SRPHandler struct {
 	BaseHandler
 
-	upstreamZone string // the one zone this handler instance serves (D10: one zone, one protocol)
+	upstreamZone string // the one zone this handler instance serves (one zone, one protocol per handler instance)
 	keystoreDir  string
 	leaseManager LeaseManager
 	coordinator  srpCoordinator
@@ -49,9 +48,9 @@ type SRPHandler struct {
 	upstreamKeyRecord *keyrec.LoadedKey
 	upstreamKeyZone   string
 
-	allowUDP                  bool // plan S7: TCP required unless the zone is flagged allow_udp
-	refuseOnForeignData       bool // plan S3.3 table; RFC 9665 S3.3.3. Default true.
-	rewriteDefaultServiceARPA bool // plan S4.3 step 6 / D5: accept default.service.arpa. as an alias for upstreamZone
+	allowUDP                  bool // TCP required unless the zone is flagged allow_udp
+	refuseOnForeignData       bool // RFC 9665 S3.3.3's NOERROR-no-KEY case. Default true.
+	rewriteDefaultServiceARPA bool // accept default.service.arpa. as an alias for upstreamZone
 	LeasePolicy               LeasePolicy
 
 	// serviceTypesMu guards serviceTypes, this process's own tracked view of the RFC 6763
@@ -88,9 +87,8 @@ type SRPHandler struct {
 }
 
 // srpCoordinator is the subset of *updatecore.Coordinator's exported surface Handle and its
-// helpers use. An interface, not the concrete type, purely so handler-level tests (the
-// plan's own Phase 3 gate, S12.2 "Handler tests -- mock UpstreamCoordinator") can exercise
-// every upstream-facing branch -- FCFS's live query, a rejected/successful forward, expiry's
+// helpers use. An interface, not the concrete type, purely so handler-level tests can
+// exercise every upstream-facing branch -- FCFS's live query, a rejected/successful forward, expiry's
 // upstream delete -- without a real network or DNS server. *updatecore.Coordinator satisfies
 // this structurally; Setup assigns one directly, with no wrapper type in between.
 type srpCoordinator interface {
@@ -135,14 +133,14 @@ func (v leaseStoreView) KeyAtName(name string) (*dns.KEY, bool) {
 }
 
 // defaultServiceARPA is the zone name real SRP clients hardcode when they have no other
-// way to discover their registration domain (RFC 9665 S3.3.1, D5). Dot-terminated and
+// way to discover their registration domain (RFC 9665 S3.3.1). Dot-terminated and
 // lower-case -- every comparison/rewrite against it below matches on that same shape.
 const defaultServiceARPA = "default.service.arpa."
 
 // zoneEnabled reports whether zone (from the request's own Zone Section) is one this
-// handler instance will accept: the one zone it's configured to serve (D10: one zone, one
-// protocol -- enforced here, in each handler's own early checks, exactly as plan S4.2
-// describes, rather than by a central dispatcher), or -- when rewriteDefaultServiceARPA is
+// handler instance will accept: the one zone it's configured to serve (one zone, one
+// protocol per handler instance -- enforced here, in each handler's own early checks,
+// rather than by a central dispatcher), or -- when rewriteDefaultServiceARPA is
 // on -- default.service.arpa. as well, an alias Handle rewrites away before anything else
 // sees it. Compared canonically since the request's own casing/trailing dot can't be
 // assumed to match the configured value.
@@ -204,7 +202,7 @@ func rewriteZoneSuffix(name, realZone string) string {
 	return name[:cut] + realZone
 }
 
-// Handle implements the plan's S4.3 ten-step happy path. Every early-return before step 7
+// Handle implements RFC 9665's ten-step happy path. Every early-return before step 7
 // (forwarding) touches neither the lease store nor the network, so a rejected request
 // leaves no trace to clean up.
 func (h *SRPHandler) Handle(ctx context.Context, w dns.ResponseWriter, r *dns.Msg) *HandlerResult {
@@ -213,7 +211,7 @@ func (h *SRPHandler) Handle(ctx context.Context, w dns.ResponseWriter, r *dns.Ms
 	}
 
 	// Step 1: classify. NotRelevant (not an error) if the message isn't SRP-shaped at
-	// all -- the router (plan S4.2) falls through to the next handler in the ordered
+	// all -- the router falls through to the next handler in the ordered
 	// list, or to plain forwarding.
 	cu, err := srp.Classify(r)
 	if err != nil {
@@ -243,9 +241,8 @@ func (h *SRPHandler) Handle(ctx context.Context, w dns.ResponseWriter, r *dns.Ms
 		return NewErrorResult(msg, err.Error(), err)
 	}
 
-	// Step 3: transport check (plan S7 / D6). Source-address allow-list is a stub
-	// (AD2/D6): parse the config, wire the call site, leave the list empty (= allow
-	// all) until a later phase actually needs it.
+	// Step 3: transport check. Source-address allow-list is a stub: parse the config,
+	// wire the call site, leave the list empty (= allow all) until real filtering is needed.
 	if !h.allowUDP {
 		if _, isUDP := w.RemoteAddr().(*net.UDPAddr); isUDP {
 			h.logger.Debugf("SRP handler: rejecting UDP request for zone %s (allow_udp not set)", zone)
@@ -253,7 +250,7 @@ func (h *SRPHandler) Handle(ctx context.Context, w dns.ResponseWriter, r *dns.Ms
 			return NewErrorResult(msg, "TCP required, got UDP", fmt.Errorf("UDP rejected: allow_udp not set for zone %s", zone))
 		}
 	}
-	// TODO(srp): srp.allowed_source_prefixes source-address allow-list (D6, stub).
+	// TODO(srp): srp.allowed_source_prefixes source-address allow-list (stub, not yet enforced).
 
 	// Step 4: SIG(0) verify against the Host Description KEY (S3.3.3) -- always
 	// present in a structurally-valid SRP update, so no three-stage signer resolution
@@ -278,7 +275,7 @@ func (h *SRPHandler) Handle(ctx context.Context, w dns.ResponseWriter, r *dns.Ms
 		return NewErrorResult(msg, err.Error(), err)
 	}
 
-	// Step 5: default.service.arpa. -> real-zone rewrite (plan S4.3/D5), when this zone
+	// Step 5: default.service.arpa. -> real-zone rewrite, when this zone
 	// opted in. Rewrites every name r.Ns carries (owner names, plus SRV.Target/PTR.Ptr --
 	// the only name-typed RDATA fields SRP itself produces) from under
 	// default.service.arpa. to under h.upstreamZone, in place, then re-runs Validate to
@@ -295,7 +292,7 @@ func (h *SRPHandler) Handle(ctx context.Context, w dns.ResponseWriter, r *dns.Ms
 	// rewriteDefaultServiceARPA is set) default.service.arpa. -- checking the latter here
 	// is enough to decide whether a rewrite is needed; no need to re-check the config
 	// flag itself. Harmless no-op if h.upstreamZone happens to literally be
-	// default.service.arpa. too (the explicitly-configured-real-zone case from Phase 5).
+	// default.service.arpa. too (an explicitly-configured real zone of that name).
 	if canonicalName(zone) == canonicalName(defaultServiceARPA) {
 		rewriteDefaultServiceARPA(r, h.upstreamZone)
 		cu, err = srp.Validate(r)
@@ -312,7 +309,7 @@ func (h *SRPHandler) Handle(ctx context.Context, w dns.ResponseWriter, r *dns.Ms
 
 	// Step 6: FCFS (S3.3.3). Checked names are the host and each service instance name
 	// only (srp.Names) -- SRV/TXT/PTR owner names are never independently checked
-	// (plan S4.4/S4.5: authorized transitively through their instance). cu's names are
+	// (authorized transitively through their instance). cu's names are
 	// under h.upstreamZone unconditionally by this point (step 5 above).
 	//
 	// Evaluate's own check here and the actual forward in step 7 below are two separate
@@ -409,7 +406,7 @@ func (h *SRPHandler) Handle(ctx context.Context, w dns.ResponseWriter, r *dns.Ms
 	// Step 8: upstream confirmed -- stage local lease-store mutations. Every node
 	// touched by a Delete All RRsets in this update is wiped and reinserted
 	// uniformly (RemoveNonKEYRecords then UpsertNonKEYRecords, both pre-existing, no
-	// new store method -- plan S4.4). A node the update doesn't mention (an omitted
+	// new store method needed). A node the update doesn't mention (an omitted
 	// service instance) is simply never touched here.
 	lease, keyLease, err := h.parseLease(r)
 	if err != nil {
@@ -681,8 +678,8 @@ func synthesizeOmittedInstanceKeys(cu *srp.ClassifiedUpdate) []dns.RR {
 	return records
 }
 
-// ptrDeleteDiff implements the one piece of genuinely new logic plan S4.4/S4.5
-// identifies: for each service instance in this update -- live (SRV present) or
+// ptrDeleteDiff implements the one piece of genuinely new logic the lease-store mapping
+// needs: for each service instance in this update -- live (SRV present) or
 // removal-shaped (bare delete-all) alike -- read its CURRENT PTR children from the store
 // and diff them against this update's own named Service Discovery adds for that instance
 // (none, for a removal-shaped instance, so every currently-stored PTR is "not named" and
@@ -697,7 +694,7 @@ func synthesizeOmittedInstanceKeys(cu *srp.ClassifiedUpdate) []dns.RR {
 // that assumption was wrong: the delete-all is scoped to the INSTANCE's own name, which
 // never reaches a PTR owned at the (different, shared) service-type name. That left every
 // removed instance's PTR(s) permanently orphaned upstream -- a real bug caught by the local
-// BIND 9 test harness (plan S12.2/S14 Option C), the same failure mode independently found
+// BIND 9 test harness, the same failure mode independently found
 // and fixed in processExpiredNode for the expiry path.
 func (h *SRPHandler) ptrDeleteDiff(cu *srp.ClassifiedUpdate) []dns.RR {
 	var diff []dns.RR
@@ -915,11 +912,11 @@ func (h *SRPHandler) scheduleLeaseExpiry(nodeKey string) {
 // just the KEY record: a Delete All RRsets at this node's own name reaches the KEY plus
 // every non-KEY record applyLocalMutations stores directly there (a host's A/AAAA, a
 // service instance's SRV/TXT) -- but a PTR's owner name is the (possibly shared) service
-// *type*, never this node's own name (plan S4.4/S4.5), so the delete-all can't reach it;
+// *type*, never this node's own name, so the delete-all can't reach it;
 // every PTR this node currently holds needs its own explicit delete, exactly mirroring
 // ptrDeleteDiff's reasoning. A single-RR KEY delete (the original implementation here)
 // left every non-KEY record permanently orphaned upstream once the local subtree was gone
-// -- a real bug caught by the local BIND 9 test harness (plan S12.2/S14 Option C).
+// -- a real bug caught by the local BIND 9 test harness.
 //
 // It also covers nodeKey's WHOLE subtree, not just nodeKey itself -- a host and its
 // service instances are normally registered with matching lease durations (Handle()'s
@@ -1019,7 +1016,7 @@ func (h *SRPHandler) processExpiredNode(ctx context.Context, nodeKey string) {
 }
 
 // deleteAllRR builds a raw RFC 2136 S2.5.3 "Delete All RRsets From A Name" (class ANY) --
-// this fork's presentation-format parser can't produce this shape (plan S10 item 1), so it
+// this fork's presentation-format parser can't produce this shape, so it
 // needs direct construction, same as pkg/srp's own (unexported, so not reusable from here)
 // deleteAll helper.
 func deleteAllRR(name string) dns.RR {
@@ -1060,7 +1057,7 @@ func (h *SRPHandler) startLeaseReconciliation(interval time.Duration) {
 // server/router.go's handleDumpQuery), so SRP-managed state shows up in the same
 // __dump.sig0lease.internal[.debug] query operators already use. A simpler format than
 // UpdateHandler's tree-indented dump -- flat, one section per node -- since SRP's tree
-// shape (documented in the plan S4.4) doesn't need the same visual nesting to be legible.
+// shape (documented in docs/siglease_rfc9665.md's lease-store mapping section) doesn't need the same visual nesting to be legible.
 func (h *SRPHandler) DumpLeasesLevel(level string) string {
 	h.leaseTimersMu.Lock()
 	defer h.leaseTimersMu.Unlock()

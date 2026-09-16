@@ -11,7 +11,7 @@ import (
 	"github.com/NetworkCommons/sig0lease/client"
 	"github.com/NetworkCommons/sig0lease/config"
 	"github.com/NetworkCommons/sig0lease/logging"
-	_ "github.com/NetworkCommons/sig0lease/pkg/dnscompat" // registers EDNS code 2 so UPDATE-LEASE unpacks; see README_proxy.md
+	_ "github.com/NetworkCommons/sig0lease/pkg/dnscompat" // registers EDNS code 2 so UPDATE-LEASE unpacks; see docs/siglease_rfc9664.md
 	"github.com/NetworkCommons/sig0lease/pkg/dnsmsg"
 	"github.com/NetworkCommons/sig0lease/pkg/lease"
 )

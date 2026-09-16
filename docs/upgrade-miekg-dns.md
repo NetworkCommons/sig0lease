@@ -7,7 +7,7 @@ made here.
 
 ## What's actually fixed upstream
 
-The three shortcomings documented in `README_proxy.md` under "miekg/dns Shortcomings" were
+The three shortcomings documented in `docs/siglease_rfc9664.md` under "miekg/dns Shortcomings" were
 tested against `codeberg.org/miekg/dns` versions v0.6.82 (pinned today) through v0.6.104
 (latest at time of writing):
 
@@ -83,7 +83,7 @@ delete"), then:
    still set, rather than a silent behavior change).
 4. `pkg/lease.FindOption`: extend the `scan` closure to also match `*dns.UPDATELEASE` (it
    lands in `Pseudo`, confirmed empirically — same section ERFC3597 currently uses).
-5. Update `pkg/lease`'s tests and `README_proxy.md`'s "miekg/dns Shortcomings" /
+5. Update `pkg/lease`'s tests and `docs/siglease_rfc9664.md`'s "miekg/dns Shortcomings" /
    "Applied Compatibility Patches" sections to reflect whichever option was taken.
 
 ## Testing either option

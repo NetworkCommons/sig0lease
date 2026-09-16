@@ -1,9 +1,9 @@
 // Package srp implements an RFC 9665 SRP requester: discovery, message building (via
-// pkg/srp), the RFC 9664 S5.2 refresh scheduler, and YXDOMAIN rename-retry. This is the
-// library plan D8 calls the deliverable; cmd/sig0lease-srp is a thin, non-shipped dev/test
+// pkg/srp), the RFC 9664 S5.2 refresh scheduler, and YXDOMAIN rename-retry. This library is
+// the deliverable; cmd/sig0lease-srp-client is a thin, non-shipped dev/test
 // CLI over it. Deliberately not a full RFC 9665 requester (no mDNS-based
-// default.service.arpa. discovery, no CNN transport handling -- both explicitly deferred,
-// D5/D6) -- this targets the Phase 3 registrar's actual supported shape: an explicitly
+// default.service.arpa. discovery, no CNN transport handling -- both out of scope for now)
+// -- this targets the registrar's actual supported shape: an explicitly
 // configured zone, reached over TCP by default.
 package srp
 
@@ -46,7 +46,7 @@ type Config struct {
 	Instances []InstanceConfig
 
 	// Key is this identity's SIG(0) signing key. Nil generates a fresh P-256 key at
-	// NewClient (D7's default) -- SRP identities are typically ephemeral/device-local, so
+	// NewClient (the default) -- SRP identities are typically ephemeral/device-local, so
 	// generating rather than requiring a pre-provisioned keystore file is the common case.
 	Key *keyrec.LoadedKey
 
@@ -125,7 +125,7 @@ func NewClient(cfg Config) (*Client, error) {
 		cfg.Query = LiveSRVQuery(cfg.Resolvers)
 	}
 	if cfg.Key == nil {
-		// D7: SRP identities default to P-256, flags-0 (BuildUpdate enforces flags-0
+		// SRP identities default to P-256, flags-0 (BuildUpdate enforces flags-0
 		// regardless, but 0 here too so Config.Key reads correctly if a caller inspects it).
 		k, err := keyrec.GenerateKey(ensureFQDN(cfg.HostLabel+"."+cfg.Domain), dns.ECDSAP256SHA256, 0, 256)
 		if err != nil {
@@ -187,8 +187,8 @@ func (c *Client) keyRR() *dns.KEY {
 	return k
 }
 
-// rename implements the plan's "S10 item 9: YXDOMAIN means rename and retry, not hard
-// fail." The RCODE alone doesn't tell the requester which name (the host, or a specific
+// rename implements the "YXDOMAIN means rename and retry, not hard
+// fail" behavior. The RCODE alone doesn't tell the requester which name (the host, or a specific
 // service instance) actually conflicted (S3.3.3's FCFS checks every name in the update),
 // so rename conservatively renames EVERYTHING -- host label and every instance label --
 // together, appending the same incrementing numeric suffix: whichever name(s) collided,

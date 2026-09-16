@@ -178,7 +178,7 @@ func main() {
 		os.Exit(1)
 	}
 
-	// Register processing module handlers based on configuration (D2: each opcode maps
+	// Register processing module handlers based on configuration (each opcode maps
 	// to an ordered list of module names, tried in turn -- e.g. [srp_handler,
 	// update_handler] for opcode 5). Each named handler is constructed and Setup at
 	// most once even if it appears under multiple opcodes.
