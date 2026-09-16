@@ -29,6 +29,13 @@ import (
 //   - "refuse_on_foreign_data": RFC 9665 S3.3.3's NOERROR-no-KEY case -- true refuses the
 //     update (REFUSED) when a name exists at the authoritative server with data but no
 //     KEY; false lets the delete-all-then-add clobber it. [OPTIONAL, defaults to true]
+//   - "advertise_registration_domain": also publish the RFC 6763 S11 "r"/"dr" registration-
+//     domain records (self-pointing at upstream_zone) alongside the always-on "b"/"db"/"lb"
+//     browsing-domain records once at least one service type is live. Unlike browsing,
+//     advertising this zone as an open target for direct RFC 2136 Dynamic Update
+//     registration (not just SRP) is a deployment policy choice -- SIG(0)/FCFS still gate who
+//     can actually write, but this controls whether domain-enumeration tools are told to try.
+//     [OPTIONAL, defaults to false]
 //   - "lease_policy": bounds applied to granted LEASE/KEY-LEASE, same shape as the base
 //     handler's. [OPTIONAL]
 //   - "lease_manager" / "storage": same mutually-exclusive lease-store backend selection
@@ -81,6 +88,10 @@ func (h *SRPHandler) Setup(cfg map[string]any) error {
 	h.refuseOnForeignData = true
 	if refuse, ok := cfg["refuse_on_foreign_data"].(bool); ok {
 		h.refuseOnForeignData = refuse
+	}
+
+	if advertise, ok := cfg["advertise_registration_domain"].(bool); ok {
+		h.advertiseRegistrationDomain = advertise
 	}
 
 	if raw, ok := cfg["lease_policy"]; ok {
