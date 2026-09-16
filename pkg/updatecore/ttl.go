@@ -1,6 +1,6 @@
 // Package updatecore holds forwarding plumbing shared by the RFC 9664 update-lease
-// handler and the RFC 9665 SRP handler (see main/docs/rfc9665-srp-implementation-plan.md
-// S4.1, D1/D8). It is a public package, not internal/, matching this repo's convention.
+// handler and the RFC 9665 SRP handler (see docs/siglease_rfc9665.md's upstream forward
+// section). It is a public package, not internal/, matching this repo's convention.
 package updatecore
 
 import (

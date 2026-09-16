@@ -8,11 +8,11 @@ import (
 	"codeberg.org/miekg/dns"
 )
 
-// serveDoT runs a DNS-over-TLS listener (RFC 7858, plan S7/Phase 7) for handler, blocking
+// serveDoT runs a DNS-over-TLS listener (RFC 7858) for handler, blocking
 // until ctx is canceled. Transport-level, like serveTCP/serveUDP: it benefits every handler
 // this proxy runs (base RFC 9664, SRP, plain forwarding alike) rather than being specific to
 // one protocol, and is opportunistic only -- no client-certificate/key-pinning
-// authentication, matching what the plan calls for (SRP's own registrar-side crypto is
+// authentication (SRP's own registrar-side crypto is
 // SIG(0), unrelated to and unaffected by this transport).
 //
 // Requires cfg.Server.TLS (validated non-nil, with Address/Cert/Key all set, by

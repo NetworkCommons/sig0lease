@@ -70,7 +70,7 @@ func (r FCFSResult) String() string {
 // S3.2.5.1 every KEY in a valid update is identical anyway, so callers may simply pass
 // ClassifiedUpdate.Host.Key for every name -- see the package-level Names helper).
 //
-// Per the plan's S3.3 table:
+// Per RFC 9665 S3.3.3's FCFS table:
 //
 //	lease store has a KEY at name, matches updateKey        -> FCFSProceed  (refresh)
 //	lease store has a KEY at name, does NOT match           -> FCFSConflict (YXDOMAIN)
@@ -178,7 +178,7 @@ func Names(cu *ClassifiedUpdate) []string {
 // for the Host Description is also given for each Service Description for which no KEY
 // record is provided" -- "as if... given for" that name, not the literal host-owned RR
 // object). Returning cu.Host.Key verbatim here was a real bug caught by a live end-to-end
-// test (plan S12, Phase 3): callers that derive a lease-store node identity from the
+// test: callers that derive a lease-store node identity from the
 // result (pkg/lease.NodeKey is name-scoped) would silently collide the instance's node
 // with the host's, since both would carry the host's own owner name.
 //

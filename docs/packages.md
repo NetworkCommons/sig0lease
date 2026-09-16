@@ -41,11 +41,11 @@ package srp // import "github.com/NetworkCommons/sig0lease/client/srp"
 
 Package srp implements an RFC 9665 SRP requester: discovery, message building
 (via pkg/srp), the RFC 9664 S5.2 refresh scheduler, and YXDOMAIN rename-retry.
-This is the library plan D8 calls the deliverable; cmd/sig0lease-srp is a thin,
-non-shipped dev/test CLI over it. Deliberately not a full RFC 9665 requester
-(no mDNS-based default.service.arpa. discovery, no CNN transport handling --
-both explicitly deferred, D5/D6) -- this targets the Phase 3 registrar's actual
-supported shape: an explicitly configured zone, reached over TCP by default.
+This library is the deliverable; cmd/sig0lease-srp-client is a thin, non-shipped
+dev/test CLI over it. Deliberately not a full RFC 9665 requester (no mDNS-based
+default.service.arpa. discovery, no CNN transport handling -- both out of scope
+for now) -- this targets the registrar's actual supported shape: an explicitly
+configured zone, reached over TCP by default.
 
 FUNCTIONS
 
@@ -53,12 +53,12 @@ func Discover(ctx context.Context, query SRVQuery, domain string) (string, error
     Discover finds the SRP registrar for domain via a
     `_dnssd-srp._tcp.<domain>.` SRV lookup -- ordinary DNS-SD service
     discovery (RFC 6763), applied to bootstrap SRP itself, per RFC 9665's
-    own discovery convention (see the plan's Appendix C zone skeleton's
+    own discovery convention (see RFC 9665 Appendix C's zone skeleton's
     optional `_dnssd-srp._tcp` SRV record). Returns "host:port" for the best
     (lowest-priority, highest-weight-among-ties) answer. A caller with an
     explicit registrar address configured should skip this entirely (see
     Config.RegistrarAddr) -- discovery is the fallback, not the only path,
-    matching D8's "dev/test tool" framing for cmd/sig0lease-srp.
+    matching cmd/sig0lease-srp-client's own "dev/test tool" framing.
 
 
 TYPES
@@ -130,7 +130,7 @@ type Config struct {
 	Instances []InstanceConfig
 
 	// Key is this identity's SIG(0) signing key. Nil generates a fresh P-256 key at
-	// NewClient (D7's default) -- SRP identities are typically ephemeral/device-local, so
+	// NewClient (the default) -- SRP identities are typically ephemeral/device-local, so
 	// generating rather than requiring a pre-provisioned keystore file is the common case.
 	Key *keyrec.LoadedKey
 
@@ -201,10 +201,10 @@ Package main implements a sig0lease client for sending UPDATE-LEASE requests
 with SIG(0) authentication to the sig0lease proxy.
 ```
 
-## github.com/NetworkCommons/sig0lease/cmd/sig0lease-srp
+## github.com/NetworkCommons/sig0lease/cmd/sig0lease-srp-client
 ```
-Package main implements sig0lease-srp, a thin CLI over client/srp -- a dev/test
-tool (plan D8), not a shipped product. The library is the deliverable; this just
+Package main implements sig0lease-srp-client, a thin CLI over client/srp -- a
+dev/test tool, not a shipped product. The library is the deliverable; this just
 exercises it.
 ```
 
@@ -243,7 +243,7 @@ func (c *Config) GetKeystoreDir() string
 
 func (c *Config) GetOpcodeMap() map[uint8][]string
     GetOpcodeMap creates a map from opcode to its ordered module list for fast
-    lookup (D2).
+    lookup.
 
 func (c *Config) Use4ByteVariant() bool
     Use4ByteVariant returns true if 4-byte variant is explicitly enabled via
@@ -256,12 +256,11 @@ func (c *Config) Validate() error
 type ProcessingConfig struct {
 	// Opcode is the DNS opcode to match (0=QUERY, 1=IQUERY, 2=STATUS, etc.)
 	Opcode uint8 `yaml:"opcode"`
-	// Modules is the ordered list of processing module names to try for this opcode
-	// (D2, main/docs/rfc9665-srp-implementation-plan.md S4.2): the router calls each
-	// in turn until one returns Processed or Error; if every one declines (NotRelevant),
-	// the opcode falls through to plain upstream forwarding. A single-module list (the
-	// common case today, e.g. just "update_handler") behaves exactly as the old
-	// single-"module" field did.
+	// Modules is the ordered list of processing module names to try for this opcode:
+	// the router calls each in turn until one returns Processed or Error; if every one
+	// declines (NotRelevant), the opcode falls through to plain upstream forwarding. A
+	// single-module list (the common case today, e.g. just "update_handler") behaves
+	// exactly as the old single-"module" field did.
 	Modules []string `yaml:"modules"`
 }
     ProcessingConfig holds opcode-specific processing configuration.
@@ -271,7 +270,7 @@ type ServerConfig struct {
 	Address string `yaml:"address"`
 	// Networks are the network protocols to enable ("udp", "tcp", "tls")
 	Networks []string `yaml:"networks"`
-	// TLS configures the "tls" network (DNS-over-TLS, RFC 7858, plan S7/Phase 7):
+	// TLS configures the "tls" network (DNS-over-TLS, RFC 7858):
 	// opportunistic only, no client-certificate/key-pinning auth -- transport-level, so it
 	// benefits every handler (base RFC 9664, SRP, plain forwarding alike), not just one
 	// protocol. Required when "tls" appears in Networks; ignored otherwise.
@@ -476,15 +475,14 @@ type SRPHandler struct {
 
 	// Has unexported fields.
 }
-    SRPHandler implements handlers.Handler for opcode 5 (UPDATE), the RFC 9665
-    SRP path -- a sibling to UpdateHandler (D1), never a branch inside it:
+    SRPHandler implements handlers.Handler for opcode 5 (UPDATE), the RFC
+    9665 SRP path -- a sibling to UpdateHandler, never a branch inside it:
     SRP's message shape and authorization model (FCFS, delete-all-then-add,
     no per-record parent/key walk) contradict two of UpdateHandler's own checks
     (validateSignerHierarchyForUpdateRecords, filterDuplicateRegistrations),
     so it needs its own Handle() rather than a mode flag on the existing one.
-    See main/docs/rfc9665-srp-implementation-plan.md S4 for the design this
-    implements; comments below cite it as "S<n>" for RFC 9665 sections and "plan
-    S<n>" for the plan document's own sections.
+    See docs/siglease_rfc9665.md for the design this implements; comments below
+    cite RFC 9665 sections as "S<n>".
 
 func NewSRPHandler() *SRPHandler
     NewSRPHandler creates a new handler for opcode 5 (UPDATE), RFC 9665 SRP
@@ -493,34 +491,34 @@ func NewSRPHandler() *SRPHandler
 func (h *SRPHandler) DumpLeasesLevel(level string) string
     DumpLeasesLevel implements the same dump-endpoint interface UpdateHandler
     does (see server/router.go's handleDumpQuery), so SRP-managed state shows up
-    in the same __dump.sig0lease.internal[.debug] query operators already use.
-    A simpler format than UpdateHandler's tree-indented dump -- flat,
-    one section per node -- since SRP's tree shape (documented in the plan S4.4)
-    doesn't need the same visual nesting to be legible.
+    in the same __dump.sig0lease.internal[.debug] query operators already use. A
+    simpler format than UpdateHandler's tree-indented dump -- flat, one section
+    per node -- since SRP's tree shape (documented in docs/siglease_rfc9665.md's
+    lease-store mapping section) doesn't need the same visual nesting to be
+    legible.
 
 func (h *SRPHandler) Handle(ctx context.Context, w dns.ResponseWriter, r *dns.Msg) *HandlerResult
-    Handle implements the plan's S4.3 ten-step happy path. Every early-return
-    before step 7 (forwarding) touches neither the lease store nor the network,
+    Handle implements RFC 9665's ten-step happy path. Every early-return before
+    step 7 (forwarding) touches neither the lease store nor the network,
     so a rejected request leaves no trace to clean up.
 
 func (h *SRPHandler) Setup(cfg map[string]any) error
     Setup initializes the SRP handler configuration.
 
     Configuration options:
-      - "upstream_zone": the one zone this handler instance serves (D10:
-        one zone, one protocol) [REQUIRED]
+      - "upstream_zone": the one zone this handler instance serves (one zone,
+        one protocol per handler instance) [REQUIRED]
       - "keystore_dir": directory holding this proxy's own SIG(0) signing keys
         [REQUIRED]
-      - "upstream": a static "host:port" override for upstream_zone (D4) -- when
-        set, skips SOA/NS discovery entirely for this zone. [OPTIONAL]
+      - "upstream": a static "host:port" override for upstream_zone -- when set,
+        skips SOA/NS discovery entirely for this zone. [OPTIONAL]
       - "bootstrap_resolvers": []string of resolver addresses used to resolve
         SOA/NS records when "upstream" is not set. [OPTIONAL]
-      - "allow_udp": permit UDP for this zone (plan S7/D6 -- TCP is required by
-        default, for non-CNN zones this proxy targets). [OPTIONAL, defaults to
-        false]
+      - "allow_udp": permit UDP for this zone (TCP is required by default,
+        for non-CNN zones this proxy targets). [OPTIONAL, defaults to false]
       - "rewrite_default_service_arpa": accept requests whose Zone Section
         is literally "default.service.arpa." (real SRP clients hardcode
-        this name -- they have no way to discover any other zone, D5) *in
+        this name -- they have no way to discover any other zone) *in
         addition to* upstream_zone, rewriting every name in the update to
         upstream_zone before FCFS/forwarding so the rest of the pipeline (and
         the authoritative server) never sees default.service.arpa. at all.
@@ -530,6 +528,14 @@ func (h *SRPHandler) Setup(cfg map[string]any) error
         refuses the update (REFUSED) when a name exists at the authoritative
         server with data but no KEY; false lets the delete-all-then-add clobber
         it. [OPTIONAL, defaults to true]
+      - "advertise_registration_domain": also publish the RFC 6763 S11 "r"/"dr"
+        registration- domain records (self-pointing at upstream_zone) alongside
+        the always-on "b"/"db"/"lb" browsing-domain records once at least one
+        service type is live. Unlike browsing, advertising this zone as an open
+        target for direct RFC 2136 Dynamic Update registration (not just SRP) is
+        a deployment policy choice -- SIG(0)/FCFS still gate who can actually
+        write, but this controls whether domain-enumeration tools are told to
+        try. [OPTIONAL, defaults to false]
       - "lease_policy": bounds applied to granted LEASE/KEY-LEASE, same shape as
         the base handler's. [OPTIONAL]
       - "lease_manager" / "storage": same mutually-exclusive lease-store backend
@@ -748,6 +754,117 @@ func ParseAdditionalRRSpec(spec string) (dns.RR, error)
 
 ```
 
+## github.com/NetworkCommons/sig0lease/pkg/dnssd
+```
+package dnssd // import "github.com/NetworkCommons/sig0lease/pkg/dnssd"
+
+Package dnssd holds pure logic for RFC 6763 (DNS-Based Service Discovery)
+concerns that sit alongside, but outside, RFC 9665's own Service Registration
+Protocol -- currently just S9's Service Type Enumeration meta-record.
+An SRP client's Service Description never carries this record itself (S9
+predates SRP and isn't part of what a client restates), so a registrar that
+wants registered services to be discoverable by "browse everything" tools
+-- not just a targeted per-type browse -- has to maintain it independently.
+See handlers.SRPHandler.reconcileServiceEnumeration for how this package's pure
+functions are combined with live lease-store state and turned into an upstream
+UPDATE.
+
+CONSTANTS
+
+const (
+	BrowseDomainPrefix              = "b"  // list of domains recommended for browsing
+	DefaultBrowseDomainPrefix       = "db" // single recommended default browsing domain
+	LegacyBrowseDomainPrefix        = "lb" // "legacy"/"automatic" browsing domain(s)
+	RegistrationDomainPrefix        = "r"  // list of domains recommended for registering via Dynamic Update
+	DefaultRegistrationDomainPrefix = "dr" // single recommended default registration domain
+)
+    RFC 6763 S11 defines five domain-enumeration meta-record prefixes,
+    each rooted at "<prefix>._dns-sd._udp.<domain>.": these are a different,
+    earlier query than S9 type enumeration -- a browse tool that implements full
+    domain enumeration asks one or more of these FIRST, to learn which domain to
+    browse/register in at all, and only then queries EnumerationOwnerName (or a
+    specific type's BrowsingOwnerName) against whatever it got back -- it never
+    queries those on the originally-entered name directly. A zone with services
+    registered via SRP but none of these records is therefore invisible to such
+    a tool even though its S9/S4.1 records are otherwise perfectly correct.
+    See SRPHandler.reconcileServiceEnumeration for why this registrar publishes
+    a trivial self-pointing answer for each (this zone IS its own recommended
+    browsing/registration domain -- one zone per handler instance) once it has
+    at least one live registration.
+
+
+FUNCTIONS
+
+func BrowsingOwnerName(svcType, zone string) string
+    BrowsingOwnerName returns the RFC 6763 S4.1 per-type Service Instance
+    Enumeration PTR owner name for svcType in zone: "<svcType>.<zone>" (e.g.
+    "_http._tcp.example.com."). This is the name a normal DNS-SD browse
+    queries directly; SRPHandler also uses it as a live ground-truth
+    check before removing svcType from the S9 enumeration record -- see
+    reconcileServiceEnumeration's doc comment.
+
+func DiffEnumerationRecords(zone string, previous, current []string, ttl uint32) []dns.RR
+    DiffEnumerationRecords returns targeted add/delete instructions to bring
+    zone's Service Type Enumeration record from previous to current (both
+    deduplicated, case-insensitively, before comparing) -- an RFC 2136 S2.5.1
+    Add to an RRset for each type newly present in current, and an S2.5.4 Delete
+    An RR From An RRSet (single-RR, not a delete-all) for each type that was in
+    previous but has dropped out of current. Each add points at "<type>.<zone>"
+    -- the canonical two-label service type plus the same domain, per S9's own
+    worked example ("_http._tcp.<Domain>"). Returns nil if previous and current
+    describe the same set (no update needed at all).
+
+    This is deliberately NOT a delete-all-then-reinsert of the whole record:
+    this handler's own local knowledge of "what's currently live" is
+    authoritative only for what it has itself seen (RFC 9665 clients restate
+    everything on every refresh, so a long-running process's local view
+    converges quickly) -- but a delete-all is authoritative over everything at
+    that name, including entries a DIFFERENT proxy process, or an earlier run
+    of this same one before a restart, wrote for a type this process hasn't
+    relearned about yet. A delete-all would silently erase those on every
+    reconcile until every such type's owner happens to re-register through the
+    current process -- observed live against a real, multi-run shared zone:
+    a second proxy process, restarted after a first had registered one service
+    type, wiped that type's still-live entry the moment it reconciled its own
+    (empty) view of the world. Targeted single-RR deletes only ever remove a
+    (type, previous) pair this function was explicitly told was previously true,
+    so a fresh process's first-ever call (previous typically empty) can only
+    ever ADD, never destroy another process's data.
+
+func DiffSelfPointingDomainRecord(prefix, zone string, wasPresent, isPresent bool, ttl uint32) []dns.RR
+    DiffSelfPointingDomainRecord returns the single add or delete instruction
+    needed to bring one RFC 6763 S11 domain-enumeration PTR (named by prefix,
+    self-pointing: "this zone IS its own recommended browsing/registration
+    domain") from wasPresent to isPresent, or nil if no change is needed.
+    Unlike DiffEnumerationRecords, which diffs a whole set of service types,
+    every S11 record this registrar ever publishes has the same trivial rdata
+    (the zone itself) regardless of which of the five prefixes it is, so there's
+    nothing to diff beyond the presence flag itself.
+
+func DomainEnumerationOwnerName(prefix, zone string) string
+    DomainEnumerationOwnerName returns the RFC 6763 S11 domain-enumeration
+    meta-record owner name for one of the *DomainPrefix constants above,
+    in zone: "<prefix>._dns-sd._udp.<zone>".
+
+func EnumerationOwnerName(zone string) string
+    EnumerationOwnerName returns the RFC 6763 S9 Service Type Enumeration PTR
+    owner name for zone: "_services._dns-sd._udp.<zone>". Fixed at "._udp"
+    regardless of whether the individual service types being enumerated are
+    themselves "._tcp" -- S9 defines exactly one enumeration name per zone,
+    not one per protocol. zone must already be dot-terminated (this package does
+    no normalization of its own, matching the rest of this codebase's convention
+    of trusting an already-canonical zone at this layer).
+
+func ServiceTypeFromInstanceName(name string) (svcType string, ok bool)
+    ServiceTypeFromInstanceName extracts the two-label DNS-SD service
+    type (e.g. "_http._tcp") from a Service Instance Name shaped
+    "<Instance>.<type>.<proto>.<Domain>." -- RFC 6763 S4.1 is explicit that the
+    Instance portion always occupies exactly one label, so the type is always
+    the second and third labels regardless of how many labels <Domain> itself
+    has. ok is false if name has fewer labels than that shape requires.
+
+```
+
 ## github.com/NetworkCommons/sig0lease/pkg/keyrec
 ```
 package keyrec // import "github.com/NetworkCommons/sig0lease/pkg/keyrec"
@@ -805,6 +922,24 @@ func LoadKeyFromFile(keystoreDir, keyName string) (*LoadedKey, error)
     Adapted from sig0namectl's LoadKeyFile() approach Expects files:
     <keystoreDir>/<keyName>.key and <keystoreDir>/<keyName>.private Uses
     codeberg.org/miekg/dns v0.6.82 API
+
+func ResolveOrCreateKey(dir, owner string, createAlgorithm uint8, logger *logging.Logger) (key *LoadedKey, created bool, err error)
+    ResolveOrCreateKey finds an existing key for owner (a fully-qualified
+    DNS name) in dir, or -- only when createAlgorithm is non-zero --
+    generates and persists a fresh one there. Search is algorithm-agnostic
+    (via FindKeysByZone's own "any algorithm, ED25519 preferred" ordering):
+    an existing key of ANY algorithm satisfies the lookup, since createAlgorithm
+    only says what to generate if nothing is found yet, not which algorithm
+    to prefer among what already exists. created reports whether a new key was
+    generated, so callers can tell the user which happened. createAlgorithm
+    == 0 means "never create" -- a missing key is then an error, not silently
+    generated, matching this package's existing strict-by-default convention
+    (see cmd/sig0lease-client's historical behavior, which this generalizes).
+
+    This is shared, rather than reimplemented per caller, because both of this
+    project's CLI clients (cmd/sig0lease-client, cmd/sig0lease-srp-client) need
+    the identical "find any existing key for this identity, or create one at an
+    explicitly chosen algorithm" logic and would otherwise duplicate it.
 
 func (lk *LoadedKey) Algorithm() uint8
     Algorithm returns the DNSSEC algorithm number
@@ -1052,11 +1187,12 @@ func (m *InMemoryLeaseStore) UpsertNonKEYRecords(ownerNodeKey string, records []
     authorized via AllowOnlineKeyRegistration) still own data.
 
     Every record is validated against the whole batch before any of them is
-    applied: if any of the given records already exists in the store under a
-    different owner, the entire call fails and nothing is written -- the same
-    "fail the parts that would otherwise succeed" policy used for duplicate
-    KEY/RR registration elsewhere (protocol.md item 6), because partially
-    applying a batch here would leave the store's consistency unguaranteed.
+    applied: if any of the given records already exists in the store under
+    a different owner, the entire call fails and nothing is written -- the
+    same "fail the parts that would otherwise succeed" policy used for
+    duplicate KEY/RR registration elsewhere (docs/siglease_rfc9664.md item 6),
+    because partially applying a batch here would leave the store's consistency
+    unguaranteed.
 
 type KEYRecord = Record
     KEYRecord is an alias to Record for clarity in tree-oriented code.
@@ -1137,7 +1273,7 @@ type LeaseStorage interface {
 	// Fails outright, applying none of the given records, if any of them
 	// already exists in the store under a different owner -- this is the
 	// store's own enforcement of "two different keys cannot register the
-	// identical RR" (protocol.md), not merely a caller-side convention.
+	// identical RR" (docs/siglease_rfc9664.md), not merely a caller-side convention.
 	UpsertNonKEYRecords(ownerNodeKey string, records []dns.RR, leaseDuration uint32, upstreamZone string) error
 	RemoveNonKEYRecords(ownerNodeKey string)
 	// RemoveSingleNonKEYRecord removes the record identified by rrKey.
@@ -1269,9 +1405,9 @@ the signed "data" is "RDATA | message", where RDATA is only the SIG's RDATA
 fields (with the Signature field itself omitted), never that RR envelope.
 This was root-caused by instrumenting a local copy of the library and
 independently confirmed against mDNSResponder's own C implementation
-(ServiceRegistration/towire.c: dns_sig0_signature_to_wire_, which hashes a
-`rr`/`rdlen` pointing at RDATA only) -- see README_proxy.md's "miekg/dns
-Shortcomings" section for the full writeup and reproduction.
+(ServiceRegistration/towire.c: dns_sig0_signature_to_wire_, which hashes
+a `rr`/`rdlen` pointing at RDATA only) -- see docs/siglease_rfc9664.md's
+"miekg/dns Shortcomings" section for the full writeup and reproduction.
 
 sig0SignerImpl below replaces dns.CryptoSIG0.Sign/Verify with a from-scratch,
 RFC-correct implementation for every algorithm this package validates (ED25519,
@@ -1305,22 +1441,22 @@ package srp // import "github.com/NetworkCommons/sig0lease/pkg/srp"
 
 Package srp implements RFC 9665 (DNS-SD Service Registration Protocol) message
 classification and structural validation. It is pure logic: no network I/O,
-no lease store access -- see main/docs/rfc9665-srp-implementation-plan.md
-S4.1. FCFS (pkg/srp/fcfs.go, needs a store view) and the handler wiring
-(handlers/srp_handler.go) are later phases; this file covers Classify(),
-the first step of S4.3's happy path.
+no lease store access -- see docs/siglease_rfc9665.md's architecture section.
+FCFS (pkg/srp/fcfs.go, needs a store view) and the handler wiring
+(handlers/srp_handler.go) build on it; this file covers Classify(), the first
+step of RFC 9665's happy path.
 
 The classification algorithm below closely follows the reference implementation
-in mDNSResponder/ServiceRegistration/srp-parse.c (srp_evaluate), which the
-plan's S12.3 names as the cross-check for this package -- see the deliberate
-divergences noted inline (multiple TXT adds; the LEASE-independent host-removal
-fallback; no base-type-precedes-subtype requirement on PTR deletes).
+in mDNSResponder/ServiceRegistration/srp-parse.c (srp_evaluate), used as
+a cross-check for this package -- see the deliberate divergences noted
+inline (multiple TXT adds; the LEASE-independent host-removal fallback;
+no base-type-precedes-subtype requirement on PTR deletes).
 
-update.go builds an unsigned RFC 9665 SRP UPDATE message from a declarative
-spec -- the requester-side counterpart to Classify/Validate. Pure logic:
-no network I/O, no crypto beyond shaping the KEY RR from already-generated key
-material (see plan S4.1 for why pkg/srp stays network-free; client/srp, Phase 4,
-owns key generation, discovery, scheduling, and actually sending the result).
+update.go builds an unsigned RFC 9665 SRP UPDATE message from a declarative spec
+-- the requester-side counterpart to Classify/Validate. Pure logic: no network
+I/O, no crypto beyond shaping the KEY RR from already-generated key material
+-- pkg/srp stays network-free; client/srp owns key generation, discovery,
+scheduling, and actually sending the result.
 
 CONSTANTS
 
@@ -1348,11 +1484,11 @@ func BuildUpdate(spec UpdateSpec) (*dns.Msg, error)
 
 func GrantedLease(resp *dns.Msg) (lease, keyLease uint32, ok bool)
     GrantedLease reads the LEASE/KEY-LEASE the registrar actually granted off
-    a successful response's echoed Update-Lease option (plan S4.3 step 10) --
-    which may differ from what was requested (the registrar's own LeasePolicy
-    can clamp either value independently). ok is false if resp carries no
-    (decodable) Update-Lease option, in which case the requester should fall
-    back to what it originally requested.
+    a successful response's echoed Update-Lease option -- which may differ from
+    what was requested (the registrar's own LeasePolicy can clamp either value
+    independently). ok is false if resp carries no (decodable) Update-Lease
+    option, in which case the requester should fall back to what it originally
+    requested.
 
 func KeyFor(cu *ClassifiedUpdate, name string) *dns.KEY
     KeyFor returns the KEY that governs name: an instance's own explicit KEY if
@@ -1361,11 +1497,10 @@ func KeyFor(cu *ClassifiedUpdate, name string) *dns.KEY
     same KEY record that is given for the Host Description is also given for
     each Service Description for which no KEY record is provided" -- "as if...
     given for" that name, not the literal host-owned RR object). Returning
-    cu.Host.Key verbatim here was a real bug caught by a live end-to-end test
-    (plan S12, Phase 3): callers that derive a lease-store node identity from
-    the result (pkg/lease.NodeKey is name-scoped) would silently collide the
-    instance's node with the host's, since both would carry the host's own owner
-    name.
+    cu.Host.Key verbatim here was a real bug caught by a live end-to-end test:
+    callers that derive a lease-store node identity from the result
+    (pkg/lease.NodeKey is name-scoped) would silently collide the instance's
+    node with the host's, since both would carry the host's own owner name.
 
     name must be cu.Host.Name or one of cu.Instances' names -- anything else is
     a caller bug, not a data problem, so KeyFor panics rather than returning a
@@ -1469,7 +1604,7 @@ func Evaluate(ctx context.Context, view StoreView, query AuthoritativeKeyQuery, 
     is identical anyway, so callers may simply pass ClassifiedUpdate.Host.Key
     for every name -- see the package-level Names helper).
 
-    Per the plan's S3.3 table:
+    Per RFC 9665 S3.3.3's FCFS table:
 
         lease store has a KEY at name, matches updateKey        -> FCFSProceed  (refresh)
         lease store has a KEY at name, does NOT match           -> FCFSConflict (YXDOMAIN)
@@ -1555,7 +1690,7 @@ const (
 	// granted LEASE/KEY-LEASE off the same response.
 	OutcomeSuccess Outcome = iota
 	// OutcomeConflict: YXDOMAIN (S3.3.3's FCFS conflict). A different key already holds
-	// one of the names in this update. Per plan S10 item 9, this is "rename and retry,"
+	// one of the names in this update. This is "rename and retry,"
 	// not a hard failure -- see client/srp's rename-retry loop.
 	OutcomeConflict
 	// OutcomeRefused: REFUSED. Covers every registrar-side rejection that isn't a naming
@@ -1645,15 +1780,15 @@ type UpdateSpec struct {
 ```
 package updatecore // import "github.com/NetworkCommons/sig0lease/pkg/updatecore"
 
-Package updatecore holds forwarding plumbing shared by the RFC
-9664 update-lease handler and the RFC 9665 SRP handler (see
-main/docs/rfc9665-srp-implementation-plan.md S4.1, D1/D8). It is a public
-package, not internal/, matching this repo's convention.
+Package updatecore holds forwarding plumbing shared by the RFC 9664 update-lease
+handler and the RFC 9665 SRP handler (see docs/siglease_rfc9665.md's upstream
+forward section). It is a public package, not internal/, matching this repo's
+convention.
 
-Package updatecore holds forwarding plumbing shared by the RFC
-9664 update-lease handler and the RFC 9665 SRP handler (see
-main/docs/rfc9665-srp-implementation-plan.md S4.1, D1/D8). It is a public
-package, not internal/, matching this repo's convention.
+Package updatecore holds forwarding plumbing shared by the RFC 9664 update-lease
+handler and the RFC 9665 SRP handler (see docs/siglease_rfc9665.md's upstream
+forward section). It is a public package, not internal/, matching this repo's
+convention.
 
 FUNCTIONS
 
@@ -1670,13 +1805,13 @@ func BuildAndSign(upstreamZone string, prereqs, records []dns.RR, signingKey *ke
     prereqs may be nil/empty -- most callers have none.
 
     Unlike the base RFC 9664 handler's constructUpstreamUpdate (handlers/
-    opcode5_update_helpers.go), this does no per-record-type branching or TTL
-    clamping -- S4.3 step 7's SRP forward is simpler by construction: it's
-    exactly "the same adds/deletes [the requester sent], re-signed with proxy
-    key" (plus, for a Service Description, the pkg/srp-computed PTR-delete diff
-    appended by the caller before this is called -- see the plan's S4.4/S4.5).
-    Any clamping SRP wants happens earlier, against the classified instructions,
-    not here.
+    opcode5_update_helpers.go), this does no per-record-type branching or
+    TTL clamping -- S4.3 step 7's SRP forward is simpler by construction:
+    it's exactly "the same adds/deletes [the requester sent], re-signed
+    with proxy key" (plus, for a Service Description, the pkg/srp-computed
+    PTR-delete diff appended by the caller before this is called -- see
+    docs/siglease_rfc9665.md's lease-store mapping section). Any clamping SRP
+    wants happens earlier, against the classified instructions, not here.
 
 func CheckConsistentTTLs(records []dns.RR) error
     CheckConsistentTTLs implements the RFC 9665 S4 MUST for the SRP path:
@@ -1744,8 +1879,8 @@ const (
 type Coordinator struct {
 	// Has unexported fields.
 }
-    Coordinator resolves the authoritative server for a zone (SOA MNAME, or a
-    configured per-zone static override, D4) and performs the two things both
+    Coordinator resolves the authoritative server for a zone (SOA MNAME,
+    or a configured per-zone static override) and performs the two things both
     handlers need against it: sending a signed UPDATE, and a live KEY-at-name
     query (S3.3.3 FCFS).
 
@@ -1768,23 +1903,35 @@ func (c *Coordinator) QueryKeyAtName(ctx context.Context, zoneHint, name string)
     when reused by a caller, the "does this name already have a KEY" question
     the base handler asks elsewhere.
 
+func (c *Coordinator) QueryPTRExists(ctx context.Context, zoneHint, name string) (bool, error)
+    QueryPTRExists reports whether at least one PTR record currently exists live
+    at name (typically a per-type browsing name "<type>.<zone>", RFC 6763 S4.1)
+    against zoneHint's resolved authoritative server -- same query/fallback
+    shape as QueryKeyAtName, but a simple presence check rather than a tri-state
+    result, since the only question here is "does anything else still provide
+    this type." Used by handlers.SRPHandler.reconcileServiceEnumeration
+    immediately before removing a type from the RFC 6763 S9 enumeration record,
+    to confirm no OTHER registrant this process's own local lease store doesn't
+    know about still provides it -- see that function's doc comment for why a
+    local-only view can't safely decide this alone.
+
 func (c *Coordinator) ResolveAuthoritativeZone(ctx context.Context, zone string) (string, error)
     ResolveAuthoritativeZone finds the zone cut (the name that actually has NS
     records) for zone or one of its parents -- or, for a zone matching a static
-    upstream override (D4), zone itself, with no NS lookup at all (the operator
-    has already asserted the zone cut by configuring the override).
+    upstream override, zone itself, with no NS lookup at all (the operator has
+    already asserted the zone cut by configuring the override).
 
 func (c *Coordinator) ResolveSOAMasterServer(ctx context.Context, zone string) (server, effectiveZone string, err error)
     ResolveSOAMasterServer returns the "host:port" of zone's SOA MNAME (walking
     up to parent zones if the exact name has none) and the effective zone that
-    answered, or -- if zone exactly matches a configured static upstream (D4) --
-    that override address with zone itself as the effective zone, skipping the
-    lookup entirely.
+    answered, or -- if zone exactly matches a configured static upstream -- that
+    override address with zone itself as the effective zone, skipping the lookup
+    entirely.
 
 func (c *Coordinator) SendUpdate(ctx context.Context, upstreamZone string, updateMsg *dns.Msg) (*dns.Msg, error)
     SendUpdate sends updateMsg (already built and signed) to upstreamZone's
     authoritative server, resolved via ResolveSOAMasterServer (so a static
-    override, D4, is honored), trying UDP then falling back to TCP.
+    override is honored), trying UDP then falling back to TCP.
 
 ```
 
@@ -1814,10 +1961,9 @@ func (r *Router) Route(ctx context.Context, w dns.ResponseWriter, rMsg *dns.Msg)
     Route determines how to handle a DNS message based on its opcode. Flow:
      1. Check for internal dump query (admin/debug endpoint)
      2. Check if opcode has any registered handlers
-     3. Try each configured handler for the opcode in order (D2):
-        - StatusProcessed: Return response to client, stop - StatusNotRelevant:
-        Try the next handler in the list - StatusError: Return error response to
-        client, stop
+     3. Try each configured handler for the opcode in order: - StatusProcessed:
+        Return response to client, stop - StatusNotRelevant: Try the next
+        handler in the list - StatusError: Return error response to client, stop
      4. If no handler is configured, or every handler declined (all
         NotRelevant), apply default forward
 
@@ -1847,13 +1993,13 @@ func (s *Server) Serve() error
 
 ## github.com/NetworkCommons/sig0lease/tests/srp_client_tester
 ```
-Package main implements a minimal RFC 9665 SRP UPDATE test client, used only by
-tests/test_srp.sh. This mirrors tests/blacklisted_tester.go's precedent: a small
-Go helper for something the shell alone can't do (build, sign, and send a real
-SRP UPDATE) and no existing binary does yet -- client/srp and cmd/sig0lease-srp
-are Phase 4, not built yet. This is deliberately NOT that client: no discovery,
-no refresh scheduler, no YXDOMAIN rename-retry -- just enough to drive
-test_srp.sh's scenarios.
+Package main implements a minimal RFC 9665 SRP UPDATE test client, used only
+by tests/test_srp.sh. This mirrors tests/blacklisted_tester.go's precedent:
+a small Go helper for something the shell alone can't do (build, sign,
+and send a real SRP UPDATE) and no existing binary did yet at the time this
+was written -- client/srp and cmd/sig0lease-srp-client were not built yet.
+This is deliberately NOT that client: no discovery, no refresh scheduler,
+no YXDOMAIN rename-retry -- just enough to drive test_srp.sh's scenarios.
 
 Identity is a P-256 (ECDSAP256SHA256) key pair persisted as a raw private-key
 file at -keyfile: created on first use, reused on subsequent calls (so a shell

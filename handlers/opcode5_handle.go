@@ -68,7 +68,7 @@ func (h *UpdateHandler) Handle(ctx context.Context, w dns.ResponseWriter, r *dns
 	// reads these TTLs -- in particular before LeasePolicy clamping (S6) and the
 	// duplicate/authoritative-RR comparisons later in this function, both of which must
 	// see the already-uniform value. This is a base-handler correctness fix independent of
-	// SRP (see docs/rfc9665-srp-implementation-plan.md S6); the SRP path uses the same
+	// SRP (see docs/siglease_rfc9665.md's TTL consistency section); the SRP path uses the same
 	// helper's CheckConsistentTTLs instead, which rejects rather than rewrites.
 	if changed := updatecore.NormalizeTTLs(updateOtherRRs); changed > 0 {
 		h.logger.Debugf("Normalized TTLs to their RRset minimum for %d RRset(s)", changed)
@@ -99,7 +99,7 @@ func (h *UpdateHandler) Handle(ctx context.Context, w dns.ResponseWriter, r *dns
 
 	signerID := keyIDFromSIG(sigRR)
 	// useHierarchy is hardcoded false: non-KEY RRs always belong to the
-	// signer (protocol.md 5.1.4). See groupOtherRecordsByTargetKey's doc
+	// signer (docs/siglease_rfc9664.md 5.1.4). See groupOtherRecordsByTargetKey's doc
 	// comment -- the useHierarchy=true path is reserved for a possible
 	// future config option and is not reachable from here today.
 	updateOtherRRsByKeyOwner, err := groupOtherRecordsByTargetKey(signerID, updateKeyRRs, updateOtherRRs, false)
@@ -296,7 +296,7 @@ func (h *UpdateHandler) Handle(ctx context.Context, w dns.ResponseWriter, r *dns
 			allNotes = append(allNotes, partialNotes...)
 		}
 
-		// Non-KEY RRs always belong to the signer (protocol.md 5.1.4), grouped
+		// Non-KEY RRs always belong to the signer (docs/siglease_rfc9664.md 5.1.4), grouped
 		// above under signerID regardless of which KEY RR(s) are in this
 		// request. The loop above only reaches that data when the signer
 		// itself is one of the iterated KEY RRs (signerInUpdate). When the
@@ -398,7 +398,7 @@ func (h *UpdateHandler) Handle(ctx context.Context, w dns.ResponseWriter, r *dns
 		// Case C: delete matrix. Only forward upstream, and only touch the
 		// local lease store, for records we actually manage; records that
 		// aren't found locally are reported via a note but otherwise ignored
-		// (protocol.md item 7).
+		// (docs/siglease_rfc9664.md item 7).
 		//
 		// Authorization is ownership-based, not just DNS-name hierarchy: a
 		// record (KEY or non-KEY) may only be deleted by its immediate
@@ -542,7 +542,7 @@ func (h *UpdateHandler) Handle(ctx context.Context, w dns.ResponseWriter, r *dns
 			scopedOtherRecords := updateOtherRRsByKeyOwner[keyIDFromKEY(keyRR)]
 			notes := make([]string, 0)
 			// Only records actually present locally are real deletions: a
-			// record named here that isn't found gets a note (protocol.md
+			// record named here that isn't found gets a note (docs/siglease_rfc9664.md
 			// item 7) but must not be sent upstream as a delete or removed
 			// from local state that never had it.
 			recordsToDelete := make([]dns.RR, 0, len(scopedOtherRecords))
@@ -561,7 +561,7 @@ func (h *UpdateHandler) Handle(ctx context.Context, w dns.ResponseWriter, r *dns
 			if !keyIsRefresh {
 				// New KEY registration: must not already exist identically at the
 				// authoritative DNS, mirroring Case A's duplicate protection
-				// (protocol.md item 6 applies to every case, not just Case A).
+				// (docs/siglease_rfc9664.md item 6 applies to every case, not just Case A).
 				exists, err := h.authoritativeHasRR(ctx, zone, keyRR)
 				if err != nil {
 					msg := makeErrorResponse(r, dns.RcodeServerFailure, fmt.Sprintf("authoritative duplicate check failed: %v", err))

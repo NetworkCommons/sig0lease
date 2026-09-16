@@ -25,8 +25,7 @@ import (
 // fakeSRPCoordinator is srpCoordinator's test double: every upstream-facing call Handle()
 // makes is recorded and driven from canned responses, so its upstream-facing branches (FCFS's
 // live query, forward success/failure, expiry's delete) can be exercised without a real
-// network or DNS server -- the plan's own Phase 3 gate (S12.2: "Handler tests -- mock
-// UpstreamCoordinator").
+// network or DNS server.
 type fakeSRPCoordinator struct {
 	// keyState defaults to AuthNXDomain ("first come") for any name the test hasn't seeded
 	// into the lease store -- matching an empty real zone, the common case.
@@ -343,12 +342,12 @@ func TestSRPHandle_RestartRefreshSucceeds_WhenUpstreamHasSynthesizedInstanceKey(
 	const host = "srptest1c.dev.zenr.io."
 	inst := oneWidgetInstance()[0].name
 
-	// Phase 1: register through a first handler, then pull the instance's KEY straight out
+	// Step 1: register through a first handler, then pull the instance's KEY straight out
 	// of what it actually forwarded upstream.
 	h1, coord1 := newSRPTestHandler(t)
 	msg := buildSRPUpdate(t, srpTestZone, id, host, []string{"192.0.2.1"}, oneWidgetInstance(), 30, 1209600, host)
 	if res := h1.Handle(context.Background(), stubTCPResponseWriter{}, msg); res.Status != StatusProcessed {
-		t.Fatalf("phase 1 registration: expected Processed, got %s: %v", res.Status, res.Error)
+		t.Fatalf("step 1 registration: expected Processed, got %s: %v", res.Status, res.Error)
 	}
 	var forwardedInstKey *dns.KEY
 	for _, rr := range coord1.sent[0].Ns {
@@ -357,11 +356,11 @@ func TestSRPHandle_RestartRefreshSucceeds_WhenUpstreamHasSynthesizedInstanceKey(
 		}
 	}
 	if forwardedInstKey == nil {
-		t.Fatalf("phase 1: no instance KEY was forwarded upstream at all -- can't simulate a restart finding it, got Ns: %+v", coord1.sent[0].Ns)
+		t.Fatalf("step 1: no instance KEY was forwarded upstream at all -- can't simulate a restart finding it, got Ns: %+v", coord1.sent[0].Ns)
 	}
 
-	// Phase 2: a brand new handler (nothing shared with h1 -- simulates a real proxy
-	// restart) whose simulated upstream state is exactly what phase 1 actually forwarded.
+	// Step 2: a brand new handler (nothing shared with h1 -- simulates a real proxy
+	// restart) whose simulated upstream state is exactly what step 1 actually forwarded.
 	h2, coord2 := newSRPTestHandler(t)
 	coord2.keyState = srp.AuthKeyPresent
 	coord2.keys = []*dns.KEY{forwardedInstKey}
@@ -425,8 +424,8 @@ func TestSRPHandle_FCFSConflict(t *testing.T) {
 	}
 }
 
-// TestSRPHandle_HijackViaBundledHost_Refused pins the plan's own named FCFS scenario
-// (S12.2: "hijack-via-bundled-host"): an attacker who owns no names of their own bundles a
+// TestSRPHandle_HijackViaBundledHost_Refused pins a named FCFS scenario
+// ("hijack-via-bundled-host"): an attacker who owns no names of their own bundles a
 // fake Host Description for someone else's ALREADY-REGISTERED host into their own update
 // (signed by their own key, not the victim's), with a service instance riding along,
 // hoping the bundled service gets authorized "for free" alongside the host claim. Every
@@ -629,14 +628,14 @@ func TestSRPHandle_AllowsUDPWhenConfigured(t *testing.T) {
 	}
 }
 
-// --- routing / dispatch (D2) ------------------------------------------------------------
+// --- routing / dispatch ------------------------------------------------------------
 
 func TestSRPHandle_NotSRPShaped_NotRelevant(t *testing.T) {
 	h, _ := newSRPTestHandler(t)
 	msg := dns.NewMsg(srpTestZone, dns.TypeSOA)
 	msg.Opcode = dns.OpcodeUpdate
 	// No Update-section content at all -- Classify rejects for "no Host Description",
-	// which Handle() must treat as NotRelevant, not Error (D2: falls through to the next
+	// which Handle() must treat as NotRelevant, not Error (falls through to the next
 	// module / plain forwarding, exactly like a plain RFC 9664 UPDATE reaching this handler).
 
 	res := h.Handle(context.Background(), stubTCPResponseWriter{}, msg)
@@ -659,11 +658,11 @@ func TestSRPHandle_WrongZone_NotRelevant(t *testing.T) {
 	}
 }
 
-// --- default.service.arpa. rewrite (Phase 6, plan S4.3 step 5 / D5) -----------------------
+// --- default.service.arpa. rewrite -----------------------
 
-// TestSRPHandle_DefaultServiceARPA_RejectedWhenRewriteDisabled pins the pre-Phase-6 default:
-// a client addressing default.service.arpa. against a handler configured for a real zone,
-// with the rewrite feature off, is declined exactly like any other foreign zone.
+// TestSRPHandle_DefaultServiceARPA_RejectedWhenRewriteDisabled pins the default: with the
+// rewrite feature off, a client addressing default.service.arpa. against a handler
+// configured for a real zone is declined exactly like any other foreign zone.
 func TestSRPHandle_DefaultServiceARPA_RejectedWhenRewriteDisabled(t *testing.T) {
 	h, _ := newSRPTestHandler(t) // rewriteDefaultServiceARPA defaults to false
 	id := newSRPTestIdentity(t)
@@ -677,8 +676,8 @@ func TestSRPHandle_DefaultServiceARPA_RejectedWhenRewriteDisabled(t *testing.T) 
 	}
 }
 
-// TestSRPHandle_DefaultServiceARPA_RewrittenToUpstreamZone is Phase 6's own happy path: a
-// client that only knows default.service.arpa. (real SRP clients hardcode it, D5) reaches a
+// TestSRPHandle_DefaultServiceARPA_RewrittenToUpstreamZone is the rewrite feature's happy
+// path: a client that only knows default.service.arpa. (real SRP clients hardcode it) reaches a
 // handler configured for a real zone with the rewrite enabled. Confirms every layer sees the
 // rewritten name -- the upstream forward, the local lease-store tree -- while the response
 // still echoes back default.service.arpa., exactly what the client itself sent.
@@ -1162,7 +1161,7 @@ func TestSRPHandle_RegistrationDomains_PublishedWhenOptedIn(t *testing.T) {
 }
 
 // TestSRPHandle_PTRDiff_DropsSubtypeOnUpdate exercises ptrDeleteDiff: upstream never
-// delete-alls a PTR's owner name (it's the shared service *type*, plan S4.4/S4.5), so
+// delete-alls a PTR's owner name (it's the shared service *type*), so
 // dropping a subtype registration on a live (still-SRV-shaped) instance needs its own
 // explicit "Delete An RR From An RRSet" in the forwarded message, or the authoritative
 // server never finds out even though the local store's wipe-then-reinsert already dropped it.
@@ -1264,7 +1263,7 @@ func TestSRPHandle_ExpiryDeletesUpstreamThenLocally(t *testing.T) {
 		// not a single-RR KEY delete -- the latter (this function's original
 		// implementation) left the host's A record permanently orphaned upstream once the
 		// local subtree was gone locally, a real bug caught by the local BIND 9 test
-		// harness (plan S12.2/S14 Option C).
+		// harness.
 		if any, ok := rr.(*dns.ANY); ok && any.Hdr.Class == dns.ClassANY && canonicalName(any.Hdr.Name) == canonicalName(host) {
 			foundDeleteAll = true
 		}
@@ -1279,7 +1278,7 @@ func TestSRPHandle_ExpiryDeletesUpstreamThenLocally(t *testing.T) {
 
 // TestSRPHandle_ExpiryPTRCleanup confirms processExpiredNode's PTR handling: a service
 // instance's own delete-all can't reach a PTR at the (possibly shared) service-type name
-// (plan S4.4/S4.5), so every PTR the expiring instance currently holds needs its own
+// so every PTR the expiring instance currently holds needs its own
 // explicit delete alongside the delete-all -- mirroring ptrDeleteDiff's reasoning for the
 // live-update path.
 func TestSRPHandle_ExpiryPTRCleanup(t *testing.T) {

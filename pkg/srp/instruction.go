@@ -1,12 +1,12 @@
 // Package srp implements RFC 9665 (DNS-SD Service Registration Protocol) message
 // classification and structural validation. It is pure logic: no network I/O, no lease
-// store access -- see main/docs/rfc9665-srp-implementation-plan.md S4.1. FCFS
+// store access -- see docs/siglease_rfc9665.md's architecture section. FCFS
 // (pkg/srp/fcfs.go, needs a store view) and the handler wiring (handlers/srp_handler.go)
-// are later phases; this file covers Classify(), the first step of S4.3's happy path.
+// build on it; this file covers Classify(), the first step of RFC 9665's happy path.
 //
 // The classification algorithm below closely follows the reference implementation in
-// mDNSResponder/ServiceRegistration/srp-parse.c (srp_evaluate), which the plan's S12.3
-// names as the cross-check for this package -- see the deliberate divergences noted
+// mDNSResponder/ServiceRegistration/srp-parse.c (srp_evaluate), used as a cross-check for
+// this package -- see the deliberate divergences noted
 // inline (multiple TXT adds; the LEASE-independent host-removal fallback; no
 // base-type-precedes-subtype requirement on PTR deletes).
 package srp

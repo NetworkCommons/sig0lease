@@ -158,7 +158,7 @@ func TestFCFS_NamesAndKeyFor(t *testing.T) {
 	}
 	// inst2 has no explicit KEY -- inherits the host's key material (S3.2.5.1), but at
 	// its OWN owner name, not the host's literal KEY RR object. Returning cu.Host.Key
-	// verbatim here was a real bug (caught by a live end-to-end test, plan S12 Phase 3):
+	// verbatim here was a real bug (caught by a live end-to-end test):
 	// pkg/lease.NodeKey is name-scoped, so a caller deriving a lease-store node identity
 	// from an inherited key with the host's name would silently collide the instance's
 	// node with the host's own.

@@ -16,7 +16,7 @@ const (
 	// granted LEASE/KEY-LEASE off the same response.
 	OutcomeSuccess Outcome = iota
 	// OutcomeConflict: YXDOMAIN (S3.3.3's FCFS conflict). A different key already holds
-	// one of the names in this update. Per plan S10 item 9, this is "rename and retry,"
+	// one of the names in this update. This is "rename and retry,"
 	// not a hard failure -- see client/srp's rename-retry loop.
 	OutcomeConflict
 	// OutcomeRefused: REFUSED. Covers every registrar-side rejection that isn't a naming
@@ -66,7 +66,7 @@ func InterpretResponse(resp *dns.Msg) Outcome {
 }
 
 // GrantedLease reads the LEASE/KEY-LEASE the registrar actually granted off a successful
-// response's echoed Update-Lease option (plan S4.3 step 10) -- which may differ from what
+// response's echoed Update-Lease option -- which may differ from what
 // was requested (the registrar's own LeasePolicy can clamp either value independently).
 // ok is false if resp carries no (decodable) Update-Lease option, in which case the
 // requester should fall back to what it originally requested.

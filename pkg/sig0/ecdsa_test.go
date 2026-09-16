@@ -12,11 +12,11 @@ import (
 	_ "github.com/NetworkCommons/sig0lease/pkg/dnscompat" // registers EDNS0 code 2 (UPDATE-LEASE) so Unpack succeeds; see that package's init()
 )
 
-// TestECDSAP256RoundTrip covers D7 (RFC 9665 requires ECDSAP256SHA256 support): generate
+// TestECDSAP256RoundTrip covers RFC 9665's requirement of ECDSAP256SHA256 support: generate
 // a fresh P-256 key, build a KEY RR the way keyrec/dnsKey.NewPrivate would (RFC 6605 S4:
 // raw X||Y, no leading 0x04, flags-0 per RFC 9665 S3.2.5.1), sign a message, round-trip it
 // through Pack/Unpack (the realistic wire path -- see server.fullUnpackHandler), and
-// verify. This is the "sign+verify round-trip test" S8 calls for.
+// verify.
 func TestECDSAP256RoundTrip(t *testing.T) {
 	priv, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	if err != nil {
@@ -60,8 +60,8 @@ func TestECDSAP256RoundTrip(t *testing.T) {
 	}
 }
 
-// TestECDSAP384RoundTrip covers the other algorithm the D7-B generalization fixed
-// alongside ECDSAP256SHA256 (same bug, same rdataOnlyPrefix fix, different curve/hash) --
+// TestECDSAP384RoundTrip covers the other algorithm the rdataOnlyPrefix fix generalized to
+// alongside ECDSAP256SHA256 (same bug, same fix, different curve/hash) --
 // unlike alg 13, nothing in this codebase actually uses alg 14 today, so this is here
 // purely to validate the shared code path rather than to satisfy a protocol requirement.
 func TestECDSAP384RoundTrip(t *testing.T) {
@@ -154,10 +154,10 @@ func TestECDSAP256TamperedMessageRejected(t *testing.T) {
 	}
 }
 
-// TestECDSAP256KnownAnswerFromMDNSResponder is a known-answer test (S8) pinning the RFC
+// TestECDSAP256KnownAnswerFromMDNSResponder is a known-answer test pinning the RFC
 // 2931 S3 hashing fix (see this package's doc comment) against a REAL SIG(0) update
-// captured from mDNSResponder's srp-client (an independent implementation) during Phase 0
-// of the RFC 9665 plan -- not a synthetic message. Before the fix, this failed with "dns:
+// captured from mDNSResponder's srp-client (an independent implementation) -- not a
+// synthetic message. Before the fix, this failed with "dns:
 // bad signature" because dns.CryptoSIG0.Verify hashes the SIG RR's full wire encoding
 // instead of RDATA-only. If this regresses, real-world SRP interop (and any other
 // non-ED25519 SIG(0) interop) is broken again.

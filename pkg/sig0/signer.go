@@ -11,7 +11,7 @@
 // field itself omitted), never that RR envelope. This was root-caused by instrumenting a
 // local copy of the library and independently confirmed against mDNSResponder's own C
 // implementation (ServiceRegistration/towire.c: dns_sig0_signature_to_wire_, which hashes
-// a `rr`/`rdlen` pointing at RDATA only) -- see README_proxy.md's "miekg/dns Shortcomings"
+// a `rr`/`rdlen` pointing at RDATA only) -- see docs/siglease_rfc9664.md's "miekg/dns Shortcomings"
 // section for the full writeup and reproduction.
 //
 // sig0SignerImpl below replaces dns.CryptoSIG0.Sign/Verify with a from-scratch,

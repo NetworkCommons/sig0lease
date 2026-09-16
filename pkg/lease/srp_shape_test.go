@@ -7,13 +7,12 @@ import (
 	"codeberg.org/miekg/dns"
 )
 
-// This file prototypes D3 (main/docs/rfc9665-srp-implementation-plan.md): "Reuse the
-// pkg/lease tree with additive PTR/subtype helpers. Prototype the mapping against RFC
-// 9665 [worked example] in Phase 1 before committing." It builds the exact worked-example
-// tree from the plan's S4.4/S4.5 (host "myhost" with A/AAAA, service instance
-// "Printer._ipps._tcp" with SRV/TXT and a base-type + "_print" subtype PTR) using ONLY
-// the store's existing, unmodified methods, and checks the specific claims those sections
-// make. Confirms the plan's own conclusion: no new store methods are needed for SRP.
+// This file confirms that pkg/lease's existing tree, with no new store methods, correctly
+// represents RFC 9665 SRP's own data model. It builds the exact worked-example
+// tree from docs/siglease_rfc9665.md's lease-store mapping section (host "myhost" with
+// A/AAAA, service instance "Printer._ipps._tcp" with SRV/TXT and a base-type + "_print"
+// subtype PTR) using ONLY the store's existing, unmodified methods, and checks the specific
+// claims that section makes: no new store methods are needed for SRP.
 
 func mustSRPRR(t *testing.T, spec string) dns.RR {
 	t.Helper()

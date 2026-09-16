@@ -10,18 +10,18 @@ import (
 // Setup initializes the SRP handler configuration.
 //
 // Configuration options:
-//   - "upstream_zone": the one zone this handler instance serves (D10: one zone, one
-//     protocol) [REQUIRED]
+//   - "upstream_zone": the one zone this handler instance serves (one zone, one
+//     protocol per handler instance) [REQUIRED]
 //   - "keystore_dir": directory holding this proxy's own SIG(0) signing keys [REQUIRED]
-//   - "upstream": a static "host:port" override for upstream_zone (D4) -- when set,
+//   - "upstream": a static "host:port" override for upstream_zone -- when set,
 //     skips SOA/NS discovery entirely for this zone. [OPTIONAL]
 //   - "bootstrap_resolvers": []string of resolver addresses used to resolve SOA/NS
 //     records when "upstream" is not set. [OPTIONAL]
-//   - "allow_udp": permit UDP for this zone (plan S7/D6 -- TCP is required by default,
+//   - "allow_udp": permit UDP for this zone (TCP is required by default,
 //     for non-CNN zones this proxy targets). [OPTIONAL, defaults to false]
 //   - "rewrite_default_service_arpa": accept requests whose Zone Section is literally
 //     "default.service.arpa." (real SRP clients hardcode this name -- they have no way to
-//     discover any other zone, D5) *in addition to* upstream_zone, rewriting every name in
+//     discover any other zone) *in addition to* upstream_zone, rewriting every name in
 //     the update to upstream_zone before FCFS/forwarding so the rest of the pipeline (and
 //     the authoritative server) never sees default.service.arpa. at all. The response still
 //     echoes back default.service.arpa., matching what the client itself sent. [OPTIONAL,

@@ -42,7 +42,7 @@ Needs `mbedtls` dev libraries on Linux (`apt-get install libmbedtls-dev`) and re
 small local patches to build in this snapshot — both are pre-existing gaps in this
 checkout's own reference-counting/replication debug instrumentation, unrelated to SRP or to
 anything in this repo, and already applied in the checkout this test suite expects (see the
-RFC 9665 plan doc's §12.3 for the exact two-patch diff and reasoning if you need to
+docs/siglease_rfc9665.md's mDNSResponder reference section for the exact two-patch diff and reasoning if you need to
 reapply them on a fresh clone: `srp-replication.c`'s missing `srpl_current_domain()`
 declaration, and `srp-log.c`'s missing `srp_log_ref_check`/`srp_log_ref_final` definitions).
 
@@ -55,7 +55,7 @@ source-level reference only, not exercised by any test here.
 
 OpenThread's SRP client/server is the RFC's other credited independent implementation. It is
 **not** used for network-level interop (its simulation platform has no host-reachable
-network interface — see the RFC 9665 plan doc's post-Phase-5 entry for the full empirical
+network interface — see docs/siglease_rfc9665.md's OpenThread interop section for the full empirical
 finding) and there is no automated script that touches this checkout. Instead, one real
 signed SRP registration message was extracted from it once and is now a hardcoded fixture in
 `pkg/srp/srp_test.go` (`TestValidate_RealOpenThreadCapture`) and

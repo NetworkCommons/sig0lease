@@ -66,7 +66,7 @@ processing_rules:
 handlers:
   # handlers.srp_handler: RFC 9665 SRP config (only read if "srp_handler" appears in
   # processing_rules above). Same shape as handlers.update, plus:
-  #   upstream:                     static "host:port" override (D4), skips SOA/NS discovery
+  #   upstream:                     static "host:port" override, skips SOA/NS discovery
   #   allow_udp:                    permit UDP for this zone (default false -- TCP required)
   #   refuse_on_foreign_data:       REFUSED when a name exists upstream with data but no KEY
   #                                 (default true)

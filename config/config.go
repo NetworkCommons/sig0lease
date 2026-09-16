@@ -14,12 +14,11 @@ import (
 type ProcessingConfig struct {
 	// Opcode is the DNS opcode to match (0=QUERY, 1=IQUERY, 2=STATUS, etc.)
 	Opcode uint8 `yaml:"opcode"`
-	// Modules is the ordered list of processing module names to try for this opcode
-	// (D2, main/docs/rfc9665-srp-implementation-plan.md S4.2): the router calls each
-	// in turn until one returns Processed or Error; if every one declines (NotRelevant),
-	// the opcode falls through to plain upstream forwarding. A single-module list (the
-	// common case today, e.g. just "update_handler") behaves exactly as the old
-	// single-"module" field did.
+	// Modules is the ordered list of processing module names to try for this opcode:
+	// the router calls each in turn until one returns Processed or Error; if every one
+	// declines (NotRelevant), the opcode falls through to plain upstream forwarding. A
+	// single-module list (the common case today, e.g. just "update_handler") behaves
+	// exactly as the old single-"module" field did.
 	Modules []string `yaml:"modules"`
 }
 
@@ -39,7 +38,7 @@ type ServerConfig struct {
 	Address string `yaml:"address"`
 	// Networks are the network protocols to enable ("udp", "tcp", "tls")
 	Networks []string `yaml:"networks"`
-	// TLS configures the "tls" network (DNS-over-TLS, RFC 7858, plan S7/Phase 7):
+	// TLS configures the "tls" network (DNS-over-TLS, RFC 7858):
 	// opportunistic only, no client-certificate/key-pinning auth -- transport-level, so it
 	// benefits every handler (base RFC 9664, SRP, plain forwarding alike), not just one
 	// protocol. Required when "tls" appears in Networks; ignored otherwise.
@@ -179,7 +178,7 @@ func LoadConfig(path string) (*Config, error) {
 	return cfg, cfg.Validate()
 }
 
-// GetOpcodeMap creates a map from opcode to its ordered module list for fast lookup (D2).
+// GetOpcodeMap creates a map from opcode to its ordered module list for fast lookup.
 func (c *Config) GetOpcodeMap() map[uint8][]string {
 	opcodeMap := make(map[uint8][]string)
 	for _, rule := range c.ProcessingRules {
