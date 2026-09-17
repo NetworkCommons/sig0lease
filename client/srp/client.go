@@ -74,6 +74,14 @@ type Config struct {
 	// the caller's only hook for surfacing/logging those failures as they happen; nil is
 	// a valid no-op default.
 	OnError func(error)
+
+	// OnRegistered, if set, is called from Run with the registrar's response after every
+	// successful registration cycle -- the initial registration and each subsequent
+	// refresh alike, Run's success-path counterpart to OnError. Without it, a caller
+	// running the full lifecycle has no visibility into whether it's still actually
+	// succeeding (as opposed to just not having crashed) or what the registrar is
+	// currently granting; nil is a valid no-op default.
+	OnRegistered func(resp *dns.Msg)
 }
 
 // Client is one SRP identity's registration lifecycle: build, sign, send, and (via Run)
@@ -204,8 +212,8 @@ func (c *Client) rename() {
 }
 
 // buildSignSend is the shared build-sign-send-interpret cycle both Register and Deregister
-// use, differing only in the UpdateSpec's Addresses/Instances/Lease shape.
-func (c *Client) buildSignSend(ctx context.Context, addresses []netip.Addr, instances []pkgsrp.InstanceSpec, lease uint32) (*dns.Msg, pkgsrp.Outcome, error) {
+// use, differing only in the UpdateSpec's Addresses/Instances/Lease/KeyLease shape.
+func (c *Client) buildSignSend(ctx context.Context, addresses []netip.Addr, instances []pkgsrp.InstanceSpec, lease, keyLease uint32) (*dns.Msg, pkgsrp.Outcome, error) {
 	addr, err := c.registrarAddr(ctx)
 	if err != nil {
 		return nil, 0, fmt.Errorf("srp/client: %w", err)
@@ -218,7 +226,7 @@ func (c *Client) buildSignSend(ctx context.Context, addresses []netip.Addr, inst
 		Key:       c.keyRR(),
 		Instances: instances,
 		Lease:     lease,
-		KeyLease:  c.cfg.RequestedKeyLease,
+		KeyLease:  keyLease,
 	}
 	msg, err := pkgsrp.BuildUpdate(spec)
 	if err != nil {
@@ -242,7 +250,7 @@ func (c *Client) buildSignSend(ctx context.Context, addresses []netip.Addr, inst
 // rename-retry) should use Run instead; Register is the primitive Run is built from, and is
 // also useful standalone for a one-shot CLI invocation.
 func (c *Client) Register(ctx context.Context) (*dns.Msg, pkgsrp.Outcome, error) {
-	return c.buildSignSend(ctx, c.cfg.Addresses, c.specs(false), c.cfg.RequestedLease)
+	return c.buildSignSend(ctx, c.cfg.Addresses, c.specs(false), c.cfg.RequestedLease, c.cfg.RequestedKeyLease)
 }
 
 // Deregister withdraws this identity's entire registration in one message: the host's
@@ -262,8 +270,13 @@ func (c *Client) Register(ctx context.Context) (*dns.Msg, pkgsrp.Outcome, error)
 // interop testing (tests/test_mdnsresponder_interop.sh), not assumed. Sending LEASE=0 is
 // still fully RFC 9665-conformant (a requester may request any lease value including 0) and
 // is required in practice for this to interoperate with that real implementation.
+//
+// Also requests KEY-LEASE=0, unlike Register's use of c.cfg.RequestedKeyLease: RFC 9665
+// S3.2.5.5.1 is explicit that "if the registration is to be permanently removed, KEY-LEASE
+// SHOULD also be zero" -- and Deregister always means permanent removal, never a lightweight
+// refresh, so there is no configured value to fall back to here.
 func (c *Client) Deregister(ctx context.Context) (*dns.Msg, pkgsrp.Outcome, error) {
-	return c.buildSignSend(ctx, nil, c.specs(true), 0)
+	return c.buildSignSend(ctx, nil, c.specs(true), 0, 0)
 }
 
 // registerWithRenameRetry calls Register, renaming and retrying on OutcomeConflict up to
@@ -331,6 +344,10 @@ func (c *Client) Run(ctx context.Context) error {
 			continue
 		}
 		backoff = minRegisterRetryBackoff
+
+		if c.cfg.OnRegistered != nil {
+			c.cfg.OnRegistered(resp)
+		}
 
 		lease, _, ok := pkgsrp.GrantedLease(resp)
 		if !ok {
