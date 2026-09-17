@@ -44,7 +44,8 @@ func BrowsingOwnerName(svcType, zone string) string {
 // though its S9/S4.1 records are otherwise perfectly correct. See
 // SRPHandler.reconcileServiceEnumeration for why this registrar publishes a trivial
 // self-pointing answer for each (this zone IS its own recommended browsing/registration
-// domain -- one zone per handler instance) once it has at least one live registration.
+// domain -- one zone per handler instance): "b"/"db"/"lb" once it has at least one live
+// registration; "r"/"dr" independently, gated only on its own opt-in config setting.
 const (
 	BrowseDomainPrefix              = "b"  // list of domains recommended for browsing
 	DefaultBrowseDomainPrefix       = "db" // single recommended default browsing domain

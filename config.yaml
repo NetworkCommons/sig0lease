@@ -75,11 +75,13 @@ handlers:
   #                                 an alias for upstream_zone, rewriting every name in the
   #                                 update before anything else sees it (default false)
   #   advertise_registration_domain: also publish the RFC 6763 S11 "r"/"dr" registration-
-  #                                 domain records (self-pointing at upstream_zone), alongside
-  #                                 the always-on "b"/"db"/"lb" browsing-domain records, once
-  #                                 at least one service type is live. Off by default --
-  #                                 advertising this zone as an open target for direct RFC
-  #                                 2136 registration (not just SRP) is a deployment choice.
+  #                                 domain records (self-pointing at upstream_zone), independent
+  #                                 of whether any service type is currently live -- unlike the
+  #                                 always-on "b"/"db"/"lb" browsing-domain records, which only
+  #                                 appear once at least one service type is live. Off by
+  #                                 default -- advertising this zone as an open target for
+  #                                 direct RFC 2136 registration (not just SRP) is a deployment
+  #                                 choice.
   srp_handler:
     upstream_zone: "srp.dev.zenr.io."
     keystore_dir: "./keystore/server"

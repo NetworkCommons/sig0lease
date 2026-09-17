@@ -1160,6 +1160,82 @@ func TestSRPHandle_RegistrationDomains_PublishedWhenOptedIn(t *testing.T) {
 	}
 }
 
+// TestSRPHandle_RegistrationDomains_PublishedWithNoLiveServices confirms "r"/"dr" are
+// published purely off advertiseRegistrationDomain, with no live service type required --
+// unlike b/db/lb (which advertise "there's something to browse," so stay absent on an empty
+// zone), "r"/"dr" advertise "you may register here," a deployment policy choice that holds
+// regardless of current occupancy. A zone that only ever published "r"/"dr" once something
+// registered would be unreachable by exactly the RFC 2136 client that relies on domain
+// enumeration to find where to register in the first place.
+func TestSRPHandle_RegistrationDomains_PublishedWithNoLiveServices(t *testing.T) {
+	h, coord := newSRPTestHandler(t)
+	h.advertiseRegistrationDomain = true
+
+	h.reconcileServiceEnumeration(context.Background())
+
+	if len(coord.sent) != 1 {
+		t.Fatalf("expected one upstream send for the reconcile, got %d: %+v", len(coord.sent), coord.sent)
+	}
+	for _, prefix := range []string{"r", "dr"} {
+		owner := prefix + "._dns-sd._udp." + srpTestZone
+		found := false
+		for _, rr := range coord.sent[0].Ns {
+			if ptr, ok := rr.(*dns.PTR); ok && ptr.Hdr.Class == dns.ClassINET && canonicalName(ptr.Hdr.Name) == canonicalName(owner) {
+				if canonicalName(ptr.Ptr) != canonicalName(srpTestZone) {
+					t.Fatalf("%s: expected the registration-domain PTR to point at the zone itself, got %q", prefix, ptr.Ptr)
+				}
+				found = true
+			}
+		}
+		if !found {
+			t.Fatalf("expected the %q registration-domain PTR even with no live service type, got Ns: %+v", prefix, coord.sent[0].Ns)
+		}
+	}
+	for _, prefix := range alwaysOnDomainEnumPrefixes {
+		owner := prefix + "._dns-sd._udp." + srpTestZone
+		for _, rr := range coord.sent[0].Ns {
+			if ptr, ok := rr.(*dns.PTR); ok && canonicalName(ptr.Hdr.Name) == canonicalName(owner) {
+				t.Fatalf("expected no %q browsing-domain PTR with no live service type, got: %s", prefix, ptr.String())
+			}
+		}
+	}
+}
+
+// TestSRPHandle_RegistrationDomains_StayPublishedWhenZoneEmpties confirms "r"/"dr" are NOT
+// withdrawn when the zone's last live service type disappears, in contrast to b/db/lb (see
+// TestSRPHandle_BrowseDomains_AddedOnRegistrationRemovedWhenZoneEmpties): the operator's
+// advertise_registration_domain policy hasn't changed just because occupancy hit zero, so
+// re-gating "r"/"dr" on anyLive would incorrectly flap them offline.
+func TestSRPHandle_RegistrationDomains_StayPublishedWhenZoneEmpties(t *testing.T) {
+	h, coord := newSRPTestHandler(t)
+	h.advertiseRegistrationDomain = true
+	id := newSRPTestIdentity(t)
+	const host = "srptest12g.dev.zenr.io."
+	inst := oneWidgetInstance()[0].name
+
+	first := buildSRPUpdate(t, srpTestZone, id, host, []string{"192.0.2.1"}, oneWidgetInstance(), 30, 1209600, host)
+	if res := h.Handle(context.Background(), stubTCPResponseWriter{}, first); res.Status != StatusProcessed {
+		t.Fatalf("fresh registration: expected Processed, got %s: %v", res.Status, res.Error)
+	}
+
+	removal := []srpInstanceSpec{{name: inst, removalShaped: true}}
+	second := buildSRPUpdate(t, srpTestZone, id, host, []string{"192.0.2.1"}, removal, 30, 1209600, host)
+	if res := h.Handle(context.Background(), stubTCPResponseWriter{}, second); res.Status != StatusProcessed {
+		t.Fatalf("removal: expected Processed, got %s: %v", res.Status, res.Error)
+	}
+
+	// sent[2]=removal forward, sent[3]=its own enumeration reconcile, which should delete
+	// b/db/lb (asserted elsewhere) but must leave "r"/"dr" untouched.
+	for _, prefix := range []string{"r", "dr"} {
+		owner := prefix + "._dns-sd._udp." + srpTestZone
+		for _, rr := range coord.sent[3].Ns {
+			if ptr, ok := rr.(*dns.PTR); ok && canonicalName(ptr.Hdr.Name) == canonicalName(owner) {
+				t.Fatalf("expected no %q registration-domain PTR delete when the zone empties while still opted in, got: %s", prefix, ptr.String())
+			}
+		}
+	}
+}
+
 // TestSRPHandle_PTRDiff_DropsSubtypeOnUpdate exercises ptrDeleteDiff: upstream never
 // delete-alls a PTR's owner name (it's the shared service *type*), so
 // dropping a subtype registration on a live (still-SRV-shaped) instance needs its own

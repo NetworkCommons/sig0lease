@@ -30,12 +30,12 @@ import (
 //     update (REFUSED) when a name exists at the authoritative server with data but no
 //     KEY; false lets the delete-all-then-add clobber it. [OPTIONAL, defaults to true]
 //   - "advertise_registration_domain": also publish the RFC 6763 S11 "r"/"dr" registration-
-//     domain records (self-pointing at upstream_zone) alongside the always-on "b"/"db"/"lb"
-//     browsing-domain records once at least one service type is live. Unlike browsing,
-//     advertising this zone as an open target for direct RFC 2136 Dynamic Update
-//     registration (not just SRP) is a deployment policy choice -- SIG(0)/FCFS still gate who
-//     can actually write, but this controls whether domain-enumeration tools are told to try.
-//     [OPTIONAL, defaults to false]
+//     domain records (self-pointing at upstream_zone), independent of whether any service
+//     type is currently live -- unlike the always-on "b"/"db"/"lb" browsing-domain records,
+//     which only appear once at least one service type is live. Advertising this zone as an
+//     open target for direct RFC 2136 Dynamic Update registration (not just SRP) is a
+//     deployment policy choice -- SIG(0)/FCFS still gate who can actually write, but this
+//     controls whether domain-enumeration tools are told to try. [OPTIONAL, defaults to false]
 //   - "lease_policy": bounds applied to granted LEASE/KEY-LEASE, same shape as the base
 //     handler's. [OPTIONAL]
 //   - "lease_manager" / "storage": same mutually-exclusive lease-store backend selection
