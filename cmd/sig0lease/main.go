@@ -116,30 +116,52 @@ func main() {
 	}
 
 	if dumpMode {
-		// Dump mode: create handler, print lease state, exit.
+		// Dump mode: create every configured handler, print combined lease state, exit.
 		opcodeMap := cfg.GetOpcodeMap()
-		for _, moduleName := range opcodeMap {
-			if moduleName == "update_handler" {
-				h := handlers.NewUpdateHandler()
-				h.SetLogger(logger)
-
-				handlerCfg := withBootstrapResolvers(applyUpdateHandlerEnvOverrides(cfg.Handlers["update"]), cfg)
-				if handlerCfg != nil {
-					if err := h.Setup(handlerCfg); err != nil {
-						logger.Errorf("Failed to setup %s: %v", moduleName, err)
-						os.Exit(1)
-					}
+		printed := false
+		seen := make(map[string]bool)
+		for _, moduleNames := range opcodeMap {
+			for _, moduleName := range moduleNames {
+				if seen[moduleName] {
+					continue
 				}
+				seen[moduleName] = true
 
-				// DumpLeasesLevel's returned string already starts with its
-				// own "=== Lease Store Dump/Summary ===" header line; printing
-				// it again here duplicated it, misplaced at the end instead
-				// of the start.
-				fmt.Print(h.DumpLeasesLevel(dumpLevel))
-				return
+				switch moduleName {
+				case "update_handler":
+					h := handlers.NewUpdateHandler()
+					h.SetLogger(logger)
+					handlerCfg := withBootstrapResolvers(applyUpdateHandlerEnvOverrides(cfg.Handlers["update"]), cfg)
+					if handlerCfg != nil {
+						if err := h.Setup(handlerCfg); err != nil {
+							logger.Errorf("Failed to setup %s: %v", moduleName, err)
+							os.Exit(1)
+						}
+					}
+					// DumpLeasesLevel's returned string already starts with its own
+					// "=== ... ===" header line; printing it again here would
+					// duplicate it, misplaced at the end instead of the start.
+					fmt.Print(h.DumpLeasesLevel(dumpLevel))
+					printed = true
+
+				case "srp_handler":
+					h := handlers.NewSRPHandler()
+					h.SetLogger(logger)
+					handlerCfg := withBootstrapResolvers(cfg.Handlers["srp_handler"], cfg)
+					if handlerCfg != nil {
+						if err := h.Setup(handlerCfg); err != nil {
+							logger.Errorf("Failed to setup %s: %v", moduleName, err)
+							os.Exit(1)
+						}
+					}
+					fmt.Print(h.DumpLeasesLevel(dumpLevel))
+					printed = true
+				}
 			}
 		}
-		fmt.Println("(no update_handler configured)")
+		if !printed {
+			fmt.Println("(no dump-capable handlers configured)")
+		}
 		return
 	}
 
@@ -156,32 +178,62 @@ func main() {
 		os.Exit(1)
 	}
 
-	// Register processing module handlers based on configuration
+	// Register processing module handlers based on configuration (each opcode maps
+	// to an ordered list of module names, tried in turn -- e.g. [srp_handler,
+	// update_handler] for opcode 5). Each named handler is constructed and Setup at
+	// most once even if it appears under multiple opcodes.
 	// Prepare handler configuration with upstream resolver for SIG(0) signing
 	opcodeMap := cfg.GetOpcodeMap()
-	for opcode, moduleName := range opcodeMap {
-		switch moduleName {
-		case "update_handler":
-			h := handlers.NewUpdateHandler()
-			h.SetLogger(logger)
-
-			// Setup handler with configuration for upstream coordination.
-			// Coordinator resolves authoritative NS from upstream_zone and sends UPDATE directly.
-			handlerCfg := withBootstrapResolvers(applyUpdateHandlerEnvOverrides(cfg.Handlers["update"]), cfg)
-			if handlerCfg != nil {
-				if err := h.Setup(handlerCfg); err != nil {
-					logger.Errorf("Failed to setup %s: %v", moduleName, err)
-					os.Exit(1)
-				}
-				logger.Infof("Upstream coordination configured for %s", moduleName)
+	registered := make(map[string]bool)
+	for opcode, moduleNames := range opcodeMap {
+		for _, moduleName := range moduleNames {
+			if registered[moduleName] {
+				logger.Infof("Module %s already registered (reused for opcode %d)", moduleName, opcode)
+				continue
 			}
 
-			srv.RegisterHandler(h)
-			logger.Infof("Registered %s for opcode %d (%s)",
-				moduleName, opcode, dns.OpcodeToString[opcode])
+			switch moduleName {
+			case "update_handler":
+				h := handlers.NewUpdateHandler()
+				h.SetLogger(logger)
 
-		default:
-			logger.Warnf("Unknown handler module: %s", moduleName)
+				// Setup handler with configuration for upstream coordination.
+				// Coordinator resolves authoritative NS from upstream_zone and sends UPDATE directly.
+				handlerCfg := withBootstrapResolvers(applyUpdateHandlerEnvOverrides(cfg.Handlers["update"]), cfg)
+				if handlerCfg != nil {
+					if err := h.Setup(handlerCfg); err != nil {
+						logger.Errorf("Failed to setup %s: %v", moduleName, err)
+						os.Exit(1)
+					}
+					logger.Infof("Upstream coordination configured for %s", moduleName)
+				}
+
+				srv.RegisterHandler(h)
+				registered[moduleName] = true
+				logger.Infof("Registered %s for opcode %d (%s)",
+					moduleName, opcode, dns.OpcodeToString[opcode])
+
+			case "srp_handler":
+				h := handlers.NewSRPHandler()
+				h.SetLogger(logger)
+
+				handlerCfg := withBootstrapResolvers(cfg.Handlers["srp_handler"], cfg)
+				if handlerCfg != nil {
+					if err := h.Setup(handlerCfg); err != nil {
+						logger.Errorf("Failed to setup %s: %v", moduleName, err)
+						os.Exit(1)
+					}
+					logger.Infof("Upstream coordination configured for %s", moduleName)
+				}
+
+				srv.RegisterHandler(h)
+				registered[moduleName] = true
+				logger.Infof("Registered %s for opcode %d (%s)",
+					moduleName, opcode, dns.OpcodeToString[opcode])
+
+			default:
+				logger.Warnf("Unknown handler module: %s", moduleName)
+			}
 		}
 	}
 

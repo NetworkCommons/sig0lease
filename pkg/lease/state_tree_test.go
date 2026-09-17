@@ -255,7 +255,7 @@ func TestSnapshot_SaveLoad_RoundTripWithNonKEYRecords(t *testing.T) {
 // TestUpsertNonKEYRecords_RejectsDifferentOwnerForIdenticalRR is the core
 // property the reshape from owner-nested to flat, globally-identity-keyed
 // non-KEY storage exists for: "two different keys cannot register the
-// identical RR" (protocol.md) is now enforced by the store itself, not by a
+// identical RR" (docs/siglease_rfc9664.md) is now enforced by the store itself, not by a
 // caller checking first. It also verifies the batch fails atomically: a
 // second, non-conflicting record in the same call must not be applied
 // either when the batch as a whole is rejected.
