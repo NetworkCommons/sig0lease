@@ -1,18 +1,18 @@
 +++
-title = 'Insights into sig0lease development'
+title = 'Insights into AI assisted development'
 layout = 'posts'
-date = 2024-04-10T11:12:15+02:00
-draft = true
+date = 2026-09-10T11:12:15+02:00
+draft = false
 #featured_image = '/images/mycosystem-quarter.jpg'
 featured_image = ""
-toc = false
+toc = true
 +++
 
-_(Ed: This article is written by team member Stefano Bocconi, with many years of development experience across various environments, including technical development roles within several large scale European projects)._
+_(Ed: This article is written by team member Stefano Bocconi)._
 
 This blog is a reflection on my experience with AI coding agents half-way through the sig0lease project funded by PTF.
 
-It also aims to give more nuances to the apparent dilemma of nowadays developer: do I write the code, or do I let an agent do it for me (and then I should review what the agent has done, I have learnt that this step is not always performed).
+It also aims to give more nuances to the apparent dilemma of nowadays developer: do I write the code, or do I let an agent do it for me? (and then I should review what the agent has done, I have learnt that this step is not always performed).
 
 At the beginning I was very curious about the possibility of coding agents, and I wanted to experiment with running a local LLM (the brain of a coding agent) on my laptop, using an open-weight model. Apart from being educational, this experiment saves subscription money paid to the various providers such as Anthropic, OpenAI, etc.
 
@@ -66,5 +66,6 @@ Although developers might be delegating more or less of the coding responsibilit
 Of course, the more explorative and less defined the task is, the more the agent will make its own choices and assumptions which are likely misguided and wrong. Agents are trained to please, and they tend to remove the burden of thinking from the developer. This is especially critical when the actual situation is more complex than the agent presents. And that risk of misguided or misleading simplifications is something to be constantly vigilant and on the look-out for.
 
 
-  
+ 
+_Stefano Bocconi is a senior software engineer and researcher with almost 30 years of experience developing software for industry, academia, and EU-funded projects. Expertise in AI (including GNNs), cryptography, blockchain, large-scale data platforms, social network analysis, and semantic technologies. Experienced in multiple programming languages, Linux system administration, data processing, and full-stack development._
 
