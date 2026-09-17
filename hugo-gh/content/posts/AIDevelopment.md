@@ -1,11 +1,11 @@
 +++
-title = 'README'
+title = 'Insights into sig0lease development'
 layout = 'posts'
 date = 2024-04-10T11:12:15+02:00
 draft = false
 #featured_image = '/images/mycosystem-quarter.jpg'
 featured_image = ""
-toc = true
+toc = false
 +++
 
 _(Ed: This article is written by team member Stefano Bocconi, with many years of development experience across various environments, including technical development roles within several large scale European projects)._
