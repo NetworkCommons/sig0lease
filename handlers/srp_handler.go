@@ -855,10 +855,21 @@ func (h *SRPHandler) parseLease(msg *dns.Msg) (uint32, uint32, error) {
 
 // clampLease applies LeasePolicy bounds to the granted LEASE/KEY-LEASE, mirroring
 // UpdateHandler.clampLeaseDurations (unexported there, so reimplemented rather than
-// shared -- a handful of lines, not worth cross-type coupling for).
+// shared -- a handful of lines, not worth cross-type coupling for). A requested value of
+// exactly 0 is left alone rather than floored to the configured minimum: RFC 9665
+// S3.2.5.5.1's removal signal (KEY-LEASE=0, and LEASE=0 alongside it for a permanent
+// removal) means "delete this," not "grant the shortest allowed duration" -- flooring it
+// would echo back a bogus non-zero grant for what is actually a deletion.
 func (h *SRPHandler) clampLease(lease, keyLease uint32) (uint32, uint32) {
-	return clampTTL(lease, h.LeasePolicy.MinRRLease, h.LeasePolicy.MaxRRLease),
-		clampTTL(keyLease, h.LeasePolicy.MinKeyLease, h.LeasePolicy.MaxKeyLease)
+	return clampLeaseValue(lease, h.LeasePolicy.MinRRLease, h.LeasePolicy.MaxRRLease),
+		clampLeaseValue(keyLease, h.LeasePolicy.MinKeyLease, h.LeasePolicy.MaxKeyLease)
+}
+
+func clampLeaseValue(value, min, max uint32) uint32 {
+	if value == 0 {
+		return 0
+	}
+	return clampTTL(value, min, max)
 }
 
 func (h *SRPHandler) buildSuccessResponse(r *dns.Msg, lease, keyLease uint32) *dns.Msg {

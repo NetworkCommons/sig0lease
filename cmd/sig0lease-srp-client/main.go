@@ -12,6 +12,7 @@ import (
 	"strconv"
 	"strings"
 	"syscall"
+	"time"
 
 	"codeberg.org/miekg/dns"
 	clientsrp "github.com/NetworkCommons/sig0lease/client/srp"
@@ -90,6 +91,13 @@ func main() {
 		Resolvers:         []string(resolvers),
 		UseTCP:            !*udp,
 		MaxRenames:        *maxRenames,
+		OnRegistered: func(resp *dns.Msg) {
+			fmt.Printf("[%s] ", time.Now().Format(time.RFC3339))
+			printResult(resp, pkgsrp.OutcomeSuccess)
+		},
+		OnError: func(err error) {
+			fmt.Fprintf(os.Stderr, "[%s] ERROR: %v\n", time.Now().Format(time.RFC3339), err)
+		},
 	}
 	c, err := clientsrp.NewClient(cfg)
 	if err != nil {
