@@ -96,6 +96,12 @@ func (c *Client) Deregister(ctx context.Context) (*dns.Msg, pkgsrp.Outcome, erro
     0) and is required in practice for this to interoperate with that real
     implementation.
 
+    Also requests KEY-LEASE=0, unlike Register's use of c.cfg.RequestedKeyLease:
+    RFC 9665 S3.2.5.5.1 is explicit that "if the registration is to be
+    permanently removed, KEY-LEASE SHOULD also be zero" -- and Deregister
+    always means permanent removal, never a lightweight refresh, so there is no
+    configured value to fall back to here.
+
 func (c *Client) Register(ctx context.Context) (*dns.Msg, pkgsrp.Outcome, error)
     Register performs exactly one build-sign-send-interpret cycle:
     no rename-retry, no scheduling. Callers wanting the full lifecycle (initial
@@ -158,6 +164,14 @@ type Config struct {
 	// the caller's only hook for surfacing/logging those failures as they happen; nil is
 	// a valid no-op default.
 	OnError func(error)
+
+	// OnRegistered, if set, is called from Run with the registrar's response after every
+	// successful registration cycle -- the initial registration and each subsequent
+	// refresh alike, Run's success-path counterpart to OnError. Without it, a caller
+	// running the full lifecycle has no visibility into whether it's still actually
+	// succeeding (as opposed to just not having crashed) or what the registrar is
+	// currently granting; nil is a valid no-op default.
+	OnRegistered func(resp *dns.Msg)
 }
     Config configures a Client. See NewClient's doc comment for defaults.
 
@@ -529,9 +543,10 @@ func (h *SRPHandler) Setup(cfg map[string]any) error
         server with data but no KEY; false lets the delete-all-then-add clobber
         it. [OPTIONAL, defaults to true]
       - "advertise_registration_domain": also publish the RFC 6763 S11 "r"/"dr"
-        registration- domain records (self-pointing at upstream_zone) alongside
-        the always-on "b"/"db"/"lb" browsing-domain records once at least one
-        service type is live. Unlike browsing, advertising this zone as an open
+        registration- domain records (self-pointing at upstream_zone),
+        independent of whether any service type is currently live -- unlike the
+        always-on "b"/"db"/"lb" browsing-domain records, which only appear once
+        at least one service type is live. Advertising this zone as an open
         target for direct RFC 2136 Dynamic Update registration (not just SRP) is
         a deployment policy choice -- SIG(0)/FCFS still gate who can actually
         write, but this controls whether domain-enumeration tools are told to
@@ -781,16 +796,17 @@ const (
     RFC 6763 S11 defines five domain-enumeration meta-record prefixes,
     each rooted at "<prefix>._dns-sd._udp.<domain>.": these are a different,
     earlier query than S9 type enumeration -- a browse tool that implements full
-    domain enumeration asks one or more of these FIRST, to learn which domain to
-    browse/register in at all, and only then queries EnumerationOwnerName (or a
-    specific type's BrowsingOwnerName) against whatever it got back -- it never
-    queries those on the originally-entered name directly. A zone with services
-    registered via SRP but none of these records is therefore invisible to such
-    a tool even though its S9/S4.1 records are otherwise perfectly correct.
-    See SRPHandler.reconcileServiceEnumeration for why this registrar publishes
-    a trivial self-pointing answer for each (this zone IS its own recommended
-    browsing/registration domain -- one zone per handler instance) once it has
-    at least one live registration.
+    domain enumeration asks one or more of these FIRST, to learn which domain
+    to browse/register in at all, and only then queries EnumerationOwnerName
+    (or a specific type's BrowsingOwnerName) against whatever it got back --
+    it never queries those on the originally-entered name directly. A zone with
+    services registered via SRP but none of these records is therefore invisible
+    to such a tool even though its S9/S4.1 records are otherwise perfectly
+    correct. See SRPHandler.reconcileServiceEnumeration for why this registrar
+    publishes a trivial self-pointing answer for each (this zone IS its own
+    recommended browsing/registration domain -- one zone per handler instance):
+    "b"/"db"/"lb" once it has at least one live registration; "r"/"dr"
+    independently, gated only on its own opt-in config setting.
 
 
 FUNCTIONS

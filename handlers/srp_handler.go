@@ -502,9 +502,10 @@ func (h *SRPHandler) collectLiveServiceTypes() []string {
 // (dnssd.DiffSelfPointingDomainRecord): "b"/"db"/"lb" present whenever at least one service
 // type is known live in the zone (by this process's own local knowledge OR confirmed still
 // live elsewhere via the same survivors check the type diff already performs), absent
-// otherwise; "r"/"dr" the same, additionally gated on h.advertiseRegistrationDomain (off by
-// default -- advertising this zone as an open target for direct RFC 2136 registration, not
-// just SRP, is a deployment policy choice). A domain-enumeration browse tool queries one or
+// otherwise; "r"/"dr" present whenever h.advertiseRegistrationDomain is set, independent of
+// whether any service type is currently live (off by default -- advertising this zone as an
+// open target for direct RFC 2136 registration, not just SRP, is a deployment policy choice,
+// not a fact about current occupancy). A domain-enumeration browse tool queries one or
 // more of these FIRST, before ever asking for the S9 type list -- without them, a zone with
 // perfectly correct S9/S4.1 records is still invisible to such a tool, since it never gets
 // that far. Reusing the type diff's own survivors safety check here means the same
@@ -568,13 +569,21 @@ func (h *SRPHandler) reconcileServiceEnumeration(ctx context.Context) {
 	// never removed just because this process's own local view emptied out; it needs the
 	// same live confirmation a type's own removal does.
 	anyLive := len(currentSet) > 0 || len(survivors) > 0
-	// registrationOptedIn additionally gates "r"/"dr" on h.advertiseRegistrationDomain -- if
-	// it's (or becomes) false while one of them was previously published, this naturally
-	// emits a delete for it below, exactly like anyLive turning false does for the other
-	// three. A fixed-order slice, not a map, so the resulting upstream instructions have a
-	// deterministic order (map iteration order doesn't, and DiffEnumerationRecords's own
-	// output is already sorted for the same reason).
-	registrationOptedIn := anyLive && h.advertiseRegistrationDomain
+	// registrationOptedIn gates "r"/"dr" on h.advertiseRegistrationDomain alone, deliberately
+	// independent of anyLive: unlike "b"/"db"/"lb" (which advertise "there's something to
+	// browse," so they're meaningless while the zone is empty), "r"/"dr" advertise "you may
+	// register here," a deployment policy choice that holds regardless of whether anything
+	// happens to be registered right now. Tying it to anyLive would leave a freshly deployed,
+	// opted-in, still-empty zone unable to advertise itself as a registration target at
+	// all -- exactly the case a plain RFC 2136 client doing domain enumeration before its
+	// first registration needs it for -- and would flap the records offline whenever the
+	// zone's live services happen to hit zero, even though the operator's policy hasn't
+	// changed. If advertiseRegistrationDomain is (or becomes) false while one of them was
+	// previously published, this still naturally emits a delete for it below. A fixed-order
+	// slice, not a map, so the resulting upstream instructions have a deterministic order (map
+	// iteration order doesn't, and DiffEnumerationRecords's own output is already sorted for
+	// the same reason).
+	registrationOptedIn := h.advertiseRegistrationDomain
 	wantedDomainEnum := []struct {
 		prefix    string
 		isPresent bool
