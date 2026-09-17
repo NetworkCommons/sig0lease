@@ -4,12 +4,11 @@ This is a copy/paste walkthrough for showing how [RFC 9665](https://datatracker.
 (DNS-SD Service Registration Protocol) actually works end to end: the SRP client signs a
 registration, sends it to a local proxy, the proxy forwards and re-signs it upstream, and
 the result lands on a **real, shared, already-provisioned authoritative DNS server**
-(`ns1.free2air.org`, serving the `zenr.io.` zone) that anyone can `dig` against. Every
-command below has been run live against that real server while writing this doc.
+(`ns1.free2air.org`, serving the `zenr.io.` zone) that anyone can `dig` against.
 
-The repo's checked-in `config.yaml` already has `srp_handler` enabled (alongside the
+The repo's checked-in `config.yaml` has `srp_handler` enabled (alongside the
 pre-existing RFC 9664 `update_handler`), pointed at `srp.dev.zenr.io.` using the proxy's
-own signing key already checked into `./keystore/server`
+own signing key already present in `./keystore/server`
 (`Kdev.zenr.io.+015+35317`, which already has SIG(0) update rights over `dev.zenr.io.` and
 everything under it, `srp.dev.zenr.io.` included). No separate config needed.
 
@@ -18,14 +17,13 @@ everything under it, `srp.dev.zenr.io.` included). No separate config needed.
 From the `./main` directory of this repo:
 
 ```bash
-go build -o ./bin/sig0lease ./cmd/sig0lease
-go build -o ./bin/sig0lease-srp-client ./cmd/sig0lease-srp-client
+make build build-client
 ```
 
 ## 1. Start the proxy
 
 ```bash
-./bin/sig0lease ./config.yaml
+./bin/$(uname)/sig0lease
 ```
 
 Leave this running in its own terminal. It listens on `:8053` and logs both `srp_handler`
@@ -36,28 +34,29 @@ and `update_handler` registering for opcode 5 (UPDATE).
 In another terminal, from `./main`:
 
 ```bash
-./bin/sig0lease-srp-client \
+./bin/$(uname)/sig0lease-srp-client \
   -domain=srp.dev.zenr.io. \
   -host=demo \
   -addr=192.0.2.42 \
   -instance=DemoWidget:_http._tcp:8080 \
   -txt=DemoWidget:path=/demo \
   -server=127.0.0.1:8053 \
-  -lease=300 -keylease=600 \
-  -keystore=./keystore/client -k=13 \
+  -lease=60 -keylease=120 \
+  -keystore=./keystore/client -k=15 \
   -once
 ```
 
 - `-keystore=./keystore/client` points at the repo's existing client keystore directory
-  (already used by the RFC 9664 client examples in `docs/siglease_rfc9664.md`). `-k=13`
-  (ECDSAP256SHA256) mints one new identity key there (`Kdemo.srp.dev.zenr.io.+013+<keytag>`,
-  printed as `Key:` in the output) on the **first** run, since nothing named
-  `demo.srp.dev.zenr.io.` exists yet; every run after that reuses the exact same file
-  (confirmed live: re-running the command above prints the same keytag, no new file
-  appears, and `-k` is then a no-op). It's not committed to git — `keystore/client` is
-  gitignored for anything beyond the pre-existing test keys already tracked there — so it's
-  local, persistent-across-runs scratch state on whichever machine runs the demo.
-- `-lease`/`-keylease` are short on purpose for a demo (5/10 minutes) so a stale record
+  (already used by the RFC 9664 client examples in `docs/siglease_rfc9664.md`).
+- `-k=13` (ECDSAP256SHA256) or `-k=15` (ED25519) mints one new identity key there 
+  (`Kdemo.srp.dev.zenr.io.+013+<keytag>` or `Kdemo.srp.dev.zenr.io.+015+<keytag>`,
+  printed as `Key:` in the output) on the **first** run, if nothing named
+  `demo.srp.dev.zenr.io.` exists yet; every run after that reuses the exact same file, 
+  and `-k` is then a no-op. It's not committed to git — `keystore/client` is
+  gitignored — so it's local, persistent-across-runs on whichever machine runs the demo.
+  If a key for the domain (`demo.srp.dev.zenr.io.` in this case) already exists, no matter 
+  the type (13 or 15), **no new key** is generated and the existing key is used. 
+- `-lease`/`-keylease` are short on purpose for a demo (1/2 minutes) so a stale record
   cleans itself up if you forget to deregister (step 6).
 - A real device would normally omit `-server` and let the client discover the registrar via
   `_dnssd-srp._tcp.<domain>.` SRV lookup; it's passed explicitly here since this points at a
@@ -73,20 +72,20 @@ narrower and wider shapes too, all against the same running proxy:
 
 ```bash
 # Host-only: no service instance at all, just an address record for the host
-./bin/sig0lease-srp-client -domain=srp.dev.zenr.io. -host=demo-host-only \
-  -addr=192.0.2.43 -server=127.0.0.1:8053 -keystore=./keystore/client -k=13 -once
+./bin/$(uname)/sig0lease-srp-client -domain=srp.dev.zenr.io. -host=demo-host-only \
+  -addr=192.0.2.43 -server=127.0.0.1:8053 -lease=60 -keylease=120 -keystore=./keystore/client -k=13 -once
 
 # A DNS-SD subtype on the same instance (repeatable -subtype/-txt/-instance, matched by label)
-./bin/sig0lease-srp-client -domain=srp.dev.zenr.io. -host=demo \
+./bin/$(uname)/sig0lease-srp-client -domain=srp.dev.zenr.io. -host=demo \
   -addr=192.0.2.42 -instance=DemoWidget:_http._tcp:8080 \
-  -subtype=DemoWidget:_printer -server=127.0.0.1:8053 -keystore=./keystore/client -once
+  -subtype=DemoWidget:_printer -server=127.0.0.1:8053 -lease=60 -keylease=120 -keystore=./keystore/client -once
 ```
 
 Expected output ends with:
 
 ```
 Status: NOERROR (Rcode=0)
-Granted: LEASE=300 KEY-LEASE=600
+Granted: LEASE=60 KEY-LEASE=120
 ```
 
 ## 3. See it on the real DNS server
@@ -102,8 +101,15 @@ dig +noall +answer TXT "DemoWidget._http._tcp.srp.dev.zenr.io." @ns1.free2air.or
 # browse every instance currently registered under this service type
 dig +noall +answer PTR "_http._tcp.srp.dev.zenr.io." @ns1.free2air.org
 
+# browse every instance currently registered under this service subtype
+dig +noall +answer PTR "_printer._sub._http._tcp.srp.dev.zenr.io." @ns1.free2air.org
+
 # RFC 6763 S9: which service TYPES exist at all on this zone (the query a "browse
 # everything" tool runs before it knows to ask for _http._tcp specifically)
+# RFC 6763 §9 defines _services._dns-sd._udp.<Domain> as enumerating only base two-label <Service> names (e.g. _http._tcp),
+# explicitly stating "only the first two labels are relevant for the purposes of service type enumeration."
+# Subtypes (_printer._sub._http._tcp) aren't part of that meta-query — they're a separate, targeted browsing mechanism: 
+# a client that already knows to look for _printer._sub._http._tcp queries that PTR name directly.
 dig +noall +answer PTR "_services._dns-sd._udp.srp.dev.zenr.io." @ns1.free2air.org
 
 # RFC 6763 S11: domain enumeration -- some browse tools query this ("is there a browsable
@@ -113,7 +119,9 @@ dig +noall +answer PTR "_services._dns-sd._udp.srp.dev.zenr.io." @ns1.free2air.o
 dig +noall +answer PTR "b._dns-sd._udp.srp.dev.zenr.io." @ns1.free2air.org
 ```
 
-### 3b. Optional: browse it with a real DNS-SD client (avahi-browse)
+### 3b. Browse it with a real DNS-SD client
+
+#### avahi-browse
 
 `dig` above proves the records exist; `avahi-browse` proves a genuine third-party DNS-SD
 client can discover them the way a real application would -- via `avahi-daemon`'s wide-area
@@ -141,6 +149,16 @@ avahi-browse -d srp.dev.zenr.io. -r _http._tcp
 # registered on this zone" without already knowing _http._tcp in advance
 avahi-browse -d srp.dev.zenr.io. -a -r
 ```
+#### dns-sd
+
+On Mac (and possibly other systems that have dns-sd) you can run this command:
+
+```bash
+# dns-sd -B <Type> <Domain> (Browse for service instances)
+dns-sd -B _services._dns-sd._udp srp.dev.zenr.io
+# Browse a particular instance
+dns-sd -B _http._tcp srp.dev.zenr.io
+```
 
 ## 4. Full lifecycle mode (optional)
 
@@ -148,9 +166,9 @@ Drop `-once` to watch the client run unattended: initial delay, then automatic r
 ~80% of the granted lease (RFC 9664 §5.2), forever, until you `Ctrl-C`:
 
 ```bash
-./bin/sig0lease-srp-client -domain=srp.dev.zenr.io. -host=demo -addr=192.0.2.42 \
+./bin/$(uname)/sig0lease-srp-client -domain=srp.dev.zenr.io. -host=demo -addr=192.0.2.42 \
   -instance=DemoWidget:_http._tcp:8080 -server=127.0.0.1:8053 \
-  -keystore=./keystore/client
+  -lease=60 -keylease=120 -keystore=./keystore/client
 ```
 
 ## 5. Try a conflict (optional)
@@ -161,8 +179,8 @@ key). It fails -- FCFS rejects a second identity trying to claim a name the firs
 already holds:
 
 ```bash
-./bin/sig0lease-srp-client -domain=srp.dev.zenr.io. -host=demo -addr=192.0.2.99 \
-  -server=127.0.0.1:8053 -keystore=$(mktemp -d) -k=13 -once
+./bin/$(uname)/sig0lease-srp-client -domain=srp.dev.zenr.io. -host=demo -addr=192.0.2.99 \
+  -server=127.0.0.1:8053 -lease=60 -keylease=120 -keystore=$(mktemp -d) -k=13 -once
 ```
 
 Drop `-once` from that same command to see the other side of a conflict instead: the client
@@ -176,7 +194,7 @@ Explicitly withdraw the host and every instance in one message (`LEASE=0`), rath
 waiting for the short demo lease to expire:
 
 ```bash
-./bin/sig0lease-srp-client \
+./bin/$(uname)/sig0lease-srp-client \
   -domain=srp.dev.zenr.io. -host=demo \
   -instance=DemoWidget:_http._tcp:8080 \
   -server=127.0.0.1:8053 -keystore=./keystore/client \
