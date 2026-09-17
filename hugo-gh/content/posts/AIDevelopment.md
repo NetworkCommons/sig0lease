@@ -2,7 +2,7 @@
 title = 'Insights into sig0lease development'
 layout = 'posts'
 date = 2024-04-10T11:12:15+02:00
-draft = false
+draft = true
 #featured_image = '/images/mycosystem-quarter.jpg'
 featured_image = ""
 toc = false
