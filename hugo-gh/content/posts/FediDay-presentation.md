@@ -26,4 +26,4 @@ We have successfully:
 
 - begun work on a client capable of handling SRP (the Service Registration Protocol) that handles registration and refreshing of host, service and service discovery DNS lease updates that is capable of registering names of hosts, details of services offered by the host together with the service discovery DNS records to publish the services, easing the searching and connection to services offered within a network domain.
 
-
+Together they represent an initial collection of tools that offer standards-based DNS publishing tools that allow users to publish and regularly update accurate, timely information on currently available services within a local community network infrastructure, automatically removing information of services that do not regularly refresh or update their details, ensuring a seamless user experience for searching and resolving these local network services.
