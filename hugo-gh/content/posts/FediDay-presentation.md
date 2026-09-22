@@ -19,10 +19,11 @@ The presentation explained how sig0lease allows time-based leasing and updating 
 ![targets](/images/PXL_20260913_122145604.MP.jpg)
  
 
+Adam summarized the current status of the sig0lease project:
 
+We have successfully:
+- completed an initial version of a DNS proxy server and client capable of handling registration, refreshing and deletion of DNS Leases (as described in [RFC 9664](https://datatracker.ietf.org/doc/rfc9664/)).
 
+- begun work on a client capable of handling SRP (the Service Registration Protocol) that handles registration and refreshing of host, service and service discovery DNS lease updates that is capable of registering names of hosts, details of services offered by the host together with the service discovery DNS records to publish the services, easing the searching and connection to services offered within a network domain.
 
-Originally, the FediDay co-ordination team had booked Adam Burns to lead a workshop on the #littleFedi project, which had recently published an article that they had a mastodon capable federated server running on an extremely resource constrained tiny computer called a Raspberry Pi Zero. However, the development team had not yet fully published the source code (which was still under an embargo) and the team lead had given Adam a tarball snapshot containing heavily redacted selected source code with documentation removed, with strict instructions not to share even this with anyone else. 
-
-  
 
