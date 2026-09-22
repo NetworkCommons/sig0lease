@@ -14,14 +14,17 @@ import (
 
 // Router routes DNS requests based on opcode to appropriate handlers or forwarder.
 type Router struct {
-	opcodeMap map[uint8]string
+	// opcodeMap holds, per opcode, the ordered list of module names to try:
+	// Route calls each in turn until one returns Processed or Error; if every one
+	// declines (NotRelevant), the opcode falls through to plain upstream forwarding.
+	opcodeMap map[uint8][]string
 	handlers  map[string]handlers.Handler
 	logger    *logging.Logger
 	resolver  *forward.Resolver
 }
 
 // NewRouter creates a new router instance.
-func NewRouter(opcodeMap map[uint8]string, logger *logging.Logger, resolver *forward.Resolver) (*Router, error) {
+func NewRouter(opcodeMap map[uint8][]string, logger *logging.Logger, resolver *forward.Resolver) (*Router, error) {
 	return &Router{
 		opcodeMap: opcodeMap,
 		handlers:  make(map[string]handlers.Handler),
@@ -45,83 +48,82 @@ func (r *Router) Shutdown() {
 // Route determines how to handle a DNS message based on its opcode.
 // Flow:
 //  1. Check for internal dump query (admin/debug endpoint)
-//  2. Check if opcode has a registered handler
-//  3. If yes, call handler and check result status:
-//     - StatusProcessed: Return response to client
-//     - StatusNotRelevant: Apply default upstream routing
-//     - StatusError: Return error response to client
-//  4. If no handler, apply default forward
+//  2. Check if opcode has any registered handlers
+//  3. Try each configured handler for the opcode in order:
+//     - StatusProcessed: Return response to client, stop
+//     - StatusNotRelevant: Try the next handler in the list
+//     - StatusError: Return error response to client, stop
+//  4. If no handler is configured, or every handler declined (all NotRelevant),
+//     apply default forward
 func (r *Router) Route(ctx context.Context, w dns.ResponseWriter, rMsg *dns.Msg) *dns.Msg {
 	// Check for internal dump query (admin/debug endpoint).
 	if r.isDumpQuery(rMsg) {
 		return r.handleDumpQuery(rMsg)
 	}
 
-	moduleName, found := r.moduleForOpcode(rMsg.Opcode)
+	moduleNames, found := r.moduleForOpcode(rMsg.Opcode)
 
-	r.logger.Debugf("Route: Opcode=%d, FoundModule=%v, Module=%s", rMsg.Opcode, found, moduleName)
+	r.logger.Debugf("Route: Opcode=%d, FoundModules=%v, Modules=%v", rMsg.Opcode, found, moduleNames)
 
-	if !found {
+	if !found || len(moduleNames) == 0 {
 		r.logger.Debugf("No handler for opcode %d, forwarding to upstream", rMsg.Opcode)
-		resp := r.forwardToUpstream(rMsg)
-		return resp
-	}
-
-	handler, ok := r.handlers[moduleName]
-	if !ok {
-		r.logger.Errorf("Handler not found for module: %s", moduleName)
-		resp := r.forwardToUpstream(rMsg)
-		return resp
-	}
-
-	// Call handler and get result
-	result := handler.Handle(ctx, w, rMsg)
-	if result == nil {
-		r.logger.Errorf("Handler returned nil result for opcode %d", rMsg.Opcode)
 		return r.forwardToUpstream(rMsg)
 	}
 
-	r.logger.Infof("Handler %s returned status=%s, reason=%s", moduleName, result.Status, result.Reason)
-
-	// Handle based on result status
-	switch result.Status {
-	case handlers.StatusProcessed:
-		// Handler processed the packet, return the response
-		r.logger.Debugf("Handler processed opcode %d, returning response with Rcode=%d", rMsg.Opcode, result.Message.Rcode)
-		return result.Message
-
-	case handlers.StatusNotRelevant:
-		// Packet not relevant to this handler (e.g., UPDATE without UPDATE-LEASE EDNS option)
-		// Apply default upstream routing.
-		r.logger.Debugf("Handler declined packet (not relevant), forwarding to upstream")
-		resp := r.forwardToUpstream(rMsg)
-		return resp
-
-	case handlers.StatusError:
-		// Handler encountered an error
-		if result.Message != nil {
-			r.logger.Errorf("Handler error: %v, returning error response with Rcode=%d", result.Error, result.Message.Rcode)
-			return result.Message
+	for _, moduleName := range moduleNames {
+		handler, ok := r.handlers[moduleName]
+		if !ok {
+			r.logger.Errorf("Handler not found for module: %s", moduleName)
+			continue
 		}
-		// Create error response if handler didn't provide one
-		resp := new(dns.Msg)
-		resp.ID = rMsg.ID
-		resp.Rcode = dns.RcodeServerFailure
-		resp.Response = true
-		r.logger.Errorf("Handler error with no response: %v", result.Error)
-		return resp
 
-	default:
-		r.logger.Errorf("Unknown handler status: %v", result.Status)
-		return r.forwardToUpstream(rMsg)
+		result := handler.Handle(ctx, w, rMsg)
+		if result == nil {
+			r.logger.Errorf("Handler %s returned nil result for opcode %d", moduleName, rMsg.Opcode)
+			continue
+		}
+
+		r.logger.Infof("Handler %s returned status=%s, reason=%s", moduleName, result.Status, result.Reason)
+
+		switch result.Status {
+		case handlers.StatusProcessed:
+			r.logger.Debugf("Handler %s processed opcode %d, returning response with Rcode=%d", moduleName, rMsg.Opcode, result.Message.Rcode)
+			return result.Message
+
+		case handlers.StatusNotRelevant:
+			// Not relevant to this handler -- try the next one in the ordered list,
+			// e.g. an SRP-shaped update tried by srp_handler first, then a
+			// plain lease update falling through to update_handler.
+			r.logger.Debugf("Handler %s declined packet (not relevant), trying next", moduleName)
+			continue
+
+		case handlers.StatusError:
+			if result.Message != nil {
+				r.logger.Errorf("Handler %s error: %v, returning error response with Rcode=%d", moduleName, result.Error, result.Message.Rcode)
+				return result.Message
+			}
+			resp := new(dns.Msg)
+			resp.ID = rMsg.ID
+			resp.Rcode = dns.RcodeServerFailure
+			resp.Response = true
+			r.logger.Errorf("Handler %s error with no response: %v", moduleName, result.Error)
+			return resp
+
+		default:
+			r.logger.Errorf("Handler %s returned unknown status: %v", moduleName, result.Status)
+			continue
+		}
 	}
+
+	// Every configured handler declined (or was missing/nil) -- default upstream routing.
+	r.logger.Debugf("All handlers declined opcode %d, forwarding to upstream", rMsg.Opcode)
+	return r.forwardToUpstream(rMsg)
 }
 
-// moduleForOpcode returns the module name for an opcode if one is configured.
-func (r *Router) moduleForOpcode(opcode uint8) (string, bool) {
-	moduleName, found := r.opcodeMap[opcode]
-	return moduleName, found
-
+// moduleForOpcode returns the ordered module-name list for an opcode if one is configured.
+func (r *Router) moduleForOpcode(opcode uint8) ([]string, bool) {
+	moduleNames, found := r.opcodeMap[opcode]
+	return moduleNames, found
 }
 
 // dumpQueryName is the internal domain used for lease dump queries.

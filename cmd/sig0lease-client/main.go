@@ -30,22 +30,23 @@ func main() {
 
 	proxyAddr := os.Args[1]
 	command := os.Args[2]
+	args, keystoreFlag := extractKeystoreFlag(os.Args[3:])
 
 	switch command {
 	case "register":
-		keystore_available()
-		cmdRegister(proxyAddr, os.Args[3:])
+		keystoreDir = resolveKeystoreDir(keystoreFlag)
+		cmdRegister(proxyAddr, args)
 	case "refresh":
-		keystore_available()
-		cmdRefresh(proxyAddr, os.Args[3:])
+		keystoreDir = resolveKeystoreDir(keystoreFlag)
+		cmdRefresh(proxyAddr, args)
 	case "register-tamper":
-		keystore_available()
-		cmdRegisterTamper(proxyAddr, os.Args[3:])
+		keystoreDir = resolveKeystoreDir(keystoreFlag)
+		cmdRegisterTamper(proxyAddr, args)
 	case "verify":
-		cmdVerify(proxyAddr, os.Args[3:])
+		cmdVerify(proxyAddr, args)
 	case "list-keys":
-		keystore_available()
-		cmdListKeys(os.Args[3:])
+		keystoreDir = resolveKeystoreDir(keystoreFlag)
+		cmdListKeys()
 	case "help":
 		printUsage()
 	default:
@@ -55,14 +56,35 @@ func main() {
 	}
 }
 
-func keystore_available() {
-	// Client keystore must be explicitly provided.
-	keystoreDir = os.Getenv("CLIENT_KEYSTORE_DIR")
-	if keystoreDir == "" {
-		fmt.Fprintf(os.Stderr, "ERROR: CLIENT_KEYSTORE_DIR is required for sig0lease-client\n")
-		fmt.Fprintf(os.Stderr, "The client keystore must be set explicitly.\n")
-		os.Exit(1)
+// extractKeystoreFlag pulls a --keystore=<dir> token out of args, wherever it appears,
+// returning the remaining positional args and the flag's value (empty if not given).
+func extractKeystoreFlag(args []string) ([]string, string) {
+	const prefix = "--keystore="
+	dir := ""
+	out := make([]string, 0, len(args))
+	for _, a := range args {
+		if strings.HasPrefix(a, prefix) {
+			dir = strings.TrimPrefix(a, prefix)
+			continue
+		}
+		out = append(out, a)
 	}
+	return out, dir
+}
+
+// resolveKeystoreDir applies this project's unified keystore-location convention (same on
+// both cmd/sig0lease-client and cmd/sig0lease-srp-client): an explicit --keystore= flag wins,
+// CLIENT_KEYSTORE_DIR is the fallback, and having neither is a fatal error.
+func resolveKeystoreDir(flagValue string) string {
+	if flagValue != "" {
+		return flagValue
+	}
+	if env := os.Getenv("CLIENT_KEYSTORE_DIR"); env != "" {
+		return env
+	}
+	fmt.Fprintf(os.Stderr, "ERROR: keystore directory is required: pass --keystore=<dir> or set CLIENT_KEYSTORE_DIR\n")
+	os.Exit(1)
+	return ""
 }
 
 // cmdRegister sends a sig0lease UPDATE-LEASE registration request
@@ -142,6 +164,33 @@ func extractSameKeyFlag(args []string) ([]string, bool) {
 	return out, sameKey
 }
 
+// extractKeyAlgFlag pulls a --k=<algorithm> token out of args, wherever it appears,
+// returning the remaining positional args, the parsed algorithm, and whether it was given.
+// When given, keyname (cmdRegRefWithMode's first positional arg) is treated as an owner
+// name to find-or-create a key for, rather than an exact keystore filename -- see that
+// function's own doc comment.
+func extractKeyAlgFlag(args []string) ([]string, uint8, bool) {
+	const prefix = "--k="
+	out := make([]string, 0, len(args))
+	var alg uint8
+	var provided bool
+	for _, a := range args {
+		if strings.HasPrefix(a, prefix) {
+			v := strings.TrimPrefix(a, prefix)
+			n, err := strconv.ParseUint(v, 10, 8)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "ERROR: invalid --k=%s: %v\n", v, err)
+				os.Exit(1)
+			}
+			alg = uint8(n)
+			provided = true
+			continue
+		}
+		out = append(out, a)
+	}
+	return out, alg, provided
+}
+
 // extractTCPFlag pulls a bare --tcp token out of args, wherever it appears,
 // returning the remaining positional args and whether it was set. Absent,
 // the client uses UDP (client.New's own default).
@@ -177,9 +226,10 @@ func cmdRegRefWithMode(proxyAddr string, args []string, operation string, tamper
 	}
 	args, sameKey := extractSameKeyFlag(args)
 	args, useTCP := extractTCPFlag(args)
+	args, keyAlg, keyAlgProvided := extractKeyAlgFlag(args)
 
 	if len(args) < 3 {
-		fmt.Fprintf(os.Stderr, "Usage: sig0lease-client <proxy> register|register-tamper|refresh <keyname> [lease] [key-lease] [rr-spec...] [--signer=update|additional|none] [--same-key] [--tcp]\n")
+		fmt.Fprintf(os.Stderr, "Usage: sig0lease-client <proxy> register|register-tamper|refresh <keyname> [lease] [key-lease] [rr-spec...] [--signer=update|additional|none] [--same-key] [--tcp] [--k=<algorithm>]\n")
 		os.Exit(1)
 	}
 
@@ -221,19 +271,39 @@ func cmdRegRefWithMode(proxyAddr string, args []string, operation string, tamper
 		updateOtherRRs = append(updateOtherRRs, rr)
 	}
 
-	// Load client key by keyname used for SIG(0) signing
-	fmt.Printf("Loading client key for key name (%s) from keystore (%s)\n", keyname, keystoreDir)
-	err := keyrec.KeyExists(keystoreDir, keyname, nil)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "ERROR: Could not find client key for key name %s: %v\n", keyname, err)
-		os.Exit(1)
-	}
-	fmt.Printf("  Found client key: %s\n", keyname)
+	// Load (or, with --k=<algorithm>, find-or-create) the client key used for SIG(0) signing.
+	// Without --k, keyname is the exact on-disk key filename, as it always has been --
+	// zero behavior change for existing callers. With --k, keyname is instead an owner
+	// name (e.g. "test.dev.zenr.io."): any existing key for that name is reused regardless
+	// of its algorithm, and a new one is generated at --k's algorithm only if none exists.
+	var clientKey *keyrec.LoadedKey
+	if keyAlgProvided {
+		fmt.Printf("Resolving client key for owner name (%s) from keystore (%s), creating with algorithm %d if not found\n", keyname, keystoreDir, keyAlg)
+		k, created, err := keyrec.ResolveOrCreateKey(keystoreDir, keyname, keyAlg, nil)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "ERROR: %v\n", err)
+			os.Exit(1)
+		}
+		clientKey = k
+		if created {
+			fmt.Printf("  ✓ Generated new client key: %s\n", clientKey.Name)
+		} else {
+			fmt.Printf("  ✓ Found existing client key: %s\n", clientKey.Name)
+		}
+	} else {
+		fmt.Printf("Loading client key for key name (%s) from keystore (%s)\n", keyname, keystoreDir)
+		if err := keyrec.KeyExists(keystoreDir, keyname, nil); err != nil {
+			fmt.Fprintf(os.Stderr, "ERROR: Could not find client key for key name %s: %v\n", keyname, err)
+			os.Exit(1)
+		}
+		fmt.Printf("  Found client key: %s\n", keyname)
 
-	clientKey, err := keyrec.LoadKeyFromFile(keystoreDir, keyname)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "ERROR: Failed to load client key: %v\n", err)
-		os.Exit(1)
+		k, err := keyrec.LoadKeyFromFile(keystoreDir, keyname)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "ERROR: Failed to load client key: %v\n", err)
+			os.Exit(1)
+		}
+		clientKey = k
 	}
 
 	if sameKey {
@@ -534,11 +604,8 @@ func cmdVerify(proxyAddr string, args []string) {
 }
 
 // cmdListKeys lists available keys in the keystore
-func cmdListKeys(args []string) {
+func cmdListKeys() {
 	dir := keystoreDir
-	if len(args) > 0 && args[0] != "" {
-		dir = args[0]
-	}
 
 	fmt.Printf("=== Available Keys in Keystore ===\n")
 	fmt.Printf("Directory: %s\n\n", dir)
@@ -573,10 +640,12 @@ Usage:
   sig0lease-client <proxy> <command> [args...]
 
 Commands:
-	register <keyname> [lease] [key-lease] [rr-spec...] [--signer=update|additional|none] [--same-key] [--tcp]
+	register <keyname> [lease] [key-lease] [rr-spec...] [--signer=update|additional|none] [--same-key] [--tcp] [--k=<algorithm>]
 		Send a sig0lease UPDATE-LEASE registration request
 
-		keyname: filename of the key in the keystore (e.g., Ktest.dev.zenr.io.+015+05044)
+		keyname: without --k, the exact filename of an existing key in the keystore
+			(e.g., Ktest.dev.zenr.io.+015+05044) -- unchanged from before, must already
+			exist. With --k, an owner name instead (e.g., test.dev.zenr.io.) -- see --k.
 		lease: lease duration in seconds
 		key-lease: key-lease duration in seconds
 			rr-spec: optional additional RR in DNS presentation format:
@@ -594,6 +663,12 @@ Commands:
 				the Update section; conflicts with an explicit KEY rr-spec for the same
 				name and with --signer=none.
 			--tcp: send the request over TCP instead of the default UDP.
+			--k=<algorithm>: DNSSEC algorithm (13=ECDSAP256SHA256, 15=ED25519) to generate
+				a NEW signing key with if keyname (read as an owner name when --k is
+				given) doesn't have one in the keystore yet. Any existing key for that
+				owner name is reused regardless of algorithm; omit --k entirely to keep
+				keyname meaning an exact filename that must already exist (the default,
+				unchanged behavior). Same convention as sig0lease-srp-client's -k.
 
 		Note: the server dispatches on the LEASE/KEY-LEASE combination and
 		requires specific RR kinds to be present for each (handlers/opcode5_handle.go):
@@ -622,8 +697,11 @@ Commands:
 		sig0lease-client 127.0.0.1:8053 register Ktest.dev.zenr.io.+015+05044 0 3600 --same-key "client.test.dev.zenr.io. 3600 IN KEY 512 3 15 c2yGNXxlrWu1LX/n9AqrCp+rIbm9FWcotgnMomlrM2E="
 		// Same request over TCP instead of UDP
 		sig0lease-client 127.0.0.1:8053 register Ktest.dev.zenr.io.+015+05044 0 3600 --same-key --tcp
+		// --k=13: keyname is an owner name here, not a filename -- generates an
+		// ECDSAP256SHA256 key on first run (reused on every later run for the same name)
+		sig0lease-client 127.0.0.1:8053 register test.dev.zenr.io. 0 3600 --same-key --k=13
 
-	refresh <keyname> [lease] [key-lease] [rr-spec...] [--signer=update|additional|none] [--same-key] [--tcp]
+	refresh <keyname> [lease] [key-lease] [rr-spec...] [--signer=update|additional|none] [--same-key] [--tcp] [--k=<algorithm>]
 		Send a sig0lease UPDATE-LEASE refresh request (8-byte variant)
 
 		keyname: filename of the key in the keystore (e.g., Ktest.dev.zenr.io.+015+05044)
@@ -632,6 +710,7 @@ Commands:
 		--signer: see register above
 		--same-key: see register above
 		--tcp: see register above
+		--k: see register above
 
 		Example:
 		// Key-only refresh: renew the signing key's own lease (LEASE=0, KEY-LEASE!=0);
@@ -655,16 +734,22 @@ Commands:
       sig0lease-client 127.0.0.1:8053 verify test.dev.zenr.io.
       sig0lease-client 127.0.0.1:8053 verify test.dev.zenr.io. --tcp
 
-  list-keys [keystore-dir]
+  list-keys [--keystore=<dir>]
     List available keys in keystore
-    
+
     Example:
-      sig0lease-client dummy list-keys
+      sig0lease-client dummy list-keys --keystore=./keystore/client
 
   help
     Show this help message
 
+Keystore location (register, refresh, register-tamper, list-keys):
+  --keystore=<dir>: directory holding client keys. If omitted, falls back to the
+    CLIENT_KEYSTORE_DIR environment variable. One of the two is required; an explicit
+    flag always wins over the environment variable. Same convention as sig0lease-srp-client's
+    -keystore flag / CLIENT_KEYSTORE_DIR fallback.
+
 Environment:
-  CLIENT_KEYSTORE_DIR: Keystore directory path (required - must be set via environment variable for client to load keys)
+  CLIENT_KEYSTORE_DIR: fallback keystore directory path, used when --keystore= is not given.
 `)
 }

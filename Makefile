@@ -2,13 +2,15 @@
 # DNS proxy server with SIG(0) authentication and SRP support
 
 BINARY_NAME=sig0lease
-CLIENT_NAME=sig0lease-client
+CLIENT_9664=sig0lease-client
+CLIENT_9665=sig0lease-srp-client
+
 OS := $(shell uname -s | tr '[:upper:]' '[:lower:]')
 VERSION ?= 0.1.0
 BUILD_DIR := ./bin/$(OS)
 CLIENT_KEYSTORE_DIR ?=
 
-.PHONY: all build build-all build-client build-client-all clean clean-binary deps docs fmt lint release run-server test-unit test-register vet
+.PHONY: all build build-all build-client build-client-all clean clean-binary deps docs fmt lint release run-server test-unit test-register test-srp test-mdnsresponder-interop vet
 
 all: build build-client test
 
@@ -18,7 +20,8 @@ build:
 
 # Build the client binary for current OS/architecture
 build-client:
-	go build -o $(BUILD_DIR)/$(CLIENT_NAME) ./cmd/sig0lease-client
+	go build -o $(BUILD_DIR)/$(CLIENT_9664) ./cmd/$(CLIENT_9664)
+	go build -o $(BUILD_DIR)/$(CLIENT_9665) ./cmd/$(CLIENT_9665)
 
 # Cross-compile server for multiple platforms
 build-all:
@@ -29,10 +32,14 @@ build-all:
 
 # Cross-compile client for multiple platforms
 build-client-all:
-	GOOS=linux GOARCH=amd64 go build -o ./bin/linux/$(CLIENT_NAME)-linux-amd64 ./cmd/sig0lease-client
-	GOOS=darwin GOARCH=amd64 go build -o ./bin/darwin/$(CLIENT_NAME)-darwin-amd64 ./cmd/sig0lease-client
-	GOOS=darwin GOARCH=arm64 go build -o ./bin/darwin/$(CLIENT_NAME)-darwin-arm64 ./cmd/sig0lease-client
-	GOOS=windows GOARCH=amd64 go build -o ./bin/windows/$(CLIENT_NAME).exe ./cmd/sig0lease-client
+	GOOS=linux GOARCH=amd64 go build -o ./bin/linux/$(CLIENT_9664)-linux-amd64 ./cmd/$(CLIENT_9664)
+	GOOS=darwin GOARCH=amd64 go build -o ./bin/darwin/$(CLIENT_9664)-darwin-amd64 ./cmd/$(CLIENT_9664)
+	GOOS=darwin GOARCH=arm64 go build -o ./bin/darwin/$(CLIENT_9664)-darwin-arm64 ./cmd/$(CLIENT_9664)
+	GOOS=windows GOARCH=amd64 go build -o ./bin/windows/$(CLIENT_9664).exe ./cmd/$(CLIENT_9664)
+	GOOS=linux GOARCH=amd64 go build -o ./bin/linux/$(CLIENT_9665)-linux-amd64 ./cmd/$(CLIENT_9665)
+	GOOS=darwin GOARCH=amd64 go build -o ./bin/darwin/$(CLIENT_9665)-darwin-amd64 ./cmd/$(CLIENT_9665)
+	GOOS=darwin GOARCH=arm64 go build -o ./bin/darwin/$(CLIENT_9665)-darwin-arm64 ./cmd/$(CLIENT_9665)
+	GOOS=windows GOARCH=amd64 go build -o ./bin/windows/$(CLIENT_9665).exe ./cmd/$(CLIENT_9665)
 
 # Create release archive
 release: build-all build-client-all
@@ -46,7 +53,8 @@ clean:
 # Clean only binaries, keep cache
 clean-binary:
 	rm -f $(BUILD_DIR)/$(BINARY_NAME)*
-	rm -f $(BUILD_DIR)/$(CLIENT_NAME)*
+	rm -f $(BUILD_DIR)/$(CLIENT_9664)*
+	rm -f $(BUILD_DIR)/$(CLIENT_9665)*
 
 # Clean all build artifacts
 clean-all:
@@ -60,9 +68,19 @@ deps:
 	go mod download
 
 # Generate documentation
+# `go doc -all ./...` looks like it should work the way `go build`/`go test` do, but `go doc`
+# only ever takes a single package argument -- with a wildcard it silently produces nothing.
+# List packages explicitly and concatenate each one's own `go doc -all` output instead.
 docs:
 	mkdir -p docs
-	go doc -all ./... > docs/packages.md 2>/dev/null || true
+	rm -f docs/packages.md
+	for pkg in $$(go list ./...); do \
+		echo "## $$pkg" >> docs/packages.md; \
+		echo '```' >> docs/packages.md; \
+		go doc -all "$$pkg" >> docs/packages.md 2>/dev/null; \
+		echo '```' >> docs/packages.md; \
+		echo "" >> docs/packages.md; \
+	done
 
 # Format code
 fmt:
@@ -93,9 +111,22 @@ test-cover:
 	go tool cover -func=coverage.out
 
 # Run full end-to-end update workflow via test script.
-# Requires CLIENT_KEYSTORE_DIR for the client key, ex. CLIENT_KEYSTORE_DIR=${PWD}/keystore/client make test-update 
+# Requires CLIENT_KEYSTORE_DIR for the client key, ex. CLIENT_KEYSTORE_DIR=${PWD}/keystore/client make test-update
 test-update: build build-client
 	CLIENT_KEYSTORE_DIR=$(CLIENT_KEYSTORE_DIR) ./tests/test_update.sh run
+
+# Run the RFC 9665 SRP end-to-end suite (register/refresh/conflict/remove/expiry) against a
+# real, disposable local BIND 9 -- no CLIENT_KEYSTORE_DIR needed, it generates its own
+# per-test identities.
+test-srp:
+	./tests/test_srp.sh run
+
+# Run the SRP interop suite against the real, unmodified mDNSResponder/ServiceRegistration
+# srp-client/srp-mdns-proxy binaries (a sibling checkout -- see tests/README.md for setup).
+# Both directions: real srp-client against our registrar, and our own client/srp against the
+# real srp-mdns-proxy.
+test-mdnsresponder-interop:
+	./tests/test_mdnsresponder_interop.sh run
 
 # Build and run the proxy with example config
 run-server: build
