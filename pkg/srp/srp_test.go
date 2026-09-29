@@ -500,3 +500,72 @@ func TestValidate_Rejections(t *testing.T) {
 		}
 	})
 }
+
+// TestValidate_ServiceNames covers validateServiceNames: Service Discovery adds must use
+// DNS-SD service names (RFC 6763 S4.1/S7), because the S9 Service Type Enumeration reads the
+// type straight off the instance name. The first case is the update from PR #45's report,
+// which registered a three-label "type" and ended up enumerated as "_vpnserver._wg".
+func TestValidate_ServiceNames(t *testing.T) {
+	const zone = "srp.dev.zenr.io."
+	const host = "vpnclient." + zone
+
+	build := func(t *testing.T, service []dns.RR) *dns.Msg {
+		t.Helper()
+		rrs := []dns.RR{
+			deleteAll(host),
+			mustRR(t, host+" 130 IN A 10.10.10.10"),
+			keyRR(host, dns.ECDSAP256SHA256, 0, appendixCPublicKey),
+		}
+		msg := newUpdate(zone, append(rrs, service...)...)
+		leaseOpt(t, msg, 130, 250)
+		return msg
+	}
+	instance := func(t *testing.T, name string) []dns.RR {
+		t.Helper()
+		return []dns.RR{
+			deleteAll(name),
+			mustRR(t, name+" 130 IN SRV 0 0 0 "+host),
+			mustRR(t, name+` 130 IN TXT "txtver=1"`),
+		}
+	}
+
+	t.Run("three-label service type rejected", func(t *testing.T) {
+		const inst = "vpnclient._vpnserver._wg._udp." + zone
+		msg := build(t, append(instance(t, inst), mustRR(t, "_vpnserver._wg._udp."+zone+" 130 IN PTR "+inst)))
+		if _, err := Classify(msg); err != nil {
+			t.Fatalf("Classify must still accept it (a Classify error would hand the update to the plain RFC 2136 path): %v", err)
+		}
+		if _, err := Validate(msg); err == nil || !strings.Contains(err.Error(), "not a DNS-SD service type") {
+			t.Fatalf("expected a service-type error, got: %v", err)
+		}
+	})
+
+	t.Run("target not an instance of the PTR's type rejected", func(t *testing.T) {
+		const inst = "vpnclient._ipps._tcp." + zone
+		msg := build(t, append(instance(t, inst), mustRR(t, "_http._tcp."+zone+" 130 IN PTR "+inst)))
+		if _, err := Validate(msg); err == nil || !strings.Contains(err.Error(), "not a service instance of") {
+			t.Fatalf("expected a target-mismatch error, got: %v", err)
+		}
+	})
+
+	t.Run("subtype accepted", func(t *testing.T) {
+		// The registration PR #45's reporter wanted, expressed as RFC 6763 S7.1 intends.
+		const inst = "vpnclient._wg._udp." + zone
+		msg := build(t, append(instance(t, inst),
+			mustRR(t, "_wg._udp."+zone+" 130 IN PTR "+inst),
+			mustRR(t, "_vpnserver._sub._wg._udp."+zone+" 130 IN PTR "+inst),
+		))
+		if _, err := Validate(msg); err != nil {
+			t.Fatalf("Validate: %v", err)
+		}
+	})
+
+	t.Run("delete of a malformed registration accepted", func(t *testing.T) {
+		// A registration made before this check existed must stay removable.
+		const inst = "vpnclient._vpnserver._wg._udp." + zone
+		msg := build(t, []dns.RR{deleteAll(inst), ptrDelete("_vpnserver._wg._udp."+zone, inst)})
+		if _, err := Validate(msg); err != nil {
+			t.Fatalf("Validate: %v", err)
+		}
+	})
+}

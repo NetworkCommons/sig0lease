@@ -5,6 +5,7 @@ import (
 	"errors"
 	"math/rand"
 	"net/netip"
+	"strings"
 	"testing"
 	"time"
 
@@ -66,6 +67,23 @@ func testConfig(t *testing.T, transport *fakeTransport) Config {
 		Send:              transport.Send,
 		Rng:               rand.New(rand.NewSource(1)),
 		Sleep:             func(ctx context.Context, d time.Duration) error { return nil },
+	}
+}
+
+// TestNewClient_RejectsMalformedServiceType: a service type that isn't RFC 6763 S7's
+// "_<service>._tcp|_udp" is refused before anything is sent -- PR #45's report registered
+// "_vpnserver._wg._udp", which the registrar then enumerated as "_vpnserver._wg".
+func TestNewClient_RejectsMalformedServiceType(t *testing.T) {
+	transport := &fakeTransport{}
+	cfg := testConfig(t, transport)
+	cfg.Instances = []InstanceConfig{{Label: "vpnclient", ServiceType: "_vpnserver._wg._udp", TXT: []string{"txtver=1"}}}
+	if _, err := NewClient(cfg); err == nil || !strings.Contains(err.Error(), "exactly two labels") {
+		t.Fatalf("expected a service-type error, got: %v", err)
+	}
+
+	cfg.Instances = []InstanceConfig{{Label: "vpnclient", ServiceType: "_wg._udp", Subtypes: []string{"_vpnserver"}, TXT: []string{"txtver=1"}}}
+	if _, err := NewClient(cfg); err != nil {
+		t.Fatalf("NewClient with a two-label type and a subtype: %v", err)
 	}
 }
 

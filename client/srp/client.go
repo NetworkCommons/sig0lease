@@ -18,6 +18,7 @@ import (
 	"codeberg.org/miekg/dns"
 	baseclient "github.com/NetworkCommons/sig0lease/client"
 	_ "github.com/NetworkCommons/sig0lease/pkg/dnscompat" // registers EDNS0 code 2 (UPDATE-LEASE); required to unpack a registrar's response
+	"github.com/NetworkCommons/sig0lease/pkg/dnssd"
 	"github.com/NetworkCommons/sig0lease/pkg/keyrec"
 	"github.com/NetworkCommons/sig0lease/pkg/sig0"
 	pkgsrp "github.com/NetworkCommons/sig0lease/pkg/srp"
@@ -28,7 +29,7 @@ import (
 // building the update (pkg/srp.BuildUpdate itself takes only already-qualified names).
 type InstanceConfig struct {
 	Label       string   // single label, e.g. "MyPrinter" -- not a full instance name
-	ServiceType string   // e.g. "_ipps._tcp" -- not a full service-type name
+	ServiceType string   // e.g. "_ipps._tcp" -- not a full service-type name; NewClient rejects any other shape (dnssd.ValidateServiceType)
 	Subtypes    []string // additional bare subtype labels, e.g. "_universal"
 	Port        uint16
 	TXT         []string
@@ -104,6 +105,11 @@ func NewClient(cfg Config) (*Client, error) {
 	}
 	if cfg.HostLabel == "" {
 		return nil, fmt.Errorf("srp/client: HostLabel is required")
+	}
+	for _, inst := range cfg.Instances {
+		if err := dnssd.ValidateServiceType(inst.ServiceType); err != nil {
+			return nil, fmt.Errorf("srp/client: instance %q: %w", inst.Label, err)
+		}
 	}
 	if cfg.RequestedLease == 0 {
 		cfg.RequestedLease = 3600

@@ -268,7 +268,8 @@ Required:
 
 Options:
   -addr value            host A/AAAA address to publish (repeatable)
-  -instance value        service instance "Label:_svctype._proto:port" (repeatable)
+  -instance value        service instance "Label:_svctype._proto:port" (repeatable); _proto is
+                         _tcp or _udp -- to narrow a type further, add a -subtype instead of a label
   -txt value              TXT string for a declared instance, "Label:content" (repeatable)
   -subtype value          DNS-SD subtype for a declared instance, "Label:subtypelabel" (repeatable)
   -server string          explicit registrar "host:port"; empty triggers _dnssd-srp._tcp discovery

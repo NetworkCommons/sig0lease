@@ -177,7 +177,7 @@ type Config struct {
 
 type InstanceConfig struct {
 	Label       string   // single label, e.g. "MyPrinter" -- not a full instance name
-	ServiceType string   // e.g. "_ipps._tcp" -- not a full service-type name
+	ServiceType string   // e.g. "_ipps._tcp" -- not a full service-type name; NewClient rejects any other shape (dnssd.ValidateServiceType)
 	Subtypes    []string // additional bare subtype labels, e.g. "_universal"
 	Port        uint16
 	TXT         []string
@@ -790,17 +790,62 @@ func ParseAdditionalRRSpec(spec string) (dns.RR, error)
 
 ```
 
+## github.com/NetworkCommons/sig0lease/pkg/dnsname
+```
+package dnsname // import "github.com/NetworkCommons/sig0lease/pkg/dnsname"
+
+Package dnsname implements DNS name case-insensitivity exactly as the DNS
+defines it: only the US-ASCII letters A-Z and a-z match each other; every other
+octet must match exactly (RFC 1035 S2.3.3, RFC 4343 S3). It is the one place the
+rest of the proxy should fold names for comparison or map keying.
+
+Go's strings.ToLower/strings.EqualFold are not a substitute: they fold Unicode,
+so they treat names BIND considers different as equal ("CAFÉ" vs "CAFé";
+U+212A KELVIN SIGN vs ASCII "k"), and ToLower rewrites bytes that aren't valid
+UTF-8 to U+FFFD, changing the name's length. codeberg.org/miekg/dns keeps name
+labels as raw bytes (no \DDD escaping), so those bytes do reach the proxy
+-- DNS-SD instance names in particular are UTF-8 text (RFC 6763 S4.1.1). The
+library's own dnsutil.Canonical folds ASCII only but goes through strings.Map,
+which has the same U+FFFD rewrite, so it is not used either.
+
+Fold keeps a name's trailing dot, for code that works on fully-qualified names
+(pkg/srp, pkg/dnssd split them into labels ending in the empty root label);
+Normalize drops it, for the lease store, the handlers and pkg/updatecore,
+which key and compare names without it.
+
+This package depends only on the standard library, so any package in the module
+can import it.
+
+FUNCTIONS
+
+func EqualFold(a, b string) bool
+    EqualFold reports whether a and b are equal under Fold, without allocating.
+
+func Fold(name string) string
+    Fold returns name with the US-ASCII letters A-Z replaced by a-z and every
+    other byte unchanged. The result always has the same length as name.
+
+func Normalize(name string) string
+    Normalize returns the form the lease store, the handlers and pkg/updatecore
+    compare and key names by: surrounding whitespace trimmed (zone names also
+    arrive from configuration), ASCII case folded (see Fold), and the trailing
+    dot removed, so "Demo.Example.", "demo.example" and " demo.example. " all
+    normalize to "demo.example".
+
+```
+
 ## github.com/NetworkCommons/sig0lease/pkg/dnssd
 ```
 package dnssd // import "github.com/NetworkCommons/sig0lease/pkg/dnssd"
 
 Package dnssd holds pure logic for RFC 6763 (DNS-Based Service Discovery)
 concerns that sit alongside, but outside, RFC 9665's own Service Registration
-Protocol -- currently just S9's Service Type Enumeration meta-record.
-An SRP client's Service Description never carries this record itself (S9
-predates SRP and isn't part of what a client restates), so a registrar that
-wants registered services to be discoverable by "browse everything" tools
--- not just a targeted per-type browse -- has to maintain it independently.
+Protocol: the S7 service name shape both SRP ends check (names.go),
+and S9's Service Type Enumeration meta-record (this file). An SRP client's
+Service Description never carries this record itself (S9 predates SRP
+and isn't part of what a client restates), so a registrar that wants
+registered services to be discoverable by "browse everything" tools --
+not just a targeted per-type browse -- has to maintain it independently.
 See handlers.SRPHandler.reconcileServiceEnumeration for how this package's pure
 functions are combined with live lease-store state and turned into an upstream
 UPDATE.
@@ -895,10 +940,32 @@ func EnumerationOwnerName(zone string) string
 func ServiceTypeFromInstanceName(name string) (svcType string, ok bool)
     ServiceTypeFromInstanceName extracts the two-label DNS-SD service
     type (e.g. "_http._tcp") from a Service Instance Name shaped
-    "<Instance>.<type>.<proto>.<Domain>." -- RFC 6763 S4.1 is explicit that the
-    Instance portion always occupies exactly one label, so the type is always
-    the second and third labels regardless of how many labels <Domain> itself
-    has. ok is false if name has fewer labels than that shape requires.
+    "<Instance>.<Service>.<Domain>." -- RFC 6763 S4.1 is explicit that the
+    Instance portion always occupies exactly one label, so <Service> always
+    starts at the second label regardless of how many labels <Domain> itself
+    has. ok is false if what follows the Instance label isn't a service name
+    (ServiceTypeFromServiceName).
+
+func ServiceTypeFromServiceName(name string) (svcType string, ok bool)
+    ServiceTypeFromServiceName returns the two-label DNS-SD service type (e.g.
+    "_http._tcp") of a name shaped "<Service>.<Domain>." -- a base-type
+    browse name such as "_http._tcp.example.com.". RFC 6763 S7 fixes
+    <Service> at exactly two labels: an underscore-prefixed Service Name,
+    then "_tcp" or "_udp". ok is false for any other shape, e.g.
+    "_vpnserver._wg._udp.example.com.", whose second label is "_wg".
+
+    This is the registrar-side structural check: it doesn't hold the Service
+    Name to RFC 6335's syntax rules (see ValidateServiceType for that), so a
+    registrar keeps accepting types a sloppy but otherwise working requester
+    sends.
+
+func ValidateServiceType(svcType string) error
+    ValidateServiceType checks svcType, a bare service type with no
+    domain (e.g. "_http._tcp"), against RFC 6763 S7: exactly two labels,
+    the first an underscore plus a Service Name valid per RFC 6335 S5.1,
+    the second "_tcp" or "_udp". It is the requester's check -- stricter
+    than ServiceTypeFromServiceName, since a requester should only ever send
+    well-formed types.
 
 ```
 
@@ -1058,6 +1125,11 @@ func RecordKey(rr dns.RR) string
                parser for the RDATA; the full data string is used instead, which
                may include the services mask -- not fully RFC 2136 compliant for
                WKS, but there is no better option available.
+
+    Names compare as RFC 2136 S1.1.2 requires (RFC 1035 S2.3.3: US-ASCII
+    case only, see pkg/dnsname) -- the owner name, and also the domain names
+    inside the RDATA of the types BIND compares that way (see foldRDATANames).
+    Any other RDATA, TXT included, is compared exactly.
 
     This is the one function that must be used everywhere a non-KEY record's
     identity is computed -- the store's own keys, duplicate/ownership checks,
@@ -1539,6 +1611,12 @@ func KeyFor(cu *ClassifiedUpdate, name string) *dns.KEY
     (pkg/lease.NodeKey is name-scoped) would silently collide the instance's
     node with the host's, since both would carry the host's own owner name.
 
+    The inherited KEY's owner name is the instance name as the requester spelled
+    it (its Delete All RRsets owner), not the lower-cased inst.Name: the handler
+    forwards this KEY upstream as the instance's published KEY, and RFC 1035
+    S2.3.3 asks for the original case to be preserved -- otherwise a "DemoScene"
+    instance ends up with its SRV/TXT at "DemoScene" and its KEY at "demoscene".
+
     name must be cu.Host.Name or one of cu.Instances' names -- anything else is
     a caller bug, not a data problem, so KeyFor panics rather than returning a
     zero value a caller could silently misuse.
@@ -1610,10 +1688,11 @@ func Validate(msg *dns.Msg) (*ClassifiedUpdate, error)
     Zone Section entry, no prerequisites, a present and internally-consistent
     Update-Lease option, TTL consistency (S4 -- a MUST, reject rather than
     normalize, unlike the base RFC 9664 handler's pkg/updatecore.NormalizeTTLs),
-    identical KEY RDATA across every KEY add, and flags-0 KEY adds (S3.2.5.1).
-    It does not verify SIG(0) or FCFS -- those need the lease store and the
-    SIG(0) signer identity, both outside this package's pure-logic scope (S4.3
-    steps 4-5).
+    identical KEY RDATA across every KEY add, flags-0 KEY adds (S3.2.5.1),
+    and DNS-SD-shaped service names on every Service Discovery add (RFC 6763
+    S4.1/S7). It does not verify SIG(0) or FCFS -- those need the lease store
+    and the SIG(0) signer identity, both outside this package's pure-logic scope
+    (S4.3 steps 4-5).
 
     Assumes the caller has already confirmed msg.Opcode == dns.OpcodeUpdate (the
     router dispatch layer's job, not this package's) and that msg has been fully
@@ -1765,7 +1844,7 @@ type ServiceDiscovery struct {
     instruction, never merged.
 
 type ServiceInstance struct {
-	Name   string   // canonical service-instance name
+	Name   string   // canonical service-instance name -- for comparison only; Delete's owner keeps the requester's case
 	Delete dns.RR   // the "Delete All RRsets From A Name" RR for Name
 	Key    *dns.KEY // explicit KEY add for this instance, or nil (inherits the host's key)
 	SRV    *dns.SRV // nil for a removal-shaped instance

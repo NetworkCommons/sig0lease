@@ -45,6 +45,27 @@ func TestServiceTypeFromInstanceName(t *testing.T) {
 			desc:     "the number of labels after type/proto doesn't change where type/proto are",
 		},
 		{
+			name:     "three-label type",
+			instance: "vpnclient._vpnserver._wg._udp.srp.dev.zenr.io.",
+			wantType: "",
+			wantOK:   false,
+			desc:     "a type is exactly two labels, so the label after _vpnserver must be _tcp/_udp -- used to yield \"_vpnserver._wg\"",
+		},
+		{
+			name:     "no protocol label",
+			instance: "sipserver._sip.example.com.",
+			wantType: "",
+			wantOK:   false,
+			desc:     "the second label of the type must be _tcp or _udp",
+		},
+		{
+			name:     "service label without underscore",
+			instance: "Widget.http._tcp.example.com.",
+			wantType: "",
+			wantOK:   false,
+			desc:     "the first label of the type must be underscore-prefixed",
+		},
+		{
 			name:     "too few labels",
 			instance: "_http._tcp.",
 			wantType: "",

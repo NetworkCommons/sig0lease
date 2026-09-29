@@ -2,8 +2,10 @@ package srp
 
 import (
 	"fmt"
+	"strings"
 
 	"codeberg.org/miekg/dns"
+	"github.com/NetworkCommons/sig0lease/pkg/dnssd"
 	leasepkg "github.com/NetworkCommons/sig0lease/pkg/lease"
 	"github.com/NetworkCommons/sig0lease/pkg/updatecore"
 )
@@ -12,8 +14,9 @@ import (
 // that needs more than the Update section alone: a single Zone Section entry, no
 // prerequisites, a present and internally-consistent Update-Lease option, TTL consistency
 // (S4 -- a MUST, reject rather than normalize, unlike the base RFC 9664 handler's
-// pkg/updatecore.NormalizeTTLs), identical KEY RDATA across every KEY add, and flags-0 KEY
-// adds (S3.2.5.1). It does not verify SIG(0) or FCFS -- those need the lease store and the
+// pkg/updatecore.NormalizeTTLs), identical KEY RDATA across every KEY add, flags-0 KEY
+// adds (S3.2.5.1), and DNS-SD-shaped service names on every Service Discovery add (RFC 6763
+// S4.1/S7). It does not verify SIG(0) or FCFS -- those need the lease store and the
 // SIG(0) signer identity, both outside this package's pure-logic scope (S4.3 steps 4-5).
 //
 // Assumes the caller has already confirmed msg.Opcode == dns.OpcodeUpdate (the router
@@ -78,6 +81,45 @@ func validatePostClassify(msg *dns.Msg, cu *ClassifiedUpdate) error {
 	}
 	if err := validateKeys(cu); err != nil {
 		return err
+	}
+	if err := validateServiceNames(cu); err != nil {
+		return err
+	}
+	return nil
+}
+
+// validateServiceNames checks every Service Discovery add against the DNS-SD naming these
+// PTRs publish (RFC 6763): the owner's base service type (the owner itself, or the base
+// type under a "<sub>._sub." subtype owner, S7.1) must be a two-label "_<service>._tcp" or
+// "_<service>._udp" (S7), and the target must be "<Instance>.<that same base type>" (S4.1 --
+// a subtype PTR still points at the instance's name under its base type). RFC 9665 S3.3.1.1
+// only requires the target to be "a service instance name"; this is what makes one. Without
+// it a three-label type such as "_vpnserver._wg._udp" was accepted and then misread by the
+// S9 Service Type Enumeration (handlers.SRPHandler.collectLiveServiceTypes) as
+// "_vpnserver._wg".
+//
+// Service Discovery deletes are not checked, so a requester can still withdraw a
+// registration made under a malformed name before this check existed.
+//
+// This runs in Validate rather than Classify on purpose: a Classify error means "not an
+// SRP update", and handlers.SRPHandler then declines the message so it falls through to
+// the next handler (plain RFC 2136) -- a malformed SRP update must be refused, not
+// forwarded as a plain one.
+func validateServiceNames(cu *ClassifiedUpdate) error {
+	for _, d := range cu.Discovery {
+		if !d.IsAdd {
+			continue
+		}
+		base := d.Name
+		if d.BaseType != "" {
+			base = d.BaseType
+		}
+		if _, ok := dnssd.ServiceTypeFromServiceName(base); !ok {
+			return fmt.Errorf("srp: Service Discovery add %s: %s is not a DNS-SD service type -- RFC 6763 S7 requires exactly two labels, \"_<service>._tcp\" or \"_<service>._udp\"", d.Name, base)
+		}
+		if _, service, _ := strings.Cut(d.Target, "."); service != base {
+			return fmt.Errorf("srp: Service Discovery add %s targets %s, which is not a service instance of %s (RFC 6763 S4.1: <Instance>.<Service>.<Domain>)", d.Name, d.Target, base)
+		}
 	}
 	return nil
 }

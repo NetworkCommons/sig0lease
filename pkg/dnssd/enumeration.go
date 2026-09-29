@@ -1,6 +1,7 @@
 // Package dnssd holds pure logic for RFC 6763 (DNS-Based Service Discovery) concerns that
-// sit alongside, but outside, RFC 9665's own Service Registration Protocol -- currently just
-// S9's Service Type Enumeration meta-record. An SRP client's Service Description never
+// sit alongside, but outside, RFC 9665's own Service Registration Protocol: the S7 service
+// name shape both SRP ends check (names.go), and S9's Service Type Enumeration meta-record
+// (this file). An SRP client's Service Description never
 // carries this record itself (S9 predates SRP and isn't part of what a client restates), so
 // a registrar that wants registered services to be discoverable by "browse everything" tools
 // -- not just a targeted per-type browse -- has to maintain it independently. See
@@ -81,20 +82,6 @@ func DiffSelfPointingDomainRecord(prefix, zone string, wasPresent, isPresent boo
 	rr := &dns.PTR{Hdr: dns.Header{Name: owner, Class: dns.ClassNONE, TTL: 0}}
 	rr.Ptr = zone
 	return []dns.RR{rr}
-}
-
-// ServiceTypeFromInstanceName extracts the two-label DNS-SD service type (e.g. "_http._tcp")
-// from a Service Instance Name shaped "<Instance>.<type>.<proto>.<Domain>." -- RFC 6763 S4.1
-// is explicit that the Instance portion always occupies exactly one label, so the type is
-// always the second and third labels regardless of how many labels <Domain> itself has. ok is
-// false if name has fewer labels than that shape requires.
-func ServiceTypeFromInstanceName(name string) (svcType string, ok bool) {
-	labels := splitLabels(dnsname.Fold(name))
-	// instance, type, proto, trailing empty root label from the split.
-	if len(labels) < 4 {
-		return "", false
-	}
-	return labels[1] + "." + labels[2], true
 }
 
 // DiffEnumerationRecords returns targeted add/delete instructions to bring zone's Service

@@ -898,6 +898,29 @@ func TestRewriteDefaultServiceARPA_OwnerAndTargetNames(t *testing.T) {
 	}
 }
 
+// --- structural validation (step 2) ------------------------------------------------------
+
+// TestSRPHandle_MalformedServiceType_Refused is PR #45's report at the handler level: an
+// instance registered under the three-label "type" _vpnserver._wg._udp used to be accepted
+// and then listed in the S9 Service Type Enumeration as "_vpnserver._wg". It must now be
+// REFUSED by this handler -- not declined as NotRelevant, which would let the router forward
+// it as a plain RFC 2136 update -- and never reach the upstream.
+func TestSRPHandle_MalformedServiceType_Refused(t *testing.T) {
+	h, coord := newSRPTestHandler(t)
+	id := newSRPTestIdentity(t)
+	const host = "vpnclient.dev.zenr.io."
+	instances := []srpInstanceSpec{{name: "vpnclient._vpnserver._wg._udp.dev.zenr.io.", port: 0, txt: "txtver=1", svctype: "_vpnserver._wg._udp.dev.zenr.io."}}
+
+	msg := buildSRPUpdate(t, srpTestZone, id, host, []string{"10.10.10.10"}, instances, 30, 1209600, host)
+	res := h.Handle(context.Background(), stubTCPResponseWriter{}, msg)
+	if res.Status != StatusError || res.Message == nil || res.Message.Rcode != dns.RcodeRefused {
+		t.Fatalf("expected REFUSED for a three-label service type, got status=%s message=%+v err=%v", res.Status, res.Message, res.Error)
+	}
+	if len(coord.sent) != 0 {
+		t.Fatalf("expected no upstream forward, got %d sends", len(coord.sent))
+	}
+}
+
 // --- SIG(0) (step 4) ---------------------------------------------------------------------
 
 func TestSRPHandle_MissingSIG0_Refused(t *testing.T) {

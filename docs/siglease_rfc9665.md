@@ -107,6 +107,16 @@ Hard requirements the handler enforces:
 - **TTL consistency** within every RRset in the update (§4) — rejected with `REFUSED` if
   violated; this is a MUST on the SRP path, unlike the base handler's normalize-to-minimum
   behavior (both live in the shared `pkg/updatecore/ttl.go`, see `docs/siglease_rfc9664.md`).
+- **DNS-SD service names** on every Service Discovery PTR add (RFC 6763 §4.1/§7): the PTR's
+  base service type (the owner, or the base type under a `<sub>._sub.` subtype owner) must be
+  exactly two labels, `_<service>._tcp` or `_<service>._udp`, and the PTR target must be
+  `<Instance>.<that base type>` — otherwise `REFUSED`. RFC 9665 itself only asks for "a service
+  instance name"; this makes one, and it is what the §9 Service Type Enumeration relies on when
+  it reads the type off the instance name (PR #45: a three-label `_vpnserver._wg._udp` was
+  enumerated as `_vpnserver._wg`). PTR deletes are not checked, so a registration made under a
+  malformed name can still be withdrawn. `sig0lease-srp-client` refuses such a type up front
+  (it also applies RFC 6335's Service Name syntax); to narrow a type, use a subtype
+  (`-subtype`).
 - Any add/delete that isn't part of a recognised instruction ⇒ not an SRP update ⇒ the
   registrar rejects with `REFUSED`.
 

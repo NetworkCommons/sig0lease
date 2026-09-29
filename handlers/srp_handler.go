@@ -467,8 +467,13 @@ func (h *SRPHandler) collectLiveServiceTypes() []string {
 			if !ok {
 				continue
 			}
+			// srp.Validate only admits service instance names with a two-label DNS-SD
+			// service type, so a failure here means the store holds something Validate
+			// never let through.
 			if svcType, ok := dnssd.ServiceTypeFromInstanceName(srv.Hdr.Name); ok {
 				types = append(types, svcType)
+			} else {
+				h.logger.Errorf("SRP handler: service-type enumeration: %s is not a DNS-SD service instance name, leaving it out", srv.Hdr.Name)
 			}
 			break // one SRV per instance node -- no need to keep scanning this node's set
 		}
