@@ -11,6 +11,7 @@ import (
 	"github.com/NetworkCommons/sig0lease/handlers"
 	"github.com/NetworkCommons/sig0lease/logging"
 	_ "github.com/NetworkCommons/sig0lease/pkg/dnscompat"
+	"github.com/NetworkCommons/sig0lease/pkg/updatecore"
 	"github.com/NetworkCommons/sig0lease/server"
 )
 
@@ -114,6 +115,10 @@ func main() {
 		logger.Errorf("Error loading config: %v", err)
 		os.Exit(1)
 	}
+	if err := updatecore.SetMaxInflightUpdates(cfg.Authoritative.MaxInflightUpdates); err != nil {
+		logger.Errorf("Error applying authoritative.max_inflight_updates: %v", err)
+		os.Exit(1)
+	}
 
 	if dumpMode {
 		// Dump mode: create every configured handler, print combined lease state, exit.
@@ -166,6 +171,11 @@ func main() {
 	}
 
 	logger.Infof("Starting DNS Proxy")
+	if n := cfg.Authoritative.MaxInflightUpdates; n > 0 {
+		logger.Infof("At most %d UPDATE(s) in flight to each authoritative server (authoritative.max_inflight_updates)", n)
+	} else {
+		logger.Infof("No limit on UPDATEs in flight to authoritative servers (authoritative.max_inflight_updates: 0)")
+	}
 
 	if v := os.Getenv("SERVER_ADDRESS"); v != "" {
 		cfg.Server.Address = v

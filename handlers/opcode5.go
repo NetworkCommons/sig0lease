@@ -4,7 +4,6 @@ package handlers
 import (
 	"context"
 	"strings"
-	"sync"
 	"time"
 
 	"codeberg.org/miekg/dns"
@@ -46,11 +45,19 @@ func NewInMemoryLeaseManager() *InMemoryLeaseManager {
 // pkg/updatecore.Coordinator is the production implementation, constructed directly in
 // Setup (below) via updatecore.NewCoordinator -- this interface exists so tests and
 // operators can substitute their own (config's "upstream_coordinator" option, or a test
-// stub; see handlers/opcode5_sig0_validation_test.go's stubUpstreamCoordinator).
+// stub; see handlers/opcode5_sig0_validation_test.go's stubUpstreamCoordinator). It covers
+// everything the handler asks of the upstream side, so a substitute is used the same way as
+// the production implementation, never bypassed.
 type UpstreamCoordinator interface {
 	// SendUpdate sends a DNS UPDATE message to the upstream authoritative server.
 	// Returns the response message or an error.
 	SendUpdate(ctx context.Context, upstreamZone string, updateMsg *dns.Msg) (*dns.Msg, error)
+	// ResolveAuthoritativeZone returns the zone cut (the name that has NS records) for zone
+	// or one of its parents: the zone an UPDATE for names under zone must name.
+	ResolveAuthoritativeZone(ctx context.Context, zone string) (string, error)
+	// QueryRRs returns the rrType records at name from zoneHint's authoritative server --
+	// none for NXDOMAIN -- for the handler's checks of what is already published.
+	QueryRRs(ctx context.Context, zoneHint, name string, rrType uint16) ([]dns.RR, error)
 }
 
 // UpdateHandler handles DNS opcode 5 (UPDATE queries).
@@ -62,14 +69,8 @@ type UpstreamCoordinator interface {
 //   - Future SRP support
 type UpdateHandler struct {
 	BaseHandler
-	upstreamZone      string            // Upstream authoritative zone (e.g., "dev.zenr.io.")
-	upstreamKeyRecord *keyrec.LoadedKey // Key for signing upstream UPDATE (Upstream key)
-	// upstreamKeyZone is the zone upstreamKeyRecord was actually found at (upstreamZone
-	// itself, or a parent of it -- FindAuthorizedProxyKey walks up). Cached alongside
-	// upstreamKeyRecord purely for the debug log resolveUpstreamSigningContext used to
-	// emit on every call before the key itself was cached at Setup() and reused for the
-	// life of the handler instead of being re-read from disk on every request/expiry.
-	upstreamKeyZone     string
+	upstreamZone        string            // Upstream authoritative zone (e.g., "dev.zenr.io.")
+	upstreamKeyRecord   *keyrec.LoadedKey // Key for signing upstream UPDATE (Upstream key)
 	leaseManager        LeaseManager
 	upstreamCoordinator UpstreamCoordinator
 	keystoreDir         string
@@ -82,10 +83,8 @@ type UpdateHandler struct {
 	// gates whether it may also be used to create new managed state. Default
 	// false (fail closed).
 	AllowOnlineKeyRegistration bool
-	leaseTimersMu              sync.Mutex
-	leaseTimers                map[string]*time.Timer
+	timers                     *expiryTimers
 	blacklistedTypes           map[uint16]struct{} // RR types blocked from registration (type code -> empty)
-	authoritativeLookup        func(ctx context.Context, zoneHint string, fqdn string, rrType uint16) ([]dns.RR, error)
 	reconcileTicker            *time.Ticker
 }
 
@@ -98,7 +97,7 @@ func NewUpdateHandler() *UpdateHandler {
 		},
 		leaseManager:        NewInMemoryLeaseManager(),
 		upstreamCoordinator: nil, // Must be configured via Setup()
-		leaseTimers:         make(map[string]*time.Timer),
+		timers:              newExpiryTimers(),
 	}
 }
 

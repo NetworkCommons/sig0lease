@@ -54,3 +54,18 @@ func TestValidate_NoTLSNetwork_ServerTLSIgnoredIfAbsent(t *testing.T) {
 		t.Fatalf("expected a plain udp/tcp config with no server.tls to validate, got: %v", err)
 	}
 }
+
+func TestAuthoritativeMaxInflightUpdates_DefaultsToOneAndRejectsNegative(t *testing.T) {
+	cfg := NewDefaultConfig()
+	if cfg.Authoritative.MaxInflightUpdates != 1 {
+		t.Fatalf("expected the default to match BIND's default sig0checks-quota (1), got %d", cfg.Authoritative.MaxInflightUpdates)
+	}
+	cfg.Authoritative.MaxInflightUpdates = 0
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("expected 0 (no limit) to be accepted, got %v", err)
+	}
+	cfg.Authoritative.MaxInflightUpdates = -1
+	if err := cfg.Validate(); err == nil {
+		t.Fatalf("expected a negative limit to be rejected")
+	}
+}

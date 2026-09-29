@@ -42,6 +42,14 @@ upstreams:
     protocol: "udp"
     timeout: "5s"
 
+# Limits on the UPDATEs this proxy sends to authoritative servers, shared by every handler.
+authoritative:
+  # How many UPDATEs the proxy may have in flight to one authoritative server at a time
+  # (0 = no limit). Every UPDATE it sends is SIG(0)-signed, and BIND 9.20 verifies at most
+  # sig0checks-quota SIG(0) signatures at a time (default 1), answering REFUSED -- not
+  # queueing -- to any beyond that. Set this to the upstream server's sig0checks-quota.
+  max_inflight_updates: 1
+
 # Processing rules map opcodes to an ORDERED list of module names. The router tries
 # each module in turn until one returns "processed" or "error"; if every one declines
 # ("not relevant" -- e.g. an SRP-shaped update handled by srp_handler, or a plain UPDATE

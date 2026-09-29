@@ -58,6 +58,15 @@ type TLSConfig struct {
 	Key string `yaml:"key"`
 }
 
+// AuthoritativeConfig holds limits on the UPDATEs this proxy sends to authoritative servers.
+type AuthoritativeConfig struct {
+	// MaxInflightUpdates caps how many UPDATEs the proxy has in flight to one authoritative
+	// server at a time; 0 means no limit. Every UPDATE it sends is SIG(0)-signed, and BIND 9.20
+	// answers REFUSED to a SIG(0) request beyond its sig0checks-quota (default 1) instead of
+	// queueing it, so set this to the upstream server's sig0checks-quota.
+	MaxInflightUpdates int `yaml:"max_inflight_updates"`
+}
+
 // Config is the top-level configuration structure.
 type Config struct {
 	// Downstream server settings
@@ -71,6 +80,9 @@ type Config struct {
 
 	// Handler-specific configuration (e.g., for update handler)
 	Handlers map[string]map[string]interface{} `yaml:"handlers"`
+
+	// Limits on the UPDATEs sent to authoritative servers, shared by every handler
+	Authoritative AuthoritativeConfig `yaml:"authoritative"`
 }
 
 // NewDefaultConfig returns a configuration with sensible defaults.
@@ -94,6 +106,8 @@ func NewDefaultConfig() *Config {
 			},
 		},
 		Handlers: make(map[string]map[string]interface{}),
+		// BIND 9.20's default sig0checks-quota.
+		Authoritative: AuthoritativeConfig{MaxInflightUpdates: 1},
 	}
 }
 
@@ -150,6 +164,10 @@ func (c *Config) Validate() error {
 		if upstream.Timeout <= 0 {
 			c.Upstreams[i].Timeout = 5 * time.Second
 		}
+	}
+
+	if c.Authoritative.MaxInflightUpdates < 0 {
+		return fmt.Errorf("authoritative.max_inflight_updates must be 0 (no limit) or more, got %d", c.Authoritative.MaxInflightUpdates)
 	}
 
 	return nil

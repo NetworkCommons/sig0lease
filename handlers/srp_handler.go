@@ -43,10 +43,7 @@ type SRPHandler struct {
 	// upstreamKeyRecord is the proxy's own SIG(0) signing key for upstreamZone, resolved
 	// once by Setup and cached for the handler's lifetime (see resolveUpstreamSigningContext)
 	// rather than re-read from keystoreDir on every request and every lease-expiry tick.
-	// upstreamKeyZone is the zone it was actually found at (upstreamZone itself, or a
-	// parent -- FindAuthorizedProxyKey walks up), cached alongside it purely for logging.
 	upstreamKeyRecord *keyrec.LoadedKey
-	upstreamKeyZone   string
 
 	allowUDP                  bool // TCP required unless the zone is flagged allow_udp
 	refuseOnForeignData       bool // RFC 9665 S3.3.3's NOERROR-no-KEY case. Default true.
@@ -82,8 +79,7 @@ type SRPHandler struct {
 	// by SRP working here. Default false (config: srp_handler.advertise_registration_domain).
 	advertiseRegistrationDomain bool
 
-	leaseTimersMu sync.Mutex
-	leaseTimers   map[string]*time.Timer
+	timers *expiryTimers
 }
 
 // srpCoordinator is the subset of *updatecore.Coordinator's exported surface Handle and its
@@ -111,7 +107,7 @@ func NewSRPHandler() *SRPHandler {
 		},
 		leaseManager:        NewInMemoryLeaseManager(),
 		refuseOnForeignData: true,
-		leaseTimers:         make(map[string]*time.Timer),
+		timers:              newExpiryTimers(),
 	}
 }
 
@@ -227,6 +223,8 @@ func (h *SRPHandler) Handle(ctx context.Context, w dns.ResponseWriter, r *dns.Ms
 		h.logger.Debugf("SRP handler: zone %s is not the configured zone %s, declining", zone, h.upstreamZone)
 		return NewNotRelevantResult(fmt.Sprintf("zone %s not enabled for SRP on this handler", zone))
 	}
+	// From here on the request is this handler's, and everything below needs the upstream.
+	requireUpstream(h.Name(), h.coordinator != nil, h.upstreamKeyRecord != nil)
 
 	h.logger.Infof("SRP UPDATE for zone %s: host=%s instances=%d discovery=%d",
 		zone, cu.Host.Name, len(cu.Instances), len(cu.Discovery))
@@ -363,7 +361,7 @@ func (h *SRPHandler) Handle(ctx context.Context, w dns.ResponseWriter, r *dns.Ms
 	forwardRecords = append(forwardRecords, h.ptrDeleteDiff(cu)...)
 	forwardRecords = append(forwardRecords, synthesizeOmittedInstanceKeys(cu)...)
 
-	signingKey, effectiveZone, err := h.resolveUpstreamSigningContext(ctx)
+	signingKey, effectiveZone, err := resolveUpstreamSigningContext(ctx, h.Name(), h.coordinator, h.upstreamKeyRecord, h.upstreamZone, h.logger)
 	if err != nil {
 		h.logger.Errorf("SRP handler: failed to resolve upstream signing context: %v", err)
 		msg := makeErrorResponse(r, dns.RcodeServerFailure, "upstream signing key resolution failed")
@@ -621,7 +619,7 @@ func (h *SRPHandler) reconcileServiceEnumeration(ctx context.Context) {
 		return
 	}
 
-	signingKey, effectiveZone, err := h.resolveUpstreamSigningContext(ctx)
+	signingKey, effectiveZone, err := resolveUpstreamSigningContext(ctx, h.Name(), h.coordinator, h.upstreamKeyRecord, h.upstreamZone, h.logger)
 	if err != nil {
 		h.logger.Errorf("SRP handler: service-type enumeration: failed to resolve signing context: %v", err)
 		return
@@ -818,30 +816,6 @@ func (h *SRPHandler) registerOrRenew(ctx context.Context, parentNodeKey string, 
 	return h.leaseManager.RegisterWithParent(ctx, parentNodeKey, keyRR, keyLease, keyLease, upstreamZone)
 }
 
-// resolveUpstreamSigningContext resolves the proxy's own signing key and the effective
-// (post-SOA-resolution, or static-override) upstream zone -- the SRP-handler equivalent
-// of UpdateHandler.resolveUpstreamSigningContext, written separately rather than shared
-// because that one is a method on *UpdateHandler and type-asserts down to
-// *updatecore.Coordinator for its zone-resolution fallback, where srpCoordinator declares
-// ResolveAuthoritativeZone directly; both are thin now that the actual resolution logic
-// lives in pkg/updatecore. The signing key itself is Setup's own upstreamKeyRecord, cached
-// once there rather than re-read from keystoreDir on every call -- see that field's doc
-// comment.
-func (h *SRPHandler) resolveUpstreamSigningContext(ctx context.Context) (*keyrec.LoadedKey, string, error) {
-	if h.upstreamKeyRecord == nil {
-		return nil, "", fmt.Errorf("upstream signing key resolution failed: no key cached (Setup did not run or did not succeed)")
-	}
-	signingKey := h.upstreamKeyRecord
-	h.logger.Debugf("Using cached proxy authorization key for upstream zone %s (found at key zone %s)", h.upstreamZone, h.upstreamKeyZone)
-
-	effectiveZone, err := h.coordinator.ResolveAuthoritativeZone(ctx, h.upstreamZone)
-	if err != nil {
-		return nil, "", fmt.Errorf("upstream zone resolution failed: %w", err)
-	}
-	h.logger.Debugf("Resolved effective upstream zone: configured=%s effective=%s", h.upstreamZone, effectiveZone)
-	return signingKey, effectiveZone, nil
-}
-
 // parseLease decodes the Update-Lease option. Unlike UpdateHandler.parseLease, this does
 // not re-derive validity (LEASE<=KEY-LEASE, 8-byte-vs-4-byte-variant policy) -- Validate()
 // (S3.3.2, called in step 2) already confirmed the option is present and internally
@@ -897,36 +871,33 @@ func (h *SRPHandler) buildSuccessResponse(r *dns.Msg, lease, keyLease uint32) *d
 	return resp
 }
 
-// scheduleLeaseExpiry arms (or re-arms) a timer that, on firing, sends the corresponding
-// upstream delete and then removes the node locally -- the same upstream-aware,
-// deferred-mutation-respecting expiry UpdateHandler.scheduleLeaseExpiry implements,
-// reimplemented here (rather than shared) for the same reason resolveUpstreamSigningContext
-// is: that one is tightly coupled to *UpdateHandler's own case-matrix and mutation model.
+// scheduleLeaseExpiry arms (or re-arms) a timer for nodeKey's next lease event -- its
+// earliest non-KEY record's LEASE or its KEY's KEY-LEASE, whichever comes first -- that fires
+// processExpiredNode. Timers and retries use the same expiryTimers table as UpdateHandler.
 func (h *SRPHandler) scheduleLeaseExpiry(nodeKey string) {
-	h.leaseTimersMu.Lock()
-	defer h.leaseTimersMu.Unlock()
-
-	if existing, ok := h.leaseTimers[nodeKey]; ok {
-		existing.Stop()
-	}
-
-	rec := h.leaseManager.Get(nodeKey)
-	if rec == nil {
-		delete(h.leaseTimers, nodeKey)
-		return
-	}
-	delay := time.Until(rec.ExpiresAt)
-	if delay < 0 {
-		delay = 0
-	}
-	h.leaseTimers[nodeKey] = time.AfterFunc(delay, func() {
-		h.processExpiredNode(context.Background(), nodeKey)
-	})
+	h.timers.schedule(h.leaseManager, nodeKey, h.expireFunc(nodeKey))
 }
 
-// processExpiredNode removes an expired node's data both upstream and locally. Unlike
-// UpdateHandler.processExpiredLease, this has no Case A/B/C/D-style branching to
-// replicate: an expired KEY node's subtree is simply deleted, upstream first.
+// expireFunc is nodeKey's timer callback: one processExpiredNode run.
+func (h *SRPHandler) expireFunc(nodeKey string) func() {
+	return func() {
+		h.processExpiredNode(context.Background(), nodeKey)
+	}
+}
+
+// finishExpiry re-arms nodeKey's timer after an expiry attempt (expiryTimers.finish): after
+// the retry backoff if the attempt left anything pending, else for its next lease event.
+func (h *SRPHandler) finishExpiry(nodeKey string, complete bool) {
+	if delay := h.timers.finish(h.leaseManager, nodeKey, complete, h.expireFunc(nodeKey)); delay > 0 {
+		h.logger.Warnf("SRP handler: expiry of %s incomplete, retrying in %s", nodeKey, delay)
+	}
+}
+
+// processExpiredNode handles one lease event for nodeKey. If only its LEASE has run out, that
+// is expireNodeData's job: the node's data goes, its KEY stays. If its KEY-LEASE has run out,
+// the node's whole subtree is deleted, upstream first -- the rest of this doc comment is about
+// that case. Unlike UpdateHandler.processExpiredLease, there is no Case A/B/C/D-style
+// branching to replicate: an expired KEY node's subtree is simply deleted.
 //
 // The upstream delete must cover everything DeleteSubtree is about to remove locally, not
 // just the KEY record: a Delete All RRsets at this node's own name reaches the KEY plus
@@ -952,13 +923,15 @@ func (h *SRPHandler) scheduleLeaseExpiry(nodeKey string) {
 // had already succeeded, is a harmless RFC 2136 no-op). Also caught by the local BIND 9 test
 // harness.
 func (h *SRPHandler) processExpiredNode(ctx context.Context, nodeKey string) {
-	h.leaseTimersMu.Lock()
-	delete(h.leaseTimers, nodeKey)
-	h.leaseTimersMu.Unlock()
-
 	rec := h.leaseManager.Get(nodeKey)
-	if rec == nil || !rec.IsExpired() {
-		return // raced a refresh; nothing to do
+	if rec == nil {
+		h.timers.disarm(nodeKey)
+		return
+	}
+	if !rec.IsExpired() {
+		// A LEASE event (or a raced refresh, for which expireNodeData finds nothing due).
+		h.finishExpiry(nodeKey, h.expireNodeData(ctx, nodeKey))
+		return
 	}
 
 	var deletes []dns.RR
@@ -977,19 +950,22 @@ func (h *SRPHandler) processExpiredNode(ctx context.Context, nodeKey string) {
 		}
 	}
 
-	signingKey, effectiveZone, err := h.resolveUpstreamSigningContext(ctx)
+	signingKey, effectiveZone, err := resolveUpstreamSigningContext(ctx, h.Name(), h.coordinator, h.upstreamKeyRecord, h.upstreamZone, h.logger)
 	if err != nil {
 		h.logger.Errorf("SRP handler: expiry of %s: failed to resolve signing context: %v", nodeKey, err)
+		h.finishExpiry(nodeKey, false)
 		return
 	}
 	upstreamMsg, err := updatecore.BuildAndSign(effectiveZone, nil, deletes, signingKey)
 	if err != nil {
 		h.logger.Errorf("SRP handler: expiry of %s: failed to build upstream delete: %v", nodeKey, err)
+		h.finishExpiry(nodeKey, false)
 		return
 	}
 	upstreamResp, err := h.coordinator.SendUpdate(ctx, effectiveZone, upstreamMsg)
 	if err != nil {
-		h.logger.Errorf("SRP handler: expiry of %s: upstream delete failed (will retry on next reconciliation pass): %v", nodeKey, err)
+		h.logger.Errorf("SRP handler: expiry of %s: upstream delete failed: %v", nodeKey, err)
+		h.finishExpiry(nodeKey, false)
 		return
 	}
 	// SendUpdate only reports a network/transport-level error -- it does not itself
@@ -1002,7 +978,8 @@ func (h *SRPHandler) processExpiredNode(ctx context.Context, nodeKey string) {
 		if upstreamResp != nil {
 			rcodeDesc = fmt.Sprintf("rcode=%d (%s)", upstreamResp.Rcode, dns.RcodeToString[upstreamResp.Rcode])
 		}
-		h.logger.Errorf("SRP handler: expiry of %s: upstream delete rejected (will retry on next reconciliation pass): %s", nodeKey, rcodeDesc)
+		h.logger.Errorf("SRP handler: expiry of %s: upstream delete rejected: %s", nodeKey, rcodeDesc)
+		h.finishExpiry(nodeKey, false)
 		return
 	}
 
@@ -1025,14 +1002,89 @@ func (h *SRPHandler) processExpiredNode(ctx context.Context, nodeKey string) {
 
 	if err := h.leaseManager.DeleteSubtree(nodeKey); err != nil {
 		h.logger.Errorf("SRP handler: expiry of %s: local DeleteSubtree failed: %v", nodeKey, err)
+		h.finishExpiry(nodeKey, false)
 		return
 	}
 	h.logger.Infof("SRP handler: expiry of %s: upstream delete confirmed, local subtree removed", nodeKey)
+	h.finishExpiry(nodeKey, true)
 
 	// RFC 6763 S9: an expired node may have been the last live instance of its service
 	// type -- recompute the enumeration record so it stops listing a type nothing still
 	// provides. Same best-effort reasoning as the call in Handle().
 	h.reconcileServiceEnumeration(ctx)
+}
+
+// expireNodeData handles a LEASE (not KEY-LEASE) event for nodeKey -- RFC 9665 S3.2.5.3/S5.1:
+// the node's due data records (a host's A/AAAA, or a service instance's SRV/TXT/PTRs) are
+// deleted, upstream first, one record at a time via expireNonKEYRecords, the same mechanism
+// UpdateHandler uses for non-KEY expiry. The KEY stays, holding the name until its own
+// KEY-LEASE runs out. Per-record deletes (never a Delete All RRsets at the node's name, which
+// would take the KEY with it) also reach PTRs at the shared service-type name exactly.
+//
+// A host's data expiring takes the data of every service instance under it along too,
+// whatever that instance's own remaining LEASE: "when the lease on a hostname expires, the
+// hostname and all services that reference it MUST be removed at the same time" (S5.1). An
+// instance registered by an earlier update, and omitted from the host's latest one, keeps
+// that earlier update's LEASE -- without this cascade, a longer one would leave it advertised
+// against a host with no addresses. The instances go first: if any of their deletes fails,
+// the host's own due records are left in place, so the retry re-triggers this cascade.
+//
+// Returns false while any due record is still pending a retry.
+func (h *SRPHandler) expireNodeData(ctx context.Context, nodeKey string) bool {
+	now := time.Now()
+	due := false
+	if set := h.leaseManager.GetNonKEYRecordSet(nodeKey); set != nil {
+		for _, rec := range set.Records {
+			if !now.Before(rec.ExpiresAt) {
+				due = true
+				break
+			}
+		}
+	}
+	if !due {
+		return true
+	}
+
+	signingKey, effectiveZone, err := resolveUpstreamSigningContext(ctx, h.Name(), h.coordinator, h.upstreamKeyRecord, h.upstreamZone, h.logger)
+	if err != nil {
+		h.logger.Errorf("SRP handler: LEASE expiry of %s: failed to resolve signing context: %v", nodeKey, err)
+		return false
+	}
+	deleteUpstream := func(ctx context.Context, rr dns.RR) error {
+		msg, err := updatecore.BuildAndSign(effectiveZone, nil, []dns.RR{updatecore.AsDelete(rr)}, signingKey)
+		if err != nil {
+			return err
+		}
+		resp, err := h.coordinator.SendUpdate(ctx, effectiveZone, msg)
+		if err != nil {
+			return err
+		}
+		if resp == nil || resp.Rcode != dns.RcodeSuccess {
+			return fmt.Errorf("rejected: %s", rcodeDescription(resp))
+		}
+		return nil
+	}
+
+	complete := true
+	for _, child := range h.leaseManager.ListSubtreeKeys(nodeKey) {
+		if h.leaseManager.Get(child) == nil {
+			continue // a non-KEY record's own id, not a service instance node
+		}
+		if !expireNonKEYRecords(ctx, h.leaseManager, h.logger, child, now, true, deleteUpstream) {
+			complete = false
+		}
+	}
+	if complete {
+		complete = expireNonKEYRecords(ctx, h.leaseManager, h.logger, nodeKey, now, false, deleteUpstream)
+	}
+	if complete {
+		h.logger.Infof("SRP handler: LEASE expiry of %s: data records deleted upstream and locally, KEY kept until KEY-LEASE", nodeKey)
+	}
+
+	// RFC 6763 S9: the removed PTRs may have been the last live instance of their service
+	// type -- same reasoning as the call at the end of processExpiredNode.
+	h.reconcileServiceEnumeration(ctx)
+	return complete
 }
 
 // deleteAllRR builds a raw RFC 2136 S2.5.3 "Delete All RRsets From A Name" (class ANY) --
@@ -1056,10 +1108,7 @@ func (h *SRPHandler) startLeaseReconciliation(interval time.Duration) {
 					continue
 				}
 				nodeKey := leasepkg.NodeKey(rec.KeyRR)
-				h.leaseTimersMu.Lock()
-				_, has := h.leaseTimers[nodeKey]
-				h.leaseTimersMu.Unlock()
-				if !has {
+				if !h.timers.armed(nodeKey) {
 					h.scheduleLeaseExpiry(nodeKey)
 				}
 			}
@@ -1079,8 +1128,8 @@ func (h *SRPHandler) startLeaseReconciliation(interval time.Duration) {
 // UpdateHandler's tree-indented dump -- flat, one section per node -- since SRP's tree
 // shape (documented in docs/siglease_rfc9665.md's lease-store mapping section) doesn't need the same visual nesting to be legible.
 func (h *SRPHandler) DumpLeasesLevel(level string) string {
-	h.leaseTimersMu.Lock()
-	defer h.leaseTimersMu.Unlock()
+	h.timers.mu.Lock()
+	defer h.timers.mu.Unlock()
 
 	isDebug := strings.ToLower(strings.TrimSpace(level)) == "debug"
 

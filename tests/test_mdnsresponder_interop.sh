@@ -85,6 +85,8 @@ handlers:
       max_key_lease_sec: 1209600
       min_rr_lease_sec: 1
       max_rr_lease_sec: 7200
+authoritative:
+  max_inflight_updates: ${BIND9_SIG0_QUOTA}
 processing_rules:
   - opcode: 5
     modules: ["srp_handler"]
@@ -401,18 +403,23 @@ run_all_tests() {
     test_d2_register
     test_d2_deregister
 
+    bind9_report_rejections || return 1
+    BIND9_REJECTIONS_REPORTED=1
+
     log_section "TEST RESULTS"
     echo -e "${GREEN}All mDNSResponder interop tests completed successfully!${NC}"
     echo -e "$PERFORMED_TESTS"
     echo ""
     echo "Direction-1 proxy log: $D1_PROXY_LOG"
     echo "srp-mdns-proxy log: $D2_MDNS_PROXY_LOG"
-    echo "BIND log: ${BIND9_RUNDIR}/named.stdout.log"
+    echo "BIND log: ${BIND9_RUNDIR}/named.log"
 }
 
 cleanup() {
     set +e
     log_section "CLEANUP"
+    # See test_srp.sh's cleanup: a failed run still shows why named rejected anything.
+    [ -z "${BIND9_REJECTIONS_REPORTED:-}" ] && bind9_report_rejections
     stop_d1_proxy
     stop_d2_mdns_proxy
     stop_bind9

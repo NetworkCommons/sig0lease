@@ -64,7 +64,6 @@ func (h *SRPHandler) Setup(cfg map[string]any) error {
 		return fmt.Errorf("failed to resolve upstream signing key for zone %s: %w", h.upstreamZone, err)
 	}
 	h.upstreamKeyRecord = upstreamKey
-	h.upstreamKeyZone = matchedZone
 	h.logger.Debugf("Loaded upstream key for configured zone %s from key zone %s", h.upstreamZone, matchedZone)
 
 	staticUpstream := map[string]string{}

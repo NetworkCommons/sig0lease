@@ -8,8 +8,8 @@ import (
 
 // AuthoritativeKeyState is the tri-state result of a live KEY-at-name query against the
 // authoritative server, consumed by pkg/srp.Evaluate (S3.3.3 FCFS) when the lease store
-// has no local record for a name. This is the RCODE-aware distinction the base RFC 9664
-// handler's queryAuthoritativeRRs discards -- keeping it is what makes the
+// has no local record for a name. This is the RCODE-aware distinction Coordinator.QueryRRs
+// (the base RFC 9664 handler's lookup) discards -- keeping it is what makes the
 // NXDOMAIN/NODATA/KEY-present cases distinguishable at all.
 //
 // Defined here rather than in pkg/srp (which consumes it) because Coordinator, the real

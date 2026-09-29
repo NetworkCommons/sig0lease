@@ -1,17 +1,32 @@
 package handlers
 
 import (
+	"fmt"
 	"io"
 	"os"
 	"path/filepath"
 	"testing"
 
+	"codeberg.org/miekg/dns"
 	"github.com/NetworkCommons/sig0lease/logging"
+	"github.com/NetworkCommons/sig0lease/pkg/keyrec"
 )
 
+// newTestHandler returns an UpdateHandler wired the way Setup leaves one -- an upstream
+// coordinator and the proxy's signing key (the repository's dev.zenr.io. test key) -- without
+// Setup's config parsing. Handlers never run without an upstream (see requireUpstream). The
+// coordinator is a stub answering every UPDATE with NOERROR; tests that need another answer
+// or the sent messages replace it. Tests that call Setup get Setup's own values instead.
 func newTestHandler() *UpdateHandler {
 	h := NewUpdateHandler()
 	h.SetLogger(logging.NewLogger("debug"))
+	key, err := keyrec.LoadKeyFromFile("../keystore/server", "Kdev.zenr.io.+015+35317")
+	if err != nil {
+		panic(fmt.Sprintf("newTestHandler: load test signing key: %v", err))
+	}
+	h.upstreamZone = "dev.zenr.io."
+	h.upstreamKeyRecord = key
+	h.upstreamCoordinator = &stubUpstreamCoordinator{resp: &dns.Msg{MsgHeader: dns.MsgHeader{Rcode: dns.RcodeSuccess}}}
 	return h
 }
 

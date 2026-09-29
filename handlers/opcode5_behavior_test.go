@@ -18,7 +18,7 @@ import (
 )
 
 func TestParseLeaseRegistrationIncludesKeyLease(t *testing.T) {
-	h := NewUpdateHandler()
+	h := newTestHandler()
 	msg := dns.NewMsg("test.dev.zenr.io.", dns.TypeSOA)
 	if msg == nil {
 		t.Fatalf("expected message")
@@ -46,10 +46,9 @@ func TestExtractUpdateRecordsAcceptsMultipleKeys(t *testing.T) {
 		t.Fatalf("expected message")
 	}
 	msg.Opcode = dns.OpcodeUpdate
-	msg.Ns = append(msg.Ns,
-		testKeyRR("test.dev.zenr.io.", "AAAATESTKEY111="),
-		testKeyRR("test.dev.zenr.io.", "AAAATESTKEY222="),
-	)
+	key1 := testKeyRR("test.dev.zenr.io.", "AAAATESTKEY111=")
+	key2 := testKeyRR("test.dev.zenr.io.", "AAAATESTKEY222=")
+	msg.Ns = append(msg.Ns, key1, key2)
 
 	keyRRs, _, err := extractUpdateRecords(msg, nil)
 	if err != nil {
@@ -58,8 +57,8 @@ func TestExtractUpdateRecordsAcceptsMultipleKeys(t *testing.T) {
 	if len(keyRRs) != 2 {
 		t.Fatalf("expected 2 KEY RRs, got %d", len(keyRRs))
 	}
-	if keyRRs[0].PublicKey[0] != 'A' || keyRRs[1].PublicKey[0] != 'A' {
-		t.Fatalf("expected valid KEY RRs")
+	if keyRRs[0].PublicKey != key1.PublicKey || keyRRs[1].PublicKey != key2.PublicKey {
+		t.Fatalf("expected both KEY RRs extracted unchanged, got %q and %q", keyRRs[0].PublicKey, keyRRs[1].PublicKey)
 	}
 }
 
@@ -133,7 +132,7 @@ func TestConstructUpstreamUpdateIncludesNonKeyOnlyRecordsOnce(t *testing.T) {
 }
 
 func TestClampLeaseDurationsAppliesBoundsAndKeepsOrder(t *testing.T) {
-	h := NewUpdateHandler()
+	h := newTestHandler()
 	h.LeasePolicy = LeasePolicy{
 		MinKeyLease: 20,
 		MaxKeyLease: 30,
@@ -162,7 +161,7 @@ func TestClampLeaseDurationsAppliesBoundsAndKeepsOrder(t *testing.T) {
 }
 
 func TestClampLeaseDurationsPreservesZeroSemantics(t *testing.T) {
-	h := NewUpdateHandler()
+	h := newTestHandler()
 	h.LeasePolicy = LeasePolicy{
 		MinKeyLease: 20,
 		MaxKeyLease: 30,
@@ -182,7 +181,7 @@ func TestClampLeaseDurationsPreservesZeroSemantics(t *testing.T) {
 }
 
 func TestNonKeyLeaseExpiresBeforeKeyLease(t *testing.T) {
-	h := NewUpdateHandler()
+	h := newTestHandler()
 	ctx := context.Background()
 	key := testKeyRR("test.dev.zenr.io.", "AAAATESTKEY444=")
 	data := &dns.TXT{Hdr: dns.Header{Name: "test.dev.zenr.io.", Class: dns.ClassINET, TTL: 60}}
@@ -195,7 +194,7 @@ func TestNonKeyLeaseExpiresBeforeKeyLease(t *testing.T) {
 		t.Fatalf("upsert non-key record: %v", err)
 	}
 	h.scheduleLeaseExpiry(lease.NodeKey(key))
-	defer h.clearLeaseTimer(lease.NodeKey(key))
+	defer h.timers.disarm(lease.NodeKey(key))
 
 	time.Sleep(1300 * time.Millisecond)
 	nonKeyLease := h.leaseManager.GetNonKEYRecordSet(lease.NodeKey(key))
@@ -208,8 +207,11 @@ func TestNonKeyLeaseExpiresBeforeKeyLease(t *testing.T) {
 	}
 
 	time.Sleep(1100 * time.Millisecond)
-	if got := h.leaseManager.LookupByKEY(key); got != nil {
-		t.Fatalf("expected key lease removed after key-lease expiry")
+	if h.leaseManager.Get(lease.NodeKey(key)) != nil {
+		t.Fatalf("expected key lease removed from the store after key-lease expiry")
+	}
+	if n := h.upstreamCoordinator.(*stubUpstreamCoordinator).sentCount(); n != 2 {
+		t.Fatalf("expected two upstream deletes (the TXT at its LEASE, the KEY at its KEY-LEASE), got %d", n)
 	}
 }
 
@@ -261,7 +263,7 @@ func TestExtractUpdateRecordsNoKEYRR_NoOtherRecords(t *testing.T) {
 
 func TestKeyLeaseZeroDeleteKeyNoOtherRecords(t *testing.T) {
 	// Case 2: KEY-LEASE == 0, LEASE != 0, no otherRecords → delete key
-	h := NewUpdateHandler()
+	h := newTestHandler()
 	ctx := context.Background()
 
 	// First, register a key lease.
@@ -281,16 +283,16 @@ func TestKeyLeaseZeroDeleteKeyNoOtherRecords(t *testing.T) {
 	if err := h.leaseManager.Delete(lease.NodeKey(key)); err != nil {
 		t.Fatalf("delete key lease: %v", err)
 	}
-	h.clearLeaseTimer(lease.NodeKey(key))
+	h.timers.disarm(lease.NodeKey(key))
 
-	if got := h.leaseManager.LookupByKEY(key); got != nil {
-		t.Fatalf("expected lease removed after deletion")
+	if h.leaseManager.Get(lease.NodeKey(key)) != nil {
+		t.Fatalf("expected lease removed from the store after deletion")
 	}
 }
 
 func TestKeyLeaseZeroDeleteKeyAndNonKeyWithOtherRecords(t *testing.T) {
 	// Case 3: KEY-LEASE == 0, LEASE == 0, otherRecords present → delete KEY and non-KEY records
-	h := NewUpdateHandler()
+	h := newTestHandler()
 	ctx := context.Background()
 
 	// Register a key lease with non-KEY records.
@@ -321,11 +323,11 @@ func TestKeyLeaseZeroDeleteKeyAndNonKeyWithOtherRecords(t *testing.T) {
 	if err := h.leaseManager.Delete(lease.NodeKey(key)); err != nil {
 		t.Fatalf("delete key lease: %v", err)
 	}
-	h.clearLeaseTimer(lease.NodeKey(key))
+	h.timers.disarm(lease.NodeKey(key))
 
 	// Verify both leases are gone.
-	if got := h.leaseManager.LookupByKEY(key); got != nil {
-		t.Fatalf("expected key lease removed after deletion")
+	if h.leaseManager.Get(lease.NodeKey(key)) != nil {
+		t.Fatalf("expected key lease removed from the store after deletion")
 	}
 	nonKeyLease = h.leaseManager.GetNonKEYRecordSet(lease.NodeKey(key))
 	if nonKeyLease != nil && len(nonKeyLease.Records) != 0 {
@@ -335,7 +337,7 @@ func TestKeyLeaseZeroDeleteKeyAndNonKeyWithOtherRecords(t *testing.T) {
 
 func TestKeyLeaseZeroNonKeyOnlyRegistration(t *testing.T) {
 	// Case 1: KEY-LEASE == 0, LEASE != 0, otherRecords present → register non-KEY lease only
-	h := NewUpdateHandler()
+	h := newTestHandler()
 	ctx := context.Background()
 
 	// Register a key lease (existing key).
@@ -367,7 +369,7 @@ func TestKeyLeaseZeroNonKeyOnlyRegistration(t *testing.T) {
 
 func TestKeyLeaseZeroDeleteKeyNoOtherRecords_Expires(t *testing.T) {
 	// Full lifecycle test: register, delete key (KEY-LEASE == 0, no otherRecords), verify expiry
-	h := NewUpdateHandler()
+	h := newTestHandler()
 	ctx := context.Background()
 
 	key := testKeyRR("test.dev.zenr.io.", "AAAATESTKEY888=")
@@ -378,8 +380,8 @@ func TestKeyLeaseZeroDeleteKeyNoOtherRecords_Expires(t *testing.T) {
 
 	// Wait for initial lease to expire.
 	time.Sleep(1500 * time.Millisecond)
-	if h.leaseManager.LookupByKEY(key) != nil {
-		t.Fatalf("expected initial lease to have expired")
+	if h.leaseManager.Get(lease.NodeKey(key)) != nil {
+		t.Fatalf("expected initial lease to have expired and been removed from the store")
 	}
 
 	// Now register a new lease and immediately delete it (KEY-LEASE == 0, no otherRecords).
@@ -392,10 +394,10 @@ func TestKeyLeaseZeroDeleteKeyNoOtherRecords_Expires(t *testing.T) {
 	if err := h.leaseManager.Delete(lease.NodeKey(key)); err != nil {
 		t.Fatalf("delete key lease: %v", err)
 	}
-	h.clearLeaseTimer(lease.NodeKey(key))
+	h.timers.disarm(lease.NodeKey(key))
 
-	if got := h.leaseManager.LookupByKEY(key); got != nil {
-		t.Fatalf("expected key lease to be removed immediately after deletion")
+	if h.leaseManager.Get(lease.NodeKey(key)) != nil {
+		t.Fatalf("expected key lease to be removed from the store immediately after deletion")
 	}
 }
 
@@ -428,7 +430,7 @@ func TestRecordKey_DistinguishesDifferentPriorities(t *testing.T) {
 }
 
 func TestSetNonKeyLease_StoresMXRecordsWithDifferentPriority(t *testing.T) {
-	h := NewUpdateHandler()
+	h := newTestHandler()
 	ctx := context.Background()
 
 	key := testKeyRR("test.dev.zenr.io.", "AAAAMXPRIORITYKEY=")
@@ -453,13 +455,13 @@ func TestSetNonKeyLease_StoresMXRecordsWithDifferentPriority(t *testing.T) {
 }
 
 func TestFilterDuplicateRegistrations_RejectsDuplicateRecord(t *testing.T) {
-	h := NewUpdateHandler()
+	h := newTestHandler()
 	existing := &dns.TXT{Hdr: dns.Header{Name: "test.dev.zenr.io.", Class: dns.ClassINET, TTL: 60}}
 	existing.TXT.Txt = []string{"existing"}
 	newRec := &dns.TXT{Hdr: dns.Header{Name: "test.dev.zenr.io.", Class: dns.ClassINET, TTL: 60}}
 	newRec.TXT.Txt = []string{"new"}
 
-	h.authoritativeLookup = func(ctx context.Context, zoneHint, fqdn string, rrType uint16) ([]dns.RR, error) {
+	h.upstreamCoordinator.(*stubUpstreamCoordinator).query = func(ctx context.Context, zoneHint, fqdn string, rrType uint16) ([]dns.RR, error) {
 		if rrType != dns.TypeTXT {
 			return nil, nil
 		}
@@ -479,11 +481,11 @@ func TestFilterDuplicateRegistrations_RejectsDuplicateRecord(t *testing.T) {
 }
 
 func TestFilterDuplicateRegistrations_RejectsAuthoritativeDuplicateRecord(t *testing.T) {
-	h := NewUpdateHandler()
+	h := newTestHandler()
 	record := &dns.TXT{Hdr: dns.Header{Name: "test.dev.zenr.io.", Class: dns.ClassINET, TTL: 60}}
 	record.TXT.Txt = []string{"existing"}
 
-	h.authoritativeLookup = func(ctx context.Context, zoneHint, fqdn string, rrType uint16) ([]dns.RR, error) {
+	h.upstreamCoordinator.(*stubUpstreamCoordinator).query = func(ctx context.Context, zoneHint, fqdn string, rrType uint16) ([]dns.RR, error) {
 		if rrType != dns.TypeTXT {
 			return nil, nil
 		}
@@ -519,7 +521,7 @@ func TestSetNonKeyLease_SameRecordDifferentTTL_SingleEntry(t *testing.T) {
 	// Register a record with TTL=60, then same record at TTL=120.
 	// Per rfc2136 - 1.1 - Comparison Rules: TTL is excluded from RR comparison.
 	// Same record with different TTLs overwrites the previous entry (single entry).
-	h := NewUpdateHandler()
+	h := newTestHandler()
 	ctx := context.Background()
 
 	key := testKeyRR("test.dev.zenr.io.", "AAAATESTKEY999=")
@@ -650,7 +652,7 @@ func TestUpdateHandlerSetupParsesBlacklistedTypes(t *testing.T) {
 	if err != nil {
 		t.Fatalf("setup test keystore: %v", err)
 	}
-	h := NewUpdateHandler()
+	h := newTestHandler()
 	h.SetLogger(logging.NewLogger("debug"))
 	cfg := map[string]interface{}{
 		"upstream_zone": "dev.zenr.io.",
@@ -719,7 +721,7 @@ func TestUpdateHandlerSetupHandlesUnknownBlacklistedTypes(t *testing.T) {
 	if err != nil {
 		t.Fatalf("setup test keystore: %v", err)
 	}
-	h := NewUpdateHandler()
+	h := newTestHandler()
 	h.SetLogger(logging.NewLogger("debug"))
 	cfg := map[string]interface{}{
 		"upstream_zone": "dev.zenr.io.",
@@ -769,7 +771,7 @@ func TestUpdateHandlerNoBlacklistAllowsAllTypes(t *testing.T) {
 	if err != nil {
 		t.Fatalf("setup test keystore: %v", err)
 	}
-	h := NewUpdateHandler()
+	h := newTestHandler()
 	h.SetLogger(logging.NewLogger("debug"))
 	cfg := map[string]interface{}{
 		"upstream_zone": "dev.zenr.io.",
@@ -802,7 +804,7 @@ func TestHandle_CaseD_KeyRefreshWithAccompanyingNonKeyDelete_ForwardsUpstreamAnd
 		t.Fatalf("load owner key: %v", err)
 	}
 
-	h := NewUpdateHandler()
+	h := newTestHandler()
 	h.SetLogger(newTestHandler().logger)
 	if err := h.Setup(map[string]any{
 		"upstream_zone": "dev.zenr.io.",
@@ -812,7 +814,7 @@ func TestHandle_CaseD_KeyRefreshWithAccompanyingNonKeyDelete_ForwardsUpstreamAnd
 	}
 	coordinator := &stubUpstreamCoordinator{resp: &dns.Msg{MsgHeader: dns.MsgHeader{Rcode: dns.RcodeSuccess}}}
 	h.upstreamCoordinator = coordinator
-	h.authoritativeLookup = func(ctx context.Context, zoneHint, fqdn string, rrType uint16) ([]dns.RR, error) {
+	h.upstreamCoordinator.(*stubUpstreamCoordinator).query = func(ctx context.Context, zoneHint, fqdn string, rrType uint16) ([]dns.RR, error) {
 		if rrType == dns.TypeKEY && canonicalName(fqdn) == canonicalName(owner.PublicKey.Hdr.Name) {
 			return []dns.RR{owner.PublicKey}, nil
 		}

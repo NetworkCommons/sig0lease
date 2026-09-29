@@ -197,15 +197,44 @@ instances' discoverability. A PTR only ever moves via an individual add/delete i
 
 **Maintenance rules (§5.1):**
 
-- Lease time governs the hostname. When the hostname's KEY-LEASE expires, the hostname and
-  every service instance targeting it are removed together (cascade).
+- `LEASE` governs the data, `KEY-LEASE` the KEYs (§3.2.5.3). When a hostname's `LEASE`
+  expires, its `A`/`AAAA` and the `SRV`/`TXT`/`PTR` of every service instance targeting it are
+  removed together (cascade), even where an instance's own `LEASE` would have run longer.
 - The registrar also tracks a lease per service instance independently (a client may
-  re-register a host with a different service set and drop the old one).
-- KEY records survive on the KEY-LEASE schedule (typically 14 days) even after the data lease
-  expires, reserving the name.
-- A Service Discovery PTR is removed whenever its target service instance is removed.
+  re-register a host with a different service set and drop the old one). An instance whose own
+  `LEASE` expires first loses its `SRV`/`TXT`/`PTR`; its host's data is left alone.
+- KEY records, the host's and the instances' alike, survive on the `KEY-LEASE` schedule
+  (typically 14 days) after the data has expired, reserving the names. When `KEY-LEASE`
+  expires, the node's whole subtree is removed.
+- A Service Discovery PTR is removed whenever its target service instance's data is removed.
 - The baseline refresh clock is 80% of the lease plus a 0–5% random offset (RFC 9664 §5.2, a
   MUST — shared with the base handler, see `docs/siglease_rfc9664.md`).
+
+**How expiry runs.** Each KEY node has one timer, armed for its next lease event: its earliest
+data record's `LEASE` or its own `KEY-LEASE`, whichever comes first. The timer table and its
+retry policy (`expiryTimers`), the timer arithmetic (`nextLeaseEvent`) and the per-record,
+upstream-first data expiry (`expireNonKEYRecords`) are the same code `UpdateHandler` uses for
+RFC 9664 records, so both handlers age the lease store the same way. A `LEASE` event deletes each
+due record upstream with an individual `Delete An RR From An RRSet`, never a `Delete All RRsets`
+at the node's name, which would take the KEY with it. This also reaches PTRs at the shared
+service-type name exactly. Each record is forgotten locally only once its upstream delete is
+confirmed. A `KEY-LEASE` event sends `Delete All RRsets` for every name in the subtree, plus
+explicit PTR deletes, and then drops the subtree locally. Either way, an attempt that leaves
+anything pending (a delete that failed or was refused) is retried after a backoff of 1s,
+doubling up to 16s (`expiryRetryDelay`). No standard sets this; it keeps the window in which
+an expired record is still published upstream short (RFC 9664 §7's "MUST NOT return that RR").
+The 30-second reconciliation pass only re-arms a node that has no timer at all. A handler
+without its upstream coordinator or signing key (a state `Setup` refuses to produce) panics
+rather than expiring anything (`requireUpstream`).
+
+**Concurrent UPDATEs.** Every UPDATE the proxy sends is SIG(0)-signed, and BIND 9.20 verifies at
+most `sig0checks-quota` SIG(0) signatures at a time (default 1), answering REFUSED to the rest
+rather than queueing them. `authoritative.max_inflight_updates` in `config.yaml` (default 1, `0`
+for no limit) caps how many UPDATEs the process has in flight to each authoritative server,
+counted across both handlers (`updatecore.SetMaxInflightUpdates`). Set it to the upstream
+server's `sig0checks-quota`. BIND frees a slot only after it has sent its response, and other
+SIG(0) clients of the same server share its quota, so an occasional REFUSED is still possible;
+the expiry retry covers it, and a client gets SERVFAIL and retries.
 
 ## 7. KEY synthesis for Service Descriptions
 

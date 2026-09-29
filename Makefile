@@ -96,18 +96,20 @@ lint:
 
 # Run the complete test matrix.
 # Requires CLIENT_KEYSTORE_DIR for the client key, ex. CLIENT_KEYSTORE_DIR=${PWD}/keystore/client make test-full
+# All go test targets run with the race detector: the handlers' lease-expiry timers run on
+# their own goroutines, and an unsynchronized test/timer access is only caught with -race.
 test-unit: fmt vet
-	CLIENT_KEYSTORE_DIR=$(CLIENT_KEYSTORE_DIR) go test ./...
+	CLIENT_KEYSTORE_DIR=$(CLIENT_KEYSTORE_DIR) go test -race ./...
 
 # Run specific test file or package
 # Example: make test-pkg PKG=./pkg/sig0
 test-pkg:
-	go test $(PKG) -v
+	go test -race $(PKG) -v
 
 # Run tests with coverage
 # Requires CLIENT_KEYSTORE_DIR for the client key, ex. CLIENT_KEYSTORE_DIR=${PWD}/keystore/client make test-cover
 test-cover:
-	CLIENT_KEYSTORE_DIR=$(CLIENT_KEYSTORE_DIR) go test ./... -coverprofile=coverage.out
+	CLIENT_KEYSTORE_DIR=$(CLIENT_KEYSTORE_DIR) go test -race ./... -coverprofile=coverage.out
 	go tool cover -func=coverage.out
 
 # Run full end-to-end update workflow via test script.

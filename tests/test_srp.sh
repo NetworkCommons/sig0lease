@@ -4,7 +4,7 @@
 #
 # Runs the real proxy process (srp_handler only) against a real, disposable local BIND 9
 # instance authoritative for srp.test. -- register -> dig -> refresh -> conflict (YXDOMAIN)
-# -> remove-one -> remove-all -> expiry. Uses tests/srp_client_tester (a minimal Go test
+# -> remove-one -> remove-all -> expiry -> LEASE-only expiry. Uses tests/srp_client_tester (a minimal Go test
 # client -- client/srp and cmd/sig0lease-srp-client are Phase 4, not built yet), not stubs/mocks.
 
 set -euo pipefail
@@ -18,12 +18,14 @@ SRP_PROXY_ADDR="127.0.0.1"
 SRP_PROXY_PORT="${SRP_PROXY_PORT:-8159}"
 SRP_PROXY_URL="${SRP_PROXY_ADDR}:${SRP_PROXY_PORT}"
 SRP_KEYSTORE_DIR="${TESTS_DIR}/keystore-srp-bind9"
-SRP_LEASE_SECONDS="${SRP_LEASE_SECONDS:-5}"
+SRP_LEASE_SECONDS="${SRP_LEASE_SECONDS:-30}" # outlasts TESTs 1-5, which assert data is still present
 SRP_KEY_LEASE_SECONDS="${SRP_KEY_LEASE_SECONDS:-1209600}"
 SRP_EXPIRY_LEASE_SECONDS=1
 SRP_EXPIRY_TIMEOUT=40 # covers the 30s reconciliation-retry path (see processExpiredNode's
                        # RCODE-check fix: a transiently-REFUSED expiry-delete self-heals on
                        # the next reconciliation pass rather than corrupting local state)
+SRP_DATA_EXPIRY_LEASE_SECONDS=2
+SRP_DATA_EXPIRY_KEY_LEASE_SECONDS=120 # well past SRP_EXPIRY_TIMEOUT -- see test_lease_expiry_keeps_keys
 
 SRP_PROXY_BIN="${TESTS_DIR}/../bin/${OS}/sig0lease"
 SRP_CLIENT_BIN="${TESTS_DIR}/../bin/${OS}/srp_client_tester"
@@ -64,6 +66,8 @@ handlers:
       max_key_lease_sec: 1209600
       min_rr_lease_sec: 1
       max_rr_lease_sec: 7200
+authoritative:
+  max_inflight_updates: ${BIND9_SIG0_QUOTA}
 processing_rules:
   - opcode: 5
     modules: ["srp_handler"]
@@ -279,6 +283,38 @@ test_expiry() {
     PERFORMED_TESTS="$PERFORMED_TESTS\n  [OK] $log_msg"
 }
 
+test_lease_expiry_keeps_keys() {
+    # RFC 9665 S3.2.5.3/S5.1: data records live for LEASE, KEYs for KEY-LEASE. With LEASE well
+    # short of KEY-LEASE, the host's A and the instance's SRV/TXT/PTR must go at LEASE while
+    # both KEYs stay published, reserving the names. KEY-LEASE is kept well past
+    # SRP_EXPIRY_TIMEOUT so a data delete that only lands via the reconciliation retry is
+    # still checked before the KEY-LEASE expiry's own cleanup could mask it.
+    local log_msg="TEST 7: LEASE expiry (LEASE=${SRP_DATA_EXPIRY_LEASE_SECONDS}s < KEY-LEASE=${SRP_DATA_EXPIRY_KEY_LEASE_SECONDS}s) removes data, keeps KEYs"
+    log_section "$log_msg"
+
+    local out
+    out="$(run_srp_client id4-lease-expiry -host=host4.srp.test. -inst=Gizmo._http._tcp.srp.test. \
+        -lease="$SRP_DATA_EXPIRY_LEASE_SECONDS" -keylease="$SRP_DATA_EXPIRY_KEY_LEASE_SECONDS")"
+    echo "$out"
+    echo "$out" | grep -q "Status: NOERROR (Rcode=0)" || { log_error "fresh registration for LEASE expiry test did not return NOERROR"; return 1; }
+    wait_for_srp_state _services._dns-sd._udp.srp.test. PTR present 10 \
+        || { log_error "S9 enumeration record did not pick the type back up after a fresh registration"; return 1; }
+
+    log_step "Waiting up to ${SRP_EXPIRY_TIMEOUT}s for the data records to expire at LEASE"
+    wait_for_srp_state host4.srp.test. A absent "$SRP_EXPIRY_TIMEOUT" || return 1
+    wait_for_srp_state Gizmo._http._tcp.srp.test. SRV absent "$SRP_EXPIRY_TIMEOUT" || return 1
+    wait_for_srp_state Gizmo._http._tcp.srp.test. TXT absent "$SRP_EXPIRY_TIMEOUT" || return 1
+    wait_for_srp_state _http._tcp.srp.test. PTR absent "$SRP_EXPIRY_TIMEOUT" || return 1
+    wait_for_srp_state _services._dns-sd._udp.srp.test. PTR absent "$SRP_EXPIRY_TIMEOUT" \
+        || { log_error "S9 enumeration record still lists a type with no live instances after LEASE expiry"; return 1; }
+
+    [ -n "$(dig_srp host4.srp.test. KEY)" ] || { log_error "host KEY disappeared at LEASE expiry -- it must stay until KEY-LEASE"; return 1; }
+    [ -n "$(dig_srp Gizmo._http._tcp.srp.test. KEY)" ] || { log_error "instance KEY disappeared at LEASE expiry -- it must stay until KEY-LEASE"; return 1; }
+
+    log_success "LEASE expiry removed host A, instance SRV/TXT, the shared-type PTR and the S9 enumeration record; both KEYs still published"
+    PERFORMED_TESTS="$PERFORMED_TESTS\n  [OK] $log_msg"
+}
+
 ################################
 # Top level
 ################################
@@ -306,18 +342,25 @@ run_all_tests() {
     test_remove_one_instance
     test_remove_all
     test_expiry
+    test_lease_expiry_keeps_keys
+
+    bind9_report_rejections || return 1
+    BIND9_REJECTIONS_REPORTED=1
 
     log_section "TEST RESULTS"
     echo -e "${GREEN}All SRP integration tests completed successfully!${NC}"
     echo -e "$PERFORMED_TESTS"
     echo ""
     echo "SRP proxy log: $SRP_PROXY_LOG"
-    echo "BIND log: ${BIND9_RUNDIR}/named.stdout.log"
+    echo "BIND log: ${BIND9_RUNDIR}/named.log"
 }
 
 cleanup() {
     set +e
     log_section "CLEANUP"
+    # A run that failed before reaching run_all_tests' own report still shows why named
+    # rejected anything -- often the reason a later wait_for_srp_state timed out.
+    [ -z "${BIND9_REJECTIONS_REPORTED:-}" ] && bind9_report_rejections
     stop_srp_proxy
     stop_bind9
     [ -n "$SRP_KEY_DIR" ] && rm -rf "$SRP_KEY_DIR"

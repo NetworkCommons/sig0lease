@@ -124,7 +124,6 @@ func (h *UpdateHandler) Setup(cfg map[string]any) error {
 		return fmt.Errorf("failed to resolve upstream signing key for zone %s: %w", h.upstreamZone, err)
 	}
 	h.upstreamKeyRecord = upstreamKey
-	h.upstreamKeyZone = matchedZone
 	h.logger.Debugf("Loaded upstream key for configured zone %s from key zone %s: %s", h.upstreamZone, matchedZone, upstreamKey)
 
 	// Optional: exactly one of "lease_manager" (Go-embedding only) or

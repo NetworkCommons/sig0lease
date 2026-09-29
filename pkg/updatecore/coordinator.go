@@ -196,6 +196,14 @@ func (c *Coordinator) SendUpdate(ctx context.Context, upstreamZone string, updat
 	}
 	c.logger.Debugf("Resolved SOA master for zone %s (effective zone %s): %s", upstreamZone, authZone, soaServer)
 
+	// Held across both attempts below, so the server never sees more of this process's
+	// UPDATEs at once than SetMaxInflightUpdates allows.
+	release, err := inflightUpdates.acquire(ctx, soaServer)
+	if err != nil {
+		return nil, err
+	}
+	defer release()
+
 	resp, udpErr := dns.Exchange(ctx, updateMsg, "udp", soaServer)
 	if udpErr == nil {
 		c.logger.Debugf("Authoritative UPDATE over UDP succeeded: server=%s rcode=%d", soaServer, resp.Rcode)
@@ -212,6 +220,34 @@ func (c *Coordinator) SendUpdate(ctx context.Context, upstreamZone string, updat
 	return nil, fmt.Errorf("authoritative update failed to SOA master %s (udp: %v, tcp: %v)", soaServer, udpErr, tcpErr)
 }
 
+// queryAuthoritative sends req to zoneHint's authoritative server (ResolveSOAMasterServer,
+// honoring a static override) over UDP, falling back to TCP on a UDP failure or a truncated
+// answer. A truncated UDP answer must not be trusted as-is: its empty (or partial) Answer
+// section would otherwise read as "no such records" -- letting FCFS treat an already-owned
+// name as free, say -- even though the name really has more data than fit in the UDP
+// response. This fork's dns.Exchange neither retries nor falls back to TCP on truncation on
+// its own (see its doc comment), so it has to happen here. what names the query in errors.
+func (c *Coordinator) queryAuthoritative(ctx context.Context, zoneHint string, req *dns.Msg, what string) (*dns.Msg, error) {
+	soaServer, _, err := c.ResolveSOAMasterServer(ctx, zoneHint)
+	if err != nil {
+		return nil, fmt.Errorf("failed to resolve authoritative server for %s: %w", zoneHint, err)
+	}
+	req.RecursionDesired = false
+
+	resp, udpErr := dns.Exchange(ctx, req, "udp", soaServer)
+	if udpErr != nil || (resp != nil && resp.Truncated) {
+		tcpResp, tcpErr := dns.Exchange(ctx, req, "tcp", soaServer)
+		if tcpErr != nil {
+			return nil, fmt.Errorf("%s failed (udp: %v, tcp: %v)", what, udpErr, tcpErr)
+		}
+		resp = tcpResp
+	}
+	if resp == nil {
+		return nil, fmt.Errorf("%s returned a nil response", what)
+	}
+	return resp, nil
+}
+
 // QueryKeyAtName is the real implementation of AuthoritativeKeyQuery (S3.3.3 FCFS):
 // one live QTYPE=KEY query at name against zoneHint's resolved authoritative server
 // (ResolveSOAMasterServer, honoring a static override), reporting the tri-state result
@@ -219,34 +255,13 @@ func (c *Coordinator) SendUpdate(ctx context.Context, upstreamZone string, updat
 // backs both the FCFS check (S3.3) and, when reused by a caller, the "does this name
 // already have a KEY" question the base handler asks elsewhere.
 func (c *Coordinator) QueryKeyAtName(ctx context.Context, zoneHint, name string) (AuthoritativeKeyState, []*dns.KEY, error) {
-	soaServer, _, err := c.ResolveSOAMasterServer(ctx, zoneHint)
-	if err != nil {
-		return 0, nil, fmt.Errorf("failed to resolve authoritative server for %s: %w", zoneHint, err)
-	}
-
 	req := dns.NewMsg(name, dns.TypeKEY)
 	if req == nil {
 		return 0, nil, fmt.Errorf("failed to build KEY query for %s", name)
 	}
-	req.RecursionDesired = false
-
-	// A truncated UDP answer must not be trusted as-is: an empty (or partial) Answer
-	// section on a TC=1 response would otherwise be read as AuthNoKey/AuthNXDomain --
-	// letting FCFS treat an already-owned name as free -- even though the name really
-	// does have KEY data, just more than fit in the UDP response. This fork's
-	// dns.Exchange does not retry or fall back to TCP on truncation on its own (see its
-	// own doc comment), so that fallback has to happen here, same as SendUpdate already
-	// does for a transport-level UDP failure.
-	resp, udpErr := dns.Exchange(ctx, req, "udp", soaServer)
-	if udpErr != nil || (resp != nil && resp.Truncated) {
-		tcpResp, tcpErr := dns.Exchange(ctx, req, "tcp", soaServer)
-		if tcpErr != nil {
-			return 0, nil, fmt.Errorf("KEY query for %s failed (udp: %v, tcp: %v)", name, udpErr, tcpErr)
-		}
-		resp = tcpResp
-	}
-	if resp == nil {
-		return 0, nil, fmt.Errorf("KEY query for %s returned a nil response", name)
+	resp, err := c.queryAuthoritative(ctx, zoneHint, req, "KEY query for "+name)
+	if err != nil {
+		return 0, nil, err
 	}
 
 	switch resp.Rcode {
@@ -280,27 +295,13 @@ func (c *Coordinator) QueryKeyAtName(ctx context.Context, zoneHint, name string)
 // local lease store doesn't know about still provides it -- see that function's doc comment
 // for why a local-only view can't safely decide this alone.
 func (c *Coordinator) QueryPTRExists(ctx context.Context, zoneHint, name string) (bool, error) {
-	soaServer, _, err := c.ResolveSOAMasterServer(ctx, zoneHint)
-	if err != nil {
-		return false, fmt.Errorf("failed to resolve authoritative server for %s: %w", zoneHint, err)
-	}
-
 	req := dns.NewMsg(name, dns.TypePTR)
 	if req == nil {
 		return false, fmt.Errorf("failed to build PTR query for %s", name)
 	}
-	req.RecursionDesired = false
-
-	resp, udpErr := dns.Exchange(ctx, req, "udp", soaServer)
-	if udpErr != nil || (resp != nil && resp.Truncated) {
-		tcpResp, tcpErr := dns.Exchange(ctx, req, "tcp", soaServer)
-		if tcpErr != nil {
-			return false, fmt.Errorf("PTR query for %s failed (udp: %v, tcp: %v)", name, udpErr, tcpErr)
-		}
-		resp = tcpResp
-	}
-	if resp == nil {
-		return false, fmt.Errorf("PTR query for %s returned a nil response", name)
+	resp, err := c.queryAuthoritative(ctx, zoneHint, req, "PTR query for "+name)
+	if err != nil {
+		return false, err
 	}
 
 	switch resp.Rcode {
@@ -316,6 +317,32 @@ func (c *Coordinator) QueryPTRExists(ctx context.Context, zoneHint, name string)
 	default:
 		return false, fmt.Errorf("PTR query for %s returned unexpected rcode %d (%s)", name, resp.Rcode, dns.RcodeToString[resp.Rcode])
 	}
+}
+
+// QueryRRs returns the rrType records at name from zoneHint's authoritative server -- none
+// for NXDOMAIN -- with the same query/fallback shape as QueryKeyAtName. Used by the RFC 9664
+// handler's checks of what is already published (signer KEYs, duplicate registrations).
+func (c *Coordinator) QueryRRs(ctx context.Context, zoneHint, name string, rrType uint16) ([]dns.RR, error) {
+	what := fmt.Sprintf("%s query for %s", dns.TypeToString[rrType], name)
+	req := dns.NewMsg(name, rrType)
+	if req == nil {
+		return nil, fmt.Errorf("failed to build %s", what)
+	}
+	resp, err := c.queryAuthoritative(ctx, zoneHint, req, what)
+	if err != nil {
+		return nil, err
+	}
+	if resp.Rcode != dns.RcodeSuccess && resp.Rcode != dns.RcodeNameError {
+		return nil, fmt.Errorf("%s returned unexpected rcode %d (%s)", what, resp.Rcode, dns.RcodeToString[resp.Rcode])
+	}
+
+	rrs := make([]dns.RR, 0, len(resp.Answer))
+	for _, rr := range resp.Answer {
+		if rr != nil && rr.Header() != nil && dns.RRToType(rr) == rrType {
+			rrs = append(rrs, rr)
+		}
+	}
+	return rrs, nil
 }
 
 // FindAuthorizedProxyKey loads the proxy's own SIG(0) signing key for zone from

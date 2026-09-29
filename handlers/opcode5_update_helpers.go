@@ -9,7 +9,6 @@ import (
 	"codeberg.org/miekg/dns"
 	"github.com/NetworkCommons/sig0lease/pkg/keyrec"
 	"github.com/NetworkCommons/sig0lease/pkg/sig0"
-	"github.com/NetworkCommons/sig0lease/pkg/updatecore"
 )
 
 // summarizeRRTypes builds a compact, deterministic "TYPE:count" summary of
@@ -156,37 +155,6 @@ func (h *UpdateHandler) constructUpstreamDeleteForKeysAndRecords(keyRRs []*dns.K
 	msg.Extra = append(msg.Extra, opt)
 
 	return h.signUpstreamUpdate(msg, "DELETE", signingKey)
-}
-
-// resolveUpstreamSigningContext resolves the proxy's own signing key and the
-// effective (post-SOA-resolution) upstream zone used to sign and address
-// forwarded UPDATE messages. Shared by add- and delete-style forwarding.
-//
-// The signing key itself is Setup's own upstreamKeyRecord, cached once there rather than
-// re-read from the keystore directory on every call -- this used to call
-// updatecore.FindAuthorizedProxyKey (disk I/O: a directory scan plus parsing the key file)
-// on every single request and every lease-expiry tick. Setup already fails the whole
-// handler if this key can't be loaded, so a nil upstreamKeyRecord here would mean Setup
-// never ran or itself failed -- both caller bugs, not a per-request condition to recover
-// from; picking up a rotated key on disk still requires restarting the process, same as
-// before this cached the lookup (this was never a live-reload mechanism).
-func (h *UpdateHandler) resolveUpstreamSigningContext(ctx context.Context) (*keyrec.LoadedKey, string, error) {
-	if h.upstreamKeyRecord == nil {
-		return nil, "", fmt.Errorf("upstream signing key resolution failed: no key cached (Setup did not run or did not succeed)")
-	}
-	signingKey := h.upstreamKeyRecord
-	h.logger.Debugf("Using cached proxy authorization key for upstream zone %s (found at key zone %s)", h.upstreamZone, h.upstreamKeyZone)
-
-	effectiveUpstreamZone := h.upstreamZone
-	if dc, ok := h.upstreamCoordinator.(*updatecore.Coordinator); ok {
-		resolvedZone, err := dc.ResolveAuthoritativeZone(ctx, h.upstreamZone)
-		if err != nil {
-			return nil, "", fmt.Errorf("upstream zone resolution failed: %w", err)
-		}
-		effectiveUpstreamZone = resolvedZone
-		h.logger.Debugf("Resolved effective upstream zone: configured=%s effective=%s", h.upstreamZone, effectiveUpstreamZone)
-	}
-	return signingKey, effectiveUpstreamZone, nil
 }
 
 func extractUpdateRecords(msg *dns.Msg, blacklistedTypes map[uint16]struct{}) ([]*dns.KEY, []dns.RR, error) {
@@ -504,56 +472,11 @@ func rrEqual(a, b dns.RR) bool {
 	}
 }
 
-func (h *UpdateHandler) queryAuthoritativeRRs(ctx context.Context, zoneHint string, fqdn string, rrType uint16) ([]dns.RR, error) {
-	if h.authoritativeLookup != nil {
-		return h.authoritativeLookup(ctx, zoneHint, fqdn, rrType)
-	}
-
-	dc, ok := h.upstreamCoordinator.(*updatecore.Coordinator)
-	if !ok {
-		return nil, fmt.Errorf("authoritative lookup requires default upstream coordinator")
-	}
-
-	soaServer, _, err := dc.ResolveSOAMasterServer(ctx, zoneHint)
-	if err != nil {
-		return nil, fmt.Errorf("failed to resolve authoritative server for %s: %w", zoneHint, err)
-	}
-
-	req := dns.NewMsg(fqdn, rrType)
-	if req == nil {
-		return nil, fmt.Errorf("failed to build authoritative query")
-	}
-	req.RecursionDesired = false
-
-	resp, udpErr := dns.Exchange(ctx, req, "udp", soaServer)
-	if udpErr != nil {
-		resp, err = dns.Exchange(ctx, req, "tcp", soaServer)
-		if err != nil {
-			return nil, fmt.Errorf("authoritative lookup failed (udp: %v, tcp: %v)", udpErr, err)
-		}
-	}
-	if resp == nil {
-		return nil, fmt.Errorf("authoritative lookup returned nil response")
-	}
-	if resp.Rcode != dns.RcodeSuccess && resp.Rcode != dns.RcodeNameError {
-		return nil, fmt.Errorf("authoritative lookup rcode=%d (%s)", resp.Rcode, dns.RcodeToString[resp.Rcode])
-	}
-
-	rrs := make([]dns.RR, 0, len(resp.Answer))
-	for _, rr := range resp.Answer {
-		if rr != nil && rr.Header() != nil && dns.RRToType(rr) == rrType {
-			rrs = append(rrs, rr)
-		}
-	}
-
-	return rrs, nil
-}
-
 func (h *UpdateHandler) authoritativeHasRR(ctx context.Context, zoneHint string, rr dns.RR) (bool, error) {
 	if rr == nil || rr.Header() == nil {
 		return false, fmt.Errorf("rr is nil")
 	}
-	rrs, err := h.queryAuthoritativeRRs(ctx, zoneHint, rr.Header().Name, dns.RRToType(rr))
+	rrs, err := h.upstreamCoordinator.QueryRRs(ctx, zoneHint, rr.Header().Name, dns.RRToType(rr))
 	if err != nil {
 		return false, err
 	}
@@ -566,7 +489,7 @@ func (h *UpdateHandler) authoritativeHasRR(ctx context.Context, zoneHint string,
 }
 
 func (h *UpdateHandler) authoritativeHasKeyAtName(ctx context.Context, zoneHint string, fqdn string) (bool, error) {
-	rrs, err := h.queryAuthoritativeRRs(ctx, zoneHint, fqdn, dns.TypeKEY)
+	rrs, err := h.upstreamCoordinator.QueryRRs(ctx, zoneHint, fqdn, dns.TypeKEY)
 	if err != nil {
 		return false, err
 	}
@@ -710,7 +633,7 @@ func (h *UpdateHandler) extractAndValidateSig0(ctx context.Context, msg *dns.Msg
 	}
 
 	// Check if the key is present online
-	authRRS, err := h.queryAuthoritativeRRs(ctx, downstreamZone, sigRR.SignerName, dns.TypeKEY)
+	authRRS, err := h.upstreamCoordinator.QueryRRs(ctx, downstreamZone, sigRR.SignerName, dns.TypeKEY)
 	if err != nil {
 		return nil, nil, signerKeySourceUnknown, fmt.Errorf("failed to resolve signer KEY from authoritative DNS: %w", err)
 	}

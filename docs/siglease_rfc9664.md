@@ -278,7 +278,8 @@ Building on the "Storage Model" rules above: the lease store is a tree rooted at
 - `BaseRecord` fields (type, expiry, lease duration, registration time, parent) are shared by KEY (`Record`) and non-KEY (`NonKEYRecord`) nodes.
 - **Deletion is always physical, never a soft flag.** A record is either present in the store (active) or absent (gone) — there is no intermediate "marked deleted" state to track or eventually reap.
 - **Expiry is handler-driven, not store-driven.** `UpdateHandler.processExpiredLease` — triggered by a per-node `time.AfterFunc` timer (`scheduleLeaseExpiry`, re-armed after every mutation and after every expiry event) — is the only code path that removes an expired KEY or non-KEY record, and it always attempts the corresponding upstream delete first. The store itself never deletes anything on its own initiative, because it has no way to also notify the authoritative server.
-- **Reconciliation backstop:** `UpdateHandler.startLeaseReconciliation` runs every 30 seconds and ensures every KEY node in the store has a live expiry timer, scheduling one via the same `scheduleLeaseExpiry` for any node that lacks one (for example, a node populated by a future snapshot-restore path that doesn't itself arm a timer). For an already-expired node this routes it through the same `processExpiredLease` almost immediately — there is exactly one deletion implementation, not a second one that might skip the upstream call.
+- **Each node's timer fires at its next lease event**, the earliest of its non-KEY records' LEASE and its own KEY-LEASE (`nextLeaseEvent`). Non-KEY records therefore expire individually on their own LEASE, while the KEY and anything else not yet due stay. Each due record gets its own upstream `Delete An RR From An RRSet` (`expireNonKEYRecords`), and it is forgotten locally only once that delete is confirmed. When the KEY expires, every non-KEY record it still owns goes through the same helper regardless of its own LEASE. A delete that is rejected or fails to send leaves the record in the store, and the attempt is retried after a backoff of 1s, doubling up to 16s (`expiryRetryDelay`); success returns the node to its normal lease-event schedule. The proxy has no function without an upstream it can sign for, so a handler missing its upstream coordinator or signing key (a state `Setup()` refuses to produce, and `cmd/sig0lease` exits when `Setup()` fails) panics rather than expiring, retrying, or forgetting anything (`requireUpstream`). The timer table (`expiryTimers`), `nextLeaseEvent` and `expireNonKEYRecords` are shared with the RFC 9665 `SRPHandler`, so both handlers age the lease store the same way (see `docs/siglease_rfc9665.md`, "Maintenance rules").
+- **Reconciliation backstop:** `UpdateHandler.startLeaseReconciliation` runs every 30 seconds and ensures every KEY node in the store has a live expiry timer (a node waiting on a retry already has one), scheduling one via the same `scheduleLeaseExpiry` for any node that lacks one (for example, a node populated by a future snapshot-restore path that doesn't itself arm a timer). For an already-expired node this routes it through the same `processExpiredLease` almost immediately — there is exactly one deletion implementation, not a second one that might skip the upstream call.
 
 **Storage backend abstraction.** All of the above is defined against a single interface, `lease.LeaseStorage` (`pkg/lease/state.go`) — KEY lifecycle, tree/hierarchy, non-KEY record sets, and snapshot import/export/persistence all live on this one interface, and every backend must implement all of it. There is no narrower interface for a partial implementation to fall back to, and the handler never type-asserts down to a subset: a backend either supports the full feature set or `Setup()` fails to configure it at all. *(This same interface, and both backends below, are reused as-is by the RFC 9665 SRP handler, confirmed generic across both handlers' differently-shaped KEY trees with zero production-code changes needed.)*
 
@@ -290,7 +291,7 @@ Two backends are selectable via `handlers.update.storage` in `config.yaml` (see 
 ### Reference to Source Files
 
 - `handlers/opcode5_handle.go` — `Handle()`, the full case dispatch, `buildSuccessResponse`.
-- `handlers/opcode5_lease.go` — lease-store read/write helpers, `validateRefreshOwnership`, `processExpiredLease`, `scheduleLeaseExpiry`, `startLeaseReconciliation`, `UpdateHandler.Shutdown`.
+- `handlers/opcode5_lease.go` — lease-store read/write helpers, `authorizeKeyRefresh`, `processExpiredLease`, `scheduleLeaseExpiry`, `startLeaseReconciliation`, `UpdateHandler.Shutdown`, and the expiry machinery shared with `SRPHandler`: `expiryTimers`, `expiryRetryDelay`, `nextLeaseEvent`, `expireNonKEYRecords`.
 - `handlers/opcode5_update_helpers.go` — SIG(0) resolution (`extractAndValidateSig0`), upstream message construction, duplicate-registration checks.
 - `handlers/opcode5_lease_option.go` — UPDATE-LEASE option parsing and request-side policy validation.
 - `handlers/opcode5_setup.go` — `Setup()`, including storage-backend selection (`buildLeaseManagerFromConfig`).
@@ -307,7 +308,12 @@ Two backends are selectable via `handlers.update.storage` in `config.yaml` (see 
 - default upstream resolvers;
 - handler-specific settings such as the upstream zone, keystore directory, lease policy bounds, blacklisted RR types, `allow_online_key_registration`, and the lease storage backend (`storage.type: memory|file`, see "Storage Backends and Expiry" above) for the update handler;
 - opcode-to-module routing (an ordered list per opcode — see `docs/siglease_rfc9665.md` §3 for
-  how SRP's handler fits into the same list).
+  how SRP's handler fits into the same list);
+- `authoritative.max_inflight_updates` (default 1, `0` for no limit): how many UPDATEs the proxy
+  has in flight to one authoritative server at a time, across all handlers. Every forwarded
+  UPDATE is SIG(0)-signed, and BIND 9.20 refuses SIG(0) requests beyond its `sig0checks-quota`
+  (default 1) instead of queueing them, so set this to the upstream server's quota — see
+  `docs/siglease_rfc9665.md` §6, "Concurrent UPDATEs".
 
 The update handler uses the configured zone to discover the authoritative server for the effective zone, then sends the rewritten UPDATE there.
 
@@ -355,7 +361,7 @@ library/CLI, config, and known limitations) — it's the source of truth for any
 isn't covered above.
 
 ## Validation
-(requires client key, see this [README](./keystore/README.md))
+(requires client key, see this [README](../keystore/README.md))
 ```bash
 CLIENT_KEYSTORE_DIR=${PWD}/keystore/client make test-unit
 CLIENT_KEYSTORE_DIR=${PWD}/keystore/client make test-update   # RFC 9664 lease flow, live against a real BIND 9
@@ -381,7 +387,7 @@ This is not a protocol problem in sig0lease; it is a library dispatch gap.
 
 ### Applied patch
 
-sig0lease adds a compatibility package at [pkg/dnscompat/updatelease.go](pkg/dnscompat/updatelease.go) that registers EDNS code `2` with an `ERFC3597` constructor at process startup. This allows strict unpacking to succeed without adding parser fallback logic.
+sig0lease adds a compatibility package at [pkg/dnscompat/updatelease.go](../pkg/dnscompat/updatelease.go) that registers EDNS code `2` with an `ERFC3597` constructor at process startup. This allows strict unpacking to succeed without adding parser fallback logic.
 
 ### UPDATE-LEASE unpacked form is not an OPT wrapper
 
@@ -400,7 +406,7 @@ The update handler now checks both `Pseudo` and `Extra`, and it accepts either:
 
 `dns unpack: overflow name`
 
-This is a library packing bug, not a sig0lease protocol issue -- real DNS traffic essentially never sets QDCOUNT > 1 anyway, and this project's own `acceptMsg` (see [server/server.go](server/server.go)) rejects any message where `len(m.Question) != 1` with FORMERR, matching the library's own `DefaultMsgAcceptFunc`. No compatibility patch was written for it. It surfaced while writing [server/transport_equivalence_test.go](server/transport_equivalence_test.go), which needed a genuine two-question wire message to test that FORMERR-rejection branch; that specific case had to be dropped since the library can't produce valid bytes for it, and the message-with-zero-questions case was kept in its place to cover the same `acceptMsg` branch.
+This is a library packing bug, not a sig0lease protocol issue -- real DNS traffic essentially never sets QDCOUNT > 1 anyway, and this project's own `acceptMsg` (see [server/server.go](../server/server.go)) rejects any message where `len(m.Question) != 1` with FORMERR, matching the library's own `DefaultMsgAcceptFunc`. No compatibility patch was written for it. It surfaced while writing [server/transport_equivalence_test.go](../server/transport_equivalence_test.go), which needed a genuine two-question wire message to test that FORMERR-rejection branch; that specific case had to be dropped since the library can't produce valid bytes for it, and the message-with-zero-questions case was kept in its place to cover the same `acceptMsg` branch.
 
 ### The handler must call `Unpack()` itself to see Ns/Extra/Pseudo
 

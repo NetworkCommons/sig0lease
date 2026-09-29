@@ -11,13 +11,26 @@ options {
     allow-query { any; };
     allow-transfer { none; };
     pid-file "@RUNDIR@/named.pid";
+    // How many SIG(0) signatures named verifies at once before REFUSING further SIG(0)
+    // requests (BIND 9.20's default is 1). lib/bind9.sh sets it from BIND9_SIG0_QUOTA, and
+    // the suites give the proxy the same authoritative.max_inflight_updates.
+    sig0checks-quota @SIG0_QUOTA@;
 };
 
+// "severity dynamic" logs at named's own debug level, which lib/bind9.sh starts at 1 (-d 1):
+// the level at which BIND logs why it refused a SIG(0)-signed request under its concurrency
+// quota ("client: debug 1: ... SIG(0) checks quota reached" -- sig0checks-quota defaults to
+// 1, so a second SIG(0) request arriving while one is being verified is refused, not
+// queued). At the default info level such a REFUSED update leaves no trace in the log at
+// all. print-category/print-severity make each line's source explicit for
+// bind9_report_rejections.
 logging {
     channel test_log {
-        file "@RUNDIR@/named.log" versions 1 size 10m;
-        severity info;
+        file "@RUNDIR@/named.log" versions 1 size 50m;
+        severity dynamic;
         print-time yes;
+        print-category yes;
+        print-severity yes;
     };
     category default { test_log; };
     category update { test_log; };

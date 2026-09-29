@@ -9,6 +9,7 @@ import (
 	"net"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -36,6 +37,9 @@ type fakeSRPCoordinator struct {
 	sendResp *dns.Msg
 	sendErr  error
 	sent     []*dns.Msg // every updateMsg passed to SendUpdate, in call order
+	// sentMu guards sent against SendUpdate calls from the handler's own expiry timers; a
+	// test that lets those timers run reads sent through sentSnapshot.
+	sentMu sync.Mutex
 
 	// onSendUpdate, if set, runs synchronously inside SendUpdate before it returns --
 	// standing in for "something else mutated the lease store while our own upstream round
@@ -58,11 +62,19 @@ func (f *fakeSRPCoordinator) QueryKeyAtName(ctx context.Context, zoneHint, name 
 }
 
 func (f *fakeSRPCoordinator) SendUpdate(ctx context.Context, upstreamZone string, updateMsg *dns.Msg) (*dns.Msg, error) {
+	f.sentMu.Lock()
 	f.sent = append(f.sent, updateMsg)
+	f.sentMu.Unlock()
 	if f.onSendUpdate != nil {
 		f.onSendUpdate()
 	}
 	return f.sendResp, f.sendErr
+}
+
+func (f *fakeSRPCoordinator) sentSnapshot() []*dns.Msg {
+	f.sentMu.Lock()
+	defer f.sentMu.Unlock()
+	return append([]*dns.Msg(nil), f.sent...)
 }
 
 func (f *fakeSRPCoordinator) ResolveAuthoritativeZone(ctx context.Context, zone string) (string, error) {
@@ -225,12 +237,11 @@ func newSRPTestHandler(t *testing.T) (*SRPHandler, *fakeSRPCoordinator) {
 	// (which would also need a real/fake coordinator's ResolveAuthoritativeZone wired up
 	// before it returns), so it has to populate the signing-key cache Setup would
 	// otherwise populate itself -- resolveUpstreamSigningContext relies on it being set.
-	upstreamKey, matchedZone, err := updatecore.FindAuthorizedProxyKey(keystoreDir, srpTestZone, h.logger)
+	upstreamKey, _, err := updatecore.FindAuthorizedProxyKey(keystoreDir, srpTestZone, h.logger)
 	if err != nil {
 		t.Fatalf("resolve test upstream signing key: %v", err)
 	}
 	h.upstreamKeyRecord = upstreamKey
-	h.upstreamKeyZone = matchedZone
 
 	coord := &fakeSRPCoordinator{
 		keyState: srp.AuthNXDomain,
@@ -1285,19 +1296,10 @@ func TestSRPHandle_PTRDiff_DropsSubtypeOnUpdate(t *testing.T) {
 
 // --- expiry (S3.4 maintenance) -----------------------------------------------------------
 
-// disarmAutoExpiry stops the background timer Handle()'s own step 9 (scheduleLeaseExpiry)
-// already armed for nodeKey. The expiry tests below use a deliberately short lease so they
-// don't have to wait long for IsExpired() to become true, but that means Handle() itself
-// also armed a real timer that would otherwise race a test's own direct call to
-// processExpiredNode -- disarming it isolates the test to exactly the call under test.
-func disarmAutoExpiry(h *SRPHandler, nodeKey string) {
-	h.leaseTimersMu.Lock()
-	defer h.leaseTimersMu.Unlock()
-	if timer, ok := h.leaseTimers[nodeKey]; ok {
-		timer.Stop()
-	}
-	delete(h.leaseTimers, nodeKey)
-}
+// The expiry tests below use a deliberately short lease so they don't have to wait long for
+// IsExpired() to become true, but that means Handle() itself (step 9, scheduleLeaseExpiry)
+// also armed a real timer for each node, which would otherwise race a test's own direct call
+// to processExpiredNode -- h.timers.disarm isolates a test to exactly the call under test.
 
 func TestSRPHandle_ExpiryDeletesUpstreamThenLocally(t *testing.T) {
 	h, coord := newSRPTestHandler(t)
@@ -1316,8 +1318,8 @@ func TestSRPHandle_ExpiryDeletesUpstreamThenLocally(t *testing.T) {
 	// nondeterministic -- see TestSRPHandle_ExpiryCoversWholeSubtree's identical reasoning).
 	hostNodeKey := leasepkg.NodeKey(id.keyAt(host))
 	instNodeKey := leasepkg.NodeKey(id.keyAt(oneWidgetInstance()[0].name))
-	disarmAutoExpiry(h, hostNodeKey)
-	disarmAutoExpiry(h, instNodeKey)
+	h.timers.disarm(hostNodeKey)
+	h.timers.disarm(instNodeKey)
 	time.Sleep(1100 * time.Millisecond)
 	rec := h.leaseManager.Get(hostNodeKey)
 	if rec == nil || !rec.IsExpired() {
@@ -1373,8 +1375,8 @@ func TestSRPHandle_ExpiryPTRCleanup(t *testing.T) {
 	// before this test's own manual call ever ran.
 	hostNodeKey := leasepkg.NodeKey(id.keyAt(host))
 	instNodeKey := leasepkg.NodeKey(id.keyAt(inst))
-	disarmAutoExpiry(h, hostNodeKey)
-	disarmAutoExpiry(h, instNodeKey)
+	h.timers.disarm(hostNodeKey)
+	h.timers.disarm(instNodeKey)
 	time.Sleep(1100 * time.Millisecond)
 
 	h.processExpiredNode(context.Background(), instNodeKey)
@@ -1426,8 +1428,8 @@ func TestSRPHandle_ExpiryCoversWholeSubtree(t *testing.T) {
 
 	hostNodeKey := leasepkg.NodeKey(id.keyAt(host))
 	instNodeKey := leasepkg.NodeKey(id.keyAt(inst))
-	disarmAutoExpiry(h, hostNodeKey)
-	disarmAutoExpiry(h, instNodeKey)
+	h.timers.disarm(hostNodeKey)
+	h.timers.disarm(instNodeKey)
 	time.Sleep(1100 * time.Millisecond)
 
 	// Only the host's own expiry runs -- the instance's own timer never fires at all here,
@@ -1485,8 +1487,12 @@ func TestSRPHandle_ExpiryUpstreamRejection_NoLocalMutation(t *testing.T) {
 		t.Fatalf("fresh registration: expected Processed, got %s: %v", res.Status, res.Error)
 	}
 
+	// Disarm the instance's timer too: left armed, it fires during the sleep below, deletes the
+	// instance on its own (so the host's expiry here no longer covers it), and reads
+	// fake.sendResp from its own goroutine, racing this test's write to it.
 	hostNodeKey := leasepkg.NodeKey(id.keyAt(host))
-	disarmAutoExpiry(h, hostNodeKey)
+	h.timers.disarm(hostNodeKey)
+	h.timers.disarm(leasepkg.NodeKey(id.keyAt(oneWidgetInstance()[0].name)))
 	time.Sleep(1100 * time.Millisecond)
 
 	fake := h.coordinator.(*fakeSRPCoordinator)
@@ -1522,7 +1528,7 @@ func TestSRPHandle_ExpiryConcurrentRefreshRace_StillDeletesLocally(t *testing.T)
 	}
 
 	hostNodeKey := leasepkg.NodeKey(id.keyAt(host))
-	disarmAutoExpiry(h, hostNodeKey)
+	h.timers.disarm(hostNodeKey)
 	time.Sleep(1100 * time.Millisecond)
 
 	fake := h.coordinator.(*fakeSRPCoordinator)
@@ -1564,8 +1570,10 @@ func TestSRPHandle_ExpiryUpstreamFailure_LeavesLocalStateIntact(t *testing.T) {
 		t.Fatalf("fresh registration: expected Processed, got %s: %v", res.Status, res.Error)
 	}
 
+	// Disarm the instance's timer too -- see TestSRPHandle_ExpiryUpstreamRejection_NoLocalMutation.
 	hostNodeKey := leasepkg.NodeKey(id.keyAt(host))
-	disarmAutoExpiry(h, hostNodeKey)
+	h.timers.disarm(hostNodeKey)
+	h.timers.disarm(leasepkg.NodeKey(id.keyAt(oneWidgetInstance()[0].name)))
 	time.Sleep(1100 * time.Millisecond)
 
 	fake := h.coordinator.(*fakeSRPCoordinator)
@@ -1577,5 +1585,264 @@ func TestSRPHandle_ExpiryUpstreamFailure_LeavesLocalStateIntact(t *testing.T) {
 	// later reconciliation pass or refresh can retry), not remove it optimistically.
 	if h.leaseManager.Get(hostNodeKey) == nil {
 		t.Fatalf("expected the host node to remain in the local store after a failed upstream expiry-delete")
+	}
+}
+
+// srpLeaseExpiryDeletes collects every RFC 2136 S2.5.4 single-RR delete (class NONE) in msgs,
+// keyed "<TYPE> <owner>" -- plus " -> <target>" for a PTR, whose owner is the shared
+// service-type name -- and fails the test on any Delete All RRsets (class ANY) or KEY delete:
+// a LEASE expiry must leave every KEY in place until its own KEY-LEASE.
+func srpLeaseExpiryDeletes(t *testing.T, msgs []*dns.Msg) map[string]bool {
+	t.Helper()
+	deletes := make(map[string]bool)
+	for _, m := range msgs {
+		for _, rr := range m.Ns {
+			hdr := rr.Header()
+			switch hdr.Class {
+			case dns.ClassANY:
+				t.Fatalf("expected no Delete All RRsets on LEASE expiry (it would delete the KEY at that name too), got %s", rr)
+			case dns.ClassNONE:
+				typ := dns.RRToType(rr)
+				if typ == dns.TypeKEY {
+					t.Fatalf("expected no KEY delete on LEASE expiry, got %s", rr)
+				}
+				key := dns.TypeToString[typ] + " " + canonicalName(hdr.Name)
+				if ptr, ok := rr.(*dns.PTR); ok {
+					key += " -> " + canonicalName(ptr.Ptr)
+				}
+				deletes[key] = true
+			}
+		}
+	}
+	return deletes
+}
+
+// srpNonKEYCount is how many non-KEY records the store holds under nodeKey.
+func srpNonKEYCount(h *SRPHandler, nodeKey string) int {
+	if set := h.leaseManager.GetNonKEYRecordSet(nodeKey); set != nil {
+		return len(set.Records)
+	}
+	return 0
+}
+
+// TestSRPHandle_LeaseExpiry_DeletesDataKeepsKEYsUntilKeyLease is the regression test for
+// LEASE having no effect on an SRP registration: the handler armed each node's expiry timer
+// from its KEY alone, so the host's A and the instance's SRV/TXT/PTR all stayed published
+// until KEY-LEASE and then went together with the KEYs. RFC 9665 S3.2.5.3/S5.1: data records
+// expire after LEASE, KEYs only after KEY-LEASE. Driven by the timers Handle() itself arms,
+// not a direct processExpiredNode call, since the scheduling is what was wrong.
+func TestSRPHandle_LeaseExpiry_DeletesDataKeepsKEYsUntilKeyLease(t *testing.T) {
+	h, coord := newSRPTestHandler(t)
+	id := newSRPTestIdentity(t)
+	const host = "srptest16.dev.zenr.io."
+	spec := oneWidgetInstance()[0]
+
+	msg := buildSRPUpdate(t, srpTestZone, id, host, []string{"192.0.2.1"}, oneWidgetInstance(), 1, 3, host) // 1s LEASE, 3s KEY-LEASE
+	if res := h.Handle(context.Background(), stubTCPResponseWriter{}, msg); res.Status != StatusProcessed {
+		t.Fatalf("fresh registration: expected Processed, got %s: %v", res.Status, res.Error)
+	}
+	registered := len(coord.sentSnapshot())
+	hostNodeKey := leasepkg.NodeKey(id.keyAt(host))
+	instNodeKey := leasepkg.NodeKey(id.keyAt(spec.name))
+
+	time.Sleep(1600 * time.Millisecond) // past LEASE, well before KEY-LEASE
+
+	for _, nk := range []string{hostNodeKey, instNodeKey} {
+		if h.leaseManager.Get(nk) == nil {
+			t.Fatalf("expected KEY node %s to survive LEASE expiry", nk)
+		}
+		if n := srpNonKEYCount(h, nk); n != 0 {
+			t.Fatalf("expected %s's data records to be removed locally at LEASE expiry, %d remain", nk, n)
+		}
+	}
+	deletes := srpLeaseExpiryDeletes(t, coord.sentSnapshot()[registered:])
+	for _, want := range []string{
+		"A " + canonicalName(host),
+		"SRV " + canonicalName(spec.name),
+		"TXT " + canonicalName(spec.name),
+		"PTR " + canonicalName(spec.svctype) + " -> " + canonicalName(spec.name),
+	} {
+		if !deletes[want] {
+			t.Fatalf("expected an upstream delete for %q at LEASE expiry, got %v", want, deletes)
+		}
+	}
+
+	time.Sleep(2200 * time.Millisecond) // past KEY-LEASE
+
+	for _, nk := range []string{hostNodeKey, instNodeKey} {
+		if h.leaseManager.Get(nk) != nil {
+			t.Fatalf("expected KEY node %s to be removed at KEY-LEASE expiry", nk)
+		}
+	}
+}
+
+// TestSRPHandle_LeaseExpiry_HostCascadesToLongerLivedInstance pins S5.1's "when the lease on
+// a hostname expires, the hostname and all services that reference it MUST be removed at the
+// same time": an instance omitted from the host's latest update keeps the earlier update's
+// longer LEASE, but its data must still go when the host's own, shorter LEASE runs out --
+// with its KEY, like the host's, kept until KEY-LEASE.
+func TestSRPHandle_LeaseExpiry_HostCascadesToLongerLivedInstance(t *testing.T) {
+	h, coord := newSRPTestHandler(t)
+	id := newSRPTestIdentity(t)
+	const host = "srptest17.dev.zenr.io."
+	spec := oneWidgetInstance()[0]
+
+	first := buildSRPUpdate(t, srpTestZone, id, host, []string{"192.0.2.1"}, oneWidgetInstance(), 3600, 7200, host)
+	if res := h.Handle(context.Background(), stubTCPResponseWriter{}, first); res.Status != StatusProcessed {
+		t.Fatalf("fresh registration: expected Processed, got %s: %v", res.Status, res.Error)
+	}
+	second := buildSRPUpdate(t, srpTestZone, id, host, []string{"192.0.2.1"}, nil, 1, 7200, host)
+	if res := h.Handle(context.Background(), stubTCPResponseWriter{}, second); res.Status != StatusProcessed {
+		t.Fatalf("host-only refresh: expected Processed, got %s: %v", res.Status, res.Error)
+	}
+
+	hostNodeKey := leasepkg.NodeKey(id.keyAt(host))
+	instNodeKey := leasepkg.NodeKey(id.keyAt(spec.name))
+	h.timers.disarm(hostNodeKey)
+	time.Sleep(1100 * time.Millisecond)
+
+	sentBefore := len(coord.sent)
+	h.processExpiredNode(context.Background(), hostNodeKey)
+
+	deletes := srpLeaseExpiryDeletes(t, coord.sent[sentBefore:])
+	for _, want := range []string{
+		"A " + canonicalName(host),
+		"SRV " + canonicalName(spec.name),
+		"TXT " + canonicalName(spec.name),
+		"PTR " + canonicalName(spec.svctype) + " -> " + canonicalName(spec.name),
+	} {
+		if !deletes[want] {
+			t.Fatalf("expected the host's LEASE expiry to delete %q upstream, got %v", want, deletes)
+		}
+	}
+	for _, nk := range []string{hostNodeKey, instNodeKey} {
+		if h.leaseManager.Get(nk) == nil {
+			t.Fatalf("expected KEY node %s to survive the host's LEASE expiry", nk)
+		}
+		if n := srpNonKEYCount(h, nk); n != 0 {
+			t.Fatalf("expected %s's data records to be removed locally, %d remain", nk, n)
+		}
+	}
+}
+
+// TestSRPHandle_LeaseExpiry_InstanceAloneLeavesHostData is the other direction of S5.1's
+// per-instance lease ("SRP registrars MUST also track a lease per service instance"): an
+// instance whose own LEASE runs out before its host's loses its SRV/TXT/PTR, while the host's
+// data -- renewed by a later update that omitted the instance -- is left alone.
+func TestSRPHandle_LeaseExpiry_InstanceAloneLeavesHostData(t *testing.T) {
+	h, coord := newSRPTestHandler(t)
+	id := newSRPTestIdentity(t)
+	const host = "srptest18.dev.zenr.io."
+	spec := oneWidgetInstance()[0]
+
+	first := buildSRPUpdate(t, srpTestZone, id, host, []string{"192.0.2.1"}, oneWidgetInstance(), 1, 7200, host)
+	if res := h.Handle(context.Background(), stubTCPResponseWriter{}, first); res.Status != StatusProcessed {
+		t.Fatalf("fresh registration: expected Processed, got %s: %v", res.Status, res.Error)
+	}
+	second := buildSRPUpdate(t, srpTestZone, id, host, []string{"192.0.2.1"}, nil, 3600, 7200, host)
+	if res := h.Handle(context.Background(), stubTCPResponseWriter{}, second); res.Status != StatusProcessed {
+		t.Fatalf("host-only refresh: expected Processed, got %s: %v", res.Status, res.Error)
+	}
+
+	hostNodeKey := leasepkg.NodeKey(id.keyAt(host))
+	instNodeKey := leasepkg.NodeKey(id.keyAt(spec.name))
+	h.timers.disarm(instNodeKey)
+	time.Sleep(1100 * time.Millisecond)
+
+	sentBefore := len(coord.sent)
+	h.processExpiredNode(context.Background(), instNodeKey)
+
+	deletes := srpLeaseExpiryDeletes(t, coord.sent[sentBefore:])
+	if deletes["A "+canonicalName(host)] {
+		t.Fatalf("expected the instance's LEASE expiry to leave the host's A record alone, got %v", deletes)
+	}
+	if !deletes["SRV "+canonicalName(spec.name)] {
+		t.Fatalf("expected the instance's SRV to be deleted upstream, got %v", deletes)
+	}
+	if n := srpNonKEYCount(h, instNodeKey); n != 0 {
+		t.Fatalf("expected the instance's data records to be removed locally, %d remain", n)
+	}
+	if n := srpNonKEYCount(h, hostNodeKey); n != 1 {
+		t.Fatalf("expected the host's A record to remain locally, got %d records", n)
+	}
+	if h.leaseManager.Get(instNodeKey) == nil {
+		t.Fatalf("expected the instance's KEY to survive its LEASE expiry")
+	}
+}
+
+// TestSRPHandle_ExpiryRetriesAfterRejection pins the shared retry policy on the SRP side: a
+// refused expiry-delete is retried after expiryRetryDelay's backoff (1s at first), rather than
+// waiting up to 30s for startLeaseReconciliation, and the retry completes the expiry once
+// upstream accepts it.
+func TestSRPHandle_ExpiryRetriesAfterRejection(t *testing.T) {
+	h, coord := newSRPTestHandler(t)
+	id := newSRPTestIdentity(t)
+	const host = "srptest19.dev.zenr.io."
+
+	msg := buildSRPUpdate(t, srpTestZone, id, host, []string{"192.0.2.1"}, nil, 1, 1, host)
+	if res := h.Handle(context.Background(), stubTCPResponseWriter{}, msg); res.Status != StatusProcessed {
+		t.Fatalf("fresh registration: expected Processed, got %s: %v", res.Status, res.Error)
+	}
+	hostNodeKey := leasepkg.NodeKey(id.keyAt(host))
+	h.timers.disarm(hostNodeKey)
+	time.Sleep(1100 * time.Millisecond)
+
+	// The first expiry-delete is refused; every later UPDATE is accepted. Set from inside
+	// SendUpdate, so sendResp is only ever touched by the goroutine about to read it.
+	refusedOnce := false
+	coord.onSendUpdate = func() {
+		if !refusedOnce {
+			refusedOnce = true
+			coord.sendResp = &dns.Msg{MsgHeader: dns.MsgHeader{Rcode: dns.RcodeRefused}}
+			return
+		}
+		coord.sendResp = &dns.Msg{MsgHeader: dns.MsgHeader{Rcode: dns.RcodeSuccess}}
+	}
+
+	h.processExpiredNode(context.Background(), hostNodeKey)
+	if h.leaseManager.Get(hostNodeKey) == nil {
+		t.Fatalf("expected the host node to remain after a REFUSED expiry-delete")
+	}
+	if !h.timers.armed(hostNodeKey) {
+		t.Fatalf("expected a retry armed after the REFUSED expiry-delete")
+	}
+
+	deadline := time.Now().Add(3 * time.Second)
+	for h.leaseManager.Get(hostNodeKey) != nil {
+		if time.Now().After(deadline) {
+			t.Fatalf("expected the retry to complete the expiry within 3s")
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+}
+
+// TestSRPHandler_FailsHardWithoutUpstream is the SRP side of requireUpstream: once a request
+// is this handler's (SRP-shaped, for its zone), a missing coordinator or signing key panics
+// instead of answering or forwarding anything.
+func TestSRPHandler_FailsHardWithoutUpstream(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		strip func(h *SRPHandler)
+		want  string
+	}{
+		{"no signing key", func(h *SRPHandler) { h.upstreamKeyRecord = nil }, "srp_handler is missing the proxy's signing key"},
+		{"no coordinator", func(h *SRPHandler) { h.coordinator = nil }, "srp_handler is missing an upstream coordinator"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			h, _ := newSRPTestHandler(t)
+			id := newSRPTestIdentity(t)
+			const host = "srptest20.dev.zenr.io."
+			msg := buildSRPUpdate(t, srpTestZone, id, host, []string{"192.0.2.1"}, nil, 60, 60, host)
+			tc.strip(h)
+
+			got := func() (r any) {
+				defer func() { r = recover() }()
+				h.Handle(context.Background(), stubTCPResponseWriter{}, msg)
+				return nil
+			}()
+			if msg, _ := got.(string); !strings.Contains(msg, tc.want) {
+				t.Fatalf("expected a panic containing %q, got %v", tc.want, got)
+			}
+		})
 	}
 }

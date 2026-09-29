@@ -26,6 +26,8 @@ func (h *UpdateHandler) Handle(ctx context.Context, w dns.ResponseWriter, r *dns
 	}
 
 	h.logger.Debugf("UPDATE-LEASE EDNS option present, processing as sig0lease packet")
+	// From here on the request is this handler's, and everything below needs the upstream.
+	requireUpstream(h.Name(), h.upstreamCoordinator != nil, h.upstreamKeyRecord != nil)
 
 	if len(r.Question) != 1 {
 		msg := makeErrorResponse(r, dns.RcodeFormatError, "exactly one question required")
@@ -442,7 +444,7 @@ func (h *UpdateHandler) Handle(ctx context.Context, w dns.ResponseWriter, r *dns
 			return NewProcessedResult(h.buildSuccessResponse(r, zone, allNotes, nil, leaseDuration, keyLeaseDuration))
 		}
 
-		signingKey, effectiveUpstreamZone, err := h.resolveUpstreamSigningContext(ctx)
+		signingKey, effectiveUpstreamZone, err := resolveUpstreamSigningContext(ctx, h.Name(), h.upstreamCoordinator, h.upstreamKeyRecord, h.upstreamZone, h.logger)
 		if err != nil {
 			msg := makeErrorResponse(r, dns.RcodeServerFailure, err.Error())
 			return NewErrorResult(msg, err.Error(), err)
@@ -452,10 +454,6 @@ func (h *UpdateHandler) Handle(ctx context.Context, w dns.ResponseWriter, r *dns
 		if err != nil {
 			msg := makeErrorResponse(r, dns.RcodeServerFailure, fmt.Sprintf("upstream delete construction failed: %v", err))
 			return NewErrorResult(msg, "upstream delete construction failed", err)
-		}
-		if h.upstreamCoordinator == nil {
-			msg := makeErrorResponse(r, dns.RcodeServerFailure, "upstream coordinator not configured")
-			return NewErrorResult(msg, "upstream coordinator not configured", fmt.Errorf("upstream coordinator is nil"))
 		}
 		upstreamResp, err := h.upstreamCoordinator.SendUpdate(ctx, effectiveUpstreamZone, deleteMsg)
 		if err != nil {
@@ -488,9 +486,9 @@ func (h *UpdateHandler) Handle(ctx context.Context, w dns.ResponseWriter, r *dns
 			// (it can never own children) -- that descendant is still fully
 			// cleaned up, just via its owning KEY's own iteration below.
 			for _, childKey := range h.leaseManager.ListSubtreeKeys(nodeKey) {
-				h.deleteNodeUpstream(ctx, childKey)
+				h.deleteNodeUpstream(ctx, childKey, signingKey)
 				h.leaseManager.RemoveNonKEYRecords(childKey)
-				h.clearLeaseTimer(childKey)
+				h.timers.disarm(childKey)
 			}
 			// The KEY's own directly-owned non-KEY data (not just descendant
 			// KEY nodes) must be cleaned up upstream here too, or it is
@@ -500,12 +498,12 @@ func (h *UpdateHandler) Handle(ctx context.Context, w dns.ResponseWriter, r *dns
 			// deleteNodeUpstream: the KEY RR was already deleted upstream
 			// above, so re-deleting it here would just be a second, redundant
 			// round trip to the real authoritative server for no benefit.
-			h.deleteNodeNonKeyUpstream(ctx, nodeKey)
+			h.deleteNodeNonKeyUpstream(ctx, nodeKey, signingKey)
 			if err := h.leaseManager.Delete(nodeKey); err != nil {
 				h.logger.Warnf("Failed to delete key lease for %s: %v (upstream delete already succeeded, local state may now diverge)", keyRR.Hdr.Name, err)
 			}
 			h.leaseManager.RemoveNonKEYRecords(nodeKey)
-			h.clearLeaseTimer(nodeKey)
+			h.timers.disarm(nodeKey)
 			h.logger.Debugf("Deleted key for %s (KEY-LEASE=0, LEASE=0)", keyRR.Hdr.Name)
 		}
 		// Remove only the specific records that were actually deleted
@@ -646,7 +644,7 @@ func (h *UpdateHandler) Handle(ctx context.Context, w dns.ResponseWriter, r *dns
 	// the add and delete halves of a single request are confirmed or
 	// rejected together rather than racing across two separate round trips.
 	if len(upstreamKeys) > 0 || len(acceptedRecordsForUpstream) > 0 || len(recordsToDeleteForUpstream) > 0 {
-		signingKey, effectiveUpstreamZone, err := h.resolveUpstreamSigningContext(ctx)
+		signingKey, effectiveUpstreamZone, err := resolveUpstreamSigningContext(ctx, h.Name(), h.upstreamCoordinator, h.upstreamKeyRecord, h.upstreamZone, h.logger)
 		if err != nil {
 			msg := makeErrorResponse(r, dns.RcodeServerFailure, err.Error())
 			return NewErrorResult(msg, err.Error(), err)
@@ -664,10 +662,6 @@ func (h *UpdateHandler) Handle(ctx context.Context, w dns.ResponseWriter, r *dns
 		}
 
 		// Send UPDATE to upstream and fail-closed if upstream does not accept it.
-		if h.upstreamCoordinator == nil {
-			msg := makeErrorResponse(r, dns.RcodeServerFailure, "upstream coordinator not configured")
-			return NewErrorResult(msg, "upstream coordinator not configured", fmt.Errorf("upstream coordinator is nil"))
-		}
 
 		h.logger.Debugf("Sending UPDATE to upstream zone=%s (configured=%s), keys=%d",
 			effectiveUpstreamZone, h.upstreamZone, len(upstreamKeys))

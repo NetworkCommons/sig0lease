@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"net"
+	"sync"
 	"testing"
 	"time"
 
@@ -16,12 +17,42 @@ import (
 type stubUpstreamCoordinator struct {
 	resp *dns.Msg
 	err  error
-	sent []*dns.Msg // every updateMsg passed to SendUpdate, in call order
+	// resolveErr, if set, is what ResolveAuthoritativeZone fails with.
+	resolveErr error
+	// query, if set, answers QueryRRs -- the authoritative data a test needs the handler to see.
+	query func(ctx context.Context, zoneHint, name string, rrType uint16) ([]dns.RR, error)
+	sent  []*dns.Msg // every updateMsg passed to SendUpdate, in call order
+	// sentMu guards sent against SendUpdate calls from the handler's own expiry timers.
+	sentMu sync.Mutex
 }
 
 func (s *stubUpstreamCoordinator) SendUpdate(ctx context.Context, upstreamZone string, updateMsg *dns.Msg) (*dns.Msg, error) {
+	s.sentMu.Lock()
 	s.sent = append(s.sent, updateMsg)
+	s.sentMu.Unlock()
 	return s.resp, s.err
+}
+
+// ResolveAuthoritativeZone treats every zone as its own zone cut, unless resolveErr is set.
+func (s *stubUpstreamCoordinator) ResolveAuthoritativeZone(ctx context.Context, zone string) (string, error) {
+	if s.resolveErr != nil {
+		return "", s.resolveErr
+	}
+	return zone, nil
+}
+
+// QueryRRs answers with query, or fails if the test gave the stub no authoritative data.
+func (s *stubUpstreamCoordinator) QueryRRs(ctx context.Context, zoneHint, name string, rrType uint16) ([]dns.RR, error) {
+	if s.query == nil {
+		return nil, fmt.Errorf("stubUpstreamCoordinator: no authoritative data for %s", name)
+	}
+	return s.query(ctx, zoneHint, name, rrType)
+}
+
+func (s *stubUpstreamCoordinator) sentCount() int {
+	s.sentMu.Lock()
+	defer s.sentMu.Unlock()
+	return len(s.sent)
 }
 
 type stubResponseWriter struct{}
@@ -179,7 +210,7 @@ func TestExtractAndValidateSig0_UsesAuthoritativeSignerKey(t *testing.T) {
 	}
 
 	h := newTestHandler()
-	h.authoritativeLookup = func(ctx context.Context, zoneHint, fqdn string, rrType uint16) ([]dns.RR, error) {
+	h.upstreamCoordinator.(*stubUpstreamCoordinator).query = func(ctx context.Context, zoneHint, fqdn string, rrType uint16) ([]dns.RR, error) {
 		if rrType != dns.TypeKEY {
 			return nil, nil
 		}
@@ -221,7 +252,7 @@ func TestExtractAndValidateSig0_RejectsSignerOutsideLeaseHierarchy(t *testing.T)
 	}
 
 	h := newTestHandler()
-	h.authoritativeLookup = func(ctx context.Context, zoneHint, fqdn string, rrType uint16) ([]dns.RR, error) {
+	h.upstreamCoordinator.(*stubUpstreamCoordinator).query = func(ctx context.Context, zoneHint, fqdn string, rrType uint16) ([]dns.RR, error) {
 		if rrType != dns.TypeKEY {
 			return nil, nil
 		}
@@ -249,7 +280,7 @@ func TestExtractAndValidateSig0_DNSFailureFallsBackToLeaseStore(t *testing.T) {
 	if err := h.leaseManager.Register(context.Background(), loaded.PublicKey, 120, 120, "dev.zenr.io."); err != nil {
 		t.Fatalf("register lease key: %v", err)
 	}
-	h.authoritativeLookup = func(ctx context.Context, zoneHint, fqdn string, rrType uint16) ([]dns.RR, error) {
+	h.upstreamCoordinator.(*stubUpstreamCoordinator).query = func(ctx context.Context, zoneHint, fqdn string, rrType uint16) ([]dns.RR, error) {
 		return nil, fmt.Errorf("authoritative DNS unavailable")
 	}
 
@@ -280,7 +311,7 @@ func TestExtractAndValidateSig0_DNSNoKeyFallsBackToLeaseStore(t *testing.T) {
 	if err := h.leaseManager.Register(context.Background(), loaded.PublicKey, 120, 120, "dev.zenr.io."); err != nil {
 		t.Fatalf("register lease key: %v", err)
 	}
-	h.authoritativeLookup = func(ctx context.Context, zoneHint, fqdn string, rrType uint16) ([]dns.RR, error) {
+	h.upstreamCoordinator.(*stubUpstreamCoordinator).query = func(ctx context.Context, zoneHint, fqdn string, rrType uint16) ([]dns.RR, error) {
 		return []dns.RR{}, nil
 	}
 
@@ -308,7 +339,7 @@ func TestExtractAndValidateSig0_RequestKeyWorksWhenDnsAndLeaseStoreDontHaveSigne
 	}
 
 	h := newTestHandler()
-	h.authoritativeLookup = func(ctx context.Context, zoneHint, fqdn string, rrType uint16) ([]dns.RR, error) {
+	h.upstreamCoordinator.(*stubUpstreamCoordinator).query = func(ctx context.Context, zoneHint, fqdn string, rrType uint16) ([]dns.RR, error) {
 		// DNS is reachable, but has no signer KEY.
 		return []dns.RR{}, nil
 	}
@@ -340,7 +371,7 @@ func TestExtractAndValidateSig0_AdditionalSigningKeyWorksWithoutAuthoritativeMat
 	}
 
 	h := newTestHandler()
-	h.authoritativeLookup = func(ctx context.Context, zoneHint, fqdn string, rrType uint16) ([]dns.RR, error) {
+	h.upstreamCoordinator.(*stubUpstreamCoordinator).query = func(ctx context.Context, zoneHint, fqdn string, rrType uint16) ([]dns.RR, error) {
 		// DNS is reachable, but has no signer KEY.
 		return []dns.RR{}, nil
 	}
@@ -378,14 +409,15 @@ func TestHandle_DoesNotPersistLeaseWhenUpstreamRejectsUpdate(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("setup handler: %v", err)
 	}
-	h.authoritativeLookup = func(ctx context.Context, zoneHint, fqdn string, rrType uint16) ([]dns.RR, error) {
+	authoritative := func(ctx context.Context, zoneHint, fqdn string, rrType uint16) ([]dns.RR, error) {
 		if rrType == dns.TypeKEY {
 			return []dns.RR{}, nil
 		}
 		return []dns.RR{}, nil
 	}
 	h.upstreamCoordinator = &stubUpstreamCoordinator{
-		resp: &dns.Msg{MsgHeader: dns.MsgHeader{Rcode: dns.RcodeYXRrset}},
+		query: authoritative,
+		resp:  &dns.Msg{MsgHeader: dns.MsgHeader{Rcode: dns.RcodeYXRrset}},
 	}
 
 	leaseOwner := "test.dev.zenr.io."
@@ -427,10 +459,10 @@ func TestHandle_ReRegistersManagedKeyWhenAuthoritativeFQDNIsMissing(t *testing.T
 	}); err != nil {
 		t.Fatalf("setup handler: %v", err)
 	}
-	h.authoritativeLookup = func(ctx context.Context, zoneHint, fqdn string, rrType uint16) ([]dns.RR, error) {
+	authoritative := func(ctx context.Context, zoneHint, fqdn string, rrType uint16) ([]dns.RR, error) {
 		return []dns.RR{}, nil
 	}
-	h.upstreamCoordinator = &stubUpstreamCoordinator{resp: &dns.Msg{MsgHeader: dns.MsgHeader{Rcode: dns.RcodeSuccess}}}
+	h.upstreamCoordinator = &stubUpstreamCoordinator{query: authoritative, resp: &dns.Msg{MsgHeader: dns.MsgHeader{Rcode: dns.RcodeSuccess}}}
 
 	keyRR := loaded.PublicKey.Clone().(*dns.KEY)
 	if err := h.leaseManager.Register(context.Background(), keyRR, 10, 10, "dev.zenr.io."); err != nil {
@@ -481,13 +513,13 @@ func TestHandle_RefreshPreservesOriginalRegisteredAt(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("setup handler: %v", err)
 	}
-	h.authoritativeLookup = func(ctx context.Context, zoneHint, fqdn string, rrType uint16) ([]dns.RR, error) {
+	authoritative := func(ctx context.Context, zoneHint, fqdn string, rrType uint16) ([]dns.RR, error) {
 		if rrType == dns.TypeKEY {
 			return []dns.RR{loaded.PublicKey}, nil
 		}
 		return []dns.RR{}, nil
 	}
-	h.upstreamCoordinator = &stubUpstreamCoordinator{resp: &dns.Msg{MsgHeader: dns.MsgHeader{Rcode: dns.RcodeSuccess}}}
+	h.upstreamCoordinator = &stubUpstreamCoordinator{query: authoritative, resp: &dns.Msg{MsgHeader: dns.MsgHeader{Rcode: dns.RcodeSuccess}}}
 
 	keyRR := loaded.PublicKey.Clone().(*dns.KEY)
 	if err := h.leaseManager.Register(context.Background(), keyRR, 60, 60, "dev.zenr.io."); err != nil {
@@ -546,13 +578,13 @@ func TestHandle_NonKeyOnlyLeaseWithoutUpdateKeyRR_RegistersNonKeyRRs(t *testing.
 		t.Fatalf("register signer key in lease store: %v", err)
 	}
 
-	h.authoritativeLookup = func(ctx context.Context, zoneHint, fqdn string, rrType uint16) ([]dns.RR, error) {
+	authoritative := func(ctx context.Context, zoneHint, fqdn string, rrType uint16) ([]dns.RR, error) {
 		if rrType == dns.TypeKEY && canonicalName(fqdn) == canonicalName(signerKey.Hdr.Name) {
 			return []dns.RR{loaded.PublicKey}, nil
 		}
 		return []dns.RR{}, nil
 	}
-	h.upstreamCoordinator = &stubUpstreamCoordinator{resp: &dns.Msg{MsgHeader: dns.MsgHeader{Rcode: dns.RcodeSuccess}}}
+	h.upstreamCoordinator = &stubUpstreamCoordinator{query: authoritative, resp: &dns.Msg{MsgHeader: dns.MsgHeader{Rcode: dns.RcodeSuccess}}}
 
 	owner := "host.test.dev.zenr.io."
 	req := buildSignedNonKeyOnlyLeaseUpdateForHandleTest(t, loaded, owner, 120, false)
@@ -593,13 +625,13 @@ func TestHandle_NonKeyOnlyLeaseRejectsUpdateKeyRR(t *testing.T) {
 		t.Fatalf("register signer key in lease store: %v", err)
 	}
 
-	h.authoritativeLookup = func(ctx context.Context, zoneHint, fqdn string, rrType uint16) ([]dns.RR, error) {
+	authoritative := func(ctx context.Context, zoneHint, fqdn string, rrType uint16) ([]dns.RR, error) {
 		if rrType == dns.TypeKEY && canonicalName(fqdn) == canonicalName(signerKey.Hdr.Name) {
 			return []dns.RR{loaded.PublicKey}, nil
 		}
 		return []dns.RR{}, nil
 	}
-	h.upstreamCoordinator = &stubUpstreamCoordinator{resp: &dns.Msg{MsgHeader: dns.MsgHeader{Rcode: dns.RcodeSuccess}}}
+	h.upstreamCoordinator = &stubUpstreamCoordinator{query: authoritative, resp: &dns.Msg{MsgHeader: dns.MsgHeader{Rcode: dns.RcodeSuccess}}}
 
 	owner := "host.test.dev.zenr.io."
 	req := buildSignedNonKeyOnlyLeaseUpdateForHandleTest(t, loaded, owner, 120, true)
@@ -779,7 +811,7 @@ func setupCaseCDeleteHandler(t *testing.T) (h *UpdateHandler, parent, child, unr
 	h.upstreamCoordinator = &stubUpstreamCoordinator{resp: &dns.Msg{MsgHeader: dns.MsgHeader{Rcode: dns.RcodeSuccess}}}
 	// Stage-3 (authoritative) SIG(0) resolution for the unrelated key, which
 	// is never lease-managed and never present in the request itself.
-	h.authoritativeLookup = func(ctx context.Context, zoneHint, fqdn string, rrType uint16) ([]dns.RR, error) {
+	h.upstreamCoordinator.(*stubUpstreamCoordinator).query = func(ctx context.Context, zoneHint, fqdn string, rrType uint16) ([]dns.RR, error) {
 		if rrType == dns.TypeKEY && canonicalName(fqdn) == canonicalName(unrelated.PublicKey.Hdr.Name) {
 			return []dns.RR{unrelated.PublicKey}, nil
 		}
@@ -908,7 +940,7 @@ func TestHandle_CaseARefresh_ForeignSignerWithOwnRegistrationCannotHijackExistin
 		t.Fatalf("setup handler: %v", err)
 	}
 	h.upstreamCoordinator = &stubUpstreamCoordinator{resp: &dns.Msg{MsgHeader: dns.MsgHeader{Rcode: dns.RcodeSuccess}}}
-	h.authoritativeLookup = func(ctx context.Context, zoneHint, fqdn string, rrType uint16) ([]dns.RR, error) {
+	h.upstreamCoordinator.(*stubUpstreamCoordinator).query = func(ctx context.Context, zoneHint, fqdn string, rrType uint16) ([]dns.RR, error) {
 		if rrType == dns.TypeKEY && canonicalName(fqdn) == canonicalName(client.PublicKey.Hdr.Name) {
 			return []dns.RR{client.PublicKey}, nil
 		}
@@ -927,7 +959,7 @@ func TestHandle_CaseARefresh_ForeignSignerWithOwnRegistrationCannotHijackExistin
 		t.Fatalf("upsert non-key record: %v", err)
 	}
 	h.scheduleLeaseExpiry(leasepkg.NodeKey(clientKeyRR))
-	defer h.clearLeaseTimer(leasepkg.NodeKey(clientKeyRR))
+	defer h.timers.disarm(leasepkg.NodeKey(clientKeyRR))
 
 	// Attack: WRONG_CLIENT_KEY_NAME registers itself for the first time
 	// (legitimately satisfying signerAuthorizedForNewRegistration via
@@ -1012,7 +1044,7 @@ func TestHandle_CaseARefresh_OnlineAuthorizedSignerCannotHijackExistingKey(t *te
 	// WRONG_CLIENT_KEY_NAME resolves as a valid SIG(0) signer purely via
 	// authoritative DNS: it is never lease-managed and never present
 	// anywhere in the request itself (signerSource=Authoritative).
-	h.authoritativeLookup = func(ctx context.Context, zoneHint, fqdn string, rrType uint16) ([]dns.RR, error) {
+	h.upstreamCoordinator.(*stubUpstreamCoordinator).query = func(ctx context.Context, zoneHint, fqdn string, rrType uint16) ([]dns.RR, error) {
 		if rrType == dns.TypeKEY && canonicalName(fqdn) == canonicalName(client.PublicKey.Hdr.Name) {
 			return []dns.RR{client.PublicKey, wrong.PublicKey}, nil
 		}
@@ -1029,7 +1061,7 @@ func TestHandle_CaseARefresh_OnlineAuthorizedSignerCannotHijackExistingKey(t *te
 		t.Fatalf("upsert non-key record: %v", err)
 	}
 	h.scheduleLeaseExpiry(leasepkg.NodeKey(clientKeyRR))
-	defer h.clearLeaseTimer(leasepkg.NodeKey(clientKeyRR))
+	defer h.timers.disarm(leasepkg.NodeKey(clientKeyRR))
 
 	// Attack: "refresh" the client's already-registered KEY+TXT data, but
 	// sign the transaction with WRONG_CLIENT_KEY_NAME instead.

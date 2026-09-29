@@ -230,6 +230,16 @@ Package config provides configuration for the DNS proxy.
 
 TYPES
 
+type AuthoritativeConfig struct {
+	// MaxInflightUpdates caps how many UPDATEs the proxy has in flight to one authoritative
+	// server at a time; 0 means no limit. Every UPDATE it sends is SIG(0)-signed, and BIND 9.20
+	// answers REFUSED to a SIG(0) request beyond its sig0checks-quota (default 1) instead of
+	// queueing it, so set this to the upstream server's sig0checks-quota.
+	MaxInflightUpdates int `yaml:"max_inflight_updates"`
+}
+    AuthoritativeConfig holds limits on the UPDATEs this proxy sends to
+    authoritative servers.
+
 type Config struct {
 	// Downstream server settings
 	Server ServerConfig `yaml:"server"`
@@ -242,6 +252,9 @@ type Config struct {
 
 	// Handler-specific configuration (e.g., for update handler)
 	Handlers map[string]map[string]interface{} `yaml:"handlers"`
+
+	// Limits on the UPDATEs sent to authoritative servers, shared by every handler
+	Authoritative AuthoritativeConfig `yaml:"authoritative"`
 }
     Config is the top-level configuration structure.
 
@@ -679,13 +692,21 @@ type UpstreamCoordinator interface {
 	// SendUpdate sends a DNS UPDATE message to the upstream authoritative server.
 	// Returns the response message or an error.
 	SendUpdate(ctx context.Context, upstreamZone string, updateMsg *dns.Msg) (*dns.Msg, error)
+	// ResolveAuthoritativeZone returns the zone cut (the name that has NS records) for zone
+	// or one of its parents: the zone an UPDATE for names under zone must name.
+	ResolveAuthoritativeZone(ctx context.Context, zone string) (string, error)
+	// QueryRRs returns the rrType records at name from zoneHint's authoritative server --
+	// none for NXDOMAIN -- for the handler's checks of what is already published.
+	QueryRRs(ctx context.Context, zoneHint, name string, rrType uint16) ([]dns.RR, error)
 }
     UpstreamCoordinator handles communication with the upstream authoritative
     server. pkg/updatecore.Coordinator is the production implementation,
     constructed directly in Setup (below) via updatecore.NewCoordinator
-    -- this interface exists so tests and operators can substitute their
-    own (config's "upstream_coordinator" option, or a test stub; see
-    handlers/opcode5_sig0_validation_test.go's stubUpstreamCoordinator).
+    -- this interface exists so tests and operators can substitute
+    their own (config's "upstream_coordinator" option, or a test stub;
+    see handlers/opcode5_sig0_validation_test.go's stubUpstreamCoordinator).
+    It covers everything the handler asks of the upstream side, so a substitute
+    is used the same way as the production implementation, never bypassed.
 
 ```
 
@@ -1806,6 +1827,13 @@ handler and the RFC 9665 SRP handler (see docs/siglease_rfc9665.md's upstream
 forward section). It is a public package, not internal/, matching this repo's
 convention.
 
+CONSTANTS
+
+const DefaultMaxInflightUpdates = 1
+    DefaultMaxInflightUpdates is BIND 9.20's default sig0checks-quota -- see
+    SetMaxInflightUpdates.
+
+
 FUNCTIONS
 
 func AsDelete(rr dns.RR) dns.RR
@@ -1857,6 +1885,19 @@ func NormalizeTTLs(records []dns.RR) int
     of distinct RRsets that needed rewriting, for caller logging; 0 means every
     RRset present was already consistent and nothing was touched.
 
+func SetMaxInflightUpdates(max int) error
+    SetMaxInflightUpdates sets how many UPDATEs this process may have in
+    flight to one authoritative server at a time; 0 means no limit. Every
+    UPDATE the proxy sends is SIG(0)-signed, and BIND 9.20 verifies at most
+    sig0checks-quota SIG(0) signatures at a time (default 1), answering REFUSED
+    -- not queueing -- a SIG(0) request that arrives while it is already at that
+    quota. Set this to the upstream server's sig0checks-quota so the proxy never
+    exceeds it on its own. BIND frees a slot only after sending its response,
+    so a request sent the instant the previous one is answered can still very
+    occasionally be refused; the lease expiry retry covers that, as it does
+    REFUSED from other SIG(0) clients of the same server. Call once at startup,
+    before any UPDATE is sent.
+
 
 TYPES
 
@@ -1870,9 +1911,9 @@ type AuthoritativeKeyQuery func(ctx context.Context, zoneHint, name string) (Aut
 
 type AuthoritativeKeyState int
     AuthoritativeKeyState is the tri-state result of a live KEY-at-name query
-    against the authoritative server, consumed by pkg/srp.Evaluate (S3.3.3
-    FCFS) when the lease store has no local record for a name. This is the
-    RCODE-aware distinction the base RFC 9664 handler's queryAuthoritativeRRs
+    against the authoritative server, consumed by pkg/srp.Evaluate (S3.3.3 FCFS)
+    when the lease store has no local record for a name. This is the RCODE-aware
+    distinction Coordinator.QueryRRs (the base RFC 9664 handler's lookup)
     discards -- keeping it is what makes the NXDOMAIN/NODATA/KEY-present cases
     distinguishable at all.
 
@@ -1930,6 +1971,12 @@ func (c *Coordinator) QueryPTRExists(ctx context.Context, zoneHint, name string)
     to confirm no OTHER registrant this process's own local lease store doesn't
     know about still provides it -- see that function's doc comment for why a
     local-only view can't safely decide this alone.
+
+func (c *Coordinator) QueryRRs(ctx context.Context, zoneHint, name string, rrType uint16) ([]dns.RR, error)
+    QueryRRs returns the rrType records at name from zoneHint's authoritative
+    server -- none for NXDOMAIN -- with the same query/fallback shape as
+    QueryKeyAtName. Used by the RFC 9664 handler's checks of what is already
+    published (signer KEYs, duplicate registrations).
 
 func (c *Coordinator) ResolveAuthoritativeZone(ctx context.Context, zone string) (string, error)
     ResolveAuthoritativeZone finds the zone cut (the name that actually has NS

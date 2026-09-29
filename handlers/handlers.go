@@ -9,6 +9,7 @@ import (
 
 	"codeberg.org/miekg/dns"
 	"github.com/NetworkCommons/sig0lease/logging"
+	"github.com/NetworkCommons/sig0lease/pkg/keyrec"
 	leasepkg "github.com/NetworkCommons/sig0lease/pkg/lease"
 )
 
@@ -89,6 +90,49 @@ func rcodeDescription(resp *dns.Msg) string {
 		return "no response"
 	}
 	return fmt.Sprintf("rcode=%d (%s)", resp.Rcode, dns.RcodeToString[resp.Rcode])
+}
+
+// requireUpstream panics unless the named handler has both its upstream coordinator and the
+// proxy's own SIG(0) signing key. Setup refuses to produce a handler without either, and
+// cmd/sig0lease exits when Setup fails, so getting here without them means a handler was
+// built some other way -- a programming error. The proxy has no function without an
+// upstream it can sign for, so it fails outright rather than logging, retrying, or skipping
+// the upstream half of an operation.
+func requireUpstream(handler string, hasCoordinator, hasSigningKey bool) {
+	if hasCoordinator && hasSigningKey {
+		return
+	}
+	var missing []string
+	if !hasCoordinator {
+		missing = append(missing, "an upstream coordinator")
+	}
+	if !hasSigningKey {
+		missing = append(missing, "the proxy's signing key")
+	}
+	panic(fmt.Sprintf("%s is missing %s: Setup did not run or did not succeed", handler, strings.Join(missing, " and ")))
+}
+
+// zoneResolver is the coordinator method resolveUpstreamSigningContext needs; both
+// handlers' coordinator interfaces include it.
+type zoneResolver interface {
+	ResolveAuthoritativeZone(ctx context.Context, zone string) (string, error)
+}
+
+// resolveUpstreamSigningContext returns what an UPDATE to the upstream server is signed with
+// and addressed to: the proxy's signing key, and upstreamZone resolved to its zone cut
+// (SOA/NS discovery, or a static override). Both handlers call it with their own fields. The
+// key is the one Setup loaded once, rather than re-read from the keystore directory on every
+// request and expiry tick; picking up a rotated key on disk needs a restart. A handler without
+// its coordinator or signing key is a programming error (requireUpstream panics); the error
+// returned is only for the zone lookup, which can fail transiently.
+func resolveUpstreamSigningContext(ctx context.Context, handler string, coordinator zoneResolver, signingKey *keyrec.LoadedKey, upstreamZone string, logger *logging.Logger) (*keyrec.LoadedKey, string, error) {
+	requireUpstream(handler, coordinator != nil, signingKey != nil)
+	effectiveZone, err := coordinator.ResolveAuthoritativeZone(ctx, upstreamZone)
+	if err != nil {
+		return nil, "", fmt.Errorf("upstream zone resolution failed: %w", err)
+	}
+	logger.Debugf("Resolved effective upstream zone: configured=%s effective=%s", upstreamZone, effectiveZone)
+	return signingKey, effectiveZone, nil
 }
 
 // buildLeaseManagerFromConfig builds a LeaseStorage backend from a handler's "storage"
