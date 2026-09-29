@@ -70,6 +70,6 @@ echo "=== Browse Domains"
 
 
 avahi-browse -bartd ${DOMAIN} 
- sleep 2
+ sleep 5
 done
 
