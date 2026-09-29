@@ -1,15 +1,10 @@
 package srp
 
-import "strings"
+import (
+	"strings"
 
-// canonicalName lower-cases a DNS name for comparison/map-keying purposes, leaving the
-// trailing dot intact (unlike handlers.canonicalName in the base RFC 9664 handler, which
-// strips it) -- this package works entirely with fully-qualified, dot-terminated names, so
-// keeping the dot avoids an extra normalization step at every call site that reconstructs
-// or compares against a wire-derived name.
-func canonicalName(name string) string {
-	return strings.ToLower(strings.TrimSpace(name))
-}
+	"github.com/NetworkCommons/sig0lease/pkg/dnsname"
+)
 
 // isSubtypePTROwner reports whether owner (a PTR RR's owner name) has the DNS-SD subtype
 // shape "<sub>._sub.<Service>.<Domain>" (RFC 6763 S7.1) -- i.e. its second label is
@@ -17,7 +12,7 @@ func canonicalName(name string) string {
 // everything from the third label on). ok is false for a non-subtype (base-type) PTR
 // owner name, in which case baseType is empty.
 func isSubtypePTROwner(owner string) (baseType string, ok bool) {
-	labels := splitLabels(canonicalName(owner))
+	labels := splitLabels(dnsname.Fold(owner))
 	// Need at least: <sub> _sub <one-or-more base-type labels> root
 	// i.e. len(labels) >= 4 including the trailing empty root label from the split.
 	if len(labels) < 4 {

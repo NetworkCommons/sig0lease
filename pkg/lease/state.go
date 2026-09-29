@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"codeberg.org/miekg/dns"
+	"github.com/NetworkCommons/sig0lease/pkg/dnsname"
 )
 
 type NodeKind string
@@ -25,7 +26,13 @@ const (
 // class tree nodes (same identity model KEY nodes already had) -- a v1 file
 // does not unmarshal into this shape, so ImportSnapshot rejects anything
 // that isn't exactly this version rather than silently loading as empty.
-const leaseSnapshotVersion = 2
+//
+// Bumped from 2 to 3 when node IDs changed without the JSON shape changing:
+// names are now case-folded for US-ASCII only (pkg/dnsname), and RecordKey
+// also folds the domain names inside RDATA. A v2 file would still unmarshal,
+// but its persisted NodeIDs could differ from what NodeKey/RecordKey compute
+// now, so it is rejected rather than loaded under IDs no lookup would find.
+const leaseSnapshotVersion = 3
 
 // BaseRecord is the shared lease node model used by KEY and non-KEY records.
 type BaseRecord struct {
@@ -258,13 +265,13 @@ func (m *InMemoryLeaseStore) RegisterWithParent(ctx context.Context, parentNodeK
 	if keyRR == nil {
 		return fmt.Errorf("key rr is nil")
 	}
-	dnsName := normalizeName(keyRR.Hdr.Name)
+	dnsName := dnsname.Normalize(keyRR.Hdr.Name)
 	if dnsName == "" {
 		return fmt.Errorf("key name is empty")
 	}
 	nodeKey := NodeKey(keyRR)
 
-	parentNodeKey = normalizeName(parentNodeKey)
+	parentNodeKey = dnsname.Normalize(parentNodeKey)
 	if parentNodeKey == nodeKey {
 		parentNodeKey = ""
 	}
@@ -273,7 +280,7 @@ func (m *InMemoryLeaseStore) RegisterWithParent(ctx context.Context, parentNodeK
 			return fmt.Errorf("cannot register KEY %s under %s: a non-KEY record can never be a parent", nodeKey, parentNodeKey)
 		}
 	}
-	upstreamZone = normalizeZone(upstreamZone)
+	upstreamZone = dnsname.Normalize(upstreamZone)
 
 	now := time.Now()
 	record := &Record{
@@ -338,7 +345,7 @@ func (m *InMemoryLeaseStore) FindByName(dnsName string) []*Record {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 
-	dnsName = normalizeName(dnsName)
+	dnsName = dnsname.Normalize(dnsName)
 	var out []*Record
 	for _, nodeKey := range m.nameIdx[dnsName] {
 		if rec := m.leases[nodeKey]; rec != nil && !rec.IsExpired() {
@@ -375,7 +382,7 @@ func (m *InMemoryLeaseStore) Get(nodeKey string) *Record {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 
-	if rec, ok := m.leases[normalizeName(nodeKey)]; ok {
+	if rec, ok := m.leases[dnsname.Normalize(nodeKey)]; ok {
 		return cloneRecord(rec)
 	}
 	return nil
@@ -390,7 +397,7 @@ func (m *InMemoryLeaseStore) DeleteSubtree(nodeKey string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	nk := normalizeName(nodeKey)
+	nk := dnsname.Normalize(nodeKey)
 	if nk == "" {
 		return fmt.Errorf("node key is empty")
 	}
@@ -404,7 +411,7 @@ func (m *InMemoryLeaseStore) ChildrenOf(nodeKey string) []string {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 
-	set := m.children[normalizeName(nodeKey)]
+	set := m.children[dnsname.Normalize(nodeKey)]
 	if len(set) == 0 {
 		return nil
 	}
@@ -422,7 +429,7 @@ func (m *InMemoryLeaseStore) ListSubtreeKeys(nodeKey string) []string {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 
-	nk := normalizeName(nodeKey)
+	nk := dnsname.Normalize(nodeKey)
 
 	all := make([]string, 0)
 	stack := []string{nk}
@@ -476,7 +483,7 @@ func (m *InMemoryLeaseStore) UpsertNonKEYRecords(ownerNodeKey string, records []
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	ownerNodeKey = normalizeName(ownerNodeKey)
+	ownerNodeKey = dnsname.Normalize(ownerNodeKey)
 	if ownerNodeKey == "" {
 		return fmt.Errorf("owner key name is empty")
 	}
@@ -502,7 +509,7 @@ func (m *InMemoryLeaseStore) UpsertNonKEYRecords(ownerNodeKey string, records []
 	}
 
 	now := time.Now()
-	zone := normalizeZone(upstreamZone)
+	zone := dnsname.Normalize(upstreamZone)
 	for _, c := range toApply {
 		entry, ok := m.nonKeyRecords[c.id]
 		if !ok {
@@ -533,7 +540,7 @@ func (m *InMemoryLeaseStore) RemoveNonKEYRecords(ownerNodeKey string) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	ownerNodeKey = normalizeName(ownerNodeKey)
+	ownerNodeKey = dnsname.Normalize(ownerNodeKey)
 	kids := m.children[ownerNodeKey]
 	for childID := range kids {
 		if _, ok := m.nonKeyRecords[childID]; ok {
@@ -558,7 +565,7 @@ func (m *InMemoryLeaseStore) RemoveSingleNonKEYRecord(ownerNodeKey, rrKey string
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	ownerNodeKey = normalizeName(ownerNodeKey)
+	ownerNodeKey = dnsname.Normalize(ownerNodeKey)
 	entry, ok := m.nonKeyRecords[rrKey]
 	if !ok {
 		// Idempotent delete: a record that's already gone (e.g. a caller
@@ -588,7 +595,7 @@ func (m *InMemoryLeaseStore) GetNonKEYRecordSet(ownerNodeKey string) *NonKEYReco
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 
-	ownerNodeKey = normalizeName(ownerNodeKey)
+	ownerNodeKey = dnsname.Normalize(ownerNodeKey)
 	kids := m.children[ownerNodeKey]
 	if len(kids) == 0 {
 		return nil
@@ -706,7 +713,7 @@ func (m *InMemoryLeaseStore) ImportSnapshot(snapshot *LeaseTreeSnapshot) error {
 			if strings.TrimSpace(node.KeyData) == "" {
 				return fmt.Errorf("snapshot key data is empty for %s", node.NodeID)
 			}
-			nodeID := normalizeName(node.NodeID)
+			nodeID := dnsname.Normalize(node.NodeID)
 			if nodeID == "" {
 				return fmt.Errorf("snapshot key node has empty node id")
 			}
@@ -732,12 +739,12 @@ func (m *InMemoryLeaseStore) ImportSnapshot(snapshot *LeaseTreeSnapshot) error {
 					ExpiresAt:     node.ExpiresAt,
 					LeaseDuration: node.LeaseDuration,
 					RegisteredAt:  node.RegisteredAt,
-					ParentKeyName: normalizeName(node.ParentKeyName),
+					ParentKeyName: dnsname.Normalize(node.ParentKeyName),
 				},
-				KeyName:          normalizeName(node.RRName),
+				KeyName:          dnsname.Normalize(node.RRName),
 				KeyRR:            keyRR,
 				KeyLeaseDuration: node.KeyLeaseDuration,
-				UpstreamZone:     normalizeZone(node.UpstreamZone),
+				UpstreamZone:     dnsname.Normalize(node.UpstreamZone),
 			}
 			if rec.RegisteredAt.IsZero() {
 				rec.RegisteredAt = time.Now()
@@ -749,7 +756,7 @@ func (m *InMemoryLeaseStore) ImportSnapshot(snapshot *LeaseTreeSnapshot) error {
 			if nodeID == "" {
 				return fmt.Errorf("snapshot non-key node has empty node id")
 			}
-			parent := normalizeName(node.ParentKeyName)
+			parent := dnsname.Normalize(node.ParentKeyName)
 			if parent == "" {
 				return fmt.Errorf("snapshot non-key node %s has empty parent", nodeID)
 			}
@@ -772,7 +779,7 @@ func (m *InMemoryLeaseStore) ImportSnapshot(snapshot *LeaseTreeSnapshot) error {
 				},
 				RRKey:        nodeID,
 				RR:           rr,
-				UpstreamZone: normalizeZone(node.UpstreamZone),
+				UpstreamZone: dnsname.Normalize(node.UpstreamZone),
 			}
 
 		default:
@@ -843,19 +850,15 @@ func (m *InMemoryLeaseStore) LoadSnapshot(path string) error {
 // (see FileLeaseStore) override it to flush state and release resources.
 func (m *InMemoryLeaseStore) Stop() {}
 
-func normalizeName(name string) string {
-	return strings.TrimSuffix(strings.ToLower(strings.TrimSpace(name)), ".")
-}
-
 // NodeKey returns the canonical composite lease-store key for a KEY RR.
 // Format: dnsname.+algo+keytag (same convention as BIND key files).
 func NodeKey(k *dns.KEY) string {
-	return fmt.Sprintf("%s.+%03d+%05d", normalizeName(k.Hdr.Name), k.Algorithm, k.KeyTag())
+	return fmt.Sprintf("%s.+%03d+%05d", dnsname.Normalize(k.Hdr.Name), k.Algorithm, k.KeyTag())
 }
 
 // NodeKeyFromSIG computes the composite lease-store key from SIG(0) signer fields.
 func NodeKeyFromSIG(signerName string, algorithm uint8, keyTag uint16) string {
-	return fmt.Sprintf("%s.+%03d+%05d", normalizeName(signerName), algorithm, keyTag)
+	return fmt.Sprintf("%s.+%03d+%05d", dnsname.Normalize(signerName), algorithm, keyTag)
 }
 
 // dnsNameFromNodeKey extracts the DNS name portion of a composite node key.
@@ -864,10 +867,6 @@ func dnsNameFromNodeKey(nodeKey string) string {
 		return nodeKey[:i]
 	}
 	return nodeKey
-}
-
-func normalizeZone(zone string) string {
-	return normalizeName(zone)
 }
 
 func cloneRecord(r *Record) *Record {
@@ -905,6 +904,11 @@ func cloneNonKeyRecord(r *NonKEYRecord) *NonKEYRecord {
 //	       may include the services mask -- not fully RFC 2136 compliant for
 //	       WKS, but there is no better option available.
 //
+// Names compare as RFC 2136 S1.1.2 requires (RFC 1035 S2.3.3: US-ASCII case
+// only, see pkg/dnsname) -- the owner name, and also the domain names inside
+// the RDATA of the types BIND compares that way (see foldRDATANames). Any
+// other RDATA, TXT included, is compared exactly.
+//
 // This is the one function that must be used everywhere a non-KEY record's
 // identity is computed -- the store's own keys, duplicate/ownership checks,
 // and deletion-by-key all have to agree on the same string for the same RR,
@@ -914,7 +918,7 @@ func RecordKey(rr dns.RR) string {
 		return ""
 	}
 	hdr := rr.Header()
-	name := strings.ToLower(hdr.Name)
+	name := dnsname.Fold(hdr.Name)
 	class := hdr.Class
 	typ := dns.RRToType(rr)
 
@@ -924,8 +928,64 @@ func RecordKey(rr dns.RR) string {
 	case uint16(4): // WKS type code (not exported by the dns library)
 		return fmt.Sprintf("%s %d %d %s", name, class, typ, rr.Data().String())
 	default:
-		return fmt.Sprintf("%s %d %d %d %s", name, class, typ, rr.Data().Len(), rr.Data().String())
+		data := foldRDATANames(rr).Data()
+		return fmt.Sprintf("%s %d %d %d %s", name, class, typ, data.Len(), data.String())
 	}
+}
+
+// foldRDATANames returns rr, or for a type whose RDATA holds domain names a
+// copy of rr with those names case-folded -- the types of RFC 4034 S6.2's
+// canonical-form list (as corrected by RFC 6840 S5.1), minus SOA and CNAME,
+// whose RDATA RecordKey never looks at. BIND compares these embedded names
+// case-insensitively when deciding whether two RRs are the same (RFC 2136
+// S1.1.1); newer types' RDATA is compared bitwise (RFC 3597 S6).
+//
+// The dns library can't do this for us: its own canonicalize (same list) is
+// unexported, and its exported dns.Equal compares these names byte for byte.
+func foldRDATANames(rr dns.RR) dns.RR {
+	cpy := rr.Clone()
+	switch x := cpy.(type) {
+	case *dns.NS:
+		x.Ns = dnsname.Fold(x.Ns)
+	case *dns.MD:
+		x.Md = dnsname.Fold(x.Md)
+	case *dns.MF:
+		x.Mf = dnsname.Fold(x.Mf)
+	case *dns.MB:
+		x.Mb = dnsname.Fold(x.Mb)
+	case *dns.MG:
+		x.Mg = dnsname.Fold(x.Mg)
+	case *dns.MR:
+		x.Mr = dnsname.Fold(x.Mr)
+	case *dns.PTR:
+		x.Ptr = dnsname.Fold(x.Ptr)
+	case *dns.MINFO:
+		x.Rmail = dnsname.Fold(x.Rmail)
+		x.Email = dnsname.Fold(x.Email)
+	case *dns.MX:
+		x.Mx = dnsname.Fold(x.Mx)
+	case *dns.RP:
+		x.Mbox = dnsname.Fold(x.Mbox)
+		x.Txt = dnsname.Fold(x.Txt)
+	case *dns.AFSDB:
+		x.Hostname = dnsname.Fold(x.Hostname)
+	case *dns.RT:
+		x.Host = dnsname.Fold(x.Host)
+	case *dns.PX:
+		x.Map822 = dnsname.Fold(x.Map822)
+		x.Mapx400 = dnsname.Fold(x.Mapx400)
+	case *dns.NAPTR:
+		x.Replacement = dnsname.Fold(x.Replacement)
+	case *dns.KX:
+		x.Exchanger = dnsname.Fold(x.Exchanger)
+	case *dns.SRV:
+		x.Target = dnsname.Fold(x.Target)
+	case *dns.DNAME:
+		x.Target = dnsname.Fold(x.Target)
+	default:
+		return rr
+	}
+	return cpy
 }
 
 // attachNodeLocked records nodeKey as a child of parentNodeKey. A root node (no parent --

@@ -10,6 +10,7 @@ import (
 	"github.com/NetworkCommons/sig0lease/forward"
 	"github.com/NetworkCommons/sig0lease/handlers"
 	"github.com/NetworkCommons/sig0lease/logging"
+	"github.com/NetworkCommons/sig0lease/pkg/dnsname"
 )
 
 // Router routes DNS requests based on opcode to appropriate handlers or forwarder.
@@ -141,7 +142,7 @@ func (r *Router) isDumpQuery(m *dns.Msg) bool {
 	if dns.RRToType(m.Question[0]) != dns.TypeTXT {
 		return false
 	}
-	return strings.EqualFold(q.Name, dumpQueryName) || strings.EqualFold(q.Name, dumpQueryDebugName)
+	return dnsname.EqualFold(q.Name, dumpQueryName) || dnsname.EqualFold(q.Name, dumpQueryDebugName)
 }
 
 // dumpLevelFromQuery extracts the log level from the query name.
@@ -151,7 +152,7 @@ func dumpLevelFromQuery(m *dns.Msg) string {
 		return "info"
 	}
 	q := m.Question[0].Header()
-	if strings.EqualFold(q.Name, dumpQueryDebugName) {
+	if dnsname.EqualFold(q.Name, dumpQueryDebugName) {
 		return "debug"
 	}
 	return "info"

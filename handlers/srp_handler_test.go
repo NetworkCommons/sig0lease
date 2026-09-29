@@ -15,6 +15,7 @@ import (
 
 	"codeberg.org/miekg/dns"
 	"github.com/NetworkCommons/sig0lease/logging"
+	"github.com/NetworkCommons/sig0lease/pkg/dnsname"
 	leasepkg "github.com/NetworkCommons/sig0lease/pkg/lease"
 	"github.com/NetworkCommons/sig0lease/pkg/sig0"
 	"github.com/NetworkCommons/sig0lease/pkg/srp"
@@ -330,7 +331,10 @@ func TestSRPHandle_ForwardsSynthesizedKEYForInstanceThatOmittedIt(t *testing.T) 
 		if !ok || key.Hdr.Class == dns.ClassNONE {
 			continue
 		}
-		if canonicalName(key.Hdr.Name) == canonicalName(inst) &&
+		// Exact, case-sensitive owner comparison: inst is mixed-case ("Widget..."), and
+		// the synthesized KEY must carry the requester's spelling, not the lower-cased
+		// name Classify uses for comparisons (see srp.KeyFor).
+		if key.Hdr.Name == inst &&
 			key.Algorithm == want.Algorithm && key.Protocol == want.Protocol && key.PublicKey == want.PublicKey {
 			found = true
 		}
@@ -362,7 +366,7 @@ func TestSRPHandle_RestartRefreshSucceeds_WhenUpstreamHasSynthesizedInstanceKey(
 	}
 	var forwardedInstKey *dns.KEY
 	for _, rr := range coord1.sent[0].Ns {
-		if key, ok := rr.(*dns.KEY); ok && key.Hdr.Class != dns.ClassNONE && canonicalName(key.Hdr.Name) == canonicalName(inst) {
+		if key, ok := rr.(*dns.KEY); ok && key.Hdr.Class != dns.ClassNONE && dnsname.Normalize(key.Hdr.Name) == dnsname.Normalize(inst) {
 			forwardedInstKey = key
 		}
 	}
@@ -410,7 +414,66 @@ func TestSRPHandle_RefreshSameKey(t *testing.T) {
 	}
 }
 
+// TestSRPHandle_RefreshChangingOnlyNameCase_KeepsPTR pins RFC 2136 S1.1's equality for
+// names inside RDATA: a refresh whose instance name differs from the stored one only in
+// ASCII case names the same PTR RR, as far as BIND is concerned. If the lease store keyed
+// the PTR by its target's exact case, ptrDeleteDiff would see the stored "Widget" PTR as
+// dropped and append a delete for it AFTER the client's own "widget" add -- and BIND, which
+// treats the two as one RR, would apply that delete and leave the instance undiscoverable.
+func TestSRPHandle_RefreshChangingOnlyNameCase_KeepsPTR(t *testing.T) {
+	h, coord := newSRPTestHandler(t)
+	id := newSRPTestIdentity(t)
+	const host = "srptestcase.dev.zenr.io."
+
+	first := buildSRPUpdate(t, srpTestZone, id, host, []string{"192.0.2.1"}, oneWidgetInstance(), 30, 1209600, host)
+	if res := h.Handle(context.Background(), stubTCPResponseWriter{}, first); res.Status != StatusProcessed {
+		t.Fatalf("registration: expected Processed, got %s: %v", res.Status, res.Error)
+	}
+	sentBefore := len(coord.sent)
+
+	lower := oneWidgetInstance()
+	lower[0].name = strings.ToLower(lower[0].name)
+	second := buildSRPUpdate(t, srpTestZone, id, host, []string{"192.0.2.1"}, lower, 30, 1209600, host)
+	if res := h.Handle(context.Background(), stubTCPResponseWriter{}, second); res.Status != StatusProcessed {
+		t.Fatalf("case-only refresh: expected Processed, got %s: %v", res.Status, res.Error)
+	}
+	if len(coord.sent) <= sentBefore {
+		t.Fatal("case-only refresh sent nothing upstream")
+	}
+	for _, rr := range coord.sent[sentBefore].Ns {
+		if p, ok := rr.(*dns.PTR); ok && p.Hdr.Class == dns.ClassNONE {
+			t.Fatalf("case-only refresh must not delete the PTR it re-adds, got delete %s in Ns: %+v", p, coord.sent[sentBefore].Ns)
+		}
+	}
+}
+
 // --- FCFS ------------------------------------------------------------------------------
+
+// TestSRPHandle_FCFS_NonASCIICaseVariantsAreDistinctNames pins DNS case-insensitivity to
+// US-ASCII only (RFC 1035 S2.3.3, RFC 4343 S3): U+212A KELVIN SIGN + "itchen" and "kitchen"
+// are different DNS names, so a second key registering "kitchen" is first-come, not a
+// conflict. Unicode folding (strings.ToLower) mapped both to "kitchen", so the lease store
+// reported the name as held by the first key and the second registration got YXDOMAIN.
+func TestSRPHandle_FCFS_NonASCIICaseVariantsAreDistinctNames(t *testing.T) {
+	h, _ := newSRPTestHandler(t)
+	idA := newSRPTestIdentity(t)
+	idB := newSRPTestIdentity(t)
+	const hostA = "kelvinhost.dev.zenr.io."
+	const hostB = "asciihost.dev.zenr.io."
+
+	instA := []srpInstanceSpec{{name: "Kitchen._http._tcp.dev.zenr.io.", port: 8080, txt: "path=/", svctype: "_http._tcp.dev.zenr.io."}}
+	msgA := buildSRPUpdate(t, srpTestZone, idA, hostA, []string{"192.0.2.1"}, instA, 30, 1209600, hostA)
+	if res := h.Handle(context.Background(), stubTCPResponseWriter{}, msgA); res.Status != StatusProcessed {
+		t.Fatalf("KELVIN SIGN registration: expected Processed, got %s: %v", res.Status, res.Error)
+	}
+
+	instB := []srpInstanceSpec{{name: "kitchen._http._tcp.dev.zenr.io.", port: 8080, txt: "path=/", svctype: "_http._tcp.dev.zenr.io."}}
+	msgB := buildSRPUpdate(t, srpTestZone, idB, hostB, []string{"192.0.2.2"}, instB, 30, 1209600, hostB)
+	res := h.Handle(context.Background(), stubTCPResponseWriter{}, msgB)
+	if res.Status != StatusProcessed || res.Message == nil || res.Message.Rcode != dns.RcodeSuccess {
+		t.Fatalf("ASCII \"kitchen\" is a different name from the KELVIN SIGN one: expected NOERROR, got status=%s message=%+v err=%v", res.Status, res.Message, res.Error)
+	}
+}
 
 func TestSRPHandle_FCFSConflict(t *testing.T) {
 	h, coord := newSRPTestHandler(t)
@@ -712,7 +775,7 @@ func TestSRPHandle_DefaultServiceARPA_RewrittenToUpstreamZone(t *testing.T) {
 
 	// The response's own Zone Section must still be default.service.arpa. -- the client's
 	// own request symmetry, unaffected by what happened internally.
-	if got := res.Message.Question[0].Header().Name; canonicalName(got) != canonicalName(defaultServiceARPA) {
+	if got := res.Message.Question[0].Header().Name; dnsname.Normalize(got) != dnsname.Normalize(defaultServiceARPA) {
 		t.Fatalf("response Zone Section = %q, want default.service.arpa. (echoed from the request)", got)
 	}
 
@@ -723,18 +786,18 @@ func TestSRPHandle_DefaultServiceARPA_RewrittenToUpstreamZone(t *testing.T) {
 	}
 	sawRealHost, sawRealInstance := false, false
 	for _, rr := range coord.sent[0].Ns {
-		name := canonicalName(rr.Header().Name)
+		name := dnsname.Normalize(rr.Header().Name)
 		if strings.Contains(name, "default.service.arpa") {
 			t.Fatalf("upstream forward still carries a default.service.arpa. name: %s", rr.String())
 		}
-		if name == canonicalName(realHost) {
+		if name == dnsname.Normalize(realHost) {
 			sawRealHost = true
 		}
 		if srv, ok := rr.(*dns.SRV); ok {
-			if strings.Contains(canonicalName(srv.SRV.Target), "default.service.arpa") {
+			if strings.Contains(dnsname.Normalize(srv.SRV.Target), "default.service.arpa") {
 				t.Fatalf("upstream SRV target still carries a default.service.arpa. name: %s", srv.String())
 			}
-			if canonicalName(srv.SRV.Target) == canonicalName(realHost) {
+			if dnsname.Normalize(srv.SRV.Target) == dnsname.Normalize(realHost) {
 				sawRealInstance = true
 			}
 		}
@@ -919,7 +982,7 @@ func TestSRPHandle_RemoveOneInstance(t *testing.T) {
 	// sent[2]=removal forward (checked below), sent[3]=its own enumeration reconcile.
 	var foundDeleteAll, foundPTRDelete bool
 	for _, rr := range coord.sent[2].Ns {
-		if any, ok := rr.(*dns.ANY); ok && canonicalName(any.Hdr.Name) == canonicalName(inst) {
+		if any, ok := rr.(*dns.ANY); ok && dnsname.Normalize(any.Hdr.Name) == dnsname.Normalize(inst) {
 			foundDeleteAll = true
 		}
 		// The instance's own Delete All RRsets never reaches its PTR -- that's owned at
@@ -929,7 +992,7 @@ func TestSRPHandle_RemoveOneInstance(t *testing.T) {
 		// covers everything") was a real bug caught by the local BIND 9 harness (plan
 		// S12.2/S14 Option C): it left every removed instance's PTR permanently orphaned
 		// upstream.
-		if ptr, ok := rr.(*dns.PTR); ok && ptr.Hdr.Class == dns.ClassNONE && canonicalName(ptr.Ptr) == canonicalName(inst) {
+		if ptr, ok := rr.(*dns.PTR); ok && ptr.Hdr.Class == dns.ClassNONE && dnsname.Normalize(ptr.Ptr) == dnsname.Normalize(inst) {
 			foundPTRDelete = true
 		}
 	}
@@ -946,7 +1009,7 @@ func TestSRPHandle_RemoveOneInstance(t *testing.T) {
 	enumOwner := "_services._dns-sd._udp." + srpTestZone
 	foundEnumDelete := false
 	for _, rr := range coord.sent[3].Ns {
-		if ptr, ok := rr.(*dns.PTR); ok && ptr.Hdr.Class == dns.ClassNONE && canonicalName(ptr.Hdr.Name) == canonicalName(enumOwner) {
+		if ptr, ok := rr.(*dns.PTR); ok && ptr.Hdr.Class == dns.ClassNONE && dnsname.Normalize(ptr.Hdr.Name) == dnsname.Normalize(enumOwner) {
 			foundEnumDelete = true
 		}
 	}
@@ -995,7 +1058,7 @@ func TestSRPHandle_ServiceEnumeration_KeepsListedWhenAnotherRegistrantStillProvi
 	enumOwner := "_services._dns-sd._udp." + srpTestZone
 	for _, msg := range coord.sent {
 		for _, rr := range msg.Ns {
-			if ptr, ok := rr.(*dns.PTR); ok && ptr.Hdr.Class == dns.ClassNONE && canonicalName(ptr.Hdr.Name) == canonicalName(enumOwner) {
+			if ptr, ok := rr.(*dns.PTR); ok && ptr.Hdr.Class == dns.ClassNONE && dnsname.Normalize(ptr.Hdr.Name) == dnsname.Normalize(enumOwner) {
 				t.Fatalf("expected no enumeration-record delete while another registrant still provides the type, got: %s", ptr.String())
 			}
 		}
@@ -1033,8 +1096,8 @@ func TestSRPHandle_BrowseDomains_AddedOnRegistrationRemovedWhenZoneEmpties(t *te
 		owner := prefix + "._dns-sd._udp." + srpTestZone
 		found := false
 		for _, rr := range coord.sent[1].Ns {
-			if ptr, ok := rr.(*dns.PTR); ok && ptr.Hdr.Class == dns.ClassINET && canonicalName(ptr.Hdr.Name) == canonicalName(owner) {
-				if canonicalName(ptr.Ptr) != canonicalName(srpTestZone) {
+			if ptr, ok := rr.(*dns.PTR); ok && ptr.Hdr.Class == dns.ClassINET && dnsname.Normalize(ptr.Hdr.Name) == dnsname.Normalize(owner) {
+				if dnsname.Normalize(ptr.Ptr) != dnsname.Normalize(srpTestZone) {
 					t.Fatalf("%s: expected the domain-enumeration PTR to point at the zone itself, got %q", prefix, ptr.Ptr)
 				}
 				found = true
@@ -1056,7 +1119,7 @@ func TestSRPHandle_BrowseDomains_AddedOnRegistrationRemovedWhenZoneEmpties(t *te
 		owner := prefix + "._dns-sd._udp." + srpTestZone
 		found := false
 		for _, rr := range coord.sent[3].Ns {
-			if ptr, ok := rr.(*dns.PTR); ok && ptr.Hdr.Class == dns.ClassNONE && canonicalName(ptr.Hdr.Name) == canonicalName(owner) {
+			if ptr, ok := rr.(*dns.PTR); ok && ptr.Hdr.Class == dns.ClassNONE && dnsname.Normalize(ptr.Hdr.Name) == dnsname.Normalize(owner) {
 				found = true
 			}
 		}
@@ -1105,7 +1168,7 @@ func TestSRPHandle_BrowseDomains_KeptWhenAnotherRegistrantStillProvidesAType(t *
 			}
 			for _, prefix := range alwaysOnDomainEnumPrefixes {
 				owner := prefix + "._dns-sd._udp." + srpTestZone
-				if canonicalName(ptr.Hdr.Name) == canonicalName(owner) {
+				if dnsname.Normalize(ptr.Hdr.Name) == dnsname.Normalize(owner) {
 					t.Fatalf("expected no %q domain-enumeration PTR delete while another registrant still provides a service type, got: %s", prefix, ptr.String())
 				}
 			}
@@ -1132,7 +1195,7 @@ func TestSRPHandle_RegistrationDomains_OffByDefault(t *testing.T) {
 		owner := prefix + "._dns-sd._udp." + srpTestZone
 		for _, sent := range coord.sent {
 			for _, rr := range sent.Ns {
-				if ptr, ok := rr.(*dns.PTR); ok && canonicalName(ptr.Hdr.Name) == canonicalName(owner) {
+				if ptr, ok := rr.(*dns.PTR); ok && dnsname.Normalize(ptr.Hdr.Name) == dnsname.Normalize(owner) {
 					t.Fatalf("expected no %q record without advertise_registration_domain, got: %s", prefix, ptr.String())
 				}
 			}
@@ -1158,8 +1221,8 @@ func TestSRPHandle_RegistrationDomains_PublishedWhenOptedIn(t *testing.T) {
 		owner := prefix + "._dns-sd._udp." + srpTestZone
 		found := false
 		for _, rr := range coord.sent[1].Ns {
-			if ptr, ok := rr.(*dns.PTR); ok && ptr.Hdr.Class == dns.ClassINET && canonicalName(ptr.Hdr.Name) == canonicalName(owner) {
-				if canonicalName(ptr.Ptr) != canonicalName(srpTestZone) {
+			if ptr, ok := rr.(*dns.PTR); ok && ptr.Hdr.Class == dns.ClassINET && dnsname.Normalize(ptr.Hdr.Name) == dnsname.Normalize(owner) {
+				if dnsname.Normalize(ptr.Ptr) != dnsname.Normalize(srpTestZone) {
 					t.Fatalf("%s: expected the registration-domain PTR to point at the zone itself, got %q", prefix, ptr.Ptr)
 				}
 				found = true
@@ -1191,8 +1254,8 @@ func TestSRPHandle_RegistrationDomains_PublishedWithNoLiveServices(t *testing.T)
 		owner := prefix + "._dns-sd._udp." + srpTestZone
 		found := false
 		for _, rr := range coord.sent[0].Ns {
-			if ptr, ok := rr.(*dns.PTR); ok && ptr.Hdr.Class == dns.ClassINET && canonicalName(ptr.Hdr.Name) == canonicalName(owner) {
-				if canonicalName(ptr.Ptr) != canonicalName(srpTestZone) {
+			if ptr, ok := rr.(*dns.PTR); ok && ptr.Hdr.Class == dns.ClassINET && dnsname.Normalize(ptr.Hdr.Name) == dnsname.Normalize(owner) {
+				if dnsname.Normalize(ptr.Ptr) != dnsname.Normalize(srpTestZone) {
 					t.Fatalf("%s: expected the registration-domain PTR to point at the zone itself, got %q", prefix, ptr.Ptr)
 				}
 				found = true
@@ -1205,7 +1268,7 @@ func TestSRPHandle_RegistrationDomains_PublishedWithNoLiveServices(t *testing.T)
 	for _, prefix := range alwaysOnDomainEnumPrefixes {
 		owner := prefix + "._dns-sd._udp." + srpTestZone
 		for _, rr := range coord.sent[0].Ns {
-			if ptr, ok := rr.(*dns.PTR); ok && canonicalName(ptr.Hdr.Name) == canonicalName(owner) {
+			if ptr, ok := rr.(*dns.PTR); ok && dnsname.Normalize(ptr.Hdr.Name) == dnsname.Normalize(owner) {
 				t.Fatalf("expected no %q browsing-domain PTR with no live service type, got: %s", prefix, ptr.String())
 			}
 		}
@@ -1240,7 +1303,7 @@ func TestSRPHandle_RegistrationDomains_StayPublishedWhenZoneEmpties(t *testing.T
 	for _, prefix := range []string{"r", "dr"} {
 		owner := prefix + "._dns-sd._udp." + srpTestZone
 		for _, rr := range coord.sent[3].Ns {
-			if ptr, ok := rr.(*dns.PTR); ok && canonicalName(ptr.Hdr.Name) == canonicalName(owner) {
+			if ptr, ok := rr.(*dns.PTR); ok && dnsname.Normalize(ptr.Hdr.Name) == dnsname.Normalize(owner) {
 				t.Fatalf("expected no %q registration-domain PTR delete when the zone empties while still opted in, got: %s", prefix, ptr.String())
 			}
 		}
@@ -1285,7 +1348,7 @@ func TestSRPHandle_PTRDiff_DropsSubtypeOnUpdate(t *testing.T) {
 		if !ok || ptr.Hdr.Class != dns.ClassNONE {
 			continue
 		}
-		if canonicalName(ptr.Hdr.Name) == canonicalName(subtype) {
+		if dnsname.Normalize(ptr.Hdr.Name) == dnsname.Normalize(subtype) {
 			foundDeleteForSubtype = true
 		}
 	}
@@ -1342,7 +1405,7 @@ func TestSRPHandle_ExpiryDeletesUpstreamThenLocally(t *testing.T) {
 		// implementation) left the host's A record permanently orphaned upstream once the
 		// local subtree was gone locally, a real bug caught by the local BIND 9 test
 		// harness.
-		if any, ok := rr.(*dns.ANY); ok && any.Hdr.Class == dns.ClassANY && canonicalName(any.Hdr.Name) == canonicalName(host) {
+		if any, ok := rr.(*dns.ANY); ok && any.Hdr.Class == dns.ClassANY && dnsname.Normalize(any.Hdr.Name) == dnsname.Normalize(host) {
 			foundDeleteAll = true
 		}
 	}
@@ -1386,10 +1449,10 @@ func TestSRPHandle_ExpiryPTRCleanup(t *testing.T) {
 	lastSent := coord.sent[len(coord.sent)-2]
 	var foundDeleteAll, foundPTRDelete bool
 	for _, rr := range lastSent.Ns {
-		if any, ok := rr.(*dns.ANY); ok && canonicalName(any.Hdr.Name) == canonicalName(inst) {
+		if any, ok := rr.(*dns.ANY); ok && dnsname.Normalize(any.Hdr.Name) == dnsname.Normalize(inst) {
 			foundDeleteAll = true
 		}
-		if ptr, ok := rr.(*dns.PTR); ok && ptr.Hdr.Class == dns.ClassNONE && canonicalName(ptr.Ptr) == canonicalName(inst) {
+		if ptr, ok := rr.(*dns.PTR); ok && ptr.Hdr.Class == dns.ClassNONE && dnsname.Normalize(ptr.Ptr) == dnsname.Normalize(inst) {
 			foundPTRDelete = true
 		}
 	}
@@ -1444,14 +1507,14 @@ func TestSRPHandle_ExpiryCoversWholeSubtree(t *testing.T) {
 	var foundHostDelete, foundInstDelete, foundPTRDelete bool
 	for _, rr := range lastSent.Ns {
 		if any, ok := rr.(*dns.ANY); ok {
-			switch canonicalName(any.Hdr.Name) {
-			case canonicalName(host):
+			switch dnsname.Normalize(any.Hdr.Name) {
+			case dnsname.Normalize(host):
 				foundHostDelete = true
-			case canonicalName(inst):
+			case dnsname.Normalize(inst):
 				foundInstDelete = true
 			}
 		}
-		if ptr, ok := rr.(*dns.PTR); ok && ptr.Hdr.Class == dns.ClassNONE && canonicalName(ptr.Ptr) == canonicalName(inst) {
+		if ptr, ok := rr.(*dns.PTR); ok && ptr.Hdr.Class == dns.ClassNONE && dnsname.Normalize(ptr.Ptr) == dnsname.Normalize(inst) {
 			foundPTRDelete = true
 		}
 	}
@@ -1606,9 +1669,9 @@ func srpLeaseExpiryDeletes(t *testing.T, msgs []*dns.Msg) map[string]bool {
 				if typ == dns.TypeKEY {
 					t.Fatalf("expected no KEY delete on LEASE expiry, got %s", rr)
 				}
-				key := dns.TypeToString[typ] + " " + canonicalName(hdr.Name)
+				key := dns.TypeToString[typ] + " " + dnsname.Normalize(hdr.Name)
 				if ptr, ok := rr.(*dns.PTR); ok {
-					key += " -> " + canonicalName(ptr.Ptr)
+					key += " -> " + dnsname.Normalize(ptr.Ptr)
 				}
 				deletes[key] = true
 			}
@@ -1657,10 +1720,10 @@ func TestSRPHandle_LeaseExpiry_DeletesDataKeepsKEYsUntilKeyLease(t *testing.T) {
 	}
 	deletes := srpLeaseExpiryDeletes(t, coord.sentSnapshot()[registered:])
 	for _, want := range []string{
-		"A " + canonicalName(host),
-		"SRV " + canonicalName(spec.name),
-		"TXT " + canonicalName(spec.name),
-		"PTR " + canonicalName(spec.svctype) + " -> " + canonicalName(spec.name),
+		"A " + dnsname.Normalize(host),
+		"SRV " + dnsname.Normalize(spec.name),
+		"TXT " + dnsname.Normalize(spec.name),
+		"PTR " + dnsname.Normalize(spec.svctype) + " -> " + dnsname.Normalize(spec.name),
 	} {
 		if !deletes[want] {
 			t.Fatalf("expected an upstream delete for %q at LEASE expiry, got %v", want, deletes)
@@ -1706,10 +1769,10 @@ func TestSRPHandle_LeaseExpiry_HostCascadesToLongerLivedInstance(t *testing.T) {
 
 	deletes := srpLeaseExpiryDeletes(t, coord.sent[sentBefore:])
 	for _, want := range []string{
-		"A " + canonicalName(host),
-		"SRV " + canonicalName(spec.name),
-		"TXT " + canonicalName(spec.name),
-		"PTR " + canonicalName(spec.svctype) + " -> " + canonicalName(spec.name),
+		"A " + dnsname.Normalize(host),
+		"SRV " + dnsname.Normalize(spec.name),
+		"TXT " + dnsname.Normalize(spec.name),
+		"PTR " + dnsname.Normalize(spec.svctype) + " -> " + dnsname.Normalize(spec.name),
 	} {
 		if !deletes[want] {
 			t.Fatalf("expected the host's LEASE expiry to delete %q upstream, got %v", want, deletes)
@@ -1753,10 +1816,10 @@ func TestSRPHandle_LeaseExpiry_InstanceAloneLeavesHostData(t *testing.T) {
 	h.processExpiredNode(context.Background(), instNodeKey)
 
 	deletes := srpLeaseExpiryDeletes(t, coord.sent[sentBefore:])
-	if deletes["A "+canonicalName(host)] {
+	if deletes["A "+dnsname.Normalize(host)] {
 		t.Fatalf("expected the instance's LEASE expiry to leave the host's A record alone, got %v", deletes)
 	}
-	if !deletes["SRV "+canonicalName(spec.name)] {
+	if !deletes["SRV "+dnsname.Normalize(spec.name)] {
 		t.Fatalf("expected the instance's SRV to be deleted upstream, got %v", deletes)
 	}
 	if n := srpNonKEYCount(h, instNodeKey); n != 0 {

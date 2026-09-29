@@ -5,9 +5,9 @@ package updatecore
 
 import (
 	"fmt"
-	"strings"
 
 	"codeberg.org/miekg/dns"
+	"github.com/NetworkCommons/sig0lease/pkg/dnsname"
 )
 
 // rrsetKey identifies an RRset for TTL-consistency purposes: RFC 2181 S5.2 defines an
@@ -17,18 +17,14 @@ import (
 // for what is otherwise the same name+type, and those are never the same RRset on the
 // wire, so must never be merged into one TTL-consistency group).
 type rrsetKey struct {
-	name  string // canonical: lower-cased, trailing dot stripped
+	name  string // dnsname.Normalize form
 	class uint16
 	rtype uint16
 }
 
-func canonicalOwnerName(name string) string {
-	return strings.TrimSuffix(strings.ToLower(strings.TrimSpace(name)), ".")
-}
-
 func keyFor(rr dns.RR) rrsetKey {
 	hdr := rr.Header()
-	return rrsetKey{name: canonicalOwnerName(hdr.Name), class: hdr.Class, rtype: dns.RRToType(rr)}
+	return rrsetKey{name: dnsname.Normalize(hdr.Name), class: hdr.Class, rtype: dns.RRToType(rr)}
 }
 
 // groupRRsets buckets records by rrsetKey, preserving each group's original relative

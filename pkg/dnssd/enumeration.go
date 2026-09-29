@@ -13,6 +13,7 @@ import (
 	"strings"
 
 	"codeberg.org/miekg/dns"
+	"github.com/NetworkCommons/sig0lease/pkg/dnsname"
 )
 
 // EnumerationOwnerName returns the RFC 6763 S9 Service Type Enumeration PTR owner name for
@@ -88,7 +89,7 @@ func DiffSelfPointingDomainRecord(prefix, zone string, wasPresent, isPresent boo
 // always the second and third labels regardless of how many labels <Domain> itself has. ok is
 // false if name has fewer labels than that shape requires.
 func ServiceTypeFromInstanceName(name string) (svcType string, ok bool) {
-	labels := splitLabels(canonicalName(name))
+	labels := splitLabels(dnsname.Fold(name))
 	// instance, type, proto, trailing empty root label from the split.
 	if len(labels) < 4 {
 		return "", false
@@ -152,19 +153,12 @@ func DiffEnumerationRecords(zone string, previous, current []string, ttl uint32)
 func dedupedSet(types []string) map[string]bool {
 	set := make(map[string]bool, len(types))
 	for _, t := range types {
-		t = canonicalName(t)
+		t = dnsname.Fold(t)
 		if t != "" {
 			set[t] = true
 		}
 	}
 	return set
-}
-
-// canonicalName lower-cases a DNS name for comparison/map-keying purposes, leaving the
-// trailing dot intact. Duplicated from pkg/srp's identical helper rather than shared --
-// see this file's deleteAllRR doc comment for why.
-func canonicalName(name string) string {
-	return strings.ToLower(strings.TrimSpace(name))
 }
 
 // splitLabels splits a canonical (already-lowercased, dot-terminated) DNS name into its

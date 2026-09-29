@@ -7,6 +7,7 @@ import (
 	"testing"
 
 	"github.com/NetworkCommons/sig0lease/logging"
+	"github.com/NetworkCommons/sig0lease/pkg/dnsname"
 	leasepkg "github.com/NetworkCommons/sig0lease/pkg/lease"
 )
 
@@ -135,7 +136,7 @@ func TestSRPSetup_FileStorageSurvivesRestart(t *testing.T) {
 	if rec == nil {
 		t.Fatalf("expected the registration made through h1 to still be present in h2 after loading the same snapshot file, got nil")
 	}
-	if rec.KeyRR == nil || canonicalName(rec.KeyRR.Hdr.Name) != canonicalName(host) {
+	if rec.KeyRR == nil || dnsname.Normalize(rec.KeyRR.Hdr.Name) != dnsname.Normalize(host) {
 		t.Fatalf("expected the restored node's KEY to be for %s, got: %+v", host, rec.KeyRR)
 	}
 }

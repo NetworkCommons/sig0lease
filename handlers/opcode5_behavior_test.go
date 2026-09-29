@@ -12,6 +12,7 @@ import (
 	"codeberg.org/miekg/dns"
 	"codeberg.org/miekg/dns/rdata"
 	"github.com/NetworkCommons/sig0lease/logging"
+	"github.com/NetworkCommons/sig0lease/pkg/dnsname"
 	"github.com/NetworkCommons/sig0lease/pkg/keyrec"
 	"github.com/NetworkCommons/sig0lease/pkg/lease"
 	"github.com/NetworkCommons/sig0lease/pkg/sig0"
@@ -815,7 +816,7 @@ func TestHandle_CaseD_KeyRefreshWithAccompanyingNonKeyDelete_ForwardsUpstreamAnd
 	coordinator := &stubUpstreamCoordinator{resp: &dns.Msg{MsgHeader: dns.MsgHeader{Rcode: dns.RcodeSuccess}}}
 	h.upstreamCoordinator = coordinator
 	h.upstreamCoordinator.(*stubUpstreamCoordinator).query = func(ctx context.Context, zoneHint, fqdn string, rrType uint16) ([]dns.RR, error) {
-		if rrType == dns.TypeKEY && canonicalName(fqdn) == canonicalName(owner.PublicKey.Hdr.Name) {
+		if rrType == dns.TypeKEY && dnsname.Normalize(fqdn) == dnsname.Normalize(owner.PublicKey.Hdr.Name) {
 			return []dns.RR{owner.PublicKey}, nil
 		}
 		return []dns.RR{}, nil

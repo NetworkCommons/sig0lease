@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"codeberg.org/miekg/dns"
+	"github.com/NetworkCommons/sig0lease/pkg/dnsname"
 	"github.com/NetworkCommons/sig0lease/pkg/dnssd"
 	"github.com/NetworkCommons/sig0lease/pkg/keyrec"
 	leasepkg "github.com/NetworkCommons/sig0lease/pkg/lease"
@@ -141,11 +142,11 @@ const defaultServiceARPA = "default.service.arpa."
 // sees it. Compared canonically since the request's own casing/trailing dot can't be
 // assumed to match the configured value.
 func (h *SRPHandler) zoneEnabled(zone string) bool {
-	z := canonicalName(zone) // handlers.canonicalName: lower-cased, trailing dot stripped
-	if z == canonicalName(h.upstreamZone) {
+	z := dnsname.Normalize(zone)
+	if z == dnsname.Normalize(h.upstreamZone) {
 		return true
 	}
-	return h.rewriteDefaultServiceARPA && z == canonicalName(defaultServiceARPA)
+	return h.rewriteDefaultServiceARPA && z == dnsname.Normalize(defaultServiceARPA)
 }
 
 // rewriteDefaultServiceARPA rewrites every name msg.Ns's records carry that ends in
@@ -185,7 +186,7 @@ func rewriteZoneSuffix(name, realZone string) string {
 	}
 	cut := len(name) - len(defaultServiceARPA)
 	tail := name[cut:]
-	if !strings.EqualFold(tail, defaultServiceARPA) {
+	if !dnsname.EqualFold(tail, defaultServiceARPA) {
 		return name
 	}
 	if cut > 0 && name[cut-1] != '.' {
@@ -262,7 +263,7 @@ func (h *SRPHandler) Handle(ctx context.Context, w dns.ResponseWriter, r *dns.Ms
 		msg := makeErrorResponse(r, dns.RcodeRefused, "missing SIG(0)")
 		return NewErrorResult(msg, err.Error(), err)
 	}
-	if canonicalName(sigRR.SignerName) != canonicalName(cu.Host.Name) {
+	if dnsname.Normalize(sigRR.SignerName) != dnsname.Normalize(cu.Host.Name) {
 		err := fmt.Errorf("SIG(0) signer %q does not match Host Description name %q", sigRR.SignerName, cu.Host.Name)
 		msg := makeErrorResponse(r, dns.RcodeRefused, "signer does not match host")
 		return NewErrorResult(msg, err.Error(), err)
@@ -291,7 +292,7 @@ func (h *SRPHandler) Handle(ctx context.Context, w dns.ResponseWriter, r *dns.Ms
 	// is enough to decide whether a rewrite is needed; no need to re-check the config
 	// flag itself. Harmless no-op if h.upstreamZone happens to literally be
 	// default.service.arpa. too (an explicitly-configured real zone of that name).
-	if canonicalName(zone) == canonicalName(defaultServiceARPA) {
+	if dnsname.Normalize(zone) == dnsname.Normalize(defaultServiceARPA) {
 		rewriteDefaultServiceARPA(r, h.upstreamZone)
 		cu, err = srp.Validate(r)
 		if err != nil {
@@ -519,7 +520,7 @@ func (h *SRPHandler) reconcileServiceEnumeration(ctx context.Context) {
 	current := h.collectLiveServiceTypes()
 	currentSet := make(map[string]bool, len(current))
 	for _, t := range current {
-		currentSet[strings.ToLower(t)] = true
+		currentSet[dnsname.Fold(t)] = true
 	}
 
 	h.serviceTypesMu.Lock()
@@ -542,7 +543,7 @@ func (h *SRPHandler) reconcileServiceEnumeration(ctx context.Context) {
 	previousForDiff := make([]string, 0, len(previous))
 	var survivors []string
 	for _, t := range previous {
-		if currentSet[strings.ToLower(t)] {
+		if currentSet[dnsname.Fold(t)] {
 			previousForDiff = append(previousForDiff, t) // still known locally too -- unaffected
 			continue
 		}
@@ -607,7 +608,7 @@ func (h *SRPHandler) reconcileServiceEnumeration(ctx context.Context) {
 			state[t] = true
 		}
 		for _, t := range survivors {
-			state[strings.ToLower(t)] = true
+			state[dnsname.Fold(t)] = true
 		}
 		return state
 	}

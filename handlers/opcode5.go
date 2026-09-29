@@ -3,10 +3,10 @@ package handlers
 
 import (
 	"context"
-	"strings"
 	"time"
 
 	"codeberg.org/miekg/dns"
+	"github.com/NetworkCommons/sig0lease/pkg/dnsname"
 	"github.com/NetworkCommons/sig0lease/pkg/keyrec"
 	leasepkg "github.com/NetworkCommons/sig0lease/pkg/lease"
 )
@@ -105,7 +105,7 @@ func keyRREqual(a, b *dns.KEY) bool {
 	if a == nil || b == nil {
 		return false
 	}
-	if !strings.EqualFold(a.Hdr.Name, b.Hdr.Name) {
+	if !dnsname.EqualFold(a.Hdr.Name, b.Hdr.Name) {
 		return false
 	}
 	return a.Flags == b.Flags &&

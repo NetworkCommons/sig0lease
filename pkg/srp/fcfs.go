@@ -182,6 +182,12 @@ func Names(cu *ClassifiedUpdate) []string {
 // result (pkg/lease.NodeKey is name-scoped) would silently collide the instance's node
 // with the host's, since both would carry the host's own owner name.
 //
+// The inherited KEY's owner name is the instance name as the requester spelled it (its
+// Delete All RRsets owner), not the lower-cased inst.Name: the handler forwards this KEY
+// upstream as the instance's published KEY, and RFC 1035 S2.3.3 asks for the original case
+// to be preserved -- otherwise a "DemoScene" instance ends up with its SRV/TXT at
+// "DemoScene" and its KEY at "demoscene".
+//
 // name must be cu.Host.Name or one of cu.Instances' names -- anything else is a caller
 // bug, not a data problem, so KeyFor panics rather than returning a zero value a caller
 // could silently misuse.
@@ -194,7 +200,7 @@ func KeyFor(cu *ClassifiedUpdate, name string) *dns.KEY {
 			if inst.Key != nil {
 				return inst.Key
 			}
-			return keyAtName(cu.Host.Key, inst.Name)
+			return keyAtName(cu.Host.Key, inst.Delete.Header().Name)
 		}
 	}
 	panic(fmt.Sprintf("srp: KeyFor called with %q, which is neither the host nor a service instance in this update", name))

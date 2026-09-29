@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"codeberg.org/miekg/dns"
+	"github.com/NetworkCommons/sig0lease/pkg/dnsname"
 	"github.com/NetworkCommons/sig0lease/pkg/keyrec"
 	leasepkg "github.com/NetworkCommons/sig0lease/pkg/lease"
 	"github.com/NetworkCommons/sig0lease/pkg/sig0"
@@ -579,7 +580,7 @@ func TestHandle_NonKeyOnlyLeaseWithoutUpdateKeyRR_RegistersNonKeyRRs(t *testing.
 	}
 
 	authoritative := func(ctx context.Context, zoneHint, fqdn string, rrType uint16) ([]dns.RR, error) {
-		if rrType == dns.TypeKEY && canonicalName(fqdn) == canonicalName(signerKey.Hdr.Name) {
+		if rrType == dns.TypeKEY && dnsname.Normalize(fqdn) == dnsname.Normalize(signerKey.Hdr.Name) {
 			return []dns.RR{loaded.PublicKey}, nil
 		}
 		return []dns.RR{}, nil
@@ -626,7 +627,7 @@ func TestHandle_NonKeyOnlyLeaseRejectsUpdateKeyRR(t *testing.T) {
 	}
 
 	authoritative := func(ctx context.Context, zoneHint, fqdn string, rrType uint16) ([]dns.RR, error) {
-		if rrType == dns.TypeKEY && canonicalName(fqdn) == canonicalName(signerKey.Hdr.Name) {
+		if rrType == dns.TypeKEY && dnsname.Normalize(fqdn) == dnsname.Normalize(signerKey.Hdr.Name) {
 			return []dns.RR{loaded.PublicKey}, nil
 		}
 		return []dns.RR{}, nil
@@ -812,7 +813,7 @@ func setupCaseCDeleteHandler(t *testing.T) (h *UpdateHandler, parent, child, unr
 	// Stage-3 (authoritative) SIG(0) resolution for the unrelated key, which
 	// is never lease-managed and never present in the request itself.
 	h.upstreamCoordinator.(*stubUpstreamCoordinator).query = func(ctx context.Context, zoneHint, fqdn string, rrType uint16) ([]dns.RR, error) {
-		if rrType == dns.TypeKEY && canonicalName(fqdn) == canonicalName(unrelated.PublicKey.Hdr.Name) {
+		if rrType == dns.TypeKEY && dnsname.Normalize(fqdn) == dnsname.Normalize(unrelated.PublicKey.Hdr.Name) {
 			return []dns.RR{unrelated.PublicKey}, nil
 		}
 		return []dns.RR{}, nil
@@ -941,7 +942,7 @@ func TestHandle_CaseARefresh_ForeignSignerWithOwnRegistrationCannotHijackExistin
 	}
 	h.upstreamCoordinator = &stubUpstreamCoordinator{resp: &dns.Msg{MsgHeader: dns.MsgHeader{Rcode: dns.RcodeSuccess}}}
 	h.upstreamCoordinator.(*stubUpstreamCoordinator).query = func(ctx context.Context, zoneHint, fqdn string, rrType uint16) ([]dns.RR, error) {
-		if rrType == dns.TypeKEY && canonicalName(fqdn) == canonicalName(client.PublicKey.Hdr.Name) {
+		if rrType == dns.TypeKEY && dnsname.Normalize(fqdn) == dnsname.Normalize(client.PublicKey.Hdr.Name) {
 			return []dns.RR{client.PublicKey}, nil
 		}
 		return []dns.RR{}, nil
@@ -1045,7 +1046,7 @@ func TestHandle_CaseARefresh_OnlineAuthorizedSignerCannotHijackExistingKey(t *te
 	// authoritative DNS: it is never lease-managed and never present
 	// anywhere in the request itself (signerSource=Authoritative).
 	h.upstreamCoordinator.(*stubUpstreamCoordinator).query = func(ctx context.Context, zoneHint, fqdn string, rrType uint16) ([]dns.RR, error) {
-		if rrType == dns.TypeKEY && canonicalName(fqdn) == canonicalName(client.PublicKey.Hdr.Name) {
+		if rrType == dns.TypeKEY && dnsname.Normalize(fqdn) == dnsname.Normalize(client.PublicKey.Hdr.Name) {
 			return []dns.RR{client.PublicKey, wrong.PublicKey}, nil
 		}
 		return []dns.RR{}, nil

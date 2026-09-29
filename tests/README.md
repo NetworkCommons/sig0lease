@@ -6,9 +6,25 @@ Orchestration scripts live directly in `tests/`; shared helpers live in `tests/l
 own header comment for the "no `set -e` in library files, `return` not `exit`" convention
 those files follow.
 
-Most of the suite (`test_update.sh`, `test_forward.sh`, `test_srp.sh`) is self-contained:
-real proxy process, real client tooling, a local disposable BIND 9 (`lib/bind9.sh`) — nothing
-outside this repo required beyond `go`, `named`/`named-checkconf`, and `dig`.
+Only `test_srp.sh` is self-contained: real proxy process, real client tooling, a local
+disposable BIND 9 (`lib/bind9.sh`, zone `srp.test.`) — nothing outside this repo required
+beyond `go`, `named`/`named-checkconf`, and `dig`.
+
+`test_update.sh` and `test_forward.sh` run against the **real DNS**, not a local BIND 9. Both
+start the proxy from a copy of `main/config.yaml` (only the listen address and the minimum
+leases are rewritten), so they also use its lease-store files under `data/`.
+
+- `test_update.sh` updates the live `test.dev.zenr.io.` records: the proxy finds the
+  authoritative server for `dev.zenr.io.` via SOA/NS lookup and signs with
+  `keystore/server/Kdev.zenr.io.+015+35317`. The suite checks results with `dig` against
+  `AUTH_SERVER` (default `ns1.free2air.org`) and adds/deletes some records there directly with
+  `nsupdate` (needs a current BIND `nsupdate` with ED25519 support). Needs
+  `CLIENT_KEYSTORE_DIR` (see the Makefile's `test-update` target). Overridable via env:
+  `AUTH_SERVER`, `PROXY_ADDR`/`PROXY_PORT` (a proxy already listening there is reused instead
+  of starting one), `PROXY_PROTOCOL`, `CLIENT_KEY_NAME`, `RR_TYPES` and the lease times. The
+  config file, the zones and the proxy key are fixed.
+- `test_forward.sh` needs internet access: it resolves public names (google.com, gmail.com,
+  ...) through the proxy's configured upstream resolvers.
 
 ## External checkouts
 

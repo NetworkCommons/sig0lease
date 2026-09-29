@@ -7,6 +7,7 @@ import (
 	"strings"
 
 	"codeberg.org/miekg/dns"
+	"github.com/NetworkCommons/sig0lease/pkg/dnsname"
 	"github.com/NetworkCommons/sig0lease/pkg/keyrec"
 	"github.com/NetworkCommons/sig0lease/pkg/sig0"
 )
@@ -227,15 +228,11 @@ func extractSig0(msg *dns.Msg) (*dns.SIG, error) {
 	return sigRR, nil
 }
 
-func canonicalName(name string) string {
-	return strings.TrimSuffix(strings.ToLower(strings.TrimSpace(name)), ".")
-}
-
 // Check that candidate is above or at basename, and if mustBeAbove is true
 // it must be strictly above
 func isNameAtOrAbove(baseName, candidate string, mustBeAbove bool) bool {
-	base := canonicalName(baseName)
-	c := canonicalName(candidate)
+	base := dnsname.Normalize(baseName)
+	c := dnsname.Normalize(candidate)
 	if base == "" || c == "" {
 		return false
 	}
@@ -266,7 +263,7 @@ func (h *UpdateHandler) signerAuthorizedForNewRegistration(signerManaged, signer
 }
 
 func (h *UpdateHandler) validateSignerHierarchyForUpdateRecords(signerName string, keyRRs []*dns.KEY, otherRecords []dns.RR) error {
-	signerCanon := canonicalName(signerName)
+	signerCanon := dnsname.Normalize(signerName)
 	if signerCanon == "" {
 		return fmt.Errorf("SIG(0) signer name is empty")
 	}
@@ -276,7 +273,7 @@ func (h *UpdateHandler) validateSignerHierarchyForUpdateRecords(signerName strin
 			return fmt.Errorf("invalid KEY RR owner name in update section")
 		}
 		keyOwner := keyRR.Hdr.Name
-		keyOwnerCanon := canonicalName(keyOwner)
+		keyOwnerCanon := dnsname.Normalize(keyOwner)
 		if keyOwnerCanon == signerCanon {
 			// Exception: signer self-KEY update is allowed.
 			continue
@@ -291,7 +288,7 @@ func (h *UpdateHandler) validateSignerHierarchyForUpdateRecords(signerName strin
 			return fmt.Errorf("invalid non-KEY RR in update section")
 		}
 		owner := rr.Header().Name
-		ownerCanon := canonicalName(owner)
+		ownerCanon := dnsname.Normalize(owner)
 		if !isNameAtOrAbove(ownerCanon, signerCanon, false) {
 			return fmt.Errorf("non-KEY RR owner %q is outside signer subtree %q", owner, signerName)
 		}
@@ -309,11 +306,11 @@ type keyID struct {
 }
 
 func keyIDFromKEY(k *dns.KEY) keyID {
-	return keyID{Name: canonicalName(k.Hdr.Name), Algorithm: k.Algorithm, KeyTag: k.KeyTag()}
+	return keyID{Name: dnsname.Normalize(k.Hdr.Name), Algorithm: k.Algorithm, KeyTag: k.KeyTag()}
 }
 
 func keyIDFromSIG(sig *dns.SIG) keyID {
-	return keyID{Name: canonicalName(sig.SignerName), Algorithm: sig.Algorithm, KeyTag: sig.KeyTag}
+	return keyID{Name: dnsname.Normalize(sig.SignerName), Algorithm: sig.Algorithm, KeyTag: sig.KeyTag}
 }
 
 // groupOtherRecordsByTargetKey assigns non-KEY RRs to their owning key identity.
@@ -343,12 +340,12 @@ func groupOtherRecordsByTargetKey(signerID keyID, updateKeyRRs []*dns.KEY, updat
 
 	// Hierarchy mode: assign by closest ancestor KEY name.
 	if len(updateKeyRRs) == 0 {
-		owner := canonicalName(updateOtherRRs[0].Header().Name)
+		owner := dnsname.Normalize(updateOtherRRs[0].Header().Name)
 		for _, rr := range updateOtherRRs {
 			if rr == nil || rr.Header() == nil {
 				return nil, fmt.Errorf("invalid non-KEY RR in update section")
 			}
-			rrOwner := canonicalName(rr.Header().Name)
+			rrOwner := dnsname.Normalize(rr.Header().Name)
 			if rrOwner != owner {
 				return nil, fmt.Errorf("mixed non-KEY owner names are not allowed without KEY RRs in update section")
 			}
@@ -375,7 +372,7 @@ func groupOtherRecordsByTargetKey(signerID keyID, updateKeyRRs []*dns.KEY, updat
 		if rr == nil || rr.Header() == nil {
 			return nil, fmt.Errorf("invalid non-KEY RR in update section")
 		}
-		rrOwner := canonicalName(rr.Header().Name)
+		rrOwner := dnsname.Normalize(rr.Header().Name)
 		var best keyID
 		bestLen := -1
 		ambiguous := false
@@ -436,7 +433,7 @@ func rrEqual(a, b dns.RR) bool {
 	}
 
 	// Common fields: NAME, CLASS, TYPE
-	if !strings.EqualFold(hdrA.Name, hdrB.Name) {
+	if !dnsname.EqualFold(hdrA.Name, hdrB.Name) {
 		return false
 	}
 	if hdrA.Class != hdrB.Class {
@@ -564,11 +561,11 @@ func (h *UpdateHandler) extractAndValidateSig0(ctx context.Context, msg *dns.Msg
 	if err != nil {
 		return nil, nil, signerKeySourceUnknown, err
 	}
-	downstreamZoneCanon := canonicalName(downstreamZone)
+	downstreamZoneCanon := dnsname.Normalize(downstreamZone)
 	if downstreamZoneCanon == "" {
 		return nil, nil, signerKeySourceUnknown, fmt.Errorf("empty downstream zone")
 	}
-	signerCanon := canonicalName(sigRR.SignerName)
+	signerCanon := dnsname.Normalize(sigRR.SignerName)
 	if signerCanon == "" {
 		return nil, nil, signerKeySourceUnknown, fmt.Errorf("SIG(0) signer name is empty")
 	}
@@ -600,7 +597,7 @@ func (h *UpdateHandler) extractAndValidateSig0(ctx context.Context, msg *dns.Msg
 		if key == nil {
 			continue
 		}
-		if strings.EqualFold(canonicalName(key.Hdr.Name), signerCanon) && key.KeyTag() == sigRR.KeyTag && key.Algorithm == sigRR.Algorithm {
+		if dnsname.Normalize(key.Hdr.Name) == signerCanon && key.KeyTag() == sigRR.KeyTag && key.Algorithm == sigRR.Algorithm {
 			verifyCandidates = append(verifyCandidates, key)
 		}
 	}
@@ -608,7 +605,7 @@ func (h *UpdateHandler) extractAndValidateSig0(ctx context.Context, msg *dns.Msg
 		if key == nil {
 			continue
 		}
-		if strings.EqualFold(canonicalName(key.Hdr.Name), signerCanon) && key.KeyTag() == sigRR.KeyTag && key.Algorithm == sigRR.Algorithm {
+		if dnsname.Normalize(key.Hdr.Name) == signerCanon && key.KeyTag() == sigRR.KeyTag && key.Algorithm == sigRR.Algorithm {
 			verifyCandidates = append(verifyCandidates, key)
 		}
 	}
@@ -622,7 +619,7 @@ func (h *UpdateHandler) extractAndValidateSig0(ctx context.Context, msg *dns.Msg
 	leaseRecord := h.leaseManager.LookupBySIG(sigRR.SignerName, sigRR.Algorithm, sigRR.KeyTag)
 	if leaseRecord != nil && leaseRecord.KeyRR != nil {
 		leaseKey := leaseRecord.KeyRR
-		if strings.EqualFold(canonicalName(leaseKey.Hdr.Name), signerCanon) && leaseKey.KeyTag() == sigRR.KeyTag && leaseKey.Algorithm == sigRR.Algorithm {
+		if dnsname.Normalize(leaseKey.Hdr.Name) == signerCanon && leaseKey.KeyTag() == sigRR.KeyTag && leaseKey.Algorithm == sigRR.Algorithm {
 			if resolved, err := verifyFromCandidates([]*dns.KEY{leaseKey}); err != nil {
 				return nil, nil, signerKeySourceUnknown, err
 			} else if resolved != nil {

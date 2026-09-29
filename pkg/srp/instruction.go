@@ -15,6 +15,7 @@ import (
 	"fmt"
 
 	"codeberg.org/miekg/dns"
+	"github.com/NetworkCommons/sig0lease/pkg/dnsname"
 )
 
 // HostDescription is RFC 9665 S3.3.1.3's (exactly one, per update) Host Description
@@ -33,7 +34,7 @@ type HostDescription struct {
 // S3.3.1.1's second bullet: a Service Discovery "Delete An RR From An RRSet" targets a
 // Service Description shaped exactly this way).
 type ServiceInstance struct {
-	Name   string   // canonical service-instance name
+	Name   string   // canonical service-instance name -- for comparison only; Delete's owner keeps the requester's case
 	Delete dns.RR   // the "Delete All RRsets From A Name" RR for Name
 	Key    *dns.KEY // explicit KEY add for this instance, or nil (inherits the host's key)
 	SRV    *dns.SRV // nil for a removal-shaped instance
@@ -122,7 +123,7 @@ func Classify(msg *dns.Msg) (*ClassifiedUpdate, error) {
 			return nil, fmt.Errorf("srp: nil RR in Update section")
 		}
 		if v, ok := rr.(*dns.ANY); ok {
-			name := canonicalName(v.Hdr.Name)
+			name := dnsname.Fold(v.Hdr.Name)
 			if _, dup := st.deletes[name]; dup {
 				return nil, fmt.Errorf("srp: more than one Delete All RRsets for %s", name)
 			}
@@ -136,7 +137,7 @@ func Classify(msg *dns.Msg) (*ClassifiedUpdate, error) {
 			continue // already handled above
 		}
 		hdr := rr.Header()
-		name := canonicalName(hdr.Name)
+		name := dnsname.Fold(hdr.Name)
 
 		switch v := rr.(type) {
 		case *dns.KEY:
@@ -248,7 +249,7 @@ func (st *classifyState) instanceFor(name string) (*ServiceInstance, error) {
 // happens to.
 func (st *classifyState) addPTR(name string, v *dns.PTR, hdr *dns.Header) error {
 	baseType, isSubtype := isSubtypePTROwner(name)
-	target := canonicalName(v.Ptr)
+	target := dnsname.Fold(v.Ptr)
 
 	switch hdr.Class {
 	case dns.ClassINET:
@@ -300,7 +301,7 @@ func (st *classifyState) reconcile() error {
 	// Validate() later finds attached.
 	if st.host == nil {
 		for _, k := range st.keyAdds {
-			name := canonicalName(k.Hdr.Name)
+			name := dnsname.Fold(k.Hdr.Name)
 			if del, ok := st.deletes[name]; ok && !st.consumed[name] {
 				st.host = &HostDescription{Name: name, Delete: del}
 				st.consumed[name] = true
@@ -331,7 +332,7 @@ func (st *classifyState) reconcile() error {
 		if len(inst.TXT) == 0 {
 			return fmt.Errorf("srp: service instance %s has an SRV add with no TXT add (S3.3.1.2 requires at least one TXT add when SRV is present)", name)
 		}
-		if canonicalName(inst.SRV.Target) != st.host.Name {
+		if dnsname.Fold(inst.SRV.Target) != st.host.Name {
 			return fmt.Errorf("srp: service instance %s's SRV target %s does not match the Host Description name %s", name, inst.SRV.Target, st.host.Name)
 		}
 		if !referenced[name] {
@@ -360,7 +361,7 @@ func (st *classifyState) reconcile() error {
 	// Host's and every ServiceInstance's resolved Key field; Classify() only resolves
 	// ownership here).
 	for _, k := range st.keyAdds {
-		name := canonicalName(k.Hdr.Name)
+		name := dnsname.Fold(k.Hdr.Name)
 		switch {
 		case name == st.host.Name:
 			if st.host.Key == nil {

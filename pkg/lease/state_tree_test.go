@@ -467,16 +467,20 @@ func TestRemoveSingleNonKEYRecord_IdempotentAndOwnershipChecked(t *testing.T) {
 	}
 }
 
-// TestImportSnapshot_RejectsWrongVersion guards the clean format cut made
-// when non-KEY storage moved to the flat model: a snapshot from the old
-// (v1, two-slice) format must fail loudly rather than silently unmarshaling
-// into an empty store.
+// TestImportSnapshot_RejectsWrongVersion guards the clean format cuts: a
+// snapshot from the old (v1, two-slice) format must fail loudly rather than
+// silently unmarshaling into an empty store, and a v2 one (same shape, node
+// IDs from before ASCII-only / RDATA-name case folding) must fail rather than
+// load under IDs no lookup computes anymore.
 func TestImportSnapshot_RejectsWrongVersion(t *testing.T) {
 	store := NewInMemoryManager()
 	defer store.Stop()
 
 	if err := store.ImportSnapshot(&LeaseTreeSnapshot{Version: 1}); err == nil {
 		t.Fatalf("expected importing a v1 (pre-reshape) snapshot to be rejected")
+	}
+	if err := store.ImportSnapshot(&LeaseTreeSnapshot{Version: 2}); err == nil {
+		t.Fatalf("expected importing a v2 (pre-case-folding-fix) snapshot to be rejected")
 	}
 
 	if err := store.ImportSnapshot(&LeaseTreeSnapshot{Version: leaseSnapshotVersion}); err != nil {

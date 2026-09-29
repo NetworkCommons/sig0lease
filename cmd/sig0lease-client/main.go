@@ -14,6 +14,7 @@ import (
 	"github.com/NetworkCommons/sig0lease/client"
 	_ "github.com/NetworkCommons/sig0lease/pkg/dnscompat"
 	"github.com/NetworkCommons/sig0lease/pkg/dnsmsg"
+	"github.com/NetworkCommons/sig0lease/pkg/dnsname"
 	"github.com/NetworkCommons/sig0lease/pkg/keyrec"
 	"github.com/NetworkCommons/sig0lease/pkg/sig0"
 )
@@ -308,7 +309,7 @@ func cmdRegRefWithMode(proxyAddr string, args []string, operation string, tamper
 
 	if sameKey {
 		for _, rr := range updateKeyRRs {
-			if strings.EqualFold(rr.Hdr.Name, clientKey.KeyName()) {
+			if dnsname.EqualFold(rr.Hdr.Name, clientKey.KeyName()) {
 				fmt.Fprintf(os.Stderr, "ERROR: --same-key conflicts with an explicit KEY rr-spec for %s already among the rr-spec arguments\n", clientKey.KeyName())
 				os.Exit(1)
 			}
@@ -372,7 +373,7 @@ func cmdRegRefWithMode(proxyAddr string, args []string, operation string, tamper
 		if rr == nil {
 			continue
 		}
-		if strings.EqualFold(rr.Hdr.Name, clientKey.KeyName()) &&
+		if dnsname.EqualFold(rr.Hdr.Name, clientKey.KeyName()) &&
 			rr.Flags == clientKey.PublicKey.Flags &&
 			rr.Protocol == clientKey.PublicKey.Protocol &&
 			rr.Algorithm == clientKey.PublicKey.Algorithm &&

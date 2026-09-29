@@ -11,6 +11,7 @@ import (
 
 	"codeberg.org/miekg/dns"
 	"github.com/NetworkCommons/sig0lease/logging"
+	"github.com/NetworkCommons/sig0lease/pkg/dnsname"
 	"github.com/NetworkCommons/sig0lease/pkg/keyrec"
 )
 
@@ -48,7 +49,7 @@ func NewCoordinator(logger *logging.Logger, bootstrapResolvers []string, staticU
 	}
 	normalized := make(map[string]string, len(staticUpstream))
 	for zone, addr := range staticUpstream {
-		normalized[normalizeZone(zone)] = addr
+		normalized[dnsname.Normalize(zone)] = addr
 	}
 	return &Coordinator{
 		logger:             logger,
@@ -57,16 +58,12 @@ func NewCoordinator(logger *logging.Logger, bootstrapResolvers []string, staticU
 	}
 }
 
-func normalizeZone(zone string) string {
-	return strings.TrimSuffix(strings.ToLower(strings.TrimSpace(zone)), ".")
-}
-
 // ResolveSOAMasterServer returns the "host:port" of zone's SOA MNAME (walking up to
 // parent zones if the exact name has none) and the effective zone that answered, or --
 // if zone exactly matches a configured static upstream -- that override address
 // with zone itself as the effective zone, skipping the lookup entirely.
 func (c *Coordinator) ResolveSOAMasterServer(ctx context.Context, zone string) (server, effectiveZone string, err error) {
-	if addr, ok := c.staticUpstream[normalizeZone(zone)]; ok {
+	if addr, ok := c.staticUpstream[dnsname.Normalize(zone)]; ok {
 		return addr, ensureFQDN(zone), nil
 	}
 
@@ -111,7 +108,7 @@ func (c *Coordinator) ResolveSOAMasterServer(ctx context.Context, zone string) (
 // zone itself, with no NS lookup at all (the operator has already asserted the
 // zone cut by configuring the override).
 func (c *Coordinator) ResolveAuthoritativeZone(ctx context.Context, zone string) (string, error) {
-	if _, ok := c.staticUpstream[normalizeZone(zone)]; ok {
+	if _, ok := c.staticUpstream[dnsname.Normalize(zone)]; ok {
 		return ensureFQDN(zone), nil
 	}
 
@@ -164,10 +161,6 @@ func parentZone(zone string) string {
 	return zone[idx+1:]
 }
 
-func canonicalName(name string) string {
-	return strings.TrimSuffix(strings.ToLower(strings.TrimSpace(name)), ".")
-}
-
 // SendUpdate sends updateMsg (already built and signed) to upstreamZone's authoritative
 // server, resolved via ResolveSOAMasterServer (so a static override is honored),
 // trying UDP then falling back to TCP.
@@ -184,9 +177,9 @@ func (c *Coordinator) SendUpdate(ctx context.Context, upstreamZone string, updat
 	msgZone := updateMsg.Question[0].Header().Name
 	c.logger.Debugf("Message zone: %s", msgZone)
 	// Compare canonically: callers pass zone strings from several sources (config,
-	// resolved via live NS lookup with a trailing dot, or normalizeZone()'d lease-store
+	// resolved via live NS lookup with a trailing dot, or dnsname.Normalize()'d lease-store
 	// values without one) that name the same zone but aren't byte-identical.
-	if canonicalName(msgZone) != canonicalName(upstreamZone) {
+	if dnsname.Normalize(msgZone) != dnsname.Normalize(upstreamZone) {
 		return nil, fmt.Errorf("update zone mismatch: message zone %q, expected upstream zone %q", msgZone, upstreamZone)
 	}
 
@@ -351,7 +344,7 @@ func (c *Coordinator) QueryRRs(ctx context.Context, zoneHint, name string, rrTyp
 // standalone function so handlers/srp_handler.go can use it without depending on
 // *handlers.UpdateHandler.
 func FindAuthorizedProxyKey(keystoreDir, zone string, logger *logging.Logger) (*keyrec.LoadedKey, string, error) {
-	zone = normalizeZone(zone)
+	zone = dnsname.Normalize(zone)
 	if zone == "" {
 		return nil, "", fmt.Errorf("zone is empty")
 	}

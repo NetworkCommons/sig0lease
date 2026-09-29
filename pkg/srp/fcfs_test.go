@@ -173,6 +173,34 @@ func TestFCFS_NamesAndKeyFor(t *testing.T) {
 	}
 }
 
+// TestFCFS_KeyForPreservesInstanceNameCase pins the case of an inherited KEY's owner
+// name: Classify lower-cases ServiceInstance.Name for comparisons, but the handler forwards
+// KeyFor's result upstream as the instance's published KEY, so it must carry the name as
+// the requester spelled it (RFC 1035 S2.3.3: compare case-insensitively, preserve case).
+// Before the fix a "DemoScene" instance got its KEY published at "demoscene".
+func TestFCFS_KeyForPreservesInstanceNameCase(t *testing.T) {
+	const zone = "example.com."
+	const host = "MyHost.example.com."
+	const inst = "DemoScene._http._tcp.example.com."
+
+	rrs := []dns.RR{
+		deleteAll(host), mustRR(t, host+" 3600 IN A 192.0.2.1"), keyRR(host, 13, 0, "hostkey"),
+		deleteAll(inst), mustRR(t, inst+" 3600 IN SRV 0 0 668 "+host), mustRR(t, inst+` 3600 IN TXT "path=/daemon"`),
+		mustRR(t, "_http._tcp.example.com. 3600 IN PTR "+inst),
+	}
+	cu, err := Classify(newUpdate(zone, rrs...))
+	if err != nil {
+		t.Fatalf("Classify: %v", err)
+	}
+
+	if got := KeyFor(cu, cu.Instances[0].Name).Hdr.Name; got != inst {
+		t.Fatalf("KeyFor(instance).Hdr.Name = %q, want the requester's spelling %q", got, inst)
+	}
+	if got := KeyFor(cu, cu.Host.Name).Hdr.Name; got != host {
+		t.Fatalf("KeyFor(host).Hdr.Name = %q, want the requester's spelling %q", got, host)
+	}
+}
+
 func TestFCFS_KeyForPanicsOnUnknownName(t *testing.T) {
 	const zone = "example.com."
 	const host = "myhost.example.com."

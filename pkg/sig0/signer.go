@@ -42,6 +42,7 @@ import (
 	"time"
 
 	"codeberg.org/miekg/dns"
+	"github.com/NetworkCommons/sig0lease/pkg/dnsname"
 )
 
 // sig0SignerImpl replaces dns.CryptoSIG0's Sign/Verify for every algorithm listed in the
@@ -271,7 +272,7 @@ func appendDomainName(buf []byte, name string) []byte {
 }
 
 func canonicalDomainName(name string) string {
-	name = strings.TrimSpace(strings.ToLower(name))
+	name = strings.TrimSpace(dnsname.Fold(name))
 	if name == "" || name == "." {
 		return "."
 	}

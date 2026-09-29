@@ -10,6 +10,7 @@ import (
 
 	"codeberg.org/miekg/dns"
 	"github.com/NetworkCommons/sig0lease/logging"
+	"github.com/NetworkCommons/sig0lease/pkg/dnsname"
 	"github.com/NetworkCommons/sig0lease/pkg/keyrec"
 	leasepkg "github.com/NetworkCommons/sig0lease/pkg/lease"
 )
@@ -360,7 +361,7 @@ func (h *UpdateHandler) dumpLeaseTreeLevel() string {
 	nodes := make(map[string]*leaseDumpNode)
 
 	addNode := func(name string) *leaseDumpNode {
-		name = canonicalName(name)
+		name = dnsname.Normalize(name)
 		if name == "" {
 			return nil
 		}
@@ -417,7 +418,7 @@ func (h *UpdateHandler) dumpLeaseTreeLevel() string {
 			continue
 		}
 
-		parentName := canonicalName(node.keyRec.ParentKeyName)
+		parentName := dnsname.Normalize(node.keyRec.ParentKeyName)
 		if parentName != "" {
 			if parentNode, ok := nodes[parentName]; ok && parentNode != nil && parentNode.keyRec != nil {
 				parentNode.children = append(parentNode.children, name)
@@ -425,7 +426,7 @@ func (h *UpdateHandler) dumpLeaseTreeLevel() string {
 			}
 		}
 
-		zone := canonicalName(node.keyRec.UpstreamZone)
+		zone := dnsname.Normalize(node.keyRec.UpstreamZone)
 		if zone == "" {
 			zone = "(unknown)"
 		}
@@ -447,7 +448,7 @@ func (h *UpdateHandler) dumpLeaseTreeLevel() string {
 
 		if node.keyRec != nil {
 			sb.WriteString(fmt.Sprintf("%sKey: %s\n", indent, name))
-			sb.WriteString(fmt.Sprintf("%s  ParentKey: %s\n", indent, valueOrNone(canonicalName(node.keyRec.ParentKeyName))))
+			sb.WriteString(fmt.Sprintf("%s  ParentKey: %s\n", indent, valueOrNone(dnsname.Normalize(node.keyRec.ParentKeyName))))
 			sb.WriteString(fmt.Sprintf("%s  UpstreamZone: %s\n", indent, valueOrNone(node.keyRec.UpstreamZone)))
 			sb.WriteString(fmt.Sprintf("%s  KeyRR: %s\n", indent, node.keyRec.KeyRR.String()))
 			sb.WriteString(fmt.Sprintf("%s  ExpiresAt: %s\n", indent, node.keyRec.ExpiresAt.Format(time.RFC3339)))
