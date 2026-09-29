@@ -449,6 +449,14 @@ second an expired record stays published upstream is a second that MUST NOT is v
 That argues for a prompt but bounded retry, e.g. exponential backoff capped well below
 30s, shared by both handlers and by the lock-contention retry of §14.2.
 
+**Implemented on `srp` (2026-09-29), independently of this plan.** Both handlers now keep
+their timers in one shared table, `expiryTimers` (`handlers/opcode5_lease.go`). An expiry
+attempt that leaves anything pending is retried after `expiryRetryDelay`: 1s, doubling up to
+16s. Success returns the node to its lease-event schedule. `startLeaseReconciliation` only
+re-arms a node that has no timer at all. §14.2's contention retry should go through the same
+`expiryTimers.finish(..., complete=false, ...)`, so a node losing `TryLock` backs off exactly
+like one whose upstream delete was refused.
+
 ### 14.4 Related but not solved by node locks: BIND's SIG(0) quota
 
 BIND 9.20 (verified on 9.20.26) verifies at most `sig0checks-quota` SIG(0) signatures at a
@@ -461,6 +469,14 @@ per authoritative server in `updatecore.Coordinator`, retry REFUSED with backoff
 REFUSED also means a policy denial), and/or have the authoritative server's operator add the
 proxy to `sig0checks-quota-exempt`. The local BIND test suite (`tests/test_srp.sh`) hits this
 regularly and now reports every refusal with its reason (`bind9_report_rejections`).
+
+**Implemented on `srp` (2026-09-29):** the first option. `updatecore.SetMaxInflightUpdates`,
+set from `authoritative.max_inflight_updates` (default 1, `0` for no limit), caps UPDATEs in
+flight per authoritative server, process-wide across both handlers. With the limit equal to
+BIND's `sig0checks-quota`, the local suites saw no refusals, at quota 1 and at quota 3. It
+sits inside `Coordinator.SendUpdate`, below any node lock this plan adds: node locks are
+non-blocking `TryLock`s taken first, and the limiter is a blocking wait held only for the
+exchange, so the two cannot deadlock.
 
 ### 14.5 Stale references
 
