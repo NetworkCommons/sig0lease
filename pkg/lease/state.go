@@ -691,7 +691,7 @@ func (m *InMemoryLeaseStore) ExportSnapshot() (*LeaseTreeSnapshot, error) {
 
 	return &LeaseTreeSnapshot{
 		Version:     leaseSnapshotVersion,
-		GeneratedAt: time.Now().UTC(),
+		GeneratedAt: time.Now(),
 		Nodes:       nodes,
 	}, nil
 }
