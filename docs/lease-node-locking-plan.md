@@ -400,3 +400,73 @@ nodeLocks: leasepkg.NewNodeLockManager(),
 5. `handlers/opcode5_behavior_test.go`: §12's concurrent-registration regression test.
 6. Full suite (`go build ./...`, `go vet ./...`, `go test -race ./...`) green.
 7. Revisit §11 item 3 (`reconcileLeaseTimers`/`processExpiredLease`) as a fast-follow.
+
+---
+
+## 14. Inputs from the SRP handler and lease-expiry work (added 2026-09-29)
+
+This plan predates the RFC 9665 SRP handler and the shared lease-expiry code now on the
+`srp` branch. Before it is implemented, fold in the following.
+
+### 14.1 Scope: the SRP handler needs the same locks
+
+`handlers/srp_handler.go` (`SRPHandler`) runs the same check → upstream round trip →
+local-apply sequence as `UpdateHandler`, against the same `pkg/lease` store:
+
+- **`Handle()`**: FCFS check (lease store, then a live KEY query) → forward to the
+  authoritative server → `applyLocalMutations`. That last step is wipe-then-reinsert of the
+  host's and each instance's non-KEY records, so each touched host/instance node is
+  delete-shaped: `{node} ∪ subtree(node)` in §4's terms.
+- **KEY-LEASE expiry** (`processExpiredNode`): deletes the node's whole subtree →
+  `{node} ∪ subtree(node)`.
+- **LEASE expiry** (`expireNodeData`): deletes the node's due data records and, for a host,
+  every instance's data too (RFC 9665 §5.1 cascade) → `{host} ∪ subtree(host)`.
+
+`processExpiredNode` already logs a "RACE DETECTED" error when a refresh lands during its
+upstream delete, and its comment names "serializing operations against the same subtree" as
+the missing fix. That is this plan.
+
+### 14.2 What contention means on a timer path
+
+§6's fail-fast → SERVFAIL applies to client requests. An expiry timer that fails `TryLock`
+has nobody to answer: it must back off without touching anything and retry later. With
+that rule, the duplicate expiry deletes seen today go away. A host and its instances
+usually share one LEASE, so their timers fire together. The host's cascade and each
+instance's own timer then delete the same instance records concurrently. With subtree
+locks, the instance's timer loses `TryLock`, retries later, and finds nothing left due.
+
+### 14.3 One retry policy for both handlers
+
+Today a failed expiry is retried on different schedules. `UpdateHandler.processExpiredLease`
+re-arms its timer on every exit, and `nextLeaseEvent` floors the delay at 100ms, so a
+persistent failure is retried 10 times a second. `SRPHandler` does not re-arm after a
+failure; the 30-second `startLeaseReconciliation` pass does. No standard motivates either
+choice. The retransmission sections of RFC 9664 (§6) and RFC 9665 (§3.2.3.2) are about the
+requester resending its own messages. RFC 9664 §7 assumes the authoritative server expires
+records itself ("MUST NOT return that RR in answers" once the lease has elapsed), and does
+not cover a proxy deleting from a separate server. The one hint from §7 is that every
+second an expired record stays published upstream is a second that MUST NOT is violated.
+That argues for a prompt but bounded retry, e.g. exponential backoff capped well below
+30s, shared by both handlers and by the lock-contention retry of §14.2.
+
+### 14.4 Related but not solved by node locks: BIND's SIG(0) quota
+
+BIND 9.20 (verified on 9.20.26) verifies at most `sig0checks-quota` SIG(0) signatures at a
+time, default **1**. A SIG(0)-signed request that arrives while another is being verified is
+answered REFUSED, not queued. The only trace is `client: debug 1: ... SIG(0) checks quota
+reached`; nothing is logged at info level. Every UPDATE the proxy sends is SIG(0)-signed,
+so any two concurrent sends from the proxy can collide. That includes sends for unrelated
+nodes, which node locks deliberately let run in parallel. Options: serialize upstream sends
+per authoritative server in `updatecore.Coordinator`, retry REFUSED with backoff (but
+REFUSED also means a policy denial), and/or have the authoritative server's operator add the
+proxy to `sig0checks-quota-exempt`. The local BIND test suite (`tests/test_srp.sh`) hits this
+regularly and now reports every refusal with its reason (`bind9_report_rejections`).
+
+### 14.5 Stale references
+
+Line references above predate the `srp` branch. For example, `UpdateHandler` is now at
+`handlers/opcode5.go:63` (not `:253-274`), and `processExpiredLease` is at
+`handlers/opcode5_lease.go:568`, not inside `:179-499`. `docs/rfc9665-srp-implementation-plan.md`
+(§8) was consolidated into `docs/siglease_rfc9665.md`. The lease-expiry helpers
+`nextLeaseEvent` and `expireNonKEYRecords` (`handlers/opcode5_lease.go`) are shared by both
+handlers and are the natural place for the §14.2/§14.3 retry policy.
