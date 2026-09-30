@@ -11,7 +11,6 @@ package dnssd
 
 import (
 	"sort"
-	"strings"
 
 	"codeberg.org/miekg/dns"
 	"github.com/NetworkCommons/sig0lease/pkg/dnsname"
@@ -146,18 +145,4 @@ func dedupedSet(types []string) map[string]bool {
 		}
 	}
 	return set
-}
-
-// splitLabels splits a canonical (already-lowercased, dot-terminated) DNS name into its
-// labels, including a trailing empty string for the root label -- e.g.
-// "widget._http._tcp.example.com." -> ["widget","_http","_tcp","example","com",""]. A
-// presentation-format split (on literal "."), not wire-aware -- fine here since every name
-// this package handles has already round-tripped through the dns library's own name
-// decompression into presentation form. Duplicated from pkg/srp's identical helper rather
-// than shared -- see this file's deleteAllRR doc comment for why.
-func splitLabels(name string) []string {
-	if name == "" {
-		return nil
-	}
-	return strings.Split(name, ".")
 }

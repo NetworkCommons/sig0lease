@@ -150,15 +150,8 @@ func ensureFQDN(zone string) string {
 }
 
 func parentZone(zone string) string {
-	zone = strings.TrimSuffix(zone, ".")
-	if zone == "" {
-		return ""
-	}
-	idx := strings.Index(zone, ".")
-	if idx < 0 {
-		return ""
-	}
-	return zone[idx+1:]
+	_, parent, _ := dnsname.CutFirstLabel(strings.TrimSuffix(zone, "."))
+	return parent
 }
 
 // SendUpdate sends updateMsg (already built and signed) to upstreamZone's authoritative

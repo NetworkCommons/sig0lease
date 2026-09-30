@@ -11,6 +11,11 @@
 // (RFC 6763 S4.1.1). The library's own dnsutil.Canonical folds ASCII only but goes through
 // strings.Map, which has the same U+FFFD rewrite, so it is not used either.
 //
+// It is likewise the one place the module splits a name into labels or checks that a string
+// can be sent as one label (labels.go, whose opening comment explains why splitting at "."
+// is exact for this library's name strings), and finds, in a wire-format message, the labels
+// the library cannot carry (wire.go).
+//
 // Fold keeps a name's trailing dot, for code that works on fully-qualified names (pkg/srp,
 // pkg/dnssd split them into labels ending in the empty root label); Normalize drops it, for
 // the lease store, the handlers and pkg/updatecore, which key and compare names without it.

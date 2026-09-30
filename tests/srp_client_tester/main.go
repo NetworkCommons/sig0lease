@@ -21,10 +21,10 @@ import (
 	"flag"
 	"fmt"
 	"os"
-	"strings"
 
 	"codeberg.org/miekg/dns"
 	_ "github.com/NetworkCommons/sig0lease/pkg/dnscompat"
+	"github.com/NetworkCommons/sig0lease/pkg/dnsname"
 	"github.com/NetworkCommons/sig0lease/pkg/lease"
 	"github.com/NetworkCommons/sig0lease/pkg/sig0"
 )
@@ -56,11 +56,11 @@ func loadOrCreateKey(path string) (*ecdsa.PrivateKey, []byte) {
 // inst2svctype derives an instance's base service type from its own FQDN by stripping the
 // leading instance-name label -- e.g. "Widget._http._tcp.srp.test." -> "_http._tcp.srp.test.".
 func inst2svctype(inst string) string {
-	parts := strings.SplitN(inst, ".", 2)
-	if len(parts) != 2 {
+	_, svcType, ok := dnsname.CutFirstLabel(inst)
+	if !ok {
 		return inst
 	}
-	return parts[1]
+	return svcType
 }
 
 func main() {

@@ -87,6 +87,45 @@ func TestNewClient_RejectsMalformedServiceType(t *testing.T) {
 	}
 }
 
+// TestNewClient_RejectsLabelThatIsNotOneDNSLabel: labels are joined into names by plain
+// concatenation, so one containing "." would be registered as several labels -- RFC 6763
+// S4.3 requires that boundary be kept, and the dns library can't carry such a label at all
+// (pkg/dnsname's labels.go) -- and one over 63 octets can't be sent.
+func TestNewClient_RejectsLabelThatIsNotOneDNSLabel(t *testing.T) {
+	cases := []struct {
+		name    string
+		mutate  func(*Config)
+		wantErr string
+	}{
+		{"dotted host label", func(c *Config) { c.HostLabel = "my.host" }, "HostLabel"},
+		{"dotted instance label", func(c *Config) { c.Instances[0].Label = "Printer v2.1" }, "label boundary"},
+		{"dotted subtype", func(c *Config) { c.Instances[0].Subtypes = []string{"_a.b"} }, "subtype"},
+		{"oversized instance label", func(c *Config) { c.Instances[0].Label = strings.Repeat("p", 64) }, "at most 63"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := testConfig(t, &fakeTransport{})
+			cfg.Instances = []InstanceConfig{{Label: "Printer", ServiceType: "_ipp._tcp", Port: 631}}
+			tc.mutate(&cfg)
+			if _, err := NewClient(cfg); err == nil || !strings.Contains(err.Error(), tc.wantErr) {
+				t.Fatalf("expected an error containing %q, got: %v", tc.wantErr, err)
+			}
+		})
+	}
+
+	// Spaces and non-ASCII text are fine in an Instance label (RFC 6763 S4.1.1), and reach
+	// the registered name unchanged.
+	cfg := testConfig(t, &fakeTransport{})
+	cfg.Instances = []InstanceConfig{{Label: "Café Printer", ServiceType: "_ipp._tcp", Port: 631}}
+	c, err := NewClient(cfg)
+	if err != nil {
+		t.Fatalf("NewClient: %v", err)
+	}
+	if got, want := c.specs(false)[0].Name, "Café Printer._ipp._tcp.example.com."; got != want {
+		t.Fatalf("instance name = %q, want %q", got, want)
+	}
+}
+
 func TestClient_Register_BuildsSignsAndSends(t *testing.T) {
 	transport := &fakeTransport{responses: []*dns.Msg{successResp(30, 1209600)}}
 	c, err := NewClient(testConfig(t, transport))

@@ -1,0 +1,939 @@
+From 4394e6a2efdc8a15d8586f9da70e9839db8cf619 Mon Sep 17 00:00:00 2001
+From: Stefano Bocconi <Stefano.Bocconi@gmail.com>
+Date: Wed, 30 Sep 2026 12:41:23 +0000
+Subject: [PATCH] Escape dots and backslashes inside labels in names
+
+A label may hold any octet (RFC 2181 section 11), a dot included: RFC 6763
+section 4.1.1 allows one in a DNS-SD instance name such as "Printer v2.1".
+unpack.Name copies such a label into the name string as is, so
+"Printer v2.1._ipp._tcp.example." reads as the two labels "Printer v2" and
+"1", and pack.Name sends it on as two: a name that passes through the library
+comes out as a different name. Writing "\." does not help either, as
+pack.Name splits at every dot and keeps the backslash as an octet of the label
+before it. A proxy that unpacks a request and packs its names again (for
+instance an RFC 9665 SRP registrar forwarding a registration) therefore
+registers a name the client never asked for.
+
+Use the RFC 1035 section 5.1 escapes in names, as github.com/miekg/dns (v1)
+does in UnpackDomainName, PackDomainName, SplitDomainName and IsFqdn, and as
+this library already does for the mailbox names of SOA, RP, MINFO, MB, MG and
+MR (unpack.MName, pack.MName):
+
+- unpack.Name escapes a dot or a backslash inside a label (\. and \\), the two
+  escapes RFC 6763 section 4.3 recommends. Every other octet is still copied
+  as is, so UTF-8 names stay readable, unlike v1's \DDD.
+- pack.Name ends a label only at an unescaped dot, and reads \X as the octet X
+  and \DDD as the octet with decimal value DDD. The 63-octet label limit
+  counts unescaped octets.
+- dnsutil.Next, Prev, IsFqdn, IsName and Split skip escaped dots; the
+  zdnsutil.go copies are regenerated with "go run dnsutil_generate.go".
+
+A name with no dot or backslash inside a label is unchanged, on the wire and
+as a string. A name string holding a backslash changes meaning: "a\.b." was
+the labels "a\" and "b" and is now the one label "a.b". So TestIsFqdn's
+"miek.nl\." is no longer fully qualified, as in v1 (TestIsFqdnEscaped).
+
+Not changed: MName, which escapes dots but not backslashes, and compareLabel,
+which for a label holding escapes orders it by its escaped form rather than
+by its octets (RFC 4034 section 6.1).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+
+Notes (not part of the commit message; git am drops them):
+
+Base: codeberg.org/miekg/dns v0.6.117, the latest release when this was
+written. It does not apply to v0.6.82 (internal/pack/pack.go has changed
+since). Apply in a checkout of that release with "git am" or "patch -p1".
+
+Tested with Go 1.27.0: "go vet" is clean and "go test ./..." passes in all 37
+packages with tests. The new tests (TestMsgEscapedNames, TestNameEscapes, the
+new unpack.TestName cases, and the new dnsutil cases) all fail without the
+source changes.
+
+Reference behavior, github.com/miekg/dns v1.1.73:
+  msg.go     UnpackDomainName  escapes . \ and other special octets
+             (isDomainNameLabelSpecial in types.go), \DDD for non-printable
+  msg.go     PackDomainName    honors \X and \DDD
+  labels.go  SplitDomainName   splits at unescaped dots only
+  defaults.go IsFqdn           false for a name ending in an escaped dot
+                               (labels_test.go TestIsFqdnEscaped)
+A wire label "Printer v2.1" unpacks with v1 to "Printer\ v2\.1._ipp._tcp.example."
+and packs back to identical bytes; with v0.6.117 unmodified it packs back as
+the two labels "Printer v2" and "1".
+
+ deleg/zdnsutil.go              | 44 +++++++++++++++------
+ dnsutil/dnsutil_test.go        |  3 +-
+ dnsutil/labels.go              | 16 +++++---
+ dnsutil/labels_test.go         | 12 ++++++
+ dnsutil/shared.go              | 44 +++++++++++++++------
+ dnsutil/shared_test.go         |  5 +++
+ internal/pack/pack.go          | 70 ++++++++++++++++++++++++++++++----
+ internal/pack/pack_test.go     | 50 ++++++++++++++++++++++++
+ internal/unpack/unpack.go      | 27 ++++++++++---
+ internal/unpack/unpack_test.go |  6 +++
+ msg_test.go                    | 36 +++++++++++++++++
+ rdata/zdnsutil.go              | 44 +++++++++++++++------
+ svcb/zdnsutil.go               | 44 +++++++++++++++------
+ zdnsutil.go                    | 44 +++++++++++++++------
+ 14 files changed, 369 insertions(+), 76 deletions(-)
+
+diff --git a/deleg/zdnsutil.go b/deleg/zdnsutil.go
+index 49b7ee8..6057046 100644
+--- a/deleg/zdnsutil.go
++++ b/deleg/zdnsutil.go
+@@ -6,6 +6,7 @@ import (
+ 	"strings"
+ 	"time"
+ 
++	"codeberg.org/miekg/dns/internal/ddd"
+ 	"codeberg.org/miekg/dns/internal/dnsstring"
+ )
+ 
+@@ -46,10 +47,12 @@ func dnsutilNext(s string, offset int) (i int, end bool) {
+ 		return 0, true
+ 	}
+ 	for i = offset; i < len(s)-1; i++ {
+-		if s[i] != '.' {
+-			continue
++		switch s[i] {
++		case '\\': // the escaped octet can't end the label; a \DDD's digits can't either
++			i++
++		case '.':
++			return i + 1, false
+ 		}
+-		return i + 1, false
+ 	}
+ 	return len(s), true
+ }
+@@ -74,7 +77,7 @@ func dnsutilPrev(s string, offset int) (i int, start bool) {
+ 	}
+ 
+ 	for i := offset; i >= 0; i-- {
+-		if s[i] != '.' {
++		if s[i] != '.' || isEscaped(s, i) {
+ 			continue
+ 		}
+ 		return i + 1, false
+@@ -92,9 +95,17 @@ func dnsutilFqdn(s string) string {
+ 	return s + "."
+ }
+ 
+-// IsFqdn checks if a domain name is fully qualified. As this library doesn't support escapes in names, this
+-// simply calls [strings.HasSuffix].
+-func dnsutilIsFqdn(s string) bool { return strings.HasSuffix(s, ".") }
++// IsFqdn checks if a domain name is fully qualified: it ends in a dot that is not escaped, so "a\\." is not.
++func dnsutilIsFqdn(s string) bool { return strings.HasSuffix(s, ".") && !isEscaped(s, len(s)-1) }
++
++// isEscaped reports whether s[i] is escaped: preceded by an odd number of backslashes.
++func isEscaped(s string, i int) bool {
++	n := 0
++	for i--; i >= 0 && s[i] == '\\'; i-- {
++		n++
++	}
++	return n%2 == 1
++}
+ 
+ // Canonical returns the domain name in canonical form. A name in canonical form is lowercase and fully qualified.
+ // Only US-ASCII letters are affected. See Section 6.2 in RFC 4034.
+@@ -125,13 +136,24 @@ func dnsutilIsName(s string) bool {
+ 		begin int
+ 	)
+ 	for begin < ls {
+-		i := strings.IndexByte(s[begin:], '.')
+-		if i == -1 {
++		i, escapes := begin, 0 // find the unescaped dot ending this label; see pack.Name
++		for ; i < ls && s[i] != '.'; i++ {
++			if s[i] != '\\' {
++				continue
++			}
++			if ddd.Is(s[i+1:]) {
++				i += 3
++				escapes += 3
++			} else {
++				i++
++				escapes++
++			}
++		}
++		if i >= ls {
+ 			break
+ 		}
+-		i += begin
+ 
+-		labelLen := i - begin
++		labelLen := i - begin - escapes
+ 		// top two bits of length must be clear and two dots back to back is not legal
+ 		if labelLen == 0 || labelLen >= 1<<6 {
+ 			return false
+diff --git a/dnsutil/dnsutil_test.go b/dnsutil/dnsutil_test.go
+index 28655d0..7902880 100644
+--- a/dnsutil/dnsutil_test.go
++++ b/dnsutil/dnsutil_test.go
+@@ -35,8 +35,9 @@ func TestIsFqdn(t *testing.T) {
+ 	}{
+ 		{"miek.nl", false},
+ 		{"miek.nl.", true},
+-		{"miek.nl\\.", true},
++		{"miek.nl\\.", false}, // the final dot is escaped
+ 		{"miek.nl\\\\.", true},
++		{"miek.nl\\\\\\.", false},
+ 		{"miek.n\\..", true},
+ 	}
+ 	for i, tc := range testcases {
+diff --git a/dnsutil/labels.go b/dnsutil/labels.go
+index 4a067b6..d411141 100644
+--- a/dnsutil/labels.go
++++ b/dnsutil/labels.go
+@@ -17,16 +17,20 @@ func Join(ls ...string) string {
+ 	return Fqdn(strings.Join(ls, "."))
+ }
+ 
+-// Split splits the name s in its labels. See [Forward] and [Next] for allocationless alternatives.
++// Split splits the name s in its labels, at every dot that is not escaped; a label keeps its escapes. See
++// [Forward] and [Next] for allocationless alternatives.
+ func Split(s string) []string {
+-	if s == "." {
++	switch s {
++	case ".":
+ 		return []string{"."}
++	case "":
++		return []string{""}
+ 	}
+-
+-	if IsFqdn(s) {
+-		return strings.Split(s[:len(s)-1], ".")
++	var labels []string
++	for l := range Forward(Fqdn(s)) {
++		labels = append(labels, l)
+ 	}
+-	return strings.Split(s, ".")
++	return labels
+ }
+ 
+ // Forward allows ranging over an name s on a per label basis. The empty string returns nothing a single root
+diff --git a/dnsutil/labels_test.go b/dnsutil/labels_test.go
+index 8b8d598..479f4fe 100644
+--- a/dnsutil/labels_test.go
++++ b/dnsutil/labels_test.go
+@@ -32,6 +32,8 @@ func TestSplit(t *testing.T) {
+ 		{"example.org", []string{"example", "org"}},
+ 		{".", []string{"."}},
+ 		{"", []string{""}},
++		{`printer\.v2._ipp._tcp.example.`, []string{`printer\.v2`, "_ipp", "_tcp", "example"}},
++		{`a\\.b.`, []string{`a\\`, "b"}},
+ 	}
+ 
+ 	for i, tc := range testcases {
+@@ -51,6 +53,9 @@ func TestNext(t *testing.T) {
+ 		{"www.miek.nl.", 0}: 4,
+ 		{"www.miek.nl.", 4}: 9,
+ 		{"www.miek.nl.", 9}: 12,
++		{`a\.b.nl.`, 0}:     5,
++		{`a\\.b.nl.`, 0}:    4,
++		{`a\046b.nl.`, 0}:   7,
+ 	}
+ 	for tc, i := range testcases {
+ 		x, ok := Next(tc.string, tc.int)
+@@ -68,6 +73,7 @@ func TestForward(t *testing.T) {
+ 		{".", []string{"."}},
+ 		{"nl.", []string{"nl"}},
+ 		{"www.miek.nl.", []string{"www", "miek", "nl"}},
++		{`a\.b.nl.`, []string{`a\.b`, "nl"}},
+ 	}
+ 	for _, tc := range testcases {
+ 		t.Run(tc.in, func(t *testing.T) {
+@@ -93,6 +99,10 @@ func TestPrev(t *testing.T) {
+ 		{"www.miek.nl.", 12}: 9,
+ 		{"www.miek.nl.", 9}:  4,
+ 		{"www.miek.nl.", 4}:  0,
++		{`a\.b.nl.`, 8}:      5,
++		{`a\.b.nl.`, 5}:      0,
++		{`a\\.b.nl.`, 4}:     0,
++		{`a\\.b.nl.`, 6}:     4,
+ 	}
+ 	for tc, i := range testcases {
+ 		x, ok := Prev(tc.string, tc.int)
+@@ -110,6 +120,7 @@ func TestBackward(t *testing.T) {
+ 		{".", []string{"."}},
+ 		{"nl.", []string{"nl"}},
+ 		{"www.miek.nl.", []string{"nl", "miek", "www"}},
++		{`a\.b.nl.`, []string{"nl", `a\.b`}},
+ 	}
+ 	for _, tc := range testcases {
+ 		t.Run(tc.in, func(t *testing.T) {
+@@ -130,6 +141,7 @@ func TestLabels(t *testing.T) {
+ 		"www.miek.nl":  3,
+ 		"nl":           1,
+ 		".":            0,
++		`a\.b.nl.`:     2,
+ 	}
+ 	for tc, i := range testcases {
+ 		x := Labels(tc)
+diff --git a/dnsutil/shared.go b/dnsutil/shared.go
+index d31fd0c..5aed462 100644
+--- a/dnsutil/shared.go
++++ b/dnsutil/shared.go
+@@ -4,6 +4,7 @@ import (
+ 	"strings"
+ 	"time"
+ 
++	"codeberg.org/miekg/dns/internal/ddd"
+ 	"codeberg.org/miekg/dns/internal/dnsstring"
+ )
+ 
+@@ -44,10 +45,12 @@ func Next(s string, offset int) (i int, end bool) {
+ 		return 0, true
+ 	}
+ 	for i = offset; i < len(s)-1; i++ {
+-		if s[i] != '.' {
+-			continue
++		switch s[i] {
++		case '\\': // the escaped octet can't end the label; a \DDD's digits can't either
++			i++
++		case '.':
++			return i + 1, false
+ 		}
+-		return i + 1, false
+ 	}
+ 	return len(s), true
+ }
+@@ -72,7 +75,7 @@ func Prev(s string, offset int) (i int, start bool) {
+ 	}
+ 
+ 	for i := offset; i >= 0; i-- {
+-		if s[i] != '.' {
++		if s[i] != '.' || isEscaped(s, i) {
+ 			continue
+ 		}
+ 		return i + 1, false
+@@ -90,9 +93,17 @@ func Fqdn(s string) string {
+ 	return s + "."
+ }
+ 
+-// IsFqdn checks if a domain name is fully qualified. As this library doesn't support escapes in names, this
+-// simply calls [strings.HasSuffix].
+-func IsFqdn(s string) bool { return strings.HasSuffix(s, ".") }
++// IsFqdn checks if a domain name is fully qualified: it ends in a dot that is not escaped, so "a\\." is not.
++func IsFqdn(s string) bool { return strings.HasSuffix(s, ".") && !isEscaped(s, len(s)-1) }
++
++// isEscaped reports whether s[i] is escaped: preceded by an odd number of backslashes.
++func isEscaped(s string, i int) bool {
++	n := 0
++	for i--; i >= 0 && s[i] == '\\'; i-- {
++		n++
++	}
++	return n%2 == 1
++}
+ 
+ // Canonical returns the domain name in canonical form. A name in canonical form is lowercase and fully qualified.
+ // Only US-ASCII letters are affected. See Section 6.2 in RFC 4034.
+@@ -123,13 +134,24 @@ func IsName(s string) bool {
+ 		begin int
+ 	)
+ 	for begin < ls {
+-		i := strings.IndexByte(s[begin:], '.')
+-		if i == -1 {
++		i, escapes := begin, 0 // find the unescaped dot ending this label; see pack.Name
++		for ; i < ls && s[i] != '.'; i++ {
++			if s[i] != '\\' {
++				continue
++			}
++			if ddd.Is(s[i+1:]) {
++				i += 3
++				escapes += 3
++			} else {
++				i++
++				escapes++
++			}
++		}
++		if i >= ls {
+ 			break
+ 		}
+-		i += begin
+ 
+-		labelLen := i - begin
++		labelLen := i - begin - escapes
+ 		// top two bits of length must be clear and two dots back to back is not legal
+ 		if labelLen == 0 || labelLen >= 1<<6 {
+ 			return false
+diff --git a/dnsutil/shared_test.go b/dnsutil/shared_test.go
+index 70630c7..6c49929 100644
+--- a/dnsutil/shared_test.go
++++ b/dnsutil/shared_test.go
+@@ -1,6 +1,7 @@
+ package dnsutil_test
+ 
+ import (
++	"strings"
+ 	"testing"
+ 
+ 	"codeberg.org/miekg/dns"
+@@ -70,6 +71,10 @@ func TestIsName(t *testing.T) {
+ 		{`.org`, false},
+ 		{`www..example.org.`, false},
+ 		{`www.example.org..`, false},
++		{`a\.`, true},                           // a relative name: the one label "a."
++		{strings.Repeat(`\.`, 63) + `.`, true},  // 63 octets once unescaped
++		{strings.Repeat(`\.`, 64) + `.`, false}, // 64
++		{strings.Repeat(`\046`, 63) + `.`, true},
+ 	}
+ 	for _, tc := range testcases {
+ 		got := dnsutil.IsName(tc.in)
+diff --git a/internal/pack/pack.go b/internal/pack/pack.go
+index e9c5bf7..fd5ba7e 100644
+--- a/internal/pack/pack.go
++++ b/internal/pack/pack.go
+@@ -190,7 +190,10 @@ func AAAA(aaaa netip.Addr, msg []byte, off int) (int, error) {
+ 	return off + net.IPv6len, nil
+ }
+ 
+-// Name packs the string s into msg.
++// Name packs the string s into msg. A backslash escapes the character after it, as in RFC 1035 section 5.1:
++// "\." is a dot inside a label rather than the end of one, "\\" is a backslash, and "\DDD" is the octet with
++// the decimal value DDD. This is how a label holding a dot, such as the DNS-SD instance name "Printer v2.1"
++// (RFC 6763 section 4.3), survives packing.
+ func Name(s string, msg []byte, off int, compression map[string]uint16, compress bool) (off1 int, err error) {
+ 	// XXX: A logical copy of this function exists in dnsutil.IsName and should be kept in sync with this function.
+ 
+@@ -204,11 +207,11 @@ func Name(s string, msg []byte, off int, compression map[string]uint16, compress
+ 		msg[off] = 0
+ 		return off + 1, nil
+ 	}
+-	if ls > 0 && s[ls-1] != '.' {
++	if ls > 0 && (s[ls-1] != '.' || isEscaped(s, ls-1)) {
+ 		return lenmsg, &Error{"name must be fully qualified"}
+ 	}
+ 
+-	// Each dot ends a segment of the name. We trade each dot byte for a length byte.
++	// Each unescaped dot ends a segment of the name. We trade each dot byte for a length byte.
+ 	// There is also a trailing zero. Emit sequence of counted strings, chopping at dots.
+ 	var (
+ 		begin    int
+@@ -216,13 +219,12 @@ func Name(s string, msg []byte, off int, compression map[string]uint16, compress
+ 	)
+ 
+ 	for begin < ls {
+-		i := strings.IndexByte(s[begin:], '.')
+-		if i == -1 {
++		i, escapes := labelEnd(s, begin)
++		if i == ls {
+ 			break
+ 		}
+-		i += begin
+ 
+-		labelLen = i - begin
++		labelLen = i - begin - escapes
+ 		if labelLen >= 1<<6 { // top two bits of length must be clear
+ 			return lenmsg, &Error{"illegal label type in name"}
+ 		}
+@@ -247,7 +249,11 @@ func Name(s string, msg []byte, off int, compression map[string]uint16, compress
+ 
+ 		// the following is covered by the length check above
+ 		msg[off] = byte(labelLen)
+-		copy(msg[off+1:], s[begin:i])
++		if escapes == 0 {
++			copy(msg[off+1:], s[begin:i])
++		} else {
++			unescapeLabel(msg[off+1:], s[begin:i])
++		}
+ 
+ 		off += 1 + labelLen
+ 		begin = i + 1
+@@ -260,6 +266,54 @@ func Name(s string, msg []byte, off int, compression map[string]uint16, compress
+ 	return off + 1, nil
+ }
+ 
++// labelEnd returns the index of the unescaped dot that ends the label starting at s[begin], or len(s) if
++// there is none, and how many octets the escapes in the label save: 1 for each "\X", 3 for each "\DDD".
++func labelEnd(s string, begin int) (i, escapes int) {
++	for i = begin; i < len(s); i++ {
++		switch s[i] {
++		case '.':
++			return i, escapes
++		case '\\':
++			if ddd.Is(s[i+1:]) {
++				i += 3
++				escapes += 3
++			} else {
++				i++
++				escapes++
++			}
++		}
++	}
++	return len(s), escapes
++}
++
++// unescapeLabel copies label to dst, replacing "\X" by X and "\DDD" by the octet DDD.
++func unescapeLabel(dst []byte, label string) {
++	j := 0
++	for i := 0; i < len(label); i++ {
++		b := label[i]
++		if b == '\\' && i+1 < len(label) {
++			if ddd.Is(label[i+1:]) {
++				b = ddd.ToByte(label[i+1:])
++				i += 3
++			} else {
++				i++
++				b = label[i]
++			}
++		}
++		dst[j] = b
++		j++
++	}
++}
++
++// isEscaped reports whether s[i] is escaped: preceded by an odd number of backslashes.
++func isEscaped(s string, i int) bool {
++	n := 0
++	for i--; i >= 0 && s[i] == '\\'; i-- {
++		n++
++	}
++	return n%2 == 1
++}
++
+ // MName packs the string s into msg taking escaped dots into account. A label may hold any number of
+ // escaped dots, \. can never be at the start of the string.
+ func MName(s string, msg []byte, off int) (off1 int, err error) {
+diff --git a/internal/pack/pack_test.go b/internal/pack/pack_test.go
+index a4211f9..2d1cabb 100644
+--- a/internal/pack/pack_test.go
++++ b/internal/pack/pack_test.go
+@@ -1,8 +1,10 @@
+ package pack
+ 
+ import (
++	"bytes"
+ 	"fmt"
+ 	"maps"
++	"strings"
+ 	"testing"
+ )
+ 
+@@ -92,3 +94,51 @@ func TestMName(t *testing.T) {
+ 		})
+ 	}
+ }
++
++func TestNameEscapes(t *testing.T) {
++	testcases := []struct {
++		in   string
++		wire []byte // nil: an error is expected
++	}{
++		{`a\.b.nl.`, []byte{3, 'a', '.', 'b', 2, 'n', 'l', 0}},
++		{`a\\.nl.`, []byte{2, 'a', '\\', 2, 'n', 'l', 0}},
++		{`a\\\.b.`, []byte{4, 'a', '\\', '.', 'b', 0}},
++		{`\065b.`, []byte{2, 'A', 'b', 0}},
++		{`a\046b.`, []byte{3, 'a', '.', 'b', 0}},
++		{`\x.`, []byte{1, 'x', 0}},
++		{`a\.`, nil},                          // the final dot is escaped: not fully qualified
++		{`\..`, []byte{1, '.', 0}},            // a label that is just a dot
++		{strings.Repeat(`\.`, 64) + `.`, nil}, // 64 octets once unescaped: too long for a label
++	}
++	for i, tc := range testcases {
++		t.Run(fmt.Sprintf("test %d", i), func(t *testing.T) {
++			buf := make([]byte, 256)
++			off, err := Name(tc.in, buf, 0, nil, false)
++			if tc.wire == nil {
++				if err == nil {
++					t.Fatalf("Name(%q) packed %v, expected an error", tc.in, buf[:off])
++				}
++				return
++			}
++			if err != nil {
++				t.Fatalf("Name(%q): %v", tc.in, err)
++			}
++			if !bytes.Equal(buf[:off], tc.wire) {
++				t.Fatalf("Name(%q) = %v, expected %v", tc.in, buf[:off], tc.wire)
++			}
++		})
++	}
++
++	// A 63-octet label written with escapes packs as one label of dots.
++	for _, in := range []string{strings.Repeat(`\.`, 63) + `.`, strings.Repeat(`\046`, 63) + `.`} {
++		buf := make([]byte, 256)
++		off, err := Name(in, buf, 0, nil, false)
++		if err != nil {
++			t.Fatalf("Name(%q): %v", in, err)
++		}
++		want := append(append([]byte{63}, bytes.Repeat([]byte{'.'}, 63)...), 0)
++		if !bytes.Equal(buf[:off], want) {
++			t.Fatalf("Name(%q) = %v, expected %v", in, buf[:off], want)
++		}
++	}
++}
+diff --git a/internal/unpack/unpack.go b/internal/unpack/unpack.go
+index 5f5cfb8..24a3afe 100644
+--- a/internal/unpack/unpack.go
++++ b/internal/unpack/unpack.go
+@@ -104,10 +104,14 @@ func String(s *cryptobyte.String) (string, error) {
+ // Note that if we jump elsewhere in the packet, we record the last offset we read from when we found the first pointer,
+ // which is where the next record or record field will start. We enforce that pointers always point backwards into the message.
+ 
+-// Name unpacks a name in a cryptobyte.String.
++// Name unpacks a name in a cryptobyte.String. A dot or a backslash inside a label is escaped with a
++// backslash (\. and \\), as in RFC 1035 section 5.1, so the string keeps the label boundaries of the wire
++// name: without it a label such as "Printer v2.1" (which RFC 6763 section 4.1.1 allows in a DNS-SD instance
++// name) reads as two labels, and packs as two. Every other octet is copied as is.
+ func Name(s *cryptobyte.String, msgBuf []byte) (string, error) {
+ 	name := make([]byte, 0, maxNamePresentationLength)
+ 	var ptrs bool
++	wire := 0 // wire-format octets read so far, excluding the root label
+ 
+ 	// If we never see a pointer, we need to ensure that we advance s to our final position.
+ 	cs := *s
+@@ -129,14 +133,25 @@ func Name(s *cryptobyte.String, msgBuf []byte) (string, error) {
+ 				return string(name), nil
+ 			}
+ 
+-			if len(name)+int(c) >= maxNamePresentationLength {
++			if wire += int(c) + 1; wire >= maxNameWireOctets {
+ 				return "", &Error{"name exceeded max wire-format octets"}
+ 			}
+ 
+-			ln := len(name)
+-			name = name[:ln+int(c)+1]          // extend slice
+-			cs.CopyBytes(name[ln : ln+int(c)]) // copy label into correct place
+-			name[ln+int(c)] = '.'
++			var label []byte
++			if !cs.ReadBytes(&label, int(c)) {
++				return "", &Error{"overflow name"}
++			}
++			if bytes.IndexAny(label, `.\`) < 0 {
++				name = append(name, label...)
++			} else {
++				for _, b := range label {
++					if b == '.' || b == '\\' {
++						name = append(name, '\\')
++					}
++					name = append(name, b)
++				}
++			}
++			name = append(name, '.')
+ 
+ 		case 0xC0: // pointer
+ 			if msgBuf == nil {
+diff --git a/internal/unpack/unpack_test.go b/internal/unpack/unpack_test.go
+index 8b3a69c..91fa3b4 100644
+--- a/internal/unpack/unpack_test.go
++++ b/internal/unpack/unpack_test.go
+@@ -22,6 +22,12 @@ func TestName(t *testing.T) {
+ 		// class. But then 192 12 which is a pointer to miek.nl, so lets decode that.
+ 		{[]byte{98, 24, 129, 128, 0, 1, 0, 5, 0, 0, 0, 1, 4, 109, 105, 101, 107, 2, 110, 108, 0, 0, 15, 0, 1, 192, 12, 0}, 25, "miek.nl.", 27, false},
+ 
++		// A dot or a backslash inside a label is escaped.
++		// Wire: 3 "a.b" 2 "nl" 0
++		{[]byte{3, 'a', '.', 'b', 2, 'n', 'l', 0}, 0, `a\.b.nl.`, 8, false},
++		// Wire: 3 "a\b" 0
++		{[]byte{3, 'a', '\\', 'b', 0}, 0, `a\\b.`, 5, false},
++
+ 		// MName
+ 		// Wire: 16 "support.norrland" 10 "nordlo.com" 0
+ 		{[]byte{16, 's', 'u', 'p', 'p', 'o', 'r', 't', '.', 'n', 'o', 'r', 'r', 'l', 'a', 'n', 'd', 10, 'n', 'o', 'r', 'd', 'l', 'o', '.', 'c', 'o', 'm', 0}, 0, `support\.norrland.nordlo\.com.`, 29, true},
+diff --git a/msg_test.go b/msg_test.go
+index 189d8fe..94c1db4 100644
+--- a/msg_test.go
++++ b/msg_test.go
+@@ -592,3 +592,39 @@ func TestMsgReadAll(t *testing.T) {
+ 		t.Fatal("expected io.ReadAll to complete, but hung")
+ 	}
+ }
++
++// TestMsgEscapedNames checks that a label holding a dot, such as the DNS-SD instance name "Printer v2.1"
++// (RFC 6763 section 4.1.1), survives packing and unpacking as one label: as an owner name, in RDATA, and
++// compressed.
++func TestMsgEscapedNames(t *testing.T) {
++	const instance = `Printer v2\.1._ipp._tcp.example.`
++
++	srv := new(dns.SRV)
++	srv.Hdr = dns.Header{Name: instance, Class: dns.ClassINET, TTL: 3600}
++	srv.Port = 631
++	srv.Target = "host.example."
++	ptr := new(dns.PTR)
++	ptr.Hdr = dns.Header{Name: "_ipp._tcp.example.", Class: dns.ClassINET, TTL: 3600}
++	ptr.Ptr = instance // packed as a compression pointer to the SRV owner name
++
++	m := dns.NewMsg("example.", dns.TypeSOA)
++	m.Answer = []dns.RR{srv, ptr}
++	if err := m.Pack(); err != nil {
++		t.Fatal(err)
++	}
++	label := append([]byte{12}, "Printer v2.1"...)
++	if bytes.Count(m.Data, label) != 1 {
++		t.Fatalf("expected the single label %q once in the packed message, got %q", label, m.Data)
++	}
++
++	m1 := &dns.Msg{Data: m.Data}
++	if err := m1.Unpack(); err != nil {
++		t.Fatal(err)
++	}
++	if got := m1.Answer[0].Header().Name; got != instance {
++		t.Errorf("expected SRV owner %s, got %s", instance, got)
++	}
++	if got := m1.Answer[1].(*dns.PTR).Ptr; got != instance {
++		t.Errorf("expected PTR target %s, got %s", instance, got)
++	}
++}
+diff --git a/rdata/zdnsutil.go b/rdata/zdnsutil.go
+index 9b36bd1..efeb0a3 100644
+--- a/rdata/zdnsutil.go
++++ b/rdata/zdnsutil.go
+@@ -6,6 +6,7 @@ import (
+ 	"strings"
+ 	"time"
+ 
++	"codeberg.org/miekg/dns/internal/ddd"
+ 	"codeberg.org/miekg/dns/internal/dnsstring"
+ )
+ 
+@@ -46,10 +47,12 @@ func dnsutilNext(s string, offset int) (i int, end bool) {
+ 		return 0, true
+ 	}
+ 	for i = offset; i < len(s)-1; i++ {
+-		if s[i] != '.' {
+-			continue
++		switch s[i] {
++		case '\\': // the escaped octet can't end the label; a \DDD's digits can't either
++			i++
++		case '.':
++			return i + 1, false
+ 		}
+-		return i + 1, false
+ 	}
+ 	return len(s), true
+ }
+@@ -74,7 +77,7 @@ func dnsutilPrev(s string, offset int) (i int, start bool) {
+ 	}
+ 
+ 	for i := offset; i >= 0; i-- {
+-		if s[i] != '.' {
++		if s[i] != '.' || isEscaped(s, i) {
+ 			continue
+ 		}
+ 		return i + 1, false
+@@ -92,9 +95,17 @@ func dnsutilFqdn(s string) string {
+ 	return s + "."
+ }
+ 
+-// IsFqdn checks if a domain name is fully qualified. As this library doesn't support escapes in names, this
+-// simply calls [strings.HasSuffix].
+-func dnsutilIsFqdn(s string) bool { return strings.HasSuffix(s, ".") }
++// IsFqdn checks if a domain name is fully qualified: it ends in a dot that is not escaped, so "a\\." is not.
++func dnsutilIsFqdn(s string) bool { return strings.HasSuffix(s, ".") && !isEscaped(s, len(s)-1) }
++
++// isEscaped reports whether s[i] is escaped: preceded by an odd number of backslashes.
++func isEscaped(s string, i int) bool {
++	n := 0
++	for i--; i >= 0 && s[i] == '\\'; i-- {
++		n++
++	}
++	return n%2 == 1
++}
+ 
+ // Canonical returns the domain name in canonical form. A name in canonical form is lowercase and fully qualified.
+ // Only US-ASCII letters are affected. See Section 6.2 in RFC 4034.
+@@ -125,13 +136,24 @@ func dnsutilIsName(s string) bool {
+ 		begin int
+ 	)
+ 	for begin < ls {
+-		i := strings.IndexByte(s[begin:], '.')
+-		if i == -1 {
++		i, escapes := begin, 0 // find the unescaped dot ending this label; see pack.Name
++		for ; i < ls && s[i] != '.'; i++ {
++			if s[i] != '\\' {
++				continue
++			}
++			if ddd.Is(s[i+1:]) {
++				i += 3
++				escapes += 3
++			} else {
++				i++
++				escapes++
++			}
++		}
++		if i >= ls {
+ 			break
+ 		}
+-		i += begin
+ 
+-		labelLen := i - begin
++		labelLen := i - begin - escapes
+ 		// top two bits of length must be clear and two dots back to back is not legal
+ 		if labelLen == 0 || labelLen >= 1<<6 {
+ 			return false
+diff --git a/svcb/zdnsutil.go b/svcb/zdnsutil.go
+index 4d45f18..8deec3f 100644
+--- a/svcb/zdnsutil.go
++++ b/svcb/zdnsutil.go
+@@ -6,6 +6,7 @@ import (
+ 	"strings"
+ 	"time"
+ 
++	"codeberg.org/miekg/dns/internal/ddd"
+ 	"codeberg.org/miekg/dns/internal/dnsstring"
+ )
+ 
+@@ -46,10 +47,12 @@ func dnsutilNext(s string, offset int) (i int, end bool) {
+ 		return 0, true
+ 	}
+ 	for i = offset; i < len(s)-1; i++ {
+-		if s[i] != '.' {
+-			continue
++		switch s[i] {
++		case '\\': // the escaped octet can't end the label; a \DDD's digits can't either
++			i++
++		case '.':
++			return i + 1, false
+ 		}
+-		return i + 1, false
+ 	}
+ 	return len(s), true
+ }
+@@ -74,7 +77,7 @@ func dnsutilPrev(s string, offset int) (i int, start bool) {
+ 	}
+ 
+ 	for i := offset; i >= 0; i-- {
+-		if s[i] != '.' {
++		if s[i] != '.' || isEscaped(s, i) {
+ 			continue
+ 		}
+ 		return i + 1, false
+@@ -92,9 +95,17 @@ func dnsutilFqdn(s string) string {
+ 	return s + "."
+ }
+ 
+-// IsFqdn checks if a domain name is fully qualified. As this library doesn't support escapes in names, this
+-// simply calls [strings.HasSuffix].
+-func dnsutilIsFqdn(s string) bool { return strings.HasSuffix(s, ".") }
++// IsFqdn checks if a domain name is fully qualified: it ends in a dot that is not escaped, so "a\\." is not.
++func dnsutilIsFqdn(s string) bool { return strings.HasSuffix(s, ".") && !isEscaped(s, len(s)-1) }
++
++// isEscaped reports whether s[i] is escaped: preceded by an odd number of backslashes.
++func isEscaped(s string, i int) bool {
++	n := 0
++	for i--; i >= 0 && s[i] == '\\'; i-- {
++		n++
++	}
++	return n%2 == 1
++}
+ 
+ // Canonical returns the domain name in canonical form. A name in canonical form is lowercase and fully qualified.
+ // Only US-ASCII letters are affected. See Section 6.2 in RFC 4034.
+@@ -125,13 +136,24 @@ func dnsutilIsName(s string) bool {
+ 		begin int
+ 	)
+ 	for begin < ls {
+-		i := strings.IndexByte(s[begin:], '.')
+-		if i == -1 {
++		i, escapes := begin, 0 // find the unescaped dot ending this label; see pack.Name
++		for ; i < ls && s[i] != '.'; i++ {
++			if s[i] != '\\' {
++				continue
++			}
++			if ddd.Is(s[i+1:]) {
++				i += 3
++				escapes += 3
++			} else {
++				i++
++				escapes++
++			}
++		}
++		if i >= ls {
+ 			break
+ 		}
+-		i += begin
+ 
+-		labelLen := i - begin
++		labelLen := i - begin - escapes
+ 		// top two bits of length must be clear and two dots back to back is not legal
+ 		if labelLen == 0 || labelLen >= 1<<6 {
+ 			return false
+diff --git a/zdnsutil.go b/zdnsutil.go
+index 3939d5d..280c03a 100644
+--- a/zdnsutil.go
++++ b/zdnsutil.go
+@@ -6,6 +6,7 @@ import (
+ 	"strings"
+ 	"time"
+ 
++	"codeberg.org/miekg/dns/internal/ddd"
+ 	"codeberg.org/miekg/dns/internal/dnsstring"
+ )
+ 
+@@ -46,10 +47,12 @@ func dnsutilNext(s string, offset int) (i int, end bool) {
+ 		return 0, true
+ 	}
+ 	for i = offset; i < len(s)-1; i++ {
+-		if s[i] != '.' {
+-			continue
++		switch s[i] {
++		case '\\': // the escaped octet can't end the label; a \DDD's digits can't either
++			i++
++		case '.':
++			return i + 1, false
+ 		}
+-		return i + 1, false
+ 	}
+ 	return len(s), true
+ }
+@@ -74,7 +77,7 @@ func dnsutilPrev(s string, offset int) (i int, start bool) {
+ 	}
+ 
+ 	for i := offset; i >= 0; i-- {
+-		if s[i] != '.' {
++		if s[i] != '.' || isEscaped(s, i) {
+ 			continue
+ 		}
+ 		return i + 1, false
+@@ -92,9 +95,17 @@ func dnsutilFqdn(s string) string {
+ 	return s + "."
+ }
+ 
+-// IsFqdn checks if a domain name is fully qualified. As this library doesn't support escapes in names, this
+-// simply calls [strings.HasSuffix].
+-func dnsutilIsFqdn(s string) bool { return strings.HasSuffix(s, ".") }
++// IsFqdn checks if a domain name is fully qualified: it ends in a dot that is not escaped, so "a\\." is not.
++func dnsutilIsFqdn(s string) bool { return strings.HasSuffix(s, ".") && !isEscaped(s, len(s)-1) }
++
++// isEscaped reports whether s[i] is escaped: preceded by an odd number of backslashes.
++func isEscaped(s string, i int) bool {
++	n := 0
++	for i--; i >= 0 && s[i] == '\\'; i-- {
++		n++
++	}
++	return n%2 == 1
++}
+ 
+ // Canonical returns the domain name in canonical form. A name in canonical form is lowercase and fully qualified.
+ // Only US-ASCII letters are affected. See Section 6.2 in RFC 4034.
+@@ -125,13 +136,24 @@ func dnsutilIsName(s string) bool {
+ 		begin int
+ 	)
+ 	for begin < ls {
+-		i := strings.IndexByte(s[begin:], '.')
+-		if i == -1 {
++		i, escapes := begin, 0 // find the unescaped dot ending this label; see pack.Name
++		for ; i < ls && s[i] != '.'; i++ {
++			if s[i] != '\\' {
++				continue
++			}
++			if ddd.Is(s[i+1:]) {
++				i += 3
++				escapes += 3
++			} else {
++				i++
++				escapes++
++			}
++		}
++		if i >= ls {
+ 			break
+ 		}
+-		i += begin
+ 
+-		labelLen := i - begin
++		labelLen := i - begin - escapes
+ 		// top two bits of length must be clear and two dots back to back is not legal
+ 		if labelLen == 0 || labelLen >= 1<<6 {
+ 			return false
+-- 
+2.47.3
+

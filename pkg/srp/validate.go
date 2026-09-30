@@ -2,9 +2,9 @@ package srp
 
 import (
 	"fmt"
-	"strings"
 
 	"codeberg.org/miekg/dns"
+	"github.com/NetworkCommons/sig0lease/pkg/dnsname"
 	"github.com/NetworkCommons/sig0lease/pkg/dnssd"
 	leasepkg "github.com/NetworkCommons/sig0lease/pkg/lease"
 	"github.com/NetworkCommons/sig0lease/pkg/updatecore"
@@ -98,6 +98,10 @@ func validatePostClassify(msg *dns.Msg, cu *ClassifiedUpdate) error {
 // S9 Service Type Enumeration (handlers.SRPHandler.collectLiveServiceTypes) as
 // "_vpnserver._wg".
 //
+// This also refuses an Instance label containing "." (RFC 6763 S4.3): the dns library can
+// only present it as several labels (see pkg/dnsname's labels.go), so the target's first
+// label is followed by more than the base type.
+//
 // Service Discovery deletes are not checked, so a requester can still withdraw a
 // registration made under a malformed name before this check existed.
 //
@@ -117,7 +121,7 @@ func validateServiceNames(cu *ClassifiedUpdate) error {
 		if _, ok := dnssd.ServiceTypeFromServiceName(base); !ok {
 			return fmt.Errorf("srp: Service Discovery add %s: %s is not a DNS-SD service type -- RFC 6763 S7 requires exactly two labels, \"_<service>._tcp\" or \"_<service>._udp\"", d.Name, base)
 		}
-		if _, service, _ := strings.Cut(d.Target, "."); service != base {
+		if _, service, _ := dnsname.CutFirstLabel(d.Target); service != base {
 			return fmt.Errorf("srp: Service Discovery add %s targets %s, which is not a service instance of %s (RFC 6763 S4.1: <Instance>.<Service>.<Domain>)", d.Name, d.Target, base)
 		}
 	}

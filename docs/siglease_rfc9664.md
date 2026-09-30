@@ -438,6 +438,39 @@ RSA algorithms (RSAMD5/RSASHA1/RSASHA256/RSASHA512) still delegate to `dns.Crypt
 
 This bug was not reported upstream to `codeberg.org/miekg/dns` (deliberate choice, not an oversight) -- this section is written to make that easy to do later: the RFC 2931 S3 quote above, the exact library code path (`sig0_signer.go`'s `CryptoSIG0.Verify`, the `sbuf := packRR(s, sbuf, 0, nil)` line), and a reproducible known-answer case (`pkg/sig0/ecdsa_test.go`'s `TestECDSAP256KnownAnswerFromMDNSResponder`, or the raw captured bytes noted in that test) are everything an upstream issue would need.
 
+### A label containing a dot doesn't survive Unpack/Pack
+
+A DNS label may hold any octet, a dot included (RFC 2181 S11), and RFC 6763 S4.1.1 allows one in a DNS-SD instance name such as `Printer v2.1`. The library can't carry such a label in a name string. `Unpack` copies the label's octets into the string as they are, so the wire label `Printer v2.1` comes out as `Printer v2.1._ipp._tcp.example.`, which reads as the labels `Printer v2` and `1`. `Pack` splits at every dot, even one after a backslash, so it sends that string back out as those two labels: `\.` is not an escape either. The library escapes dots only in mailbox fields (SOA RNAME, RP, MINFO, MB, MG, MR). This is still the case in v0.6.117. `github.com/miekg/dns` v1 handled it with the RFC 1035 S5.1 escapes: its `UnpackDomainName` writes `\.` and its `PackDomainName` reads it.
+
+For the proxy this meant that an update carrying such a label, validly signed, was accepted and forwarded upstream under a different name than the one the client asked for.
+
+### Applied handling
+
+- Both handlers call `refuseDottedLabels` ([handlers/handlers.go](../handlers/handlers.go)) as soon as they take a request. It scans the request's wire bytes with `dnsname.DottedWireLabel` ([pkg/dnsname/wire.go](../pkg/dnsname/wire.go)) and answers REFUSED, naming the label. Plain forwarding sends the original bytes unchanged, so it needs no check.
+- `client/srp.NewClient` refuses a host, instance or subtype label that contains a dot (`dnsname.CheckLabel`). That is the only way this library lets it keep the label boundary, which RFC 6763 S4.3 requires.
+- `TestLibraryReadsEveryDotAsLabelBoundary` ([pkg/dnsname/labels_test.go](../pkg/dnsname/labels_test.go)) pins the library behavior, so an upgrade that changes it is noticed. See the next section.
+- [miekg-dns-escaped-names.patch](miekg-dns-escaped-names.patch) is a proposed upstream fix, against v0.6.117. It is not applied here. It makes `Unpack` escape `.` and `\` inside a label and `Pack` honor `\X` and `\DDD`, and its notes point to the v1 functions that already did this.
+
+### When the library starts escaping dots
+
+`TestLibraryReadsEveryDotAsLabelBoundary` fails the first time `go test ./...` runs against a library version that escapes dots inside labels, whether through the patch above or some other change, and its failure message points here. It is the only test that fails: that was checked by porting the patch onto v0.6.82 and running the whole suite against it. Everything else keeps passing because the refusal above still catches every dotted label, so a green run apart from this test does not mean nothing else needs changing.
+
+A release carrying the change will be newer than v0.6.117, which already removed `OPT.SetUDPSize` (used in [pkg/updatecore/forward.go](../pkg/updatecore/forward.go), [pkg/dnsmsg/update.go](../pkg/dnsmsg/update.go) and [tests/srp_client_tester/main.go](../tests/srp_client_tester/main.go)). Expect it to come as part of a larger upgrade; see [upgrade-miekg-dns.md](upgrade-miekg-dns.md).
+
+Then work through these steps in order. **Do steps 1 and 2 before step 5**: both compare names as plain strings, and today the refusal is what keeps escaped names away from them.
+
+1. **`isNameAtOrAbove`** ([handlers/opcode5_update_helpers.go](../handlers/opcode5_update_helpers.go)) is the signer-hierarchy check: a SIG(0) signer may only update names at or below its own. It tests `strings.HasSuffix(base, "."+c)`. With escapes, the owner `x\.victim.example.`, which is the single label `x.victim` under `example.`, passes that test for the signer `victim.example.`, and that signer could then write outside its own subtree. Compare label by label instead.
+2. **`rewriteZoneSuffix`** ([handlers/srp_handler.go](../handlers/srp_handler.go)) treats the byte before `default.service.arpa.` as a label boundary if it is a dot. An escaped dot passes, so `x\.default.service.arpa.`, which is the label `x.default` under `service.arpa.`, would be rewritten into the upstream zone. Also require that the dot is not escaped.
+3. **[pkg/dnsname/labels.go](../pkg/dnsname/labels.go)**: make `Labels` and `CutFirstLabel` split only at unescaped dots, skipping `\X` and `\DDD`. Replace `CheckLabel`'s refusal of a dot with a function that escapes `.` and `\` (RFC 6763 S4.3); the 63-octet limit then counts unescaped octets. Rewrite the file's opening comment, which describes today's library.
+4. **[client/srp/client.go](../client/srp/client.go)**: escape host, instance and subtype labels with that function when joining them into names, instead of refusing a dotted one. Escape backslashes too: today they work as plain characters, but the library would then read them as escapes.
+5. **Remove the refusal**: `refuseDottedLabels` in [handlers/handlers.go](../handlers/handlers.go), its calls in [handlers/opcode5_handle.go](../handlers/opcode5_handle.go) and [handlers/srp_handler.go](../handlers/srp_handler.go), and [pkg/dnsname/wire.go](../pkg/dnsname/wire.go) with its tests.
+6. **Tests**:
+   - Make `TestLibraryReadsEveryDotAsLabelBoundary` pin the new behavior: a dotted label unpacks escaped and packs back as one label.
+   - Turn the refusal tests into tests that the name is registered, and forwarded upstream, as the single label it is: `TestHandle_DottedLabel_Refused`, `TestSRPHandle_DottedInstanceLabel_Refused`, `TestNewClient_RejectsLabelThatIsNotOneDNSLabel`, and the "instance label containing a dot rejected" case of `TestValidate_ServiceNames` in [pkg/srp/srp_test.go](../pkg/srp/srp_test.go).
+   - Update the cases that spell a dotted label the way today's library presents it, unescaped: `TestCheckLabel` in [pkg/dnsname/labels_test.go](../pkg/dnsname/labels_test.go), and the "dot in the instance label" case of `TestServiceTypeFromInstanceName` in [pkg/dnssd/enumeration_test.go](../pkg/dnssd/enumeration_test.go).
+   - Add tests for steps 1 and 2 with an escaped dot.
+7. **Docs**: rewrite this section and the one above, drop item 7 from "Applied Compatibility Patches" below, and delete [miekg-dns-escaped-names.patch](miekg-dns-escaped-names.patch).
+
 ## Applied Compatibility Patches
 
 The following project-side patches are currently in place:
@@ -448,6 +481,7 @@ The following project-side patches are currently in place:
 4. `pkg/lease.FindOption` recognizes UPDATE-LEASE whether it arrives as a direct `ERFC3597` record or under an `OPT` wrapper, for both request and response parsing.
 5. `server/server.go` wraps the handler chain in `fullUnpackHandler`, which calls `r.Unpack()` before dispatch so every request (UDP and TCP) reaches the router fully decoded, per the `dns.Handler` contract (see above).
 6. `pkg/sig0/signer.go` replaces `dns.CryptoSIG0.Sign`/`Verify` for ED25519, ECDSAP256SHA256, and ECDSAP384SHA384 with an RFC-2931-correct, RDATA-only hash-input implementation (`rdataOnlyPrefix`), fixing a library bug that hashes the full SIG RR wire encoding instead.
+7. `handlers.refuseDottedLabels` answers REFUSED to an update carrying a label with a dot in it, which the library would forward as several labels; `client/srp.NewClient` refuses such a label (see above).
 
 # Implementation Status
 

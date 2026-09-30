@@ -52,6 +52,7 @@ func TestValidateServiceType(t *testing.T) {
 		{"_http-._tcp", "hyphen"},
 		{"_http--alt._tcp", "hyphen"},
 		{"_1234._tcp", "at least one letter"},
+		{"_http._tcp.", "exactly two labels"},
 	}
 	for _, tc := range cases {
 		err := ValidateServiceType(tc.svcType)

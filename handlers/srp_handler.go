@@ -230,6 +230,11 @@ func (h *SRPHandler) Handle(ctx context.Context, w dns.ResponseWriter, r *dns.Ms
 	h.logger.Infof("SRP UPDATE for zone %s: host=%s instances=%d discovery=%d",
 		zone, cu.Host.Name, len(cu.Instances), len(cu.Discovery))
 
+	if res := refuseDottedLabels(r); res != nil {
+		h.logger.Debugf("SRP handler: %v", res.Error)
+		return res
+	}
+
 	// Step 2: structural validation. ValidateClassified runs every check Validate does
 	// beyond Classify itself, reusing step 1's own cu rather than re-classifying the
 	// identical message a second time (a real, measurable cost per request -- Classify

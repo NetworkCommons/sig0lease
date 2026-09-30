@@ -29,6 +29,11 @@ func (h *UpdateHandler) Handle(ctx context.Context, w dns.ResponseWriter, r *dns
 	// From here on the request is this handler's, and everything below needs the upstream.
 	requireUpstream(h.Name(), h.upstreamCoordinator != nil, h.upstreamKeyRecord != nil)
 
+	if res := refuseDottedLabels(r); res != nil {
+		h.logger.Debugf("Refusing UPDATE: %v", res.Error)
+		return res
+	}
+
 	if len(r.Question) != 1 {
 		msg := makeErrorResponse(r, dns.RcodeFormatError, "exactly one question required")
 		return NewErrorResult(msg, "invalid question count", fmt.Errorf("multiple questions"))

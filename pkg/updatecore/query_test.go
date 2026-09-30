@@ -91,3 +91,18 @@ func TestQueryRRs_NXDOMAINIsEmptyNotAnError(t *testing.T) {
 		t.Fatalf("expected no records and no error for NXDOMAIN, got %v, %v", rrs, err)
 	}
 }
+
+func TestParentZone(t *testing.T) {
+	cases := []struct{ in, want string }{
+		{"srp.dev.zenr.io.", "dev.zenr.io"},
+		{"srp.dev.zenr.io", "dev.zenr.io"},
+		{"io.", ""},
+		{"io", ""},
+		{"", ""},
+	}
+	for _, c := range cases {
+		if got := parentZone(c.in); got != c.want {
+			t.Errorf("parentZone(%q) = %q, want %q", c.in, got, c.want)
+		}
+	}
+}

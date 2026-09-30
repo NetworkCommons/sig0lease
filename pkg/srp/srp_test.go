@@ -1,6 +1,7 @@
 package srp
 
 import (
+	"bytes"
 	"encoding/hex"
 	"strings"
 	"testing"
@@ -544,6 +545,33 @@ func TestValidate_ServiceNames(t *testing.T) {
 		const inst = "vpnclient._ipps._tcp." + zone
 		msg := build(t, append(instance(t, inst), mustRR(t, "_http._tcp."+zone+" 130 IN PTR "+inst)))
 		if _, err := Validate(msg); err == nil || !strings.Contains(err.Error(), "not a service instance of") {
+			t.Fatalf("expected a target-mismatch error, got: %v", err)
+		}
+	})
+
+	t.Run("instance label containing a dot rejected", func(t *testing.T) {
+		// RFC 6763 S4.3 lets an Instance label contain ".", but the dns library unpacks
+		// "printerv2.1" as two labels and would forward it that way (see pkg/dnsname's
+		// labels.go). Build the update with a placeholder "x", check it validates, then turn
+		// the "x" into a "." in the wire bytes: one label on the wire, same length, so any
+		// compression pointers into it stay valid.
+		const inst = "printerv2x1._ipps._tcp." + zone
+		msg := build(t, append(instance(t, inst), mustRR(t, "_ipps._tcp."+zone+" 130 IN PTR "+inst)))
+		if _, err := Validate(msg); err != nil {
+			t.Fatalf("Validate before the dot is patched in: %v", err)
+		}
+		if err := msg.Pack(); err != nil {
+			t.Fatalf("Pack: %v", err)
+		}
+		placeholder, dotted := []byte("\x0bprinterv2x1"), []byte("\x0bprinterv2.1")
+		if !bytes.Contains(msg.Data, placeholder) {
+			t.Fatalf("wire message has no %q label to patch", placeholder)
+		}
+		wire := &dns.Msg{Data: bytes.ReplaceAll(msg.Data, placeholder, dotted)}
+		if err := wire.Unpack(); err != nil {
+			t.Fatalf("Unpack: %v", err)
+		}
+		if _, err := Validate(wire); err == nil || !strings.Contains(err.Error(), "not a service instance of") {
 			t.Fatalf("expected a target-mismatch error, got: %v", err)
 		}
 	})

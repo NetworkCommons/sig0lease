@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"net"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -642,6 +643,90 @@ func TestHandle_NonKeyOnlyLeaseRejectsUpdateKeyRR(t *testing.T) {
 	}
 	if res.Message.Rcode != dns.RcodeRefused {
 		t.Fatalf("expected REFUSED for non-KEY-only update containing KEY RR, got rcode=%d", res.Message.Rcode)
+	}
+}
+
+// TestHandle_DottedLabel_Refused: an RFC 9664 update whose owner name has a label with a "."
+// in it on the wire, validly signed over those bytes, is REFUSED before anything is sent
+// upstream -- the dns library would decode "host.1" as two labels, and the handler would
+// register that other name under the proxy's own signature.
+func TestHandle_DottedLabel_Refused(t *testing.T) {
+	keystoreDir, err := createTestKeystore(t)
+	if err != nil {
+		t.Fatalf("setup test keystore: %v", err)
+	}
+	loaded, err := keyrec.LoadKeyFromFile(keystoreDir, "Kdev.zenr.io.+015+35317")
+	if err != nil {
+		t.Fatalf("load key: %v", err)
+	}
+
+	h := NewUpdateHandler()
+	h.SetLogger(newTestHandler().logger)
+	if err := h.Setup(map[string]any{
+		"upstream_zone": "dev.zenr.io.",
+		"keystore_dir":  keystoreDir,
+	}); err != nil {
+		t.Fatalf("setup handler: %v", err)
+	}
+	signerKey := loaded.PublicKey.Clone().(*dns.KEY)
+	if err := h.leaseManager.Register(context.Background(), signerKey, 120, 120, "dev.zenr.io."); err != nil {
+		t.Fatalf("register signer key in lease store: %v", err)
+	}
+	authoritative := func(ctx context.Context, zoneHint, fqdn string, rrType uint16) ([]dns.RR, error) {
+		if rrType == dns.TypeKEY && dnsname.Normalize(fqdn) == dnsname.Normalize(signerKey.Hdr.Name) {
+			return []dns.RR{loaded.PublicKey}, nil
+		}
+		return []dns.RR{}, nil
+	}
+	stub := &stubUpstreamCoordinator{query: authoritative, resp: &dns.Msg{MsgHeader: dns.MsgHeader{Rcode: dns.RcodeSuccess}}}
+	h.upstreamCoordinator = stub
+
+	// Build the update, put the dot into its wire form, and sign those bytes, as a client
+	// with a dotted label would.
+	msg := dns.NewMsg("test.dev.zenr.io.", dns.TypeSOA)
+	msg.Opcode = dns.OpcodeUpdate
+	txt := &dns.TXT{Hdr: dns.Header{Name: "hostx1.test.dev.zenr.io.", Class: dns.ClassINET, TTL: 60}}
+	txt.TXT.Txt = []string{"payload"}
+	msg.Ns = append(msg.Ns, txt)
+	opt := &dns.OPT{Hdr: dns.Header{Name: "."}}
+	opt.SetUDPSize(uint16(dns.DefaultMsgSize))
+	if err := leasepkg.Encode8Byte(120, 0).Encode(opt); err != nil {
+		t.Fatalf("encode lease option: %v", err)
+	}
+	msg.Extra = append(msg.Extra, opt)
+	// dns.SIG0Sign signs msg.Data up to its last record, which it expects to be the SIG it
+	// replaces: pack with a stand-in there, then let SignMessage add the real one.
+	standIn := new(dns.SIG)
+	standIn.Hdr = dns.Header{Name: ".", Class: dns.ClassANY}
+	msg.Pseudo = append(msg.Pseudo, standIn)
+	msg.Data = withDottedLabel(t, msg, "hostx1", "host.1").Data
+	msg.Pseudo = msg.Pseudo[:len(msg.Pseudo)-1]
+	signed, err := sig0.SignMessage(msg, loaded.PublicKey, loaded.PrivateKey)
+	if err != nil {
+		t.Fatalf("sign message: %v", err)
+	}
+	unpacked := func() *dns.Msg {
+		m := &dns.Msg{Data: append([]byte(nil), signed.Data...)}
+		if err := m.Unpack(); err != nil {
+			t.Fatalf("unpack: %v", err)
+		}
+		return m
+	}
+	// On a copy: dns.SIG0Verify truncates the message's Data to drop the SIG.
+	if err := sig0.VerifySignature(unpacked(), loaded.PublicKey); err != nil {
+		t.Fatalf("the dotted update must carry a valid signature, or this test proves less: %v", err)
+	}
+	req := unpacked()
+
+	res := h.Handle(context.Background(), stubResponseWriter{}, req)
+	if res == nil || res.Status != StatusError || res.Message == nil || res.Message.Rcode != dns.RcodeRefused {
+		t.Fatalf("expected REFUSED, got %+v", res)
+	}
+	if res.Error == nil || !strings.Contains(res.Error.Error(), `"host.1"`) {
+		t.Fatalf("expected the error to name the label, got: %v", res.Error)
+	}
+	if len(stub.sent) != 0 {
+		t.Fatalf("expected no upstream update, got %d", len(stub.sent))
 	}
 }
 

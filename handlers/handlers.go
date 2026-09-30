@@ -9,6 +9,7 @@ import (
 
 	"codeberg.org/miekg/dns"
 	"github.com/NetworkCommons/sig0lease/logging"
+	"github.com/NetworkCommons/sig0lease/pkg/dnsname"
 	"github.com/NetworkCommons/sig0lease/pkg/keyrec"
 	leasepkg "github.com/NetworkCommons/sig0lease/pkg/lease"
 )
@@ -80,6 +81,33 @@ func makeErrorResponse(req *dns.Msg, rcode uint16, _ string) *dns.Msg {
 	resp.Response = true
 	resp.Rcode = rcode
 	return resp
+}
+
+// refuseDottedLabels returns an error result -- REFUSED -- if the request r, as it arrived on
+// the wire, carries a DNS label with a "." octet in it, and nil otherwise. The dns library
+// decodes such a label as two or more labels (pkg/dnsname's labels.go), so a handler that
+// sends r's names on -- both do, re-encoded in an update under the proxy's own signature --
+// would register a different name than the one requested, and say nothing. RFC 6763 S4.1.1
+// allows a "." in an Instance label and RFC 2181 S11 in any label, so this is the proxy's
+// limit, not the requester's error. Plain forwarding sends r's original bytes and is
+// unaffected, which is why each handler calls this only once it has taken the request.
+//
+// A request built in-process rather than read off the wire has no wire form (Data) to check.
+func refuseDottedLabels(r *dns.Msg) *HandlerResult {
+	if len(r.Data) == 0 {
+		return nil
+	}
+	label, found, err := dnsname.DottedWireLabel(r.Data)
+	if err != nil {
+		msg := makeErrorResponse(r, dns.RcodeFormatError, err.Error())
+		return NewErrorResult(msg, err.Error(), err)
+	}
+	if !found {
+		return nil
+	}
+	err = fmt.Errorf("label %q contains \".\", which this proxy cannot carry: its DNS library would send it on as several labels", label)
+	msg := makeErrorResponse(r, dns.RcodeRefused, err.Error())
+	return NewErrorResult(msg, err.Error(), err)
 }
 
 // rcodeDescription renders resp's RCODE for a log line, or "no response" for a nil resp --

@@ -921,6 +921,39 @@ func TestSRPHandle_MalformedServiceType_Refused(t *testing.T) {
 	}
 }
 
+// TestSRPHandle_DottedInstanceLabel_Refused: RFC 6763 S4.1.1 allows a "." in an Instance
+// label, but the dns library would decode "printerv2.1" as two labels and the handler would
+// forward that other name upstream. It must be REFUSED, naming the label, before anything is
+// sent -- and the same update without the dot must go through, so the dot is the reason.
+func TestSRPHandle_DottedInstanceLabel_Refused(t *testing.T) {
+	id := newSRPTestIdentity(t)
+	const host = "printer.dev.zenr.io."
+	instances := []srpInstanceSpec{{name: "printerv2x1._ipp._tcp.dev.zenr.io.", port: 631, txt: "txtvers=1", svctype: "_ipp._tcp.dev.zenr.io."}}
+	build := func() *dns.Msg {
+		return buildSRPUpdate(t, srpTestZone, id, host, []string{"10.10.10.10"}, instances, 30, 1209600, host)
+	}
+
+	h, coord := newSRPTestHandler(t)
+	if res := h.Handle(context.Background(), stubTCPResponseWriter{}, build()); res.Status != StatusProcessed {
+		t.Fatalf("control update without the dot: status=%s err=%v", res.Status, res.Error)
+	}
+	if len(coord.sent) == 0 {
+		t.Fatalf("control update without the dot was not forwarded upstream")
+	}
+
+	h, coord = newSRPTestHandler(t)
+	res := h.Handle(context.Background(), stubTCPResponseWriter{}, withDottedLabel(t, build(), "printerv2x1", "printerv2.1"))
+	if res.Status != StatusError || res.Message == nil || res.Message.Rcode != dns.RcodeRefused {
+		t.Fatalf("expected REFUSED, got status=%s message=%+v err=%v", res.Status, res.Message, res.Error)
+	}
+	if res.Error == nil || !strings.Contains(res.Error.Error(), `"printerv2.1"`) {
+		t.Fatalf("expected the error to name the label, got: %v", res.Error)
+	}
+	if len(coord.sent) != 0 {
+		t.Fatalf("expected no upstream forward, got %d sends", len(coord.sent))
+	}
+}
+
 // --- SIG(0) (step 4) ---------------------------------------------------------------------
 
 func TestSRPHandle_MissingSIG0_Refused(t *testing.T) {

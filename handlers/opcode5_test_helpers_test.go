@@ -1,6 +1,7 @@
 package handlers
 
 import (
+	"bytes"
 	"fmt"
 	"io"
 	"os"
@@ -9,6 +10,7 @@ import (
 
 	"codeberg.org/miekg/dns"
 	"github.com/NetworkCommons/sig0lease/logging"
+	_ "github.com/NetworkCommons/sig0lease/pkg/dnscompat" // registers EDNS0 code 2 (UPDATE-LEASE); withDottedLabel unpacks messages carrying it
 	"github.com/NetworkCommons/sig0lease/pkg/keyrec"
 )
 
@@ -67,4 +69,31 @@ func copyFile(src, dst string) error {
 
 	_, err = io.Copy(dstFile, srcFile)
 	return err
+}
+
+// withDottedLabel returns msg as a client would send it with its wire label from replaced by
+// to -- the same length, holding a "." the library cannot produce itself (pkg/dnsname's
+// labels.go) -- and decoded again, the way the server hands a request to a handler. Same
+// length, so compression pointers into it stay valid; the SIG(0) signature no longer
+// matches, which the handler must not get far enough to notice.
+func withDottedLabel(t *testing.T, msg *dns.Msg, from, to string) *dns.Msg {
+	t.Helper()
+	if len(from) != len(to) {
+		t.Fatalf("withDottedLabel: %q and %q differ in length", from, to)
+	}
+	if len(msg.Data) == 0 {
+		if err := msg.Pack(); err != nil {
+			t.Fatalf("pack: %v", err)
+		}
+	}
+	f := append([]byte{byte(len(from))}, from...)
+	r := append([]byte{byte(len(to))}, to...)
+	if !bytes.Contains(msg.Data, f) {
+		t.Fatalf("withDottedLabel: wire message has no %q label", from)
+	}
+	out := &dns.Msg{Data: bytes.ReplaceAll(msg.Data, f, r)}
+	if err := out.Unpack(); err != nil {
+		t.Fatalf("unpack: %v", err)
+	}
+	return out
 }

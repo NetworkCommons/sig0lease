@@ -17,7 +17,7 @@ import (
 // 6335's syntax rules (see ValidateServiceType for that), so a registrar keeps accepting
 // types a sloppy but otherwise working requester sends.
 func ServiceTypeFromServiceName(name string) (svcType string, ok bool) {
-	labels := splitLabels(dnsname.Fold(name))
+	labels := dnsname.Labels(dnsname.Fold(name))
 	// service, proto, and at least the trailing empty root label from the split.
 	if len(labels) < 3 || !isServiceLabel(labels[0]) || !isProtoLabel(labels[1]) {
 		return "", false
@@ -31,7 +31,7 @@ func ServiceTypeFromServiceName(name string) (svcType string, ok bool) {
 // starts at the second label regardless of how many labels <Domain> itself has. ok is false
 // if what follows the Instance label isn't a service name (ServiceTypeFromServiceName).
 func ServiceTypeFromInstanceName(name string) (svcType string, ok bool) {
-	_, service, found := strings.Cut(name, ".")
+	_, service, found := dnsname.CutFirstLabel(name)
 	if !found {
 		return "", false
 	}
@@ -44,10 +44,11 @@ func ServiceTypeFromInstanceName(name string) (svcType string, ok bool) {
 // check -- stricter than ServiceTypeFromServiceName, since a requester should only ever send
 // well-formed types.
 func ValidateServiceType(svcType string) error {
-	service, proto, ok := strings.Cut(svcType, ".")
-	if !ok || strings.Contains(proto, ".") {
+	labels := dnsname.Labels(svcType)
+	if len(labels) != 2 {
 		return fmt.Errorf("service type %q must be exactly two labels, \"_<service>._tcp\" or \"_<service>._udp\" (RFC 6763 S7) -- to narrow a type further, register a subtype of it (RFC 6763 S7.1)", svcType)
 	}
+	service, proto := labels[0], labels[1]
 	if !isProtoLabel(dnsname.Fold(proto)) {
 		return fmt.Errorf("service type %q: second label must be _tcp or _udp, got %q (RFC 6763 S7)", svcType, proto)
 	}

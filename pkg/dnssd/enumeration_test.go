@@ -45,6 +45,20 @@ func TestServiceTypeFromInstanceName(t *testing.T) {
 			desc:     "the number of labels after type/proto doesn't change where type/proto are",
 		},
 		{
+			name:     "spaces and non-ASCII in the instance label",
+			instance: "Café Printer._ipp._tcp.example.com.",
+			wantType: "_ipp._tcp",
+			wantOK:   true,
+			desc:     "an Instance label is arbitrary UTF-8 text per RFC 6763 S4.1.1",
+		},
+		{
+			name:     "dot in the instance label",
+			instance: "Printer v2.1._ipp._tcp.example.com.",
+			wantType: "",
+			wantOK:   false,
+			desc:     "how the dns library presents the one Instance label \"Printer v2.1\" -- as \"Printer v2\" then \"1\" (pkg/dnsname's labels.go)",
+		},
+		{
 			name:     "three-label type",
 			instance: "vpnclient._vpnserver._wg._udp.srp.dev.zenr.io.",
 			wantType: "",
