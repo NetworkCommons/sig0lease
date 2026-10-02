@@ -153,8 +153,9 @@ func (h *SRPHandler) zoneEnabled(zone string) bool {
 // default.service.arpa. (case-insensitively) to end in realZone instead, in place: every
 // RR's own owner name (via its Header -- generic across every SRP RR type, so this needs
 // no type switch for that part), plus SRV.Target and PTR.Ptr, the only two name-typed RDATA
-// fields SRP itself ever produces. msg.Question is never touched by this function -- see
-// Handle's step 5 comment for why.
+// fields SRP itself ever produces. msg.Question is left as the client sent it: nothing after
+// the rewrite reads it (the upstream forward is built for the real zone, and replies carry
+// no Zone section -- updateResponse).
 func rewriteDefaultServiceARPA(msg *dns.Msg, realZone string) {
 	for _, rr := range msg.Ns {
 		hdr := rr.Header()
@@ -289,9 +290,6 @@ func (h *SRPHandler) Handle(ctx context.Context, w dns.ResponseWriter, r *dns.Ms
 	// addressed: a constrained client (default.service.arpa.) and a direct client
 	// (h.upstreamZone) naming the same host correctly collide in FCFS instead of silently
 	// writing two different local nodes that both resolve to the same upstream name.
-	// r.Question is deliberately left untouched -- makeErrorResponse/buildSuccessResponse
-	// both echo it verbatim, so the response still shows the client exactly the zone name
-	// it itself sent, matching normal RFC 2136 request/response symmetry.
 	// zoneEnabled already confirmed the incoming zone is either h.upstreamZone or (when
 	// rewriteDefaultServiceARPA is set) default.service.arpa. -- checking the latter here
 	// is enough to decide whether a rewrite is needed; no need to re-check the config
@@ -422,7 +420,7 @@ func (h *SRPHandler) Handle(ctx context.Context, w dns.ResponseWriter, r *dns.Ms
 		msg := makeErrorResponse(r, dns.RcodeServerFailure, "internal error")
 		return NewErrorResult(msg, err.Error(), err)
 	}
-	lease, keyLease = h.clampLease(lease, keyLease)
+	lease, keyLease = h.LeasePolicy.clamp(lease, keyLease)
 
 	touchedNodeKeys, err := h.applyLocalMutations(ctx, cu, lease, keyLease, effectiveZone)
 	if err != nil {
@@ -448,7 +446,7 @@ func (h *SRPHandler) Handle(ctx context.Context, w dns.ResponseWriter, r *dns.Ms
 	h.reconcileServiceEnumeration(ctx)
 
 	// Step 10: NOERROR + echo the granted LEASE/KEY-LEASE.
-	resp := h.buildSuccessResponse(r, lease, keyLease)
+	resp := leaseResponse(r, lease, keyLease, h.logger)
 	return NewProcessedResult(resp)
 }
 
@@ -845,41 +843,6 @@ func (h *SRPHandler) parseLease(msg *dns.Msg) (uint32, uint32, error) {
 		return 0, 0, fmt.Errorf("SRP requires the 8-byte Update-Lease variant (LEASE + KEY-LEASE)")
 	}
 	return lo.Lease, *lo.KeyLease, nil
-}
-
-// clampLease applies LeasePolicy bounds to the granted LEASE/KEY-LEASE, mirroring
-// UpdateHandler.clampLeaseDurations (unexported there, so reimplemented rather than
-// shared -- a handful of lines, not worth cross-type coupling for). A requested value of
-// exactly 0 is left alone rather than floored to the configured minimum: RFC 9665
-// S3.2.5.5.1's removal signal (KEY-LEASE=0, and LEASE=0 alongside it for a permanent
-// removal) means "delete this," not "grant the shortest allowed duration" -- flooring it
-// would echo back a bogus non-zero grant for what is actually a deletion.
-func (h *SRPHandler) clampLease(lease, keyLease uint32) (uint32, uint32) {
-	return clampLeaseValue(lease, h.LeasePolicy.MinRRLease, h.LeasePolicy.MaxRRLease),
-		clampLeaseValue(keyLease, h.LeasePolicy.MinKeyLease, h.LeasePolicy.MaxKeyLease)
-}
-
-func clampLeaseValue(value, min, max uint32) uint32 {
-	if value == 0 {
-		return 0
-	}
-	return clampTTL(value, min, max)
-}
-
-func (h *SRPHandler) buildSuccessResponse(r *dns.Msg, lease, keyLease uint32) *dns.Msg {
-	resp := &dns.Msg{MsgHeader: r.MsgHeader, Question: r.Question}
-	resp.Response = true
-	resp.Authoritative = true
-	resp.Rcode = dns.RcodeSuccess
-
-	opt := &dns.OPT{Hdr: dns.Header{Name: "."}}
-	opt.SetUDPSize(uint16(dns.DefaultMsgSize))
-	leaseOpt := leasepkg.Encode8Byte(lease, keyLease)
-	if err := leaseOpt.Encode(opt); err != nil {
-		h.logger.Debugf("failed to encode response lease option: %v", err)
-	}
-	resp.Extra = append(resp.Extra, opt)
-	return resp
 }
 
 // scheduleLeaseExpiry arms (or re-arms) a timer for nodeKey's next lease event -- its

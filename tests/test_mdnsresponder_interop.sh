@@ -18,11 +18,10 @@
 # Direction 2: OUR client (client/srp, via cmd/sig0lease-srp-client) against the real
 # srp-mdns-proxy -- both Register and, importantly, Deregister (this project's own new
 # removal capability, added specifically to extend interop coverage past plain registration).
-# srp-mdns-proxy's own log line (srp_evaluate: ... validates) is the actual interop signal
-# checked, not just the RCODE -- Register's RCODE is SERVFAIL in this sandbox only because
-# srp-mdns-proxy's last step (bridging to a local mDNS daemon at /var/run/mdnsd) has nothing
-# to connect to here; that's an environment gap unrelated to protocol correctness, unlike
-# Deregister, which needs no such daemon and returns a genuine NOERROR end-to-end.
+# srp-mdns-proxy hands what it accepts to mDNSResponder's own daemon (mdnsd, built from the
+# same checkout and started here; needs root), so both calls must return NOERROR, its log
+# must confirm the update, and mDNSResponder's dns-sd must then find (and, after Deregister,
+# no longer find) the service on the local link.
 
 set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -36,6 +35,7 @@ D1_PROXY_ADDR="127.0.0.1"
 D1_PROXY_PORT="${D1_PROXY_PORT:-18159}"
 D1_PROXY_URL="${D1_PROXY_ADDR}:${D1_PROXY_PORT}"
 D1_KEYSTORE_DIR="${TESTS_DIR}/keystore-srp-bind9-default-arpa"
+D1_MAX_RR_LEASE_SECONDS=7200 # the D1 proxy's max_rr_lease_sec; D1-TEST 1 asks for more
 
 D1_PROXY_BIN="${TESTS_DIR}/../bin/${OS}/sig0lease"
 D2_CLIENT_BIN="${TESTS_DIR}/../bin/${OS}/sig0lease-srp-client"
@@ -84,7 +84,7 @@ handlers:
       min_key_lease_sec: 1
       max_key_lease_sec: 1209600
       min_rr_lease_sec: 1
-      max_rr_lease_sec: 7200
+      max_rr_lease_sec: ${D1_MAX_RR_LEASE_SECONDS}
 authoritative:
   max_inflight_updates: ${BIND9_SIG0_QUOTA}
 processing_rules:
@@ -186,17 +186,25 @@ run_srp_client_bg_wait() {
 }
 
 test_d1_register() {
-    local log_msg="D1-TEST 1: Plain registration (srp-client) -> dig at authoritative"
+    local log_msg="D1-TEST 1: Plain registration (srp-client) -> dig at authoritative, granted lease adopted"
     log_section "$log_msg"
 
-    run_srp_client_bg_wait /tmp/d1-register.log d1-register "Register Reply for d1-register: 0" || return 1
+    # Asks for more than the proxy grants (a later --lease-time overrides the driver's 3600).
+    # srp-client logs the lease it will refresh on before its Register Reply line: "set to"
+    # when it read the proxy's Update Lease option, "defaults to" its own request when it did
+    # not -- which it did for as long as our replies echoed the Zone section (RFC 2136 S3.8,
+    # handlers.updateResponse).
+    run_srp_client_bg_wait /tmp/d1-register.log d1-register "Register Reply for d1-register: 0" \
+        --lease-time $(( D1_MAX_RR_LEASE_SECONDS * 2 )) || return 1
+    grep -q "Lease time set to ${D1_MAX_RR_LEASE_SECONDS}\$" /tmp/d1-register.log \
+        || { log_error "srp-client did not adopt the lease the proxy granted (${D1_MAX_RR_LEASE_SECONDS}s):"; grep "Lease time" /tmp/d1-register.log; return 1; }
 
     [ -n "$(dig_d1_wait d1-register.default.service.arpa. A)" ] || { log_error "host A record not found"; return 1; }
     [ -n "$(dig_d1_wait d1-register.default.service.arpa. KEY)" ] || { log_error "host KEY record not found"; return 1; }
     [ -n "$(dig_d1_wait d1-register._ipps._tcp.default.service.arpa. SRV)" ] || { log_error "instance SRV not found"; return 1; }
     [ -n "$(dig_d1_wait _ipps._tcp.default.service.arpa. PTR)" ] || { log_error "PTR not found"; return 1; }
 
-    log_success "Plain registration landed: host A/KEY, instance SRV, PTR all present"
+    log_success "Plain registration landed: host A/KEY, instance SRV, PTR all present; srp-client refreshes on the granted ${D1_MAX_RR_LEASE_SECONDS}s"
     PERFORMED_TESTS="$PERFORMED_TESTS\n  [OK] $log_msg"
 }
 
@@ -326,29 +334,35 @@ stop_d2_mdns_proxy() {
 }
 
 test_d2_register() {
-    local log_msg="D2-TEST 1: Register (our client) -> srp-mdns-proxy validates it"
+    local log_msg="D2-TEST 1: Register (our client) -> srp-mdns-proxy -> mdnsd, found with dns-sd"
     log_section "$log_msg"
 
-    # || true: the CLI itself exits 1 on a non-Success outcome, and SERVFAIL (not Success) is
-    # the expected result here -- see the comment below. The real pass/fail signal is
-    # srp-mdns-proxy's own log line, checked next.
     # -k=13 generates this identity's key on first use (sig0lease-srp-client no longer
     # auto-generates a missing key by default -- see the -k flag doc); the deregister
     # call below reuses the same key without needing -k again.
     local out
     out="$("$D2_CLIENT_BIN" -domain=default.service.arpa. -host=d2-register -addr=192.0.2.111 -udp \
-        -server="127.0.0.1:${D2_MDNS_PROXY_PORT}" -instance=Gizmo:_http._tcp:8080 -once \
-        -keystore="${D2_KEY_DIR}/d2-register" -k=13 2>&1 || true)"
+        -server="127.0.0.1:${D2_MDNS_PROXY_PORT}" -instance=Gizmo:_http._tcp:8080 -txt=Gizmo:path=/d2 -once \
+        -keystore="${D2_KEY_DIR}/d2-register" -k=13 2>&1)" || { echo "$out"; log_error "register did not succeed"; return 1; }
     echo "$out"
+    echo "$out" | grep -q "Status: NOERROR (Rcode=0)" || { log_error "register did not return NOERROR"; return 1; }
 
-    # SERVFAIL here is expected and NOT a failure: it's srp-mdns-proxy's own last step
-    # (bridging to a local mDNS daemon at /var/run/mdnsd) hitting an environment gap, not a
-    # protocol problem -- see this script's top comment. The actual interop signal is
-    # srp-mdns-proxy's own log line below.
     grep -q "srp_evaluate: update for d2-register.local. #0, .*validates" "$D2_MDNS_PROXY_LOG" \
         || { log_error "srp-mdns-proxy's own log did not confirm the update validates"; tail -n 40 "$D2_MDNS_PROXY_LOG"; return 1; }
 
-    log_success "srp-mdns-proxy's independent parser validated our Register message"
+    # srp-mdns-proxy publishes under local.; mDNSResponder's own browser must see it there.
+    local browse resolve
+    browse="$(dnssd_for 3 -B _http._tcp local.)"
+    echo "$browse"
+    echo "$browse" | grep -qE "Add .* _http\._tcp\. +Gizmo\$" \
+        || { log_error "dns-sd -B did not find Gizmo._http._tcp.local."; return 1; }
+    resolve="$(dnssd_for 3 -L Gizmo _http._tcp local.)"
+    echo "$resolve"
+    echo "$resolve" | grep -q "can be reached at d2-register.local.:8080" \
+        || { log_error "dns-sd -L did not resolve Gizmo to d2-register.local.:8080"; return 1; }
+    echo "$resolve" | grep -q "path=/d2" || { log_error "dns-sd -L did not show Gizmo's TXT path=/d2"; return 1; }
+
+    log_success "srp-mdns-proxy validated our Register (NOERROR) and mdnsd advertises Gizmo: dns-sd finds and resolves it"
     PERFORMED_TESTS="$PERFORMED_TESTS\n  [OK] $log_msg"
 }
 
@@ -366,7 +380,18 @@ test_d2_deregister() {
     grep -q "delete for presumably previously-registered instance which is being withdrawn: Gizmo._http._tcp.default.service.arpa." "$D2_MDNS_PROXY_LOG" \
         || { log_error "srp-mdns-proxy's own log did not confirm the instance delete"; tail -n 40 "$D2_MDNS_PROXY_LOG"; return 1; }
 
-    log_success "Deregister fully succeeded end-to-end, srp-mdns-proxy's own log confirms the delete"
+    # A browse started right away may first report Gizmo from mdnsd's cache, then its
+    # removal about a second later: what counts is the last event dns-sd reports for it.
+    local browse last
+    browse="$(dnssd_for 4 -B _http._tcp local.)"
+    echo "$browse"
+    last="$(echo "$browse" | grep -E "(Add|Rmv) .* _http\._tcp\. +Gizmo\$" | tail -n 1)"
+    if echo "$last" | grep -q "Add"; then
+        log_error "dns-sd -B still finds Gizmo._http._tcp.local. after Deregister"
+        return 1
+    fi
+
+    log_success "Deregister fully succeeded end-to-end: srp-mdns-proxy confirms the delete and dns-sd no longer finds Gizmo"
     PERFORMED_TESTS="$PERFORMED_TESTS\n  [OK] $log_msg"
 }
 
@@ -376,7 +401,7 @@ test_d2_deregister() {
 run_all_tests() {
     log_section "MDNSRESPONDER INTEROP TEST SUITE (RFC 9665 plan S12.3/S14 Option C)"
     echo "Real components only: real proxy process, real client library, and the real,"
-    echo "unmodified mDNSResponder/ServiceRegistration srp-client/srp-mdns-proxy binaries."
+    echo "unmodified mDNSResponder srp-client/srp-mdns-proxy/mdnsd/dns-sd binaries."
     echo ""
 
     trap cleanup EXIT
@@ -385,12 +410,14 @@ run_all_tests() {
     require_command named
     require_command go
     require_command timeout
+    require_command stdbuf
 
     D2_KEY_DIR="$(mktemp -d /tmp/sig0lease-d2-identities.XXXXXX)"
 
     build_interop_binaries
     start_bind9
     start_d1_proxy
+    start_mdnsd
     start_d2_mdns_proxy
 
     test_d1_register
@@ -412,6 +439,7 @@ run_all_tests() {
     echo ""
     echo "Direction-1 proxy log: $D1_PROXY_LOG"
     echo "srp-mdns-proxy log: $D2_MDNS_PROXY_LOG"
+    echo "mdnsd log: $MDNSD_LOG"
     echo "BIND log: ${BIND9_RUNDIR}/named.log"
 }
 
@@ -422,6 +450,7 @@ cleanup() {
     [ -z "${BIND9_REJECTIONS_REPORTED:-}" ] && bind9_report_rejections
     stop_d1_proxy
     stop_d2_mdns_proxy
+    stop_mdnsd
     stop_bind9
     pkill -f "$MDNSRESPONDER_SRP_CLIENT_BIN" 2>/dev/null
     [ -n "$D2_KEY_DIR" ] && rm -rf "$D2_KEY_DIR"

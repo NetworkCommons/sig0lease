@@ -19,6 +19,13 @@ func ExpiryFromResponse(now time.Time, requestedLease, requestedKeyLease uint32,
     ExpiryFromResponse computes the data-record and KEY expiration times using
     the server-granted LEASE and KEY-LEASE when present in the response.
 
+func StatusNotes(resp *dns.Msg) []string
+    StatusNotes returns the proxy's status notes from an UPDATE response:
+    the EXTRA-TEXT of each Extended DNS Error option (RFC 8914) it carries,
+    in order. The RFC 9664 handler sends one per note, such as "record not found
+    for delete: ...", so a person can see what the proxy did with each record;
+    they are not meant for parsing.
+
 
 TYPES
 
@@ -49,16 +56,24 @@ configured zone, reached over TCP by default.
 
 FUNCTIONS
 
-func Discover(ctx context.Context, query SRVQuery, domain string) (string, error)
-    Discover finds the SRP registrar for domain via a
-    `_dnssd-srp._tcp.<domain>.` SRV lookup -- ordinary DNS-SD service
-    discovery (RFC 6763), applied to bootstrap SRP itself, per RFC 9665's
-    own discovery convention (see RFC 9665 Appendix C's zone skeleton's
-    optional `_dnssd-srp._tcp` SRV record). Returns "host:port" for the best
-    (lowest-priority, highest-weight-among-ties) answer. A caller with an
-    explicit registrar address configured should skip this entirely (see
-    Config.RegistrarAddr) -- discovery is the fallback, not the only path,
-    matching cmd/sig0lease-srp-client's own "dev/test tool" framing.
+func Discover(ctx context.Context, query DNSQuery, domain string, mode DiscoveryMode) (string, error)
+    Discover finds the SRP registrar for domain. As RFC 9665 S3.1.1 specifies,
+    it first finds the apex of the closest DNS zone enclosing domain with SOA
+    queries (RFC 8765 S6.1, see zoneApex). It then looks up the SRV record at
+    "_dnssd-srp._tcp.<name>." -- the service name RFC 9665 S10.4.1 registers,
+    in RFC 6763 S7's "_<service>._tcp" form -- for each name mode selects (see
+    DiscoveryMode), in order, and stops at the first name that has one. It never
+    looks above the apex: a zone cut separates authority, so a registrar named
+    in the parent zone speaks for nothing in the child. A failed query ends
+    the search with its error instead of moving on to the next name, since the
+    name it could not ask about may hold the answer. The best (lowest-priority,
+    highest-weight-among-ties) SRV target is then resolved to an address with
+    the same query, so every step of discovery asks the same resolvers: a target
+    that only those resolvers know (a lab DNS, the local BIND 9 test zone) still
+    works. Returns "address:port". A caller with an explicit registrar address
+    configured should skip this entirely (see Config.RegistrarAddr) -- discovery
+    is the fallback, not the only path, matching cmd/sig0lease-srp-client's own
+    "dev/test tool" framing.
 
 
 TYPES
@@ -145,10 +160,12 @@ type Config struct {
 
 	// RegistrarAddr, if set, bypasses discovery entirely -- an explicit "host:port",
 	// matching every other test/dev client this project's test suite already uses.
-	// Discovery (Domain's `_dnssd-srp._tcp` SRV) is the fallback when this is empty.
+	// Discovery (the `_dnssd-srp._tcp` SRV closest to Domain within its zone, or at the
+	// zone apex only -- see Discover and Discovery) is the fallback when this is empty.
 	RegistrarAddr string
-	Resolvers     []string // bootstrap resolvers for discovery; LiveSRVQuery's default if empty
-	Query         SRVQuery // discovery implementation; LiveSRVQuery(Resolvers) if nil
+	Discovery     DiscoveryMode // where discovery looks for the SRV; DiscoveryClosest (the zero value) by default
+	Resolvers     []string      // bootstrap resolvers for discovery; LiveDNSQuery's default if empty
+	Query         DNSQuery      // discovery implementation; LiveDNSQuery(Resolvers) if nil
 
 	UseTCP     bool          // default true (S3.5's MUST for non-constrained networks)
 	Timeout    time.Duration // per-request transport timeout; default 20s
@@ -175,27 +192,55 @@ type Config struct {
 }
     Config configures a Client. See NewClient's doc comment for defaults.
 
+type DNSQuery func(ctx context.Context, name string, qtype uint16) (*dns.Msg, error)
+    DNSQuery is the shape of a live DNS lookup, injected so Discover is testable
+    without real network I/O. It returns the whole response, since discovery
+    reads both the Answer section (SRV, or an SOA at a zone apex) and the
+    Authority section (the SOA a negative answer carries). A NOERROR or NXDOMAIN
+    response is an answer, not an error.
+
+func LiveDNSQuery(resolvers []string) DNSQuery
+    LiveDNSQuery returns a DNSQuery that performs a real lookup against
+    resolvers (falling back to defaultBootstrapResolvers if empty), trying
+    each in turn until one answers with NOERROR or NXDOMAIN. Any other RCODE
+    (SERVFAIL, REFUSED, ...) counts as that resolver failing, like a network
+    error.
+
+type DiscoveryMode int
+    DiscoveryMode selects the names Discover looks under for the registrar's
+    "_dnssd-srp._tcp" SRV record.
+
+const (
+	// DiscoveryClosest, the default, looks under the registration domain first, then under
+	// each parent name in turn, ending at the apex of the zone enclosing it. The first name
+	// with an SRV record wins, so a record under a subdomain names the registrar for that
+	// subdomain and everything below it, the way the apex record does for the whole zone.
+	// This goes beyond RFC 9665 S3.1.1, which looks only under the apex, so that a registrar
+	// can serve one registration domain inside a zone without a zone cut at that domain
+	// (https://github.com/NetworkCommons/sig0lease/issues/46). A domain with no record below
+	// the apex finds exactly what S3.1.1 finds. A record below the apex is one that a
+	// requester following S3.1.1 alone never sees -- S3.1.1 leaves other discovery
+	// mechanisms open.
+	DiscoveryClosest DiscoveryMode = iota
+	// DiscoveryApexOnly looks only under the zone apex, as RFC 9665 S3.1.1 specifies: it
+	// finds the registrar any S3.1.1 requester would find.
+	DiscoveryApexOnly
+)
 type InstanceConfig struct {
-	Label       string   // single label, e.g. "MyPrinter" -- not a full instance name
+	Label       string   // single label, e.g. "My Printer" -- not a full instance name; NewClient rejects one containing "." (dnsname.CheckLabel)
 	ServiceType string   // e.g. "_ipps._tcp" -- not a full service-type name; NewClient rejects any other shape (dnssd.ValidateServiceType)
-	Subtypes    []string // additional bare subtype labels, e.g. "_universal"
+	Subtypes    []string // additional bare subtype labels, e.g. "_universal"; checked like Label
 	Port        uint16
 	TXT         []string
+	// Remove withdraws this instance instead of registering it (RFC 9665 S3.2.5.5.2, first
+	// method): the update carries a bare Delete All RRsets for its name, and Port, TXT and
+	// Subtypes are ignored. The host and every other instance are registered as usual.
+	Remove bool
 }
     InstanceConfig describes one service instance to register, in the same
     "label relative to Domain" terms as HostLabel -- Client joins these into
     fully-qualified names when building the update (pkg/srp.BuildUpdate itself
     takes only already-qualified names).
-
-type SRVQuery func(ctx context.Context, name string) ([]*dns.SRV, error)
-    SRVQuery is the shape of a live SRV lookup, injected so Discover is testable
-    without real network I/O. Returns the answer's SRV records (possibly none),
-    in whatever order the server returned them.
-
-func LiveSRVQuery(resolvers []string) SRVQuery
-    LiveSRVQuery returns an SRVQuery that performs a real SRV lookup against
-    resolvers (falling back to defaultBootstrapResolvers if empty), trying each
-    in turn until one answers with NOERROR.
 
 type Transport func(ctx context.Context, addr string, useTCP bool, msg *dns.Msg) (*dns.Msg, error)
     Transport sends a signed SRP UPDATE to addr and returns the response.
@@ -483,6 +528,9 @@ type LeasePolicy struct {
 	MaxRRLease  uint32
 }
     LeasePolicy controls clamping for lease durations and forwarded RR TTLs.
+    A zero bound is no bound. UpdateHandler and SRPHandler each hold one,
+    read from their own "lease_policy" config by parseLeasePolicy, and clamp
+    every granted lease with LeasePolicy.clamp.
 
 type LeaseRecord = leasepkg.Record
     LeaseRecord is the shared lease state record used by handlers.
@@ -808,6 +856,11 @@ labels as raw bytes (no \DDD escaping), so those bytes do reach the proxy
 library's own dnsutil.Canonical folds ASCII only but goes through strings.Map,
 which has the same U+FFFD rewrite, so it is not used either.
 
+It is likewise the one place the module splits a name into labels or checks that
+a string can be sent as one label (labels.go, whose opening comment explains
+why splitting at "." is exact for this library's name strings), and finds,
+in a wire-format message, the labels the library cannot carry (wire.go).
+
 Fold keeps a name's trailing dot, for code that works on fully-qualified names
 (pkg/srp, pkg/dnssd split them into labels ending in the empty root label);
 Normalize drops it, for the lease store, the handlers and pkg/updatecore,
@@ -818,12 +871,45 @@ can import it.
 
 FUNCTIONS
 
+func CheckLabel(label string) error
+    CheckLabel returns an error unless label can be sent as exactly one DNS
+    label: 1 to 63 octets, with no "." (which the library would send as a
+    label boundary -- see above). RFC 6763 S4.3 requires software that joins an
+    Instance label onto <Service>.<Domain> to keep that label boundary intact;
+    with this library, refusing such a label is the only way to. Every other
+    octet is allowed: S4.1.1 makes Instance labels arbitrary UTF-8 text,
+    spaces included.
+
+func CutFirstLabel(name string) (first, rest string, ok bool)
+    CutFirstLabel splits name after its first label, returning that label and
+    the name that follows it: "Widget._http._tcp.example.com." -> ("Widget",
+    "_http._tcp.example.com.", true). This is how a Service Instance Name
+    divides into <Instance> and <Service>.<Domain>, since RFC 6763 S4.1 makes
+    <Instance> exactly one label however many <Domain> has. ok is false if name
+    is a single label with nothing after it, in which case first is name and
+    rest is "".
+
+func DottedWireLabel(msg []byte) (label string, found bool, err error)
+    DottedWireLabel returns the first label in msg, a wire-format DNS message,
+    that contains a "." octet. The library cannot carry such a label (see
+    labels.go): it decodes it as two or more labels, and encoding the result
+    again sends a different name. It checks the question names, every RR owner
+    name, and the name in the RDATA of the types rdataNameOffset lists -- every
+    name a handler here reads and re-sends. found is false if there is no such
+    label; err is non-nil only if msg is too malformed to walk.
+
 func EqualFold(a, b string) bool
     EqualFold reports whether a and b are equal under Fold, without allocating.
 
 func Fold(name string) string
     Fold returns name with the US-ASCII letters A-Z replaced by a-z and every
     other byte unchanged. The result always has the same length as name.
+
+func Labels(name string) []string
+    Labels splits name into its labels. A fully-qualified name's last
+    element is the empty root label -- "widget._http._tcp.example.com." ->
+    ["widget","_http","_tcp","example","com",""] -- so a caller can tell it from
+    a relative name. Returns nil for "".
 
 func Normalize(name string) string
     Normalize returns the form the lease store, the handlers and pkg/updatecore
@@ -2131,21 +2217,5 @@ func (s *Server) Serve() error
 ## github.com/NetworkCommons/sig0lease/tests
 ```
 
-```
-
-## github.com/NetworkCommons/sig0lease/tests/srp_client_tester
-```
-Package main implements a minimal RFC 9665 SRP UPDATE test client, used only
-by tests/test_srp.sh. This mirrors tests/blacklisted_tester.go's precedent:
-a small Go helper for something the shell alone can't do (build, sign,
-and send a real SRP UPDATE) and no existing binary did yet at the time this
-was written -- client/srp and cmd/sig0lease-srp-client were not built yet.
-This is deliberately NOT that client: no discovery, no refresh scheduler,
-no YXDOMAIN rename-retry -- just enough to drive test_srp.sh's scenarios.
-
-Identity is a P-256 (ECDSAP256SHA256) key pair persisted as a raw private-key
-file at -keyfile: created on first use, reused on subsequent calls (so a shell
-test case can control fresh-vs-reuse identity simply by removing or keeping that
-file between calls).
 ```
 

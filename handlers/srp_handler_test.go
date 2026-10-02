@@ -754,7 +754,8 @@ func TestSRPHandle_DefaultServiceARPA_RejectedWhenRewriteDisabled(t *testing.T) 
 // path: a client that only knows default.service.arpa. (real SRP clients hardcode it) reaches a
 // handler configured for a real zone with the rewrite enabled. Confirms every layer sees the
 // rewritten name -- the upstream forward, the local lease-store tree -- while the response
-// still echoes back default.service.arpa., exactly what the client itself sent.
+// carries no Zone section at all (RFC 2136 S3.8, updateResponse), so no rewritten name
+// reaches the client.
 func TestSRPHandle_DefaultServiceARPA_RewrittenToUpstreamZone(t *testing.T) {
 	h, coord := newSRPTestHandler(t)
 	h.rewriteDefaultServiceARPA = true
@@ -773,10 +774,8 @@ func TestSRPHandle_DefaultServiceARPA_RewrittenToUpstreamZone(t *testing.T) {
 		t.Fatalf("expected Processed/NOERROR, got status=%s message=%+v err=%v", res.Status, res.Message, res.Error)
 	}
 
-	// The response's own Zone Section must still be default.service.arpa. -- the client's
-	// own request symmetry, unaffected by what happened internally.
-	if got := res.Message.Question[0].Header().Name; dnsname.Normalize(got) != dnsname.Normalize(defaultServiceARPA) {
-		t.Fatalf("response Zone Section = %q, want default.service.arpa. (echoed from the request)", got)
+	if len(res.Message.Question) != 0 {
+		t.Fatalf("response Zone Section = %v, want none (RFC 2136 S3.8)", res.Message.Question)
 	}
 
 	// The upstream forward must carry the REWRITTEN names -- default.service.arpa. must not

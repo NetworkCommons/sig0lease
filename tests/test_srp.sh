@@ -4,8 +4,8 @@
 #
 # Runs the real proxy process (srp_handler only) against a real, disposable local BIND 9
 # instance authoritative for srp.test. -- register -> dig -> refresh -> conflict (YXDOMAIN)
-# -> remove-one -> remove-all -> expiry -> LEASE-only expiry. Uses tests/srp_client_tester (a minimal Go test
-# client -- client/srp and cmd/sig0lease-srp-client are Phase 4, not built yet), not stubs/mocks.
+# -> remove-one -> remove-all -> expiry -> LEASE-only expiry -> registrar discovery. Every update is sent by the real
+# requester, cmd/sig0lease-srp-client (client/srp), in -once mode -- no stubs/mocks.
 
 set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -17,6 +17,7 @@ SRP_ZONE="srp.test."
 SRP_PROXY_ADDR="127.0.0.1"
 SRP_PROXY_PORT="${SRP_PROXY_PORT:-8159}"
 SRP_PROXY_URL="${SRP_PROXY_ADDR}:${SRP_PROXY_PORT}"
+BIND9_SRP_REGISTRAR_PORT="$SRP_PROXY_PORT" # the zone's _dnssd-srp._tcp SRV points TEST 8 here
 SRP_KEYSTORE_DIR="${TESTS_DIR}/keystore-srp-bind9"
 SRP_LEASE_SECONDS="${SRP_LEASE_SECONDS:-30}" # outlasts TESTs 1-5, which assert data is still present
 SRP_KEY_LEASE_SECONDS="${SRP_KEY_LEASE_SECONDS:-1209600}"
@@ -28,7 +29,7 @@ SRP_DATA_EXPIRY_LEASE_SECONDS=2
 SRP_DATA_EXPIRY_KEY_LEASE_SECONDS=120 # well past SRP_EXPIRY_TIMEOUT -- see test_lease_expiry_keeps_keys
 
 SRP_PROXY_BIN="${TESTS_DIR}/../bin/${OS}/sig0lease"
-SRP_CLIENT_BIN="${TESTS_DIR}/../bin/${OS}/srp_client_tester"
+SRP_CLIENT_BIN="${TESTS_DIR}/../bin/${OS}/sig0lease-srp-client"
 SRP_PROXY_LOG="/tmp/sig0lease_srp_proxy.log"
 SRP_TMP_CONFIG=""
 SRP_PROXY_PID=""
@@ -39,7 +40,7 @@ PERFORMED_TESTS=""
 build_srp_binaries() {
     log_section "BUILD"
     (cd "$TESTS_DIR/.." && go build -o "$SRP_PROXY_BIN" ./cmd/sig0lease)
-    (cd "$TESTS_DIR/.." && go build -o "$SRP_CLIENT_BIN" ./tests/srp_client_tester)
+    (cd "$TESTS_DIR/.." && go build -o "$SRP_CLIENT_BIN" ./cmd/sig0lease-srp-client)
     log_success "Binaries built"
 }
 
@@ -107,14 +108,14 @@ stop_srp_proxy() {
     fi
 }
 
-# run_srp_client <identity-name> [extra srp_client_tester flags...] -- identity-name selects
-# a per-test persistent key file under a scratch dir (fresh on first use, reused after);
-# pass a never-before-used name to get a fresh identity, the same name again to reuse one
-# (refresh / conflict scenarios).
+# run_srp_client <identity-name> [extra sig0lease-srp-client flags...] -- sends one update
+# (-once) to the proxy. identity-name selects a keystore directory under a scratch dir: -k=13
+# creates a key there on first use and is a no-op after. Pass a never-before-used name for a
+# fresh identity, the same name again to reuse one (refresh / conflict scenarios).
 run_srp_client() {
     local identity="$1"; shift
-    "$SRP_CLIENT_BIN" -server="$SRP_PROXY_URL" -zone="$SRP_ZONE" \
-        -keyfile="${SRP_KEY_DIR}/${identity}.key" "$@"
+    "$SRP_CLIENT_BIN" -server="$SRP_PROXY_URL" -domain="$SRP_ZONE" \
+        -keystore="${SRP_KEY_DIR}/${identity}" -k=13 -once "$@"
 }
 
 # dig_srp <name> <type> -- query BIND directly (not through the proxy), short form.
@@ -152,7 +153,7 @@ test_register_and_dig() {
     log_section "$log_msg"
 
     local out
-    out="$(run_srp_client id1 -host=host1.srp.test. -inst=Widget._http._tcp.srp.test. \
+    out="$(run_srp_client id1 -host=host1 -addr=192.0.2.1 -instance=Widget:_http._tcp:8080 -txt=Widget:path=/ \
         -lease="$SRP_LEASE_SECONDS" -keylease="$SRP_KEY_LEASE_SECONDS")"
     echo "$out"
     echo "$out" | grep -q "Status: NOERROR (Rcode=0)" || { log_error "registration did not return NOERROR"; return 1; }
@@ -178,7 +179,7 @@ test_refresh() {
     log_section "$log_msg"
 
     local out
-    out="$(run_srp_client id1 -host=host1.srp.test. -inst=Widget._http._tcp.srp.test. \
+    out="$(run_srp_client id1 -host=host1 -addr=192.0.2.1 -instance=Widget:_http._tcp:8080 -txt=Widget:path=/ \
         -lease="$SRP_LEASE_SECONDS" -keylease="$SRP_KEY_LEASE_SECONDS")"
     echo "$out"
     echo "$out" | grep -q "Status: NOERROR (Rcode=0)" || { log_error "refresh did not return NOERROR"; return 1; }
@@ -192,7 +193,7 @@ test_conflict() {
     log_section "$log_msg"
 
     local out
-    out="$(run_srp_client id2-conflict -host=host1.srp.test. -inst=Gadget._http._tcp.srp.test. \
+    out="$(run_srp_client id2-conflict -host=host1 -addr=192.0.2.1 -instance=Gadget:_http._tcp:8080 -txt=Gadget:path=/ \
         -lease="$SRP_LEASE_SECONDS" -keylease="$SRP_KEY_LEASE_SECONDS")" || true
     echo "$out"
     echo "$out" | grep -q "Status: YXDOMAIN (Rcode=6)" || { log_error "expected YXDOMAIN for a conflicting registration"; return 1; }
@@ -211,7 +212,7 @@ test_remove_one_instance() {
     log_section "$log_msg"
 
     local out
-    out="$(run_srp_client id1 -host=host1.srp.test. -inst=Widget._http._tcp.srp.test. -inst-remove \
+    out="$(run_srp_client id1 -host=host1 -addr=192.0.2.1 -remove=Widget:_http._tcp \
         -lease="$SRP_LEASE_SECONDS" -keylease="$SRP_KEY_LEASE_SECONDS")"
     echo "$out"
     echo "$out" | grep -q "Status: NOERROR (Rcode=0)" || { log_error "instance removal did not return NOERROR"; return 1; }
@@ -239,7 +240,7 @@ test_remove_all() {
     log_section "$log_msg"
 
     local out
-    out="$(run_srp_client id1 -host=host1.srp.test. -addr="" \
+    out="$(run_srp_client id1 -host=host1 \
         -lease="$SRP_LEASE_SECONDS" -keylease="$SRP_KEY_LEASE_SECONDS")"
     echo "$out"
     echo "$out" | grep -q "Status: NOERROR (Rcode=0)" || { log_error "host address removal did not return NOERROR"; return 1; }
@@ -256,7 +257,7 @@ test_expiry() {
     log_section "$log_msg"
 
     local out
-    out="$(run_srp_client id3-expiry -host=host3.srp.test. -inst=Sprocket._http._tcp.srp.test. \
+    out="$(run_srp_client id3-expiry -host=host3 -addr=192.0.2.1 -instance=Sprocket:_http._tcp:8080 -txt=Sprocket:path=/ \
         -lease="$SRP_EXPIRY_LEASE_SECONDS" -keylease="$SRP_EXPIRY_LEASE_SECONDS")"
     echo "$out"
     echo "$out" | grep -q "Status: NOERROR (Rcode=0)" || { log_error "fresh registration for expiry test did not return NOERROR"; return 1; }
@@ -293,7 +294,7 @@ test_lease_expiry_keeps_keys() {
     log_section "$log_msg"
 
     local out
-    out="$(run_srp_client id4-lease-expiry -host=host4.srp.test. -inst=Gizmo._http._tcp.srp.test. \
+    out="$(run_srp_client id4-lease-expiry -host=host4 -addr=192.0.2.1 -instance=Gizmo:_http._tcp:8080 -txt=Gizmo:path=/ \
         -lease="$SRP_DATA_EXPIRY_LEASE_SECONDS" -keylease="$SRP_DATA_EXPIRY_KEY_LEASE_SECONDS")"
     echo "$out"
     echo "$out" | grep -q "Status: NOERROR (Rcode=0)" || { log_error "fresh registration for LEASE expiry test did not return NOERROR"; return 1; }
@@ -315,12 +316,36 @@ test_lease_expiry_keeps_keys() {
     PERFORMED_TESTS="$PERFORMED_TESTS\n  [OK] $log_msg"
 }
 
+test_discovery() {
+    # RFC 9665 S3.1.1 end to end, with no -server: SOA for srp.test. (the zone apex), SRV
+    # _dnssd-srp._tcp.srp.test. -> proxy.srp.test.:<proxy port>, then proxy.srp.test.'s A
+    # record. Every query goes to BIND via -resolver; the machine's own resolver knows none of
+    # these names. Runs last: its live _http._tcp instance would keep the S9 enumeration record
+    # present, which TESTs 6 and 7 wait to see cleared.
+    local log_msg="TEST 8: Registrar discovery (no -server) via -resolver"
+    log_section "$log_msg"
+
+    local out
+    out="$("$SRP_CLIENT_BIN" -resolver="${BIND9_ADDR}:${BIND9_PORT}" -domain="$SRP_ZONE" \
+        -keystore="${SRP_KEY_DIR}/id5-discovery" -k=13 -once \
+        -host=host5 -addr=192.0.2.5 -instance=Doohickey:_http._tcp:8080 -txt=Doohickey:path=/ \
+        -lease="$SRP_LEASE_SECONDS" -keylease="$SRP_KEY_LEASE_SECONDS")"
+    echo "$out"
+    echo "$out" | grep -q "Status: NOERROR (Rcode=0)" || { log_error "registration via discovery did not return NOERROR"; return 1; }
+
+    [ -n "$(dig_srp host5.srp.test. A)" ] || { log_error "host A record not found at authoritative"; return 1; }
+    [ -n "$(dig_srp Doohickey._http._tcp.srp.test. SRV)" ] || { log_error "instance SRV not found at authoritative"; return 1; }
+
+    log_success "Client found the registrar via SOA + _dnssd-srp._tcp SRV + target A, all through -resolver, and registered"
+    PERFORMED_TESTS="$PERFORMED_TESTS\n  [OK] $log_msg"
+}
+
 ################################
 # Top level
 ################################
 run_all_tests() {
     log_section "SIG0LEASE SRP (RFC 9665) INTEGRATION TEST SUITE"
-    echo "Real components only: real proxy process (srp_handler), real client helper,"
+    echo "Real components only: real proxy process (srp_handler), real client (sig0lease-srp-client),"
     echo "real local BIND 9 authoritative for ${SRP_ZONE} (plan S14 Option C)."
     echo ""
 
@@ -343,6 +368,7 @@ run_all_tests() {
     test_remove_all
     test_expiry
     test_lease_expiry_keeps_keys
+    test_discovery
 
     bind9_report_rejections || return 1
     BIND9_REJECTIONS_REPORTED=1

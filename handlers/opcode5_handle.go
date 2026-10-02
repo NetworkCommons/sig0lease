@@ -55,7 +55,7 @@ func (h *UpdateHandler) Handle(ctx context.Context, w dns.ResponseWriter, r *dns
 
 	originalLeaseDuration := leaseDuration
 	originalKeyLeaseDuration := keyLeaseDuration
-	leaseDuration, keyLeaseDuration = h.clampLeaseDurations(leaseDuration, keyLeaseDuration)
+	leaseDuration, keyLeaseDuration = h.LeasePolicy.clamp(leaseDuration, keyLeaseDuration)
 	if leaseDuration != originalLeaseDuration || keyLeaseDuration != originalKeyLeaseDuration {
 		h.logger.Debugf("Lease policy clamped request durations: lease=%d->%d key-lease=%d->%d",
 			originalLeaseDuration, leaseDuration, originalKeyLeaseDuration, keyLeaseDuration)
@@ -131,7 +131,6 @@ func (h *UpdateHandler) Handle(ctx context.Context, w dns.ResponseWriter, r *dns
 	// KEY-LEASE!=0, LEASE!=0 requires at least one KEY RR and a Non-KEY RRs.
 
 	var allNotes []string
-	var responseKeys []*dns.KEY
 	upstreamKeys := make([]*dns.KEY, 0)
 	var acceptedRecordsForUpstream []dns.RR
 	// recordsToDeleteForUpstream accumulates Case D's accompanying non-KEY
@@ -215,7 +214,6 @@ func (h *UpdateHandler) Handle(ctx context.Context, w dns.ResponseWriter, r *dns
 						},
 					})
 
-					responseKeys = append(responseKeys, keyRR)
 					upstreamKeys = append(upstreamKeys, keyRR)
 					acceptedRecordsForUpstream = append(acceptedRecordsForUpstream, scopedOtherRecords...)
 					continue
@@ -247,7 +245,6 @@ func (h *UpdateHandler) Handle(ctx context.Context, w dns.ResponseWriter, r *dns
 					},
 				})
 
-				responseKeys = append(responseKeys, keyRR)
 				acceptedRecordsForUpstream = append(acceptedRecordsForUpstream, scopedOtherRecords...)
 				continue
 			}
@@ -297,7 +294,6 @@ func (h *UpdateHandler) Handle(ctx context.Context, w dns.ResponseWriter, r *dns
 
 			h.logger.Debugf("Lease processed for %s (lease=%d seconds, key-lease=%d seconds)", keyName, leaseDuration, keyLeaseDuration)
 
-			responseKeys = append(responseKeys, keyRR)
 			upstreamKeys = append(upstreamKeys, keyRR)
 			acceptedRecordsForUpstream = append(acceptedRecordsForUpstream, acceptedRecords...)
 			allNotes = append(allNotes, partialNotes...)
@@ -376,7 +372,6 @@ func (h *UpdateHandler) Handle(ctx context.Context, w dns.ResponseWriter, r *dns
 					return h.leaseManager.RenewLease(ctx, pendingKeyRR, pendingKeyLease, pendingKeyLease)
 				},
 			})
-			responseKeys = append(responseKeys, pendingKeyRR)
 			upstreamKeys = append(upstreamKeys, pendingKeyRR)
 			allNotes = append(allNotes, fmt.Sprintf("KEY %s was missing at the authoritative DNS and has been re-registered with remaining lease", pendingKeyRR.Hdr.Name))
 		}
@@ -446,7 +441,7 @@ func (h *UpdateHandler) Handle(ctx context.Context, w dns.ResponseWriter, r *dns
 		if len(keysToDelete) == 0 && len(recordsToDelete) == 0 {
 			// Nothing locally managed to delete, so there is nothing to
 			// confirm upstream either: just report the notes.
-			return NewProcessedResult(h.buildSuccessResponse(r, zone, allNotes, nil, leaseDuration, keyLeaseDuration))
+			return NewProcessedResult(h.buildSuccessResponse(r, allNotes, leaseDuration, keyLeaseDuration))
 		}
 
 		signingKey, effectiveUpstreamZone, err := resolveUpstreamSigningContext(ctx, h.Name(), h.upstreamCoordinator, h.upstreamKeyRecord, h.upstreamZone, h.logger)
@@ -522,7 +517,7 @@ func (h *UpdateHandler) Handle(ctx context.Context, w dns.ResponseWriter, r *dns
 			}
 		}
 
-		return NewProcessedResult(h.buildSuccessResponse(r, zone, allNotes, nil, leaseDuration, keyLeaseDuration))
+		return NewProcessedResult(h.buildSuccessResponse(r, allNotes, leaseDuration, keyLeaseDuration))
 	} else if keyLeaseDuration != 0 && leaseDuration == 0 {
 		// Case D: KEY-only registration/refresh with optional non-KEY deletes.
 		if len(updateKeyRRs) == 0 {
@@ -636,7 +631,6 @@ func (h *UpdateHandler) Handle(ctx context.Context, w dns.ResponseWriter, r *dns
 				},
 			})
 
-			responseKeys = append(responseKeys, keyRR)
 			upstreamKeys = append(upstreamKeys, keyRR)
 			recordsToDeleteForUpstream = append(recordsToDeleteForUpstream, recordsToDelete...)
 			allNotes = append(allNotes, notes...)
@@ -663,7 +657,7 @@ func (h *UpdateHandler) Handle(ctx context.Context, w dns.ResponseWriter, r *dns
 		}
 		if len(upstreamUpdate.Ns) == 0 {
 			// No records to forward, just return success.
-			return NewProcessedResult(h.buildSuccessResponse(r, zone, allNotes, nil, leaseDuration, keyLeaseDuration))
+			return NewProcessedResult(h.buildSuccessResponse(r, allNotes, leaseDuration, keyLeaseDuration))
 		}
 
 		// Send UPDATE to upstream and fail-closed if upstream does not accept it.
@@ -705,50 +699,28 @@ func (h *UpdateHandler) Handle(ctx context.Context, w dns.ResponseWriter, r *dns
 		}
 	}
 
-	h.logger.Debugf("Sending success response (%d KEY RRs processed)", len(responseKeys))
-
-	// Echo back the KEY RRs in response to confirm registration.
-	answers := make([]dns.RR, 0, len(responseKeys))
-	for _, key := range responseKeys {
-		answers = append(answers, key)
-	}
-	return NewProcessedResult(h.buildSuccessResponse(r, zone, allNotes, answers, leaseDuration, keyLeaseDuration))
+	h.logger.Debugf("Sending success response (%d status notes)", len(allNotes))
+	return NewProcessedResult(h.buildSuccessResponse(r, allNotes, leaseDuration, keyLeaseDuration))
 }
 
-// buildSuccessResponse builds a successful UPDATE response echoing the given
-// answer RRs and status notes (as TXT records). It also echoes the LEASE and
-// KEY-LEASE durations actually applied to this request (after LeasePolicy
-// clamping), so the client can detect if the proxy granted less than what
-// was requested for either value.
-func (h *UpdateHandler) buildSuccessResponse(r *dns.Msg, zone string, notes []string, answers []dns.RR, leaseDuration, keyLeaseDuration uint32) *dns.Msg {
-	resp := &dns.Msg{
-		MsgHeader: r.MsgHeader,
-		Question:  r.Question,
-	}
-	resp.Response = true
-	resp.Authoritative = true
-	resp.Rcode = dns.RcodeSuccess
-	appendStatusNotes(resp, zone, notes)
-	resp.Answer = append(resp.Answer, answers...)
-
-	opt := &dns.OPT{Hdr: dns.Header{Name: "."}}
-	opt.SetUDPSize(uint16(dns.DefaultMsgSize))
-	leaseOpt := leasepkg.Encode8Byte(leaseDuration, keyLeaseDuration)
-	if err := leaseOpt.Encode(opt); err != nil {
-		h.logger.Debugf("failed to encode response lease option: %v", err)
-	}
-	resp.Extra = append(resp.Extra, opt)
-
+// buildSuccessResponse builds a successful UPDATE response: leaseResponse (the LEASE and
+// KEY-LEASE actually applied after LeasePolicy clamping, so the client can detect if the
+// proxy granted less than what was requested for either value), plus the status notes.
+func (h *UpdateHandler) buildSuccessResponse(r *dns.Msg, notes []string, leaseDuration, keyLeaseDuration uint32) *dns.Msg {
+	resp := leaseResponse(r, leaseDuration, keyLeaseDuration, h.logger)
+	appendStatusNotes(resp, notes)
 	return resp
 }
 
-func appendStatusNotes(resp *dns.Msg, zone string, notes []string) {
-	if resp == nil || len(notes) == 0 {
-		return
-	}
+// appendStatusNotes adds each note to resp as an Extended DNS Error option (RFC 8914):
+// INFO-CODE 0, "Other", with the note as its EXTRA-TEXT. RFC 8914 S2 allows EDE in any
+// response, NOERROR included, and more than one per message, and means EXTRA-TEXT for people
+// to read, not for parsing. The options travel in resp's one OPT RR, so the reply still
+// copies none of the request's sections (RFC 2136 S3.8). The notes, and the KEY RRs this
+// handler used to echo, once went in the answer slot, which in an UPDATE reply is the
+// Prerequisite section.
+func appendStatusNotes(resp *dns.Msg, notes []string) {
 	for _, note := range notes {
-		txt := &dns.TXT{Hdr: dns.Header{Name: zone, Class: dns.ClassINET, TTL: 0}}
-		txt.TXT.Txt = []string{note}
-		resp.Answer = append(resp.Answer, txt)
+		resp.Pseudo = append(resp.Pseudo, &dns.EDE{InfoCode: dns.ExtendedErrorOther, ExtraText: note})
 	}
 }

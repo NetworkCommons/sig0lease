@@ -22,10 +22,13 @@ BIND9_PORT="${BIND9_PORT:-5300}"
 # named's sig0checks-quota, and the proxy's matching authoritative.max_inflight_updates in the
 # suites' generated configs. 1 is BIND 9.20's own default.
 BIND9_SIG0_QUOTA="${BIND9_SIG0_QUOTA:-1}"
+# Port that srp.test.'s _dnssd-srp._tcp SRV record advertises for the registrar. test_srp.sh
+# sets it to its proxy's port, before calling start_bind9.
+BIND9_SRP_REGISTRAR_PORT="${BIND9_SRP_REGISTRAR_PORT:-8159}"
 BIND9_RUNDIR=""
 BIND9_PID=""
 
-# start_bind9 copies the named.conf.in/srp.test.zone.in templates (checked into the repo)
+# start_bind9 fills in the named.conf.in/srp.test.zone.in templates (checked into the repo)
 # into a fresh scratch runtime directory -- never running named against the source tree's
 # own copy, since dynamic updates rewrite the zone file and bump its SOA serial in place.
 start_bind9() {
@@ -36,7 +39,7 @@ start_bind9() {
 
     BIND9_RUNDIR="$(mktemp -d /tmp/sig0lease-bind9.XXXXXX)"
     sed "s#@RUNDIR@#${BIND9_RUNDIR}#g; s#@SIG0_QUOTA@#${BIND9_SIG0_QUOTA}#g" "${BIND9_TEMPLATE_DIR}/named.conf.in" > "${BIND9_RUNDIR}/named.conf"
-    cp "${BIND9_TEMPLATE_DIR}/srp.test.zone.in" "${BIND9_RUNDIR}/srp.test.zone"
+    sed "s#@SRP_REGISTRAR_PORT@#${BIND9_SRP_REGISTRAR_PORT}#g" "${BIND9_TEMPLATE_DIR}/srp.test.zone.in" > "${BIND9_RUNDIR}/srp.test.zone"
     cp "${BIND9_TEMPLATE_DIR}/default.service.arpa.zone.in" "${BIND9_RUNDIR}/default.service.arpa.zone"
 
     # Output kept for failures only: on success it is just BIND's "option 'sig0checks-quota'
