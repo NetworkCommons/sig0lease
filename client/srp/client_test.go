@@ -87,6 +87,16 @@ func TestNewClient_RejectsMalformedServiceType(t *testing.T) {
 	}
 }
 
+// TestNewClient_RejectsUnknownDiscoveryMode: a bad mode is a configuration error at
+// NewClient, not a discovery failure that Run would report and retry on every cycle.
+func TestNewClient_RejectsUnknownDiscoveryMode(t *testing.T) {
+	cfg := testConfig(t, &fakeTransport{})
+	cfg.Discovery = DiscoveryMode(7)
+	if _, err := NewClient(cfg); err == nil || !strings.Contains(err.Error(), "unknown DiscoveryMode") {
+		t.Fatalf("expected an unknown-mode error, got: %v", err)
+	}
+}
+
 // TestNewClient_RejectsLabelThatIsNotOneDNSLabel: labels are joined into names by plain
 // concatenation, so one containing "." would be registered as several labels -- RFC 6763
 // S4.3 requires that boundary be kept, and the dns library can't carry such a label at all
@@ -204,12 +214,15 @@ func TestClient_Deregister_SendsRemovalShapedUpdate(t *testing.T) {
 	}
 }
 
-func TestClient_Register_DiscoversWhenNoExplicitAddr(t *testing.T) {
+// TestClient_Register_WithdrawsOneInstance: an instance with Remove set goes out as a bare
+// Delete All RRsets (RFC 9665 S3.2.5.5.2), while the host keeps its addresses and the other
+// instance is registered as usual.
+func TestClient_Register_WithdrawsOneInstance(t *testing.T) {
 	transport := &fakeTransport{responses: []*dns.Msg{successResp(30, 1209600)}}
 	cfg := testConfig(t, transport)
-	cfg.RegistrarAddr = ""
-	cfg.Query = func(ctx context.Context, name string) ([]*dns.SRV, error) {
-		return []*dns.SRV{srvRR("registrar.example.com.", 0, 0, 8853)}, nil
+	cfg.Instances = []InstanceConfig{
+		{Label: "Screen", ServiceType: "_rfb._tcp", Remove: true},
+		{Label: "Shell", ServiceType: "_ssh._tcp", Port: 22},
 	}
 	c, err := NewClient(cfg)
 	if err != nil {
@@ -218,8 +231,77 @@ func TestClient_Register_DiscoversWhenNoExplicitAddr(t *testing.T) {
 	if _, _, err := c.Register(context.Background()); err != nil {
 		t.Fatalf("Register: %v", err)
 	}
-	if transport.addrs[0] != "registrar.example.com:8853" {
+
+	cu, err := pkgsrp.Validate(transport.sent[0])
+	if err != nil {
+		t.Fatalf("sent message failed Validate(): %v", err)
+	}
+	if len(cu.Host.Addresses) != 1 {
+		t.Fatalf("host has %d address adds, want 1 (withdrawing an instance keeps the host)", len(cu.Host.Addresses))
+	}
+	srvByName := map[string]*dns.SRV{}
+	for _, inst := range cu.Instances {
+		srvByName[inst.Name] = inst.SRV
+	}
+	if srv, ok := srvByName["screen._rfb._tcp.example.com."]; !ok || srv != nil {
+		t.Fatalf("Screen: present=%v SRV=%v, want a removal-shaped instance (SRV nil)", ok, srv)
+	}
+	if srv := srvByName["shell._ssh._tcp.example.com."]; srv == nil || srv.Port != 22 {
+		t.Fatalf("Shell: SRV=%v, want a live registration on port 22", srv)
+	}
+	for _, d := range cu.Discovery {
+		if d.Target == "screen._rfb._tcp.example.com." {
+			t.Fatalf("withdrawn instance still has a Service Discovery instruction: %+v", d)
+		}
+	}
+}
+
+func TestClient_Register_DiscoversWhenNoExplicitAddr(t *testing.T) {
+	transport := &fakeTransport{responses: []*dns.Msg{successResp(30, 1209600)}}
+	cfg := testConfig(t, transport)
+	cfg.RegistrarAddr = ""
+	cfg.Query = (&fakeDNS{
+		apexes: []string{"example.com."},
+		srv:    map[string][]*dns.SRV{"_dnssd-srp._tcp.example.com.": {srvRR("registrar.example.com.", 0, 0, 8853)}},
+		hosts:  registrarHosts,
+	}).query
+	c, err := NewClient(cfg)
+	if err != nil {
+		t.Fatalf("NewClient: %v", err)
+	}
+	if _, _, err := c.Register(context.Background()); err != nil {
+		t.Fatalf("Register: %v", err)
+	}
+	if transport.addrs[0] != "192.0.2.1:8853" {
 		t.Fatalf("sent to %q, want the discovered address", transport.addrs[0])
+	}
+}
+
+// TestClient_Register_DiscoveryApexOnly: Config.Discovery reaches Discover. With a record at
+// both the domain and its zone apex, DiscoveryApexOnly sends to the apex's registrar.
+func TestClient_Register_DiscoveryApexOnly(t *testing.T) {
+	transport := &fakeTransport{responses: []*dns.Msg{successResp(30, 1209600)}}
+	cfg := testConfig(t, transport)
+	cfg.Domain = "srp.example.com."
+	cfg.RegistrarAddr = ""
+	cfg.Discovery = DiscoveryApexOnly
+	cfg.Query = (&fakeDNS{
+		apexes: []string{"example.com."},
+		srv: map[string][]*dns.SRV{
+			"_dnssd-srp._tcp.example.com.":     {srvRR("apex-registrar.example.com.", 0, 0, 8853)},
+			"_dnssd-srp._tcp.srp.example.com.": {srvRR("domain-registrar.example.com.", 0, 0, 8853)},
+		},
+		hosts: registrarHosts,
+	}).query
+	c, err := NewClient(cfg)
+	if err != nil {
+		t.Fatalf("NewClient: %v", err)
+	}
+	if _, _, err := c.Register(context.Background()); err != nil {
+		t.Fatalf("Register: %v", err)
+	}
+	if transport.addrs[0] != "192.0.2.2:8853" {
+		t.Fatalf("sent to %q, want apex-registrar's address", transport.addrs[0])
 	}
 }
 
@@ -419,7 +501,7 @@ func TestClient_Run_RetriesOnDiscoveryFailure(t *testing.T) {
 	transport := &fakeTransport{}
 	cfg := testConfig(t, transport)
 	cfg.RegistrarAddr = ""
-	cfg.Query = func(ctx context.Context, name string) ([]*dns.SRV, error) { return nil, nil }
+	cfg.Query = (&fakeDNS{apexes: []string{"example.com."}}).query
 
 	var gotErrs []error
 	cfg.OnError = func(err error) { gotErrs = append(gotErrs, err) }

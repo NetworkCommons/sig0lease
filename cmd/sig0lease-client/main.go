@@ -500,24 +500,24 @@ func cmdRegRefWithMode(proxyAddr string, args []string, operation string, tamper
 		dataExpiry, keyExpiry := client.ExpiryFromResponse(time.Now(), leaseDuration, keyLeaseDuration, resp)
 		fmt.Printf("  Data expiration time: %s\n", dataExpiry.Format(time.RFC3339))
 		fmt.Printf("  Key expiration time: %s\n", keyExpiry.Format(time.RFC3339))
-
-		if len(resp.Answer) > 0 {
-			fmt.Printf("\nAnswer Section:\n")
-			for _, rr := range resp.Answer {
-				fmt.Printf("  %s\n", rr.String())
-			}
-		}
+		printStatusNotes(resp)
 	} else {
 		fmt.Printf("\n✗ %s FAILED\n", strings.ToUpper(operation))
 		fmt.Printf("  Response code: %s\n", dns.RcodeToString[resp.Rcode])
-
-		if len(resp.Answer) > 0 {
-			fmt.Printf("\nAnswer Section:\n")
-			for _, rr := range resp.Answer {
-				fmt.Printf("  %s\n", rr.String())
-			}
-		}
+		printStatusNotes(resp)
 		os.Exit(1)
+	}
+}
+
+// printStatusNotes prints the proxy's status notes from resp, if it sent any.
+func printStatusNotes(resp *dns.Msg) {
+	notes := client.StatusNotes(resp)
+	if len(notes) == 0 {
+		return
+	}
+	fmt.Printf("\nProxy notes:\n")
+	for _, note := range notes {
+		fmt.Printf("  %s\n", note)
 	}
 }
 

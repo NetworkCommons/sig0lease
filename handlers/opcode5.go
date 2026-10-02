@@ -22,14 +22,6 @@ type LeaseRecord = leasepkg.Record
 // directly wherever a single entry is needed, rather than a second alias.
 type NonKEYLeaseRecord = leasepkg.NonKEYRecordSet
 
-// LeasePolicy controls clamping for lease durations and forwarded RR TTLs.
-type LeasePolicy struct {
-	MinKeyLease uint32
-	MaxKeyLease uint32
-	MinRRLease  uint32
-	MaxRRLease  uint32
-}
-
 // LeaseManager is the shared lease manager abstraction.
 type LeaseManager = leasepkg.LeaseStorage
 

@@ -59,11 +59,16 @@ In another terminal, from `./main`:
 - `-lease`/`-keylease` are short on purpose for a demo (1/2 minutes) so a stale record
   cleans itself up if you forget to deregister (step 6).
 - A real device would normally omit `-server` and let the client discover the registrar via
-  `_dnssd-srp._tcp.<domain>.` SRV lookup; it's passed explicitly here since this points at a
-  local proxy rather than a publicly discoverable one. Discovery needs an SRV record
-  published for the zone and network reachability from wherever the client runs to the
-  registrar, neither of which every environment running this walkthrough has, which is why
-  `-server` is used throughout instead.
+  SRV lookups for `_dnssd-srp._tcp.<name>.`, trying `-domain` first and then each parent name up
+  to the apex of the zone enclosing it (`srp.dev.zenr.io.`, `dev.zenr.io.`, then `zenr.io.`);
+  `-discovery=apex` tries only the apex, as RFC 9665 §3.1.1 specifies. `-server` is passed
+  explicitly here since this points at a local proxy rather than a publicly discoverable one.
+  Discovery needs an SRV record published at one of those names and network reachability from
+  wherever the client runs to the registrar, neither of which every environment running this
+  walkthrough has, which is why `-server` is used throughout instead. Note that
+  `_dnssd-srp._tcp.dev.zenr.io.` already exists and points at a different deployment's
+  registrar, one serving `dev.zenr.io.`: without `-server`, `srp.dev.zenr.io.` would find that
+  registrar unless `_dnssd-srp._tcp.srp.dev.zenr.io.` is published too.
 
 ### 2b. Other registration shapes (optional)
 

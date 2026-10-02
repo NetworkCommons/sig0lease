@@ -94,6 +94,8 @@ handlers:
     upstream_zone: "srp.dev.zenr.io."
     keystore_dir: "./keystore/server"
     rewrite_default_service_arpa: true
+    # mDNSResponder's srp-client sends SRP over UDP only (docs/srp-live-demo.md).
+    allow_udp: true
     # advertise_registration_domain: false
     lease_policy:
       min_key_lease_sec: 30
@@ -128,6 +130,10 @@ handlers:
     # are RECOMMENDED.
     # Servers implementing Update Lease MUST have a default minimum lease duration.
     # A minimum of 30 seconds for both the LEASE and KEY-LEASE durations is RECOMMENDED.
+    # The non-KEY bounds must not be looser than the KEY bounds (min_rr_lease_sec <=
+    # min_key_lease_sec; max_rr_lease_sec set and <= max_key_lease_sec when the latter is set),
+    # or the proxy refuses to start: such a policy would grant a LEASE longer than the KEY-LEASE.
+    # The same rule applies to handlers.srp_handler's lease_policy.
     lease_policy:
       min_key_lease_sec: 30
       max_key_lease_sec: 1800

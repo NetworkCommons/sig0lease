@@ -68,19 +68,53 @@ func (b *BaseHandler) CanHandle(opcode uint8) bool {
 // release on shutdown do not need to override it.
 func (b *BaseHandler) Shutdown() {}
 
-// makeErrorResponse builds a minimal error response echoing req's header/question, with
-// rcode set. msg is currently unused (kept as a parameter for call-site readability --
-// see the "Note" below); shared by UpdateHandler and SRPHandler, whose two prior
-// method-per-handler copies were byte-for-byte identical.
+// updateResponse starts the reply to the UPDATE request req: req's header (so its ID and
+// Opcode) with QR and rcode set, and no sections. RFC 2136 S3.8 lets a reply either copy
+// every section of the request or carry none; every reply UpdateHandler and SRPHandler send
+// carries none. Copying only the Zone section, as they once did, is neither, and
+// mDNSResponder's srp-client then ignores the granted lease: it reads the Update Lease option
+// only from a reply whose one record is the OPT RR, and otherwise refreshes on the lease it
+// asked for.
+func updateResponse(req *dns.Msg, rcode uint16) *dns.Msg {
+	resp := &dns.Msg{MsgHeader: req.MsgHeader}
+	resp.Response = true
+	resp.Rcode = rcode
+	return resp
+}
+
+// leaseResponse is the NOERROR reply to a lease update: updateResponse plus the Update Lease
+// option carrying the LEASE and KEY-LEASE actually granted (RFC 9664 S4), so the requester
+// refreshes on those rather than on what it asked for.
+//
+// The option goes in resp.Pseudo, from which the dns library builds the reply's one OPT RR,
+// together with the EDNS fields of the header copied from req. An OPT RR added to resp.Extra
+// instead, as this code once did, became a second OPT RR whenever req used EDNS -- which every
+// lease update does -- and RFC 6891 S6.1.1 allows one. mDNSResponder's srp-client then ignored
+// the granted lease, since it reads it only from a reply whose one record is the OPT RR.
+func leaseResponse(req *dns.Msg, lease, keyLease uint32, logger *logging.Logger) *dns.Msg {
+	resp := updateResponse(req, dns.RcodeSuccess)
+	resp.Authoritative = true
+	resp.UDPSize = uint16(dns.DefaultMsgSize)
+
+	opt := &dns.OPT{}
+	if err := leasepkg.Encode8Byte(lease, keyLease).Encode(opt); err != nil {
+		logger.Debugf("failed to encode response lease option: %v", err)
+	}
+	for _, option := range opt.Options {
+		resp.Pseudo = append(resp.Pseudo, option)
+	}
+	return resp
+}
+
+// makeErrorResponse builds the error reply to req (updateResponse with rcode). msg is
+// currently unused (kept as a parameter for call-site readability -- see the "Note" below);
+// shared by UpdateHandler and SRPHandler.
 //
 // Note: we don't include detailed error messages in the response. Errors are logged
 // locally but responses use standard DNS rcodes. In future versions, we can add extended
 // error EDNS options.
 func makeErrorResponse(req *dns.Msg, rcode uint16, _ string) *dns.Msg {
-	resp := &dns.Msg{MsgHeader: req.MsgHeader, Question: req.Question}
-	resp.Response = true
-	resp.Rcode = rcode
-	return resp
+	return updateResponse(req, rcode)
 }
 
 // refuseDottedLabels returns an error result -- REFUSED -- if the request r, as it arrived on

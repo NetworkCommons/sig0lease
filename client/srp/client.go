@@ -34,6 +34,10 @@ type InstanceConfig struct {
 	Subtypes    []string // additional bare subtype labels, e.g. "_universal"; checked like Label
 	Port        uint16
 	TXT         []string
+	// Remove withdraws this instance instead of registering it (RFC 9665 S3.2.5.5.2, first
+	// method): the update carries a bare Delete All RRsets for its name, and Port, TXT and
+	// Subtypes are ignored. The host and every other instance are registered as usual.
+	Remove bool
 }
 
 // Transport sends a signed SRP UPDATE to addr and returns the response. Config.Send
@@ -57,10 +61,12 @@ type Config struct {
 
 	// RegistrarAddr, if set, bypasses discovery entirely -- an explicit "host:port",
 	// matching every other test/dev client this project's test suite already uses.
-	// Discovery (Domain's `_dnssd-srp._tcp` SRV) is the fallback when this is empty.
+	// Discovery (the `_dnssd-srp._tcp` SRV closest to Domain within its zone, or at the
+	// zone apex only -- see Discover and Discovery) is the fallback when this is empty.
 	RegistrarAddr string
-	Resolvers     []string // bootstrap resolvers for discovery; LiveSRVQuery's default if empty
-	Query         SRVQuery // discovery implementation; LiveSRVQuery(Resolvers) if nil
+	Discovery     DiscoveryMode // where discovery looks for the SRV; DiscoveryClosest (the zero value) by default
+	Resolvers     []string      // bootstrap resolvers for discovery; LiveDNSQuery's default if empty
+	Query         DNSQuery      // discovery implementation; LiveDNSQuery(Resolvers) if nil
 
 	UseTCP     bool          // default true (S3.5's MUST for non-constrained networks)
 	Timeout    time.Duration // per-request transport timeout; default 20s
@@ -125,6 +131,9 @@ func NewClient(cfg Config) (*Client, error) {
 			}
 		}
 	}
+	if err := cfg.Discovery.validate(); err != nil {
+		return nil, fmt.Errorf("srp/client: Discovery: %w", err)
+	}
 	if cfg.RequestedLease == 0 {
 		cfg.RequestedLease = 3600
 	}
@@ -150,7 +159,7 @@ func NewClient(cfg Config) (*Client, error) {
 		cfg.Sleep = ctxSleep
 	}
 	if cfg.Query == nil {
-		cfg.Query = LiveSRVQuery(cfg.Resolvers)
+		cfg.Query = LiveDNSQuery(cfg.Resolvers)
 	}
 	if cfg.Key == nil {
 		// SRP identities default to P-256, flags-0 (BuildUpdate enforces flags-0
@@ -176,7 +185,7 @@ func (c *Client) registrarAddr(ctx context.Context) (string, error) {
 	if c.cfg.RegistrarAddr != "" {
 		return c.cfg.RegistrarAddr, nil
 	}
-	return Discover(ctx, c.cfg.Query, c.cfg.Domain)
+	return Discover(ctx, c.cfg.Query, c.cfg.Domain, c.cfg.Discovery)
 }
 
 func (c *Client) hostFQDN() string {
@@ -185,7 +194,8 @@ func (c *Client) hostFQDN() string {
 
 // specs builds the current (possibly renamed) UpdateSpec instance list, joining each
 // instance's label onto its service type and Domain. remove marks every instance
-// removal-shaped (InstanceSpec.Remove) for Deregister; Register always passes false.
+// removal-shaped (InstanceSpec.Remove) for Deregister; Register passes false, so only the
+// instances whose InstanceConfig.Remove is set are withdrawn.
 func (c *Client) specs(remove bool) []pkgsrp.InstanceSpec {
 	out := make([]pkgsrp.InstanceSpec, len(c.cfg.Instances))
 	for i, inst := range c.cfg.Instances {
@@ -201,7 +211,7 @@ func (c *Client) specs(remove bool) []pkgsrp.InstanceSpec {
 			Subtypes:    subtypes,
 			Port:        inst.Port,
 			TXT:         inst.TXT,
-			Remove:      remove,
+			Remove:      remove || inst.Remove,
 		}
 	}
 	return out

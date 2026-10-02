@@ -12,10 +12,9 @@ $TTL 3600
 ns      IN A    127.0.0.1
 @       IN KEY  512 3 15 FNZq5ao1LH+zGRNOz0yeZvMVjlSwG+OYRCpz33kdeBg=
 
-; RFC 9665's own discovery convention (client/srp.Discover, plan S14's Appendix C zone
-; skeleton): a real requester finds its registrar via a plain SRV lookup for this name.
-; Port matches test_srp.sh's own SRP_PROXY_PORT default (8159) -- illustrative/for the
-; client/srp live discovery test, not consumed by test_srp.sh itself (which always passes
-; an explicit -server, matching D8's "dev/test tool" framing).
-_dnssd-srp._tcp IN SRV 0 0 8159 proxy.srp.test.
+; RFC 9665 S3.1.1 discovery: srp.test. is the zone apex, so a requester finds its registrar
+; by an SRV lookup for this name, then an address lookup for the target. test_srp.sh's
+; discovery test does exactly that (no -server). start_bind9 replaces @SRP_REGISTRAR_PORT@
+; with BIND9_SRP_REGISTRAR_PORT, which test_srp.sh sets to the port its proxy listens on.
+_dnssd-srp._tcp IN SRV 0 0 @SRP_REGISTRAR_PORT@ proxy.srp.test.
 proxy   IN A    127.0.0.1

@@ -35,48 +35,56 @@ go build -o "bin/${OS}/sig0lease-client" ./cmd/sig0lease-client
 # Start proxy in background
 start_proxy
 
-# Test 1: A record query (opcode 0 - QUERY)
-log_step "Test 1: A record lookup for google.com"
-dig @${PROXY_ADDR} -p ${PROXY_PORT} google.com A +short 2>/dev/null | head -3
-echo ""
+FAILED_TESTS=""
 
-# Test 2: AAAA record query (IPv6)
-log_step "Test 2: AAAA record lookup for ipv6.google.com"
-dig @${PROXY_ADDR} -p ${PROXY_PORT} ipv6.google.com AAAA +short 2>/dev/null || echo "(no IPv6 available)"
-echo ""
+# expect_answer <label> <dig arguments...> -- one query through the proxy (+short); the test
+# passes only if the answer has at least one record. dig's own error lines (timeouts, no
+# servers reached, ID mismatch) start with ";;" and do not count as records.
+expect_answer() {
+    local label="$1"; shift
+    log_step "$label"
+    local out records
+    out="$(dig @"${PROXY_ADDR}" -p "${PROXY_PORT}" +short +time=3 +tries=2 "$@" 2>&1)" || true
+    echo "$out" | head -5
+    records="$(echo "$out" | grep -v -e '^;;' -e '^$' || true)"
+    if [ -n "$records" ]; then
+        log_success "$label"
+    else
+        log_error "$label: no answer"
+        FAILED_TESTS="$FAILED_TESTS\n  $label"
+    fi
+    echo ""
+}
 
-# Test 3: MX record query
-log_step "Test 3: MX records for gmail.com"
-dig @${PROXY_ADDR} -p ${PROXY_PORT} gmail.com MX +short 2>/dev/null | head -5
-echo ""
+expect_answer "Test 1: A record lookup for google.com" google.com A
+expect_answer "Test 2: AAAA record lookup for ipv6.google.com" ipv6.google.com AAAA
+expect_answer "Test 3: MX records for gmail.com" gmail.com MX
+expect_answer "Test 4: TXT records for google.com" google.com TXT
+expect_answer "Test 5: Name servers for example.com" example.com NS
+expect_answer "Test 6: Reverse lookup for 8.8.8.8" -x 8.8.8.8
+expect_answer "Test 7: A record lookup for google.com over TCP" +tcp google.com A
 
-# Test 4: TXT record query (opcode 0 - QUERY)
-log_step "Test 4: TXT records for google.com"
-dig @${PROXY_ADDR} -p ${PROXY_PORT} google.com TXT +short 2>/dev/null | head -5
-echo ""
-
-# Test 5: NS record query (opcode 0 - QUERY)
-log_step "Test 5: Name servers for example.com"
-dig @${PROXY_ADDR} -p ${PROXY_PORT} example.com NS +short 2>/dev/null
-echo ""
-
-# Test 6: Reverse DNS (PTR) (opcode 0 - QUERY)
-log_step "Test 6: Reverse lookup for 8.8.8.8"
-dig @${PROXY_ADDR} -p ${PROXY_PORT} -x 8.8.8.8 +short 2>/dev/null || echo "(reverse lookup failed)"
-echo ""
-
-# Test 7: DNS over TCP (opcode 0 - QUERY)
-log_step "Test 7: Query using TCP"
-dig @${PROXY_ADDR} -p ${PROXY_PORT} tcp google.com A +short 2>/dev/null | head -3
-echo ""
-
-# Test 8: Verify ID preservation in error responses
-echo "Test 8: Error response preserves transaction ID"
-# Query a non-existent domain to verify error responses have correct IDs
-dig @${PROXY_ADDR} -p ${PROXY_PORT} nonexistent-domain-12345.example. A +short 2>&1 | grep -E "(no servers|timeout)" || echo "ID preservation working correctly (error received)"
+# Test 8: an error reply reaches the client with the query's ID. A reply with another ID is one
+# dig ignores ("ID mismatch") while it keeps waiting, so it ends in a timeout instead of the
+# NXDOMAIN the upstream resolver sends.
+label="Test 8: NXDOMAIN reply for a nonexistent name keeps the query's ID"
+log_step "$label"
+out="$(dig @"${PROXY_ADDR}" -p "${PROXY_PORT}" +time=3 +tries=2 nonexistent-domain-12345.example. A 2>&1)" || true
+echo "$out" | grep -E "status:|mismatch|timed out|no servers" || true
+if echo "$out" | grep -q "status: NXDOMAIN" && ! echo "$out" | grep -qiE "mismatch|timed out|no servers"; then
+    log_success "$label"
+else
+    log_error "$label: expected an NXDOMAIN reply with the query's ID"
+    FAILED_TESTS="$FAILED_TESTS\n  $label"
+fi
 echo ""
 
 # Cleanup
 stop_proxy
 
+if [ -n "$FAILED_TESTS" ]; then
+    log_section "Forward tests FAILED"
+    echo -e "Failed:$FAILED_TESTS"
+    exit 1
+fi
 log_section "Testing forward functionality Complete!"

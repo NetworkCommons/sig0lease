@@ -158,8 +158,10 @@ Compressed SRV target names (§3.2.5.4) are accepted, matching real client behav
 5. Apply as a normal RFC 2136 update via the shared forward path (`docs/siglease_rfc9664.md`).
    After applying, every updated Service Description carries a KEY equal to the Host
    Description KEY (see §7 below — the registrar synthesizes this when a client omits it).
-6. Response RCODE ∈ `{NOERROR, SERVFAIL, REFUSED, YXDOMAIN}`; the response always echoes the
-   granted `LEASE`/`KEY-LEASE`.
+6. Response RCODE ∈ `{NOERROR, SERVFAIL, REFUSED, YXDOMAIN}`; a NOERROR response carries the
+   granted `LEASE`/`KEY-LEASE` and nothing else: no Zone, Prerequisite or Update section
+   (RFC 2136 §3.8), and one OPT RR. mDNSResponder's `srp-client` reads the granted lease only
+   from that exact shape, and otherwise refreshes on the lease it asked for.
 
 **Authorization for SRP is steps 2 and 3, nothing more.** Once structural validation confirms
 every KEY in the update equals the signing key, per-name FCFS is the entire ownership check —
@@ -303,8 +305,8 @@ zone, having no other way to discover one. Setting `srp_handler.rewrite_default_
 true` lets a zone additionally accept requests addressed to `default.service.arpa.`, rewriting
 every name in the update (each RR's own owner name, plus `SRV.Target`/`PTR.Ptr`, the only two
 name-typed RDATA fields SRP produces) to the configured `upstream_zone` before FCFS or
-forwarding ever see it. The response's Zone Section is left untouched, so the client still sees
-exactly the zone name it sent.
+forwarding ever see it. Responses carry no Zone Section (item 6 above), so no rewritten name
+reaches the client.
 
 The rewrite runs *after* SIG(0) verification (which covers the original, unrewritten bytes) but
 *before* FCFS: FCFS's live upstream query and the whole local lease-store tree need
@@ -392,8 +394,9 @@ off of.
 
 ## 12. Testing and interop
 
-- `make test-srp` runs a full register → refresh → conflict → remove-one → remove-all → expiry
+- `make test-srp` runs a full register → refresh → conflict → remove-one → remove-all → expiry → discovery
   suite against a disposable local BIND 9, with no external dependency — this is the CI gate.
+  Every update in it is sent by `cmd/sig0lease-srp-client`, the same requester users run.
 - `make test-mdnsresponder-interop` runs the same registrar, plus `client/srp`, against the
   real, unmodified Apple `mDNSResponder/ServiceRegistration` binaries (a sibling checkout, not
   vendored — see `tests/README.md` for setup and the exact pinned commit). It covers plain
@@ -415,11 +418,34 @@ build-srp-client` target.
 
 Capabilities:
 
-- **Discovery** — a real `_dnssd-srp._tcp.<domain>.` SRV lookup (RFC 9665's own discovery
-  convention), used whenever no explicit registrar address is configured.
+- **Discovery** — SOA queries find the apex of the zone enclosing the domain (RFC 8765 §6.1,
+  as RFC 9665 §3.1.1 specifies). SRV lookups for `_dnssd-srp._tcp.<name>.` then find the
+  registrar, and an A (or AAAA) lookup gives its address. All of these queries go to the same
+  resolvers (`-resolver`), so a registrar that only a lab DNS or the local BIND 9 test zone knows
+  is still found. Used whenever no explicit registrar address is configured. Which names the SRV
+  lookups try depends on `Config.Discovery` (`-discovery`):
+  - `DiscoveryClosest` (`closest`, the default) tries the domain first, then each parent name, up
+    to and including the zone apex; the first SRV found wins. A record at
+    `_dnssd-srp._tcp.dev.zenr.io.` therefore names the registrar for `dev.zenr.io.` and every
+    name below it, even though `dev.zenr.io.` is not a zone of its own (it sits inside `zenr.io.`),
+    unless a deeper record overrides it. This goes beyond §3.1.1 so that a registrar can serve one
+    registration domain inside a zone without a zone cut there
+    ([#46](https://github.com/NetworkCommons/sig0lease/issues/46)). With no record below the apex
+    it finds what §3.1.1 finds. A record below the apex is invisible to a requester that follows
+    §3.1.1 alone.
+  - `DiscoveryApexOnly` (`apex`) tries only `_dnssd-srp._tcp.<zone apex>.`, exactly as §3.1.1
+    specifies. Use it to check what a stock SRP client would find.
+
+  Neither mode looks above the zone apex, since a registrar named in a parent zone has no
+  authority over a delegated child zone. A failed query ends discovery with its error, without
+  moving on to the next name. Each registration domain should have one registrar: if a deeper
+  record and the apex record both lead to registrars that accept the same domain, clients in
+  the two modes register with different registrars, and each keeps its own lease state.
 - **Register** — one build-sign-send-interpret cycle. Supports a bare host registration (no
   service instances), any number of service instances, multiple addresses, multiple TXT strings
-  per instance, and DNS-SD subtypes per instance.
+  per instance, and DNS-SD subtypes per instance. An instance marked for removal (`-remove`)
+  goes out as a bare Delete All RRsets in the same update, withdrawing just that instance
+  while the host and the other instances stay registered (RFC 9665 §3.2.5.5.2).
 - **Deregister** — withdraws the host and every configured instance in one message, requesting
   `LEASE=0`. RFC 9665's own removal signal is structural (zero address adds in the Host
   Description); some real-world registrars (`srp-mdns-proxy`) additionally require

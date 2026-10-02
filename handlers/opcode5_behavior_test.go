@@ -132,7 +132,7 @@ func TestConstructUpstreamUpdateIncludesNonKeyOnlyRecordsOnce(t *testing.T) {
 	}
 }
 
-func TestClampLeaseDurationsAppliesBoundsAndKeepsOrder(t *testing.T) {
+func TestLeasePolicyClamp_AppliesBoundsAndKeepsOrder(t *testing.T) {
 	h := newTestHandler()
 	h.LeasePolicy = LeasePolicy{
 		MinKeyLease: 20,
@@ -141,7 +141,7 @@ func TestClampLeaseDurationsAppliesBoundsAndKeepsOrder(t *testing.T) {
 		MaxRRLease:  20,
 	}
 
-	lease, keyLease := h.clampLeaseDurations(25, 100)
+	lease, keyLease := h.LeasePolicy.clamp(25, 100)
 	if keyLease != 30 {
 		t.Fatalf("expected key-lease clamped to 30, got %d", keyLease)
 	}
@@ -155,13 +155,13 @@ func TestClampLeaseDurationsAppliesBoundsAndKeepsOrder(t *testing.T) {
 		MinRRLease:  10,
 		MaxRRLease:  30,
 	}
-	lease, keyLease = h.clampLeaseDurations(29, 29)
+	lease, keyLease = h.LeasePolicy.clamp(29, 29)
 	if lease != 25 || keyLease != 25 {
 		t.Fatalf("expected lease<=key-lease invariant after clamp, got lease=%d key-lease=%d", lease, keyLease)
 	}
 }
 
-func TestClampLeaseDurationsPreservesZeroSemantics(t *testing.T) {
+func TestLeasePolicyClamp_PreservesZeroSemantics(t *testing.T) {
 	h := newTestHandler()
 	h.LeasePolicy = LeasePolicy{
 		MinKeyLease: 20,
@@ -170,12 +170,12 @@ func TestClampLeaseDurationsPreservesZeroSemantics(t *testing.T) {
 		MaxRRLease:  20,
 	}
 
-	lease, keyLease := h.clampLeaseDurations(0, 0)
+	lease, keyLease := h.LeasePolicy.clamp(0, 0)
 	if lease != 0 || keyLease != 0 {
 		t.Fatalf("expected zero delete semantics preserved, got lease=%d key-lease=%d", lease, keyLease)
 	}
 
-	lease, keyLease = h.clampLeaseDurations(0, 99)
+	lease, keyLease = h.LeasePolicy.clamp(0, 99)
 	if lease != 0 || keyLease != 30 {
 		t.Fatalf("expected key-only lease semantics preserved with clamped key-lease, got lease=%d key-lease=%d", lease, keyLease)
 	}
