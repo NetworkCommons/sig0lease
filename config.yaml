@@ -24,6 +24,8 @@ server:
   # Its own address (conventionally 853, separate from plain DNS on the address above);
   # opportunistic TLS only, no client-certificate authentication. Transport-level, so it
   # benefits every handler (update_handler and srp_handler alike), not protocol-specific.
+  # One long-lived certificate; self-signed is fine, since clients don't check it
+  # (docs/siglease_rfc9664.md, "DNS-over-TLS", shows how to make one).
   # tls:
   #   address: ":853"
   #   cert: "/path/to/cert.pem"

@@ -275,7 +275,14 @@ name at all.
   used elsewhere in this project (`sig0namectl` and the existing keystore).
 - The server can offer DNS-over-TLS (opportunistic, no client-certificate authentication) as a
   transport-level listener that benefits this handler along with every other one — see
-  `docs/siglease_rfc9664.md`.
+  `docs/siglease_rfc9664.md`. RFC 9665 §7 says a registrar MUST offer TLS; here it is a
+  configuration choice (`server.networks` plus `server.tls`), off in the example `config.yaml`.
+  `client/srp` can use it (`Config.Network = NetworkTLS`, `-tls` on the CLI): it then discovers
+  the registrar through `_dnssd-srp-tls._tcp` (§13) and never falls back to plain TCP (§7: a
+  requester able to use TLS SHOULD NOT). As §7 specifies, TLS gives Opportunistic Privacy only
+  (RFC 7858 §4.1): the client does not check the registrar's certificate, so the connection is
+  encrypted but the registrar is not authenticated. RFC 9665 §6.5 mentions out-of-band key
+  pinning (RFC 7858 §4.2) and leaves it out of scope; it is not implemented.
 - Source-address filtering (RFC 9665 §3.1.3's SHOULD) is a wired but dormant stub:
   `srp_handler.allowed_source_prefixes` is parsed and the check point exists, but an empty list
   (the only value currently supported end-to-end) allows every source. See §11 below.
@@ -396,7 +403,10 @@ off of.
 
 - `make test-srp` runs a full register → refresh → conflict → remove-one → remove-all → expiry → discovery
   suite against a disposable local BIND 9, with no external dependency — this is the CI gate.
-  Every update in it is sent by `cmd/sig0lease-srp-client`, the same requester users run.
+  Every update in it is sent by `cmd/sig0lease-srp-client`, the same requester users run. The
+  last test discovers the registrar through `_dnssd-srp-tls._tcp` and registers over
+  DNS-over-TLS, against the proxy's DoT listener with a throwaway certificate generated for the
+  run.
 - `make test-mdnsresponder-interop` runs the same registrar, plus `client/srp`, against the
   real, unmodified Apple `mDNSResponder/ServiceRegistration` binaries (a sibling checkout, not
   vendored — see `tests/README.md` for setup and the exact pinned commit). It covers plain
@@ -420,7 +430,9 @@ Capabilities:
 
 - **Discovery** — SOA queries find the apex of the zone enclosing the domain (RFC 8765 §6.1,
   as RFC 9665 §3.1.1 specifies). SRV lookups for `_dnssd-srp._tcp.<name>.` then find the
-  registrar, and an A (or AAAA) lookup gives its address. All of these queries go to the same
+  registrar, and an A (or AAAA) lookup gives its address. A client using DNS-over-TLS
+  (`NetworkTLS`, `-tls`) looks up `_dnssd-srp-tls._tcp.<name>.` instead and never falls back to
+  `_dnssd-srp._tcp` (§7); the same rules below apply to it. All of these queries go to the same
   resolvers (`-resolver`), so a registrar that only a lab DNS or the local BIND 9 test zone knows
   is still found. Used whenever no explicit registrar address is configured. Which names the SRV
   lookups try depends on `Config.Discovery` (`-discovery`):
@@ -446,6 +458,19 @@ Capabilities:
   per instance, and DNS-SD subtypes per instance. An instance marked for removal (`-remove`)
   goes out as a bare Delete All RRsets in the same update, withdrawing just that instance
   while the host and the other instances stay registered (RFC 9665 §3.2.5.5.2).
+- **Zone Section: a deviation from RFC 9665 §3.3** — every update names the registration
+  domain (`Config.Domain`, `-domain`) in its Zone Section. §3.3, like RFC 2136, wants the zone
+  being updated there, which is the apex discovery finds with its SOA queries: for
+  `srp.dev.zenr.io.` that is `zenr.io.`, not `srp.dev.zenr.io.`. The two only coincide when the
+  domain is itself a zone apex, as `srp.test.` is in the test suite. It stays this way on
+  purpose: the registrar accepts an update only when its Zone Section is the zone it serves
+  (`upstream_zone`) or `default.service.arpa.`, so naming the apex would stop the proxy from
+  matching it, and with `-server` the client never looks the apex up at all. Nothing upstream
+  sees the requester's Zone Section: the proxy builds a new UPDATE for the authoritative server,
+  with the real zone it resolved for `upstream_zone` ("Authoritative Forwarding" in
+  `docs/siglease_rfc9664.md`), so the updates the authoritative server receives follow RFC 2136. Real requesters use the field the same way:
+  `mDNSResponder`'s and OpenThread's clients send `default.service.arpa.`, which is not a zone
+  apex either.
 - **Deregister** — withdraws the host and every configured instance in one message, requesting
   `LEASE=0`. RFC 9665's own removal signal is structural (zero address adds in the Host
   Description); some real-world registrars (`srp-mdns-proxy`) additionally require
@@ -461,6 +486,10 @@ Capabilities:
 - **Identity/keystore** — `-keystore=<dir>` with a `CLIENT_KEYSTORE_DIR` environment-variable
   fallback (the same convention as `cmd/sig0lease-client`); a missing key is an error unless
   `-k=13` (ECDSAP256SHA256) or `-k=15` (ED25519) is given, in which case one is generated for
-  that host+domain identity and reused on every later run.
+  that host+domain identity and reused on every later run. The key is found by its file name,
+  `K<host>.<domain>.+<algorithm>+<keytag>`. When more than one key in the directory matches, the
+  client uses the first in a fixed order (ED25519 keys first, then the others, each sorted by
+  file name) and prints a warning naming them all; every run picks the same key. Since a
+  registrar binds the name to the key, keep one key per identity directory.
 
 `go run ./cmd/sig0lease-srp-client -h` lists every flag.

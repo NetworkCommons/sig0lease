@@ -961,7 +961,11 @@ run_all_tests() {
     echo "Summary of what was tested:"
     echo -e "$PERFORMED_TESTS"
     echo ""
-    echo "Proxy process was exercised at $PROXY_URL"
+    if [ "$PROXY_PROTOCOL" = "tls" ]; then
+        echo "Proxy process was exercised at $PROXY_TLS_URL over tls"
+    else
+        echo "Proxy process was exercised at $PROXY_URL over $PROXY_PROTOCOL"
+    fi
     echo "Logs: $LOG_FILE"
 }
 
@@ -977,6 +981,9 @@ cleanup() {
 
     stop_proxy
 
+    if [ -n "$TMP_TLS_DIR" ] && [ -d "$TMP_TLS_DIR" ]; then
+        rm -rf "$TMP_TLS_DIR"
+    fi
     if [ -n "$TMP_CONFIG_FILE" ] && [ -f "$TMP_CONFIG_FILE" ]; then
         rm -f "$TMP_CONFIG_FILE"
     fi

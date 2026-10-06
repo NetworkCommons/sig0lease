@@ -8,7 +8,8 @@ those files follow.
 
 Only `test_srp.sh` is self-contained: real proxy process, real client (`cmd/sig0lease-srp-client`), a local
 disposable BIND 9 (`lib/bind9.sh`, zone `srp.test.`) — nothing outside this repo required
-beyond `go`, `named`/`named-checkconf`, and `dig`.
+beyond `go`, `named`/`named-checkconf`, `dig`, and `openssl` (for the throwaway certificate of
+the proxy's DNS-over-TLS listener, which TEST 9 registers through).
 
 `test_update.sh` and `test_forward.sh` run against the **real DNS**, not a local BIND 9. Both
 start the proxy from a copy of `main/config.yaml` (only the listen address and the minimum
@@ -22,7 +23,10 @@ leases are rewritten), so they also use its lease-store files under `data/`.
   `CLIENT_KEYSTORE_DIR` (see the Makefile's `test-update` target). Overridable via env:
   `AUTH_SERVER`, `PROXY_ADDR`/`PROXY_PORT` (a proxy already listening there is reused instead
   of starting one), `PROXY_PROTOCOL`, `CLIENT_KEY_NAME`, `RR_TYPES` and the lease times. The
-  config file, the zones and the proxy key are fixed.
+  config file, the zones and the proxy key are fixed. `PROXY_PROTOCOL` is `udp` (default),
+  `tcp`, or `tls`: with `tls` the client sends DNS-over-TLS to `PROXY_ADDR:PROXY_TLS_PORT`
+  (default 8853). A proxy the script starts gets that listener turned on in its scratch config,
+  with a throwaway certificate (needs `openssl`); a reused proxy must already serve DoT there.
 - `test_forward.sh` needs internet access: it resolves public names (google.com, gmail.com,
   ...) through the proxy's configured upstream resolvers.
 

@@ -338,6 +338,34 @@ server:
     key: /path/to/key.pem
 ```
 
+The proxy uses this one certificate for as long as it runs; nothing generates one for it. A
+self-signed certificate is enough, since no client checks it (see below). Create it once and
+keep it, for example:
+
+```bash
+openssl ecparam -name prime256v1 -genkey -noout -out key.pem
+openssl req -new -x509 -key key.pem -out cert.pem -days 3650 -subj "/CN=proxy.example"
+```
+
+Generating a new certificate at every start would work for today's clients, but a long-lived
+one keeps the option of key pinning (RFC 7858 §4.2), where a client is configured with the
+proxy's key in advance, and pinning needs a key that does not change. RFC 9665 §6.5 mentions
+pinning for SRP registrars and leaves it out of scope; it is not implemented here.
+
+Both clients can send over DoT: `sig0lease-client <dot-address> ... --tls` and
+`sig0lease-srp-client -tls` (with `-server`, give the DoT address; without it, discovery uses the
+`_dnssd-srp-tls._tcp` record, see `docs/siglease_rfc9665.md`). Both use RFC 7858 §4.1's
+Opportunistic Privacy profile, the only one RFC 9665 §7 uses for SRP: the client encrypts but
+does not check the server's certificate, so it is protected against passive eavesdroppers but
+not against an active attacker in the path. Neither client falls back to plain TCP or UDP when
+TLS fails.
+
+The transport is tested at three levels. `server/transport_tls_test.go` sends a query from
+`client.New(..., "tls", ...)` to the real DoT listener. `PROXY_PROTOCOL=tls` runs the whole
+`tests/test_update.sh` suite over DoT, against a listener the script turns on in its scratch
+config with a throwaway certificate. `tests/test_srp.sh`'s TEST 9 discovers the registrar
+through `_dnssd-srp-tls._tcp` and registers over DoT.
+
 ## Project Layout
 
 - `cmd/sig0lease/` - proxy entrypoint

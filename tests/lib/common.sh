@@ -36,10 +36,14 @@ CLIENT_LOG_FILE="/tmp/sig0lease_client.log"
 PROXY_ADDR="${PROXY_ADDR:-127.0.0.1}"
 PROXY_PORT="${PROXY_PORT:-8053}"
 PROXY_URL="$PROXY_ADDR:$PROXY_PORT"
-# Transport run_client (tests/lib/client.sh) uses to reach PROXY_URL.
+# Transport run_client (tests/lib/client.sh) uses to reach the proxy.
 # Defaults to udp; set PROXY_PROTOCOL=tcp to run the whole suite over TCP
-# instead (passes --tcp through to sig0lease-client).
+# instead (passes --tcp through to sig0lease-client), or PROXY_PROTOCOL=tls
+# for DNS-over-TLS (--tls), sent to PROXY_TLS_URL: the proxy's DoT listener,
+# which prepare_lease_config turns on in the scratch config it writes.
 PROXY_PROTOCOL="${PROXY_PROTOCOL:-udp}"
+PROXY_TLS_PORT="${PROXY_TLS_PORT:-8853}"
+PROXY_TLS_URL="$PROXY_ADDR:$PROXY_TLS_PORT"
 
 AUTH_SERVER="${AUTH_SERVER:-ns1.free2air.org}"
 PROXY_KEYSTORE_DIR="./keystore/server"
@@ -47,6 +51,7 @@ PROXY_KEY_NAME="${PROXY_KEYSTORE_DIR}/Kdev.zenr.io.+015+35317.key"
 
 # Configuration
 TMP_CONFIG_FILE=""
+TMP_TLS_DIR="" # holds the DoT listener's throwaway certificate when PROXY_PROTOCOL=tls
 LEASE_CONFIG_FILE="$CONFIG_FILE"
 LEASE_CONFIG_PREPARED=false
 REUSED_PROXY=false
@@ -120,6 +125,24 @@ log_file() {
 require_command() {
     if ! command -v "$1" >/dev/null 2>&1; then
         log_error "Required command not found: $1"
+        return 1
+    fi
+}
+
+# make_tls_cert <dir> -- writes a fresh self-signed ECDSA P-256 certificate (cert.pem) and its
+# private key (key.pem) into dir, for a test proxy's DNS-over-TLS listener (server.tls). The
+# project's clients use opportunistic DoT and never check the certificate, so a throwaway one
+# per run is enough. Plain ecparam/req subcommands, which OpenSSL and macOS's LibreSSL both
+# have.
+make_tls_cert() {
+    local dir="$1"
+    require_command openssl || return 1
+    if ! openssl ecparam -name prime256v1 -genkey -noout -out "$dir/key.pem"; then
+        log_error "openssl could not generate the DoT listener's key in $dir"
+        return 1
+    fi
+    if ! openssl req -new -x509 -key "$dir/key.pem" -out "$dir/cert.pem" -days 1 -subj "/CN=sig0lease-test"; then
+        log_error "openssl could not generate the DoT listener's certificate in $dir"
         return 1
     fi
 }

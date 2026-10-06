@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 
 	"codeberg.org/miekg/dns"
@@ -118,8 +119,9 @@ func ListKeysInDirectory(keystoreDir string, logger *logging.Logger) ([]string, 
 }
 
 // FindKeysByZone searches for keys by zone name in the keystore.
-// Returns the key names. possibly none.
-// First searches ED25519 (algorithm 15) and then other algorithms.
+// Returns the key names, possibly none, in a fixed order: ED25519 (algorithm 15) keys
+// first, then keys of any other algorithm, each group sorted alphabetically. The order is
+// fixed so that a caller taking the first name picks the same key on every run.
 // Provenance: Inspired by sig0namectl's LoadOrGenerateKey()
 func FindKeysByZone(keystoreDir, zoneName string, logger *logging.Logger) ([]string, error) {
 	if !strings.HasSuffix(zoneName, ".") {
@@ -131,8 +133,6 @@ func FindKeysByZone(keystoreDir, zoneName string, logger *logging.Logger) ([]str
 		return nil, err
 	}
 
-	keyNamesSet := make(map[string]struct{}, 10)
-
 	// Key filenames are in format: Kzone.+algorithm+keytag
 	// Look for a key that starts with this zone name. The trailing "+"
 	// anchors the match to the label boundary between the zone name and the
@@ -142,30 +142,21 @@ func FindKeysByZone(keystoreDir, zoneName string, logger *logging.Logger) ([]str
 	// prefix match does not respect that.
 	prefix := "K" + zoneName + "+"
 
-	// First pass: look for ED25519 (algorithm 15)
+	var ed25519Keys, otherKeys []string
 	for _, keyName := range keys {
-		if strings.HasPrefix(keyName, prefix) && strings.Contains(keyName, "+015+") {
-			if _, exists := keyNamesSet[keyName]; !exists {
-				keyNamesSet[keyName] = struct{}{}
-			}
+		suffix, ok := strings.CutPrefix(keyName, prefix)
+		if !ok {
+			continue
+		}
+		if strings.HasPrefix(suffix, "015+") {
+			ed25519Keys = append(ed25519Keys, keyName)
+		} else {
+			otherKeys = append(otherKeys, keyName)
 		}
 	}
-
-	// Second pass: return any other algorithm if ED25519 not found
-	for _, keyName := range keys {
-		if strings.HasPrefix(keyName, prefix) {
-			if _, exists := keyNamesSet[keyName]; !exists {
-				keyNamesSet[keyName] = struct{}{}
-			}
-		}
-	}
-	// Pre-allocate slice with the exact size of the map
-	keyNames := make([]string, 0, len(keyNamesSet))
-
-	for key := range keyNamesSet {
-		keyNames = append(keyNames, key)
-	}
-	return keyNames, nil
+	slices.Sort(ed25519Keys)
+	slices.Sort(otherKeys)
+	return append(ed25519Keys, otherKeys...), nil
 }
 
 // KeyExists searches for a key by filename without .key in the keystore.

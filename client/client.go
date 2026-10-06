@@ -3,6 +3,7 @@ package client
 
 import (
 	"context"
+	"crypto/tls"
 	"fmt"
 	"net"
 	"time"
@@ -18,7 +19,8 @@ type Client struct {
 	dnsClient *dns.Client
 }
 
-// New creates a new DNS client.
+// New creates a new DNS client. protocol is "udp" (the default), "tcp", or "tls" for
+// DNS-over-TLS (RFC 7858) with the Opportunistic Privacy profile (see opportunisticTLS).
 func New(server string, protocol string, timeout time.Duration) *Client {
 	if protocol == "" {
 		protocol = "udp"
@@ -37,6 +39,11 @@ func New(server string, protocol string, timeout time.Duration) *Client {
 		ReadTimeout:  timeout,
 		WriteTimeout: timeout,
 	}
+	if protocol == "tls" {
+		// With a TLSConfig, the transport dials TLS over the "tcp" network queryTCP asks
+		// for: DoT is the TCP exchange inside TLS.
+		dnsClient.Transport.TLSConfig = opportunisticTLS()
+	}
 
 	return &Client{
 		server:    server,
@@ -49,7 +56,7 @@ func New(server string, protocol string, timeout time.Duration) *Client {
 // Query sends a DNS query and returns the response.
 func (c *Client) Query(msg *dns.Msg) (*dns.Msg, error) {
 	switch c.protocol {
-	case "tcp":
+	case "tcp", "tls":
 		return c.queryTCP(msg)
 	case "udp":
 		return c.queryUDP(msg)
@@ -120,7 +127,22 @@ func (c *Client) queryUDP(msg *dns.Msg) (*dns.Msg, error) {
 	return resp, nil
 }
 
-// queryTCP sends a DNS query over TCP.
+// opportunisticTLS is the TLS configuration for "tls": DNS-over-TLS with RFC 7858 S4.1's
+// Opportunistic Privacy profile. For SRP it is the only profile RFC 9665 S7 uses, since there
+// is no way to share a registrar's key with its requesters, and the proxy's DoT listener
+// offers nothing else either. The server's certificate is not checked, so the connection is
+// encrypted but the server is not authenticated: it protects against passive eavesdroppers,
+// not against an active attacker in the path. NextProtos offers the "dot" ALPN identifier
+// the proxy's own DoT listener advertises (server/transport_tls.go).
+func opportunisticTLS() *tls.Config {
+	return &tls.Config{
+		InsecureSkipVerify: true,
+		NextProtos:         dns.NextProtos,
+	}
+}
+
+// queryTCP sends a DNS query over TCP, or over TLS when New configured the transport for
+// "tls".
 func (c *Client) queryTCP(msg *dns.Msg) (*dns.Msg, error) {
 	// Use miekg/dns client for TCP - Exchange returns (msg, rtt, err)
 	ctx, cancel := context.WithTimeout(context.Background(), c.timeout)

@@ -35,7 +35,9 @@ type Client struct {
     Client represents a DNS client for sending queries.
 
 func New(server string, protocol string, timeout time.Duration) *Client
-    New creates a new DNS client.
+    New creates a new DNS client. protocol is "udp" (the default), "tcp",
+    or "tls" for DNS-over-TLS (RFC 7858) with the Opportunistic Privacy profile
+    (see opportunisticTLS).
 
 func (c *Client) Query(msg *dns.Msg) (*dns.Msg, error)
     Query sends a DNS query and returns the response.
@@ -56,17 +58,21 @@ configured zone, reached over TCP by default.
 
 FUNCTIONS
 
-func Discover(ctx context.Context, query DNSQuery, domain string, mode DiscoveryMode) (string, error)
-    Discover finds the SRP registrar for domain. As RFC 9665 S3.1.1 specifies,
-    it first finds the apex of the closest DNS zone enclosing domain with SOA
-    queries (RFC 8765 S6.1, see zoneApex). It then looks up the SRV record at
-    "_dnssd-srp._tcp.<name>." -- the service name RFC 9665 S10.4.1 registers,
-    in RFC 6763 S7's "_<service>._tcp" form -- for each name mode selects (see
-    DiscoveryMode), in order, and stops at the first name that has one. It never
-    looks above the apex: a zone cut separates authority, so a registrar named
-    in the parent zone speaks for nothing in the child. A failed query ends
-    the search with its error instead of moving on to the next name, since the
-    name it could not ask about may hold the answer. The best (lowest-priority,
+func Discover(ctx context.Context, query DNSQuery, domain string, mode DiscoveryMode, network Network) (string, error)
+    Discover finds the SRP registrar for domain that is reachable over network.
+    As RFC 9665 S3.1.1 specifies, it first finds the apex of the closest DNS
+    zone enclosing domain with SOA queries (RFC 8765 S6.1, see zoneApex).
+    It then looks up the SRV record at "<service>.<name>.", where service
+    is network's DiscoveryService -- "_dnssd-srp-tls._tcp" for NetworkTLS,
+    "_dnssd-srp._tcp" otherwise, the service names RFC 9665 S10.4 registers
+    in RFC 6763 S7's "_<service>._tcp" form -- for each name mode selects
+    (see DiscoveryMode), in order, and stops at the first name that has one.
+    A NetworkTLS search never falls back to "_dnssd-srp._tcp": S7 says a
+    requester able to use TLS SHOULD NOT fall back to TCP. It never looks
+    above the apex: a zone cut separates authority, so a registrar named in
+    the parent zone speaks for nothing in the child. A failed query ends the
+    search with its error instead of moving on to the next name, since the name
+    it could not ask about may hold the answer. The best (lowest-priority,
     highest-weight-among-ties) SRV target is then resolved to an address with
     the same query, so every step of discovery asks the same resolvers: a target
     that only those resolvers know (a lab DNS, the local BIND 9 test zone) still
@@ -160,14 +166,15 @@ type Config struct {
 
 	// RegistrarAddr, if set, bypasses discovery entirely -- an explicit "host:port",
 	// matching every other test/dev client this project's test suite already uses.
-	// Discovery (the `_dnssd-srp._tcp` SRV closest to Domain within its zone, or at the
-	// zone apex only -- see Discover and Discovery) is the fallback when this is empty.
+	// Discovery (the `_dnssd-srp._tcp` SRV, or `_dnssd-srp-tls._tcp` for NetworkTLS,
+	// closest to Domain within its zone, or at the zone apex only -- see Discover and
+	// Discovery) is the fallback when this is empty.
 	RegistrarAddr string
 	Discovery     DiscoveryMode // where discovery looks for the SRV; DiscoveryClosest (the zero value) by default
 	Resolvers     []string      // bootstrap resolvers for discovery; LiveDNSQuery's default if empty
 	Query         DNSQuery      // discovery implementation; LiveDNSQuery(Resolvers) if nil
 
-	UseTCP     bool          // default true (S3.5's MUST for non-constrained networks)
+	Network    Network       // default NetworkTCP (S3.5's MUST for non-constrained networks)
 	Timeout    time.Duration // per-request transport timeout; default 20s
 	MaxRenames int           // default 5 -- rename-retry attempts before giving up on YXDOMAIN
 
@@ -207,8 +214,8 @@ func LiveDNSQuery(resolvers []string) DNSQuery
     error.
 
 type DiscoveryMode int
-    DiscoveryMode selects the names Discover looks under for the registrar's
-    "_dnssd-srp._tcp" SRV record.
+    DiscoveryMode selects the names Discover looks under for the registrar's SRV
+    record.
 
 const (
 	// DiscoveryClosest, the default, looks under the registration domain first, then under
@@ -242,10 +249,36 @@ type InstanceConfig struct {
     fully-qualified names when building the update (pkg/srp.BuildUpdate itself
     takes only already-qualified names).
 
-type Transport func(ctx context.Context, addr string, useTCP bool, msg *dns.Msg) (*dns.Msg, error)
-    Transport sends a signed SRP UPDATE to addr and returns the response.
-    Config.Send defaults to a real network implementation (see liveTransport);
-    tests inject a fake.
+type Network int
+    Network is how a Client reaches its registrar.
+
+const (
+	// NetworkTCP, the default, is plain DNS over TCP, which RFC 9665 S3.5 requires on
+	// networks that are not constrained.
+	NetworkTCP Network = iota
+	// NetworkTLS is DNS-over-TLS (RFC 7858). The registrar's certificate is not checked:
+	// RFC 9665 S7 has no way to share the registrar's key, so TLS gives Opportunistic
+	// Privacy only (RFC 7858 S4.1). Discovery looks for the "_dnssd-srp-tls._tcp" SRV record
+	// instead of "_dnssd-srp._tcp", and nothing falls back to plain TCP (S7: a requester
+	// able to use TLS SHOULD NOT).
+	NetworkTLS
+	// NetworkUDP is for constrained networks (RFC 9665 S3.1.2): a registrar accepts it only
+	// where it allows UDP.
+	NetworkUDP
+)
+func (n Network) DiscoveryService() string
+    DiscoveryService returns the service whose SRV record names a registrar
+    reachable over n: "_dnssd-srp-tls._tcp" for NetworkTLS (RFC 9665 S10.4.2),
+    "_dnssd-srp._tcp" otherwise (S10.4.1).
+
+func (n Network) String() string
+    String returns the protocol name the base client package (client.New) takes
+    for n.
+
+type Transport func(ctx context.Context, addr string, network Network, msg *dns.Msg) (*dns.Msg, error)
+    Transport sends a signed SRP UPDATE to addr over network and returns
+    the response. Config.Send defaults to a real network implementation (see
+    liveTransport); tests inject a fake.
 
 ```
 
@@ -1064,8 +1097,10 @@ FUNCTIONS
 
 func FindKeysByZone(keystoreDir, zoneName string, logger *logging.Logger) ([]string, error)
     FindKeysByZone searches for keys by zone name in the keystore. Returns the
-    key names. possibly none. First searches ED25519 (algorithm 15) and then
-    other algorithms. Provenance: Inspired by sig0namectl's LoadOrGenerateKey()
+    key names, possibly none, in a fixed order: ED25519 (algorithm 15) keys
+    first, then keys of any other algorithm, each group sorted alphabetically.
+    The order is fixed so that a caller taking the first name picks the same key
+    on every run. Provenance: Inspired by sig0namectl's LoadOrGenerateKey()
 
 func KeyExists(keystoreDir, keyName string, logger *logging.Logger) error
     KeyExists searches for a key by filename without .key in the keystore.
@@ -1120,11 +1155,14 @@ func ResolveOrCreateKey(dir, owner string, createAlgorithm uint8, logger *loggin
     (via FindKeysByZone's own "any algorithm, ED25519 preferred" ordering):
     an existing key of ANY algorithm satisfies the lookup, since createAlgorithm
     only says what to generate if nothing is found yet, not which algorithm
-    to prefer among what already exists. created reports whether a new key was
-    generated, so callers can tell the user which happened. createAlgorithm
-    == 0 means "never create" -- a missing key is then an error, not silently
-    generated, matching this package's existing strict-by-default convention
-    (see cmd/sig0lease-client's historical behavior, which this generalizes).
+    to prefer among what already exists. When several keys match, the first
+    in FindKeysByZone's order is used, so every run picks the same one, and
+    logger (if non-nil) gets a warning naming them all. created reports whether
+    a new key was generated, so callers can tell the user which happened.
+    createAlgorithm == 0 means "never create" -- a missing key is then an error,
+    not silently generated, matching this package's existing strict-by-default
+    convention (see cmd/sig0lease-client's historical behavior, which this
+    generalizes).
 
     This is shared, rather than reimplemented per caller, because both of this
     project's CLI clients (cmd/sig0lease-client, cmd/sig0lease-srp-client) need

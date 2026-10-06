@@ -40,9 +40,60 @@ type InstanceConfig struct {
 	Remove bool
 }
 
-// Transport sends a signed SRP UPDATE to addr and returns the response. Config.Send
-// defaults to a real network implementation (see liveTransport); tests inject a fake.
-type Transport func(ctx context.Context, addr string, useTCP bool, msg *dns.Msg) (*dns.Msg, error)
+// Transport sends a signed SRP UPDATE to addr over network and returns the response.
+// Config.Send defaults to a real network implementation (see liveTransport); tests inject a
+// fake.
+type Transport func(ctx context.Context, addr string, network Network, msg *dns.Msg) (*dns.Msg, error)
+
+// Network is how a Client reaches its registrar.
+type Network int
+
+const (
+	// NetworkTCP, the default, is plain DNS over TCP, which RFC 9665 S3.5 requires on
+	// networks that are not constrained.
+	NetworkTCP Network = iota
+	// NetworkTLS is DNS-over-TLS (RFC 7858). The registrar's certificate is not checked:
+	// RFC 9665 S7 has no way to share the registrar's key, so TLS gives Opportunistic
+	// Privacy only (RFC 7858 S4.1). Discovery looks for the "_dnssd-srp-tls._tcp" SRV record
+	// instead of "_dnssd-srp._tcp", and nothing falls back to plain TCP (S7: a requester
+	// able to use TLS SHOULD NOT).
+	NetworkTLS
+	// NetworkUDP is for constrained networks (RFC 9665 S3.1.2): a registrar accepts it only
+	// where it allows UDP.
+	NetworkUDP
+)
+
+// String returns the protocol name the base client package (client.New) takes for n.
+func (n Network) String() string {
+	switch n {
+	case NetworkTCP:
+		return "tcp"
+	case NetworkTLS:
+		return "tls"
+	case NetworkUDP:
+		return "udp"
+	default:
+		return fmt.Sprintf("Network(%d)", int(n))
+	}
+}
+
+func (n Network) validate() error {
+	switch n {
+	case NetworkTCP, NetworkTLS, NetworkUDP:
+		return nil
+	}
+	return fmt.Errorf("unknown Network %d", n)
+}
+
+// DiscoveryService returns the service whose SRV record names a registrar reachable over n:
+// "_dnssd-srp-tls._tcp" for NetworkTLS (RFC 9665 S10.4.2), "_dnssd-srp._tcp" otherwise
+// (S10.4.1).
+func (n Network) DiscoveryService() string {
+	if n == NetworkTLS {
+		return "_dnssd-srp-tls._tcp"
+	}
+	return "_dnssd-srp._tcp"
+}
 
 // Config configures a Client. See NewClient's doc comment for defaults.
 type Config struct {
@@ -61,14 +112,15 @@ type Config struct {
 
 	// RegistrarAddr, if set, bypasses discovery entirely -- an explicit "host:port",
 	// matching every other test/dev client this project's test suite already uses.
-	// Discovery (the `_dnssd-srp._tcp` SRV closest to Domain within its zone, or at the
-	// zone apex only -- see Discover and Discovery) is the fallback when this is empty.
+	// Discovery (the `_dnssd-srp._tcp` SRV, or `_dnssd-srp-tls._tcp` for NetworkTLS,
+	// closest to Domain within its zone, or at the zone apex only -- see Discover and
+	// Discovery) is the fallback when this is empty.
 	RegistrarAddr string
 	Discovery     DiscoveryMode // where discovery looks for the SRV; DiscoveryClosest (the zero value) by default
 	Resolvers     []string      // bootstrap resolvers for discovery; LiveDNSQuery's default if empty
 	Query         DNSQuery      // discovery implementation; LiveDNSQuery(Resolvers) if nil
 
-	UseTCP     bool          // default true (S3.5's MUST for non-constrained networks)
+	Network    Network       // default NetworkTCP (S3.5's MUST for non-constrained networks)
 	Timeout    time.Duration // per-request transport timeout; default 20s
 	MaxRenames int           // default 5 -- rename-retry attempts before giving up on YXDOMAIN
 
@@ -134,6 +186,9 @@ func NewClient(cfg Config) (*Client, error) {
 	if err := cfg.Discovery.validate(); err != nil {
 		return nil, fmt.Errorf("srp/client: Discovery: %w", err)
 	}
+	if err := cfg.Network.validate(); err != nil {
+		return nil, fmt.Errorf("srp/client: Network: %w", err)
+	}
 	if cfg.RequestedLease == 0 {
 		cfg.RequestedLease = 3600
 	}
@@ -185,7 +240,7 @@ func (c *Client) registrarAddr(ctx context.Context) (string, error) {
 	if c.cfg.RegistrarAddr != "" {
 		return c.cfg.RegistrarAddr, nil
 	}
-	return Discover(ctx, c.cfg.Query, c.cfg.Domain, c.cfg.Discovery)
+	return Discover(ctx, c.cfg.Query, c.cfg.Domain, c.cfg.Discovery, c.cfg.Network)
 }
 
 func (c *Client) hostFQDN() string {
@@ -268,7 +323,7 @@ func (c *Client) buildSignSend(ctx context.Context, addresses []netip.Addr, inst
 		return nil, 0, fmt.Errorf("srp/client: sign update: %w", err)
 	}
 
-	resp, err := c.cfg.Send(ctx, addr, c.cfg.UseTCP, signed)
+	resp, err := c.cfg.Send(ctx, addr, c.cfg.Network, signed)
 	if err != nil {
 		return nil, 0, fmt.Errorf("srp/client: send update to %s: %w", addr, err)
 	}
@@ -403,15 +458,11 @@ func ctxSleep(ctx context.Context, d time.Duration) error {
 	}
 }
 
-// liveTransport sends msg to addr over UDP or TCP using the existing base client package,
+// liveTransport sends msg to addr over network using the existing base client package,
 // the same transport every other client/test tool in this codebase already uses.
 func liveTransport(timeout time.Duration) Transport {
-	return func(ctx context.Context, addr string, useTCP bool, msg *dns.Msg) (*dns.Msg, error) {
-		protocol := "udp"
-		if useTCP {
-			protocol = "tcp"
-		}
-		c := baseclient.New(addr, protocol, timeout)
+	return func(ctx context.Context, addr string, network Network, msg *dns.Msg) (*dns.Msg, error) {
+		c := baseclient.New(addr, network.String(), timeout)
 		return c.Query(msg)
 	}
 }

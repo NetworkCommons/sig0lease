@@ -19,8 +19,9 @@ CLIENT_BIN="${TESTS_DIR}/../bin/${OS}/sig0lease-client"
 # concatenation, so rr-specs containing spaces/quotes are safe).
 # Transport is controlled by PROXY_PROTOCOL (see lib/common.sh; defaults to
 # udp, same udp-unless-told-otherwise mechanism as PROXY_ADDR/PROXY_PORT) --
-# every call site gets --tcp for free when PROXY_PROTOCOL=tcp, no call site
-# needs to pass it itself.
+# every call site gets --tcp for free when PROXY_PROTOCOL=tcp, or --tls and
+# the proxy's DoT address (PROXY_TLS_URL) when PROXY_PROTOCOL=tls; no call
+# site needs to pass either itself.
 run_client() {
     require_client_keystore_dir || return 1
 
@@ -30,13 +31,23 @@ run_client() {
     local key_lease_seconds="$4"
     shift 4
     local extra=("$@")
-    if [ "$PROXY_PROTOCOL" = "tcp" ]; then
-        extra+=(--tcp)
-    fi
+    local url="$PROXY_URL"
+    case "$PROXY_PROTOCOL" in
+        udp) ;;
+        tcp) extra+=(--tcp) ;;
+        tls)
+            extra+=(--tls)
+            url="$PROXY_TLS_URL"
+            ;;
+        *)
+            log_error "Unknown PROXY_PROTOCOL=$PROXY_PROTOCOL (want udp, tcp or tls)"
+            return 1
+            ;;
+    esac
 
     log_file run_client "operation=$operation keyname=$keyname lease=$lease_seconds key_lease=$key_lease_seconds extra=${extra[*]:-}"
-    echo "CLIENT_KEYSTORE_DIR=\"$CLIENT_KEYSTORE_DIR\" \"$CLIENT_BIN\" \"$PROXY_URL\" $operation \"$keyname\" $lease_seconds $key_lease_seconds ${extra[*]:-}"
-    CLIENT_KEYSTORE_DIR="$CLIENT_KEYSTORE_DIR" "$CLIENT_BIN" "$PROXY_URL" "$operation" "$keyname" "$lease_seconds" "$key_lease_seconds" "${extra[@]}"
+    echo "CLIENT_KEYSTORE_DIR=\"$CLIENT_KEYSTORE_DIR\" \"$CLIENT_BIN\" \"$url\" $operation \"$keyname\" $lease_seconds $key_lease_seconds ${extra[*]:-}"
+    CLIENT_KEYSTORE_DIR="$CLIENT_KEYSTORE_DIR" "$CLIENT_BIN" "$url" "$operation" "$keyname" "$lease_seconds" "$key_lease_seconds" "${extra[@]}"
 }
 
 # verify_keystore checks that the two well-known test keys this suite relies
