@@ -41,6 +41,27 @@ func TestSRPSetup_DefaultStorageIsInMemory(t *testing.T) {
 	}
 }
 
+// TestSRPSetup_UpstreamZoneTrimmed: see TestSetup_UpstreamZoneTrimmed.
+func TestSRPSetup_UpstreamZoneTrimmed(t *testing.T) {
+	cfg := baseSRPSetupCfg(t)
+	cfg["upstream_zone"] = "  " + srpTestZone + "\t"
+	h := NewSRPHandler()
+	h.SetLogger(logging.NewLogger("debug"))
+	if err := h.Setup(cfg); err != nil {
+		t.Fatalf("Setup returned error: %v", err)
+	}
+	if h.upstreamZone != srpTestZone {
+		t.Fatalf("upstreamZone = %q, want %q", h.upstreamZone, srpTestZone)
+	}
+
+	cfg["upstream_zone"] = "   "
+	h = NewSRPHandler()
+	h.SetLogger(logging.NewLogger("debug"))
+	if err := h.Setup(cfg); err == nil {
+		t.Fatal("expected a whitespace-only upstream_zone to be rejected as missing")
+	}
+}
+
 func TestSRPSetup_StorageTypeFile_CreatesFileBackedStore(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "srp_lease_snapshot.json")
 	cfg := baseSRPSetupCfg(t)
