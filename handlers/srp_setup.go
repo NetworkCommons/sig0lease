@@ -2,6 +2,7 @@ package handlers
 
 import (
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/NetworkCommons/sig0lease/pkg/updatecore"
@@ -42,8 +43,11 @@ import (
 //     as UpdateHandler.Setup -- see that method's doc comment for the full shape.
 //     [OPTIONAL, defaults to an in-memory store with no persistence]
 func (h *SRPHandler) Setup(cfg map[string]any) error {
-	zone, ok := cfg["upstream_zone"].(string)
-	if !ok || zone == "" {
+	// Surrounding whitespace is trimmed here, where the name comes from configuration:
+	// dnsname.Normalize keeps it, since a DNS label may begin with a space.
+	zone, _ := cfg["upstream_zone"].(string)
+	zone = strings.TrimSpace(zone)
+	if zone == "" {
 		return fmt.Errorf("upstream_zone is required in config")
 	}
 	h.upstreamZone = zone

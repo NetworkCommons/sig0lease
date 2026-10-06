@@ -101,13 +101,15 @@ func parseStringSlice(raw any) []string {
 //   - "allow_online_key_registration": Allow a signer resolved only via authoritative DNS
 //     (not lease-managed, not present in the request) to register new KEY RRs [OPTIONAL, defaults to false]
 func (h *UpdateHandler) Setup(cfg map[string]any) error {
-	// Extract upstream zone
-	if zone, ok := cfg["upstream_zone"].(string); ok && zone != "" {
-		h.upstreamZone = zone
-		h.logger.Debugf("UpdateHandler upstream zone: %s", zone)
-	} else {
+	// Extract upstream zone. Surrounding whitespace is trimmed here, where the name comes from
+	// configuration: dnsname.Normalize keeps it, since a DNS label may begin with a space.
+	zone, _ := cfg["upstream_zone"].(string)
+	zone = strings.TrimSpace(zone)
+	if zone == "" {
 		return fmt.Errorf("upstream_zone is required in config")
 	}
+	h.upstreamZone = zone
+	h.logger.Debugf("UpdateHandler upstream zone: %s", zone)
 
 	// Keystore directory - required for loading keys
 	keystoreDir, ok := cfg["keystore_dir"].(string)

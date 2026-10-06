@@ -271,8 +271,11 @@ func appendDomainName(buf []byte, name string) []byte {
 	return buf
 }
 
+// canonicalDomainName is name in RFC 4034 S6.2 canonical form, ASCII case folded, with every
+// other byte kept -- a leading space included, since a label may begin with one, and the
+// signature is checked against the name exactly as sent.
 func canonicalDomainName(name string) string {
-	name = strings.TrimSpace(dnsname.Fold(name))
+	name = dnsname.Fold(name)
 	if name == "" || name == "." {
 		return "."
 	}

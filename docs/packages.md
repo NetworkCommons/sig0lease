@@ -946,10 +946,12 @@ func Labels(name string) []string
 
 func Normalize(name string) string
     Normalize returns the form the lease store, the handlers and pkg/updatecore
-    compare and key names by: surrounding whitespace trimmed (zone names also
-    arrive from configuration), ASCII case folded (see Fold), and the trailing
-    dot removed, so "Demo.Example.", "demo.example" and " demo.example. " all
-    normalize to "demo.example".
+    compare and key names by: ASCII case folded (see Fold) and the trailing
+    dot removed, so "Demo.Example." and "demo.example" both normalize to
+    "demo.example". It does not trim whitespace: a label may begin with a
+    space or U+00A0 (RFC 6763 S4.1.1 allows any non-control character),
+    so " demo.example." is a different name. A name read from configuration is
+    trimmed where it is read (the handlers' Setup), not here.
 
 ```
 
@@ -1555,8 +1557,14 @@ const (
 	NodeKindNonKEY NodeKind = "non-key"
 )
 type NodeSnapshot struct {
-	NodeKind      NodeKind  `json:"node_kind"`
-	NodeID        string    `json:"node_id"` // composite identity: KEY -> NodeKey(keyRR), non-KEY -> RecordKey(rr)
+	NodeKind NodeKind `json:"node_kind"`
+	// NodeID is a KEY node's NodeKey(keyRR), the value its children's ParentKeyName holds. It
+	// is written so a reader can match the two up, and import checks it against the key in
+	// RRWire: the file's checksum (snapshotFile) refuses a hand edit, and this check refuses a
+	// file whose IDs aren't the ones the store computes. A non-KEY node's RecordKey(rr) is
+	// derived from RRWire instead; nothing refers to it. Both fields hold names, so any bytes,
+	// but a JSON string only valid UTF-8: they are written with quoteNodeKey's escapes.
+	NodeID        string    `json:"node_id,omitempty"`
 	ParentKeyName string    `json:"parent_key_name,omitempty"`
 	RRType        uint16    `json:"rr_type,omitempty"`
 	UpstreamZone  string    `json:"upstream_zone"`
@@ -1566,16 +1574,16 @@ type NodeSnapshot struct {
 
 	// KEY-only.
 	KeyLeaseDuration uint32 `json:"key_lease_duration,omitempty"`
-	RRName           string `json:"rr_name,omitempty"`
-	RRClass          uint16 `json:"rr_class,omitempty"`
-	RRTTL            uint32 `json:"rr_ttl,omitempty"`
-	KeyFlags         uint16 `json:"key_flags,omitempty"`
-	KeyProtocol      uint8  `json:"key_protocol,omitempty"`
-	KeyAlgorithm     uint8  `json:"key_algorithm,omitempty"`
-	KeyData          string `json:"key_data,omitempty"`
 
-	// non-KEY-only: full presentation-format RR, reparsed via dns.New on import.
-	RRText string `json:"rr_text,omitempty"`
+	// The node's RR, KEY or not. RRWire is the RR in DNS wire format (base64 in the JSON), and
+	// the only field import rebuilds the record from. Wire format keeps every octet of every
+	// name: a DNS-SD Instance label may hold spaces (RFC 6763 S4.1.1), which presentation text
+	// can't carry with this dns library (it neither escapes nor unescapes them), and a subtype
+	// label arbitrary 8-bit bytes (S7.1), which a JSON string can't carry. RRDisplay is the
+	// same RR as rr.String(), for people reading the file; it is never read back, though the
+	// file's checksum still covers it, so editing it fails the load like any other edit.
+	RRWire    []byte `json:"rr_wire"`
+	RRDisplay string `json:"rr_display"`
 }
     NodeSnapshot is a persisted tree node row -- KEY or non-KEY, discriminated
     by NodeKind. Which of the KEY-only / non-KEY-only fields below are populated

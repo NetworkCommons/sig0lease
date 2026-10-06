@@ -34,7 +34,10 @@ func TestNormalize(t *testing.T) {
 	}{
 		{"Demo.Example.", "demo.example"},
 		{"demo.example", "demo.example"},
-		{" demo.example. ", "demo.example"},
+		// Whitespace is kept: a label may begin with it (RFC 6763 S4.1.1), so these name
+		// different nodes than "demo.example".
+		{" demo.example.", " demo.example"},
+		{"\u00a0Demo.example.", "\u00a0demo.example"},
 		{"CAFÉ.example.", "cafÉ.example"},
 		{".", ""},
 		{"", ""},

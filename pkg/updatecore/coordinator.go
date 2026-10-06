@@ -142,7 +142,6 @@ func (c *Coordinator) ResolveAuthoritativeZone(ctx context.Context, zone string)
 }
 
 func ensureFQDN(zone string) string {
-	zone = strings.TrimSpace(zone)
 	if zone == "" || strings.HasSuffix(zone, ".") {
 		return zone
 	}
