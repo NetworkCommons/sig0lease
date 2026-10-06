@@ -21,13 +21,15 @@ import (
 type fakeTransport struct {
 	sent      []*dns.Msg
 	addrs     []string
+	networks  []Network
 	responses []*dns.Msg
 	err       error
 }
 
-func (f *fakeTransport) Send(ctx context.Context, addr string, useTCP bool, msg *dns.Msg) (*dns.Msg, error) {
+func (f *fakeTransport) Send(ctx context.Context, addr string, network Network, msg *dns.Msg) (*dns.Msg, error) {
 	f.sent = append(f.sent, msg)
 	f.addrs = append(f.addrs, addr)
+	f.networks = append(f.networks, network)
 	if f.err != nil {
 		return nil, f.err
 	}
@@ -524,5 +526,60 @@ func TestClient_Run_RetriesOnDiscoveryFailure(t *testing.T) {
 	}
 	if len(gotErrs) == 0 {
 		t.Fatal("expected OnError to be called for the failed discovery attempts")
+	}
+}
+
+// TestClient_Register_DefaultNetworkIsTCP: a Config that leaves Network unset sends over TCP,
+// RFC 9665 S3.5's requirement on networks that are not constrained.
+func TestClient_Register_DefaultNetworkIsTCP(t *testing.T) {
+	transport := &fakeTransport{responses: []*dns.Msg{successResp(30, 1209600)}}
+	c, err := NewClient(testConfig(t, transport))
+	if err != nil {
+		t.Fatalf("NewClient: %v", err)
+	}
+	if _, _, err := c.Register(context.Background()); err != nil {
+		t.Fatalf("Register: %v", err)
+	}
+	if transport.networks[0] != NetworkTCP {
+		t.Fatalf("sent over %s, want tcp", transport.networks[0])
+	}
+}
+
+// TestClient_Register_TLSDiscoversTLSRegistrar: with Network set to NetworkTLS and no
+// explicit address, the update goes over TLS to the registrar named by
+// "_dnssd-srp-tls._tcp", not the "_dnssd-srp._tcp" one.
+func TestClient_Register_TLSDiscoversTLSRegistrar(t *testing.T) {
+	transport := &fakeTransport{responses: []*dns.Msg{successResp(30, 1209600)}}
+	cfg := testConfig(t, transport)
+	cfg.RegistrarAddr = ""
+	cfg.Network = NetworkTLS
+	cfg.Query = tlsAndPlainDNS().query
+	c, err := NewClient(cfg)
+	if err != nil {
+		t.Fatalf("NewClient: %v", err)
+	}
+	if _, _, err := c.Register(context.Background()); err != nil {
+		t.Fatalf("Register: %v", err)
+	}
+	if transport.addrs[0] != "192.0.2.2:853" || transport.networks[0] != NetworkTLS {
+		t.Fatalf("sent to %q over %s, want 192.0.2.2:853 over tls", transport.addrs[0], transport.networks[0])
+	}
+}
+
+func TestNewClient_RejectsUnknownNetwork(t *testing.T) {
+	cfg := testConfig(t, &fakeTransport{})
+	cfg.Network = Network(7)
+	if _, err := NewClient(cfg); err == nil {
+		t.Fatal("NewClient accepted an unknown Network")
+	}
+}
+
+// TestNetwork_String pins the protocol names liveTransport hands to the base client
+// package's client.New, which accepts exactly these.
+func TestNetwork_String(t *testing.T) {
+	for n, want := range map[Network]string{NetworkTCP: "tcp", NetworkTLS: "tls", NetworkUDP: "udp"} {
+		if got := n.String(); got != want {
+			t.Errorf("%d.String() = %q, want %q", int(n), got, want)
+		}
 	}
 }

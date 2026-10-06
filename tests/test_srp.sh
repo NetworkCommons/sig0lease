@@ -4,8 +4,9 @@
 #
 # Runs the real proxy process (srp_handler only) against a real, disposable local BIND 9
 # instance authoritative for srp.test. -- register -> dig -> refresh -> conflict (YXDOMAIN)
-# -> remove-one -> remove-all -> expiry -> LEASE-only expiry -> registrar discovery. Every update is sent by the real
-# requester, cmd/sig0lease-srp-client (client/srp), in -once mode -- no stubs/mocks.
+# -> remove-one -> remove-all -> expiry -> LEASE-only expiry -> registrar discovery -> registrar
+# discovery and update over DNS-over-TLS. Every update is sent by the real requester,
+# cmd/sig0lease-srp-client (client/srp), in -once mode -- no stubs/mocks.
 
 set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -18,6 +19,8 @@ SRP_PROXY_ADDR="127.0.0.1"
 SRP_PROXY_PORT="${SRP_PROXY_PORT:-8159}"
 SRP_PROXY_URL="${SRP_PROXY_ADDR}:${SRP_PROXY_PORT}"
 BIND9_SRP_REGISTRAR_PORT="$SRP_PROXY_PORT" # the zone's _dnssd-srp._tcp SRV points TEST 8 here
+SRP_PROXY_TLS_PORT="${SRP_PROXY_TLS_PORT:-8160}" # the proxy's DNS-over-TLS listener
+BIND9_SRP_REGISTRAR_TLS_PORT="$SRP_PROXY_TLS_PORT" # the zone's _dnssd-srp-tls._tcp SRV points TEST 9 here
 SRP_KEYSTORE_DIR="${TESTS_DIR}/keystore-srp-bind9"
 SRP_LEASE_SECONDS="${SRP_LEASE_SECONDS:-30}" # outlasts TESTs 1-5, which assert data is still present
 SRP_KEY_LEASE_SECONDS="${SRP_KEY_LEASE_SECONDS:-1209600}"
@@ -34,6 +37,7 @@ SRP_PROXY_LOG="/tmp/sig0lease_srp_proxy.log"
 SRP_TMP_CONFIG=""
 SRP_PROXY_PID=""
 SRP_KEY_DIR=""
+SRP_TLS_DIR="" # the DoT listener's throwaway certificate (make_tls_cert)
 
 PERFORMED_TESTS=""
 
@@ -52,6 +56,11 @@ server:
   networks:
     - udp
     - tcp
+    - tls
+  tls:
+    address: ":${SRP_PROXY_TLS_PORT}"
+    cert: "${SRP_TLS_DIR}/cert.pem"
+    key: "${SRP_TLS_DIR}/key.pem"
 upstreams:
   - address: "8.8.8.8:53"
     protocol: "udp"
@@ -93,7 +102,7 @@ start_srp_proxy() {
         cat "$SRP_PROXY_LOG"
         return 1
     fi
-    log_success "SRP proxy started (PID $SRP_PROXY_PID) on $SRP_PROXY_URL, log: $SRP_PROXY_LOG"
+    log_success "SRP proxy started (PID $SRP_PROXY_PID) on $SRP_PROXY_URL, DNS-over-TLS on port $SRP_PROXY_TLS_PORT, log: $SRP_PROXY_LOG"
 }
 
 stop_srp_proxy() {
@@ -340,6 +349,32 @@ test_discovery() {
     PERFORMED_TESTS="$PERFORMED_TESTS\n  [OK] $log_msg"
 }
 
+test_discovery_tls() {
+    # TEST 8 for a requester that uses TLS (-tls): SOA for srp.test., then the
+    # _dnssd-srp-tls._tcp.srp.test. SRV -> proxy.srp.test.:<proxy DoT port> (RFC 9665 S3.1.1),
+    # then the update over DNS-over-TLS (S7). That port speaks only TLS, and the plain
+    # _dnssd-srp._tcp record points at the proxy's plain-DNS port instead, so a NOERROR shows
+    # the client both used the TLS record and completed the TLS handshake. Runs after TEST 7
+    # for the same reason as TEST 8.
+    local log_msg="TEST 9: Registrar discovery and update over DNS-over-TLS (-tls, no -server)"
+    log_section "$log_msg"
+
+    local out
+    out="$("$SRP_CLIENT_BIN" -tls -resolver="${BIND9_ADDR}:${BIND9_PORT}" -domain="$SRP_ZONE" \
+        -keystore="${SRP_KEY_DIR}/id6-discovery-tls" -k=13 -once \
+        -host=host6 -addr=192.0.2.6 -instance=Thingamajig:_http._tcp:8080 -txt=Thingamajig:path=/ \
+        -lease="$SRP_LEASE_SECONDS" -keylease="$SRP_KEY_LEASE_SECONDS")"
+    echo "$out"
+    echo "$out" | grep -q "_dnssd-srp-tls._tcp" || { log_error "client did not report discovering via _dnssd-srp-tls._tcp"; return 1; }
+    echo "$out" | grep -q "Status: NOERROR (Rcode=0)" || { log_error "registration over DNS-over-TLS did not return NOERROR"; return 1; }
+
+    [ -n "$(dig_srp host6.srp.test. A)" ] || { log_error "host A record not found at authoritative"; return 1; }
+    [ -n "$(dig_srp Thingamajig._http._tcp.srp.test. SRV)" ] || { log_error "instance SRV not found at authoritative"; return 1; }
+
+    log_success "Client found the registrar via SOA + _dnssd-srp-tls._tcp SRV + target A and registered over DNS-over-TLS"
+    PERFORMED_TESTS="$PERFORMED_TESTS\n  [OK] $log_msg"
+}
+
 ################################
 # Top level
 ################################
@@ -356,6 +391,8 @@ run_all_tests() {
     require_command go
 
     SRP_KEY_DIR="$(mktemp -d /tmp/sig0lease-srp-client-identities.XXXXXX)"
+    SRP_TLS_DIR="$(mktemp -d /tmp/sig0lease-srp-tls.XXXXXX)"
+    make_tls_cert "$SRP_TLS_DIR"
 
     build_srp_binaries
     start_bind9
@@ -369,6 +406,7 @@ run_all_tests() {
     test_expiry
     test_lease_expiry_keeps_keys
     test_discovery
+    test_discovery_tls
 
     bind9_report_rejections || return 1
     BIND9_REJECTIONS_REPORTED=1
@@ -390,6 +428,7 @@ cleanup() {
     stop_srp_proxy
     stop_bind9
     [ -n "$SRP_KEY_DIR" ] && rm -rf "$SRP_KEY_DIR"
+    [ -n "$SRP_TLS_DIR" ] && rm -rf "$SRP_TLS_DIR"
     set -e
 }
 

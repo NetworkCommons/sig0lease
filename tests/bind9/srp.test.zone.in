@@ -17,4 +17,9 @@ ns      IN A    127.0.0.1
 ; discovery test does exactly that (no -server). start_bind9 replaces @SRP_REGISTRAR_PORT@
 ; with BIND9_SRP_REGISTRAR_PORT, which test_srp.sh sets to the port its proxy listens on.
 _dnssd-srp._tcp IN SRV 0 0 @SRP_REGISTRAR_PORT@ proxy.srp.test.
+; A requester that uses TLS looks up _dnssd-srp-tls._tcp instead (RFC 9665 S3.1.1, S7): it
+; points at the proxy's DNS-over-TLS listener, which test_srp.sh's TLS discovery test finds
+; and sends to. start_bind9 replaces @SRP_REGISTRAR_TLS_PORT@ with
+; BIND9_SRP_REGISTRAR_TLS_PORT, which test_srp.sh sets to that listener's port.
+_dnssd-srp-tls._tcp IN SRV 0 0 @SRP_REGISTRAR_TLS_PORT@ proxy.srp.test.
 proxy   IN A    127.0.0.1

@@ -18,6 +18,7 @@ import (
 	"time"
 
 	"codeberg.org/miekg/dns"
+	"github.com/NetworkCommons/sig0lease/client"
 	"github.com/NetworkCommons/sig0lease/config"
 	"github.com/NetworkCommons/sig0lease/logging"
 )
@@ -134,6 +135,47 @@ func TestServeDoT_RoundTrips(t *testing.T) {
 	}
 	if resp.Rcode != dns.RcodeSuccess {
 		t.Fatalf("got rcode=%d, want success", resp.Rcode)
+	}
+}
+
+// TestServeDoT_ProjectClient sends a query through this project's own client package over
+// "tls" -- the transport both CLI clients and client/srp use -- to serveDoT. That client
+// does not check the certificate (opportunistic DoT, see client.New), so the self-signed test
+// certificate needs no trust anchor here, unlike TestServeDoT_RoundTrips. The same query over
+// plain "tcp" must fail: that shows the "tls" client really did the TLS handshake the
+// listener requires.
+func TestServeDoT_ProjectClient(t *testing.T) {
+	dotAddr := reserveAddr(t, "tcp")
+	certPath, keyPath := generateTestCert(t, t.TempDir())
+
+	srv := &Server{
+		cfg: &config.Config{Server: config.ServerConfig{
+			TLS: &config.TLSConfig{Address: dotAddr, Cert: certPath, Key: keyPath},
+		}},
+		logger: logging.NewLogger("debug"),
+	}
+	handler := dns.HandlerFunc(func(ctx context.Context, w dns.ResponseWriter, r *dns.Msg) {
+		resp := &dns.Msg{MsgHeader: r.MsgHeader, Question: r.Question}
+		resp.Response = true
+		resp.Rcode = dns.RcodeSuccess
+		resp.WriteTo(w)
+	})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	go srv.serveDoT(ctx, handler)
+	waitReady(t, dotAddr, "tls")
+
+	resp, err := client.New(dotAddr, "tls", 2*time.Second).Query(dns.NewMsg("dot-client.example.", dns.TypeA))
+	if err != nil {
+		t.Fatalf("query over tls: %v", err)
+	}
+	if resp.Rcode != dns.RcodeSuccess || len(resp.Question) != 1 || resp.Question[0].Header().Name != "dot-client.example." {
+		t.Fatalf("unexpected response over tls: %v", resp)
+	}
+
+	if _, err := client.New(dotAddr, "tcp", 500*time.Millisecond).Query(dns.NewMsg("dot-client.example.", dns.TypeA)); err == nil {
+		t.Fatal("plain tcp query to the DoT listener succeeded; want a failure, since the listener only speaks TLS")
 	}
 }
 

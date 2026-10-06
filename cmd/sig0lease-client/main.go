@@ -12,6 +12,7 @@ import (
 
 	"codeberg.org/miekg/dns"
 	"github.com/NetworkCommons/sig0lease/client"
+	"github.com/NetworkCommons/sig0lease/logging"
 	_ "github.com/NetworkCommons/sig0lease/pkg/dnscompat"
 	"github.com/NetworkCommons/sig0lease/pkg/dnsmsg"
 	"github.com/NetworkCommons/sig0lease/pkg/dnsname"
@@ -192,29 +193,31 @@ func extractKeyAlgFlag(args []string) ([]string, uint8, bool) {
 	return out, alg, provided
 }
 
-// extractTCPFlag pulls a bare --tcp token out of args, wherever it appears,
-// returning the remaining positional args and whether it was set. Absent,
-// the client uses UDP (client.New's own default).
-func extractTCPFlag(args []string) ([]string, bool) {
-	const flag = "--tcp"
-	useTCP := false
+// extractProtocolFlag pulls a bare --tcp or --tls token out of args, wherever it appears,
+// returning the remaining positional args and the protocol string client.New expects:
+// "tcp", "tls" (DNS-over-TLS, opportunistic -- see client.New), or, with neither, "udp".
+// Passing both exits with an error, since a request goes over exactly one of them.
+func extractProtocolFlag(args []string) ([]string, string) {
+	protocol := "udp"
 	out := make([]string, 0, len(args))
 	for _, a := range args {
-		if a == flag {
-			useTCP = true
+		var p string
+		switch a {
+		case "--tcp":
+			p = "tcp"
+		case "--tls":
+			p = "tls"
+		default:
+			out = append(out, a)
 			continue
 		}
-		out = append(out, a)
+		if protocol != "udp" && protocol != p {
+			fmt.Fprintln(os.Stderr, "ERROR: --tcp and --tls are mutually exclusive")
+			os.Exit(1)
+		}
+		protocol = p
 	}
-	return out, useTCP
-}
-
-// queryProtocol maps --tcp's presence to the protocol string client.New expects.
-func queryProtocol(useTCP bool) string {
-	if useTCP {
-		return "tcp"
-	}
-	return "udp"
+	return out, protocol
 }
 
 func cmdRegRefWithMode(proxyAddr string, args []string, operation string, tamper bool) {
@@ -226,11 +229,11 @@ func cmdRegRefWithMode(proxyAddr string, args []string, operation string, tamper
 		os.Exit(1)
 	}
 	args, sameKey := extractSameKeyFlag(args)
-	args, useTCP := extractTCPFlag(args)
+	args, protocol := extractProtocolFlag(args)
 	args, keyAlg, keyAlgProvided := extractKeyAlgFlag(args)
 
 	if len(args) < 3 {
-		fmt.Fprintf(os.Stderr, "Usage: sig0lease-client <proxy> register|register-tamper|refresh <keyname> [lease] [key-lease] [rr-spec...] [--signer=update|additional|none] [--same-key] [--tcp] [--k=<algorithm>]\n")
+		fmt.Fprintf(os.Stderr, "Usage: sig0lease-client <proxy> register|register-tamper|refresh <keyname> [lease] [key-lease] [rr-spec...] [--signer=update|additional|none] [--same-key] [--tcp|--tls] [--k=<algorithm>]\n")
 		os.Exit(1)
 	}
 
@@ -280,7 +283,8 @@ func cmdRegRefWithMode(proxyAddr string, args []string, operation string, tamper
 	var clientKey *keyrec.LoadedKey
 	if keyAlgProvided {
 		fmt.Printf("Resolving client key for owner name (%s) from keystore (%s), creating with algorithm %d if not found\n", keyname, keystoreDir, keyAlg)
-		k, created, err := keyrec.ResolveOrCreateKey(keystoreDir, keyname, keyAlg, nil)
+		// The logger carries ResolveOrCreateKey's warning when more than one key matches.
+		k, created, err := keyrec.ResolveOrCreateKey(keystoreDir, keyname, keyAlg, logging.NewLogger("info"))
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "ERROR: %v\n", err)
 			os.Exit(1)
@@ -455,7 +459,6 @@ func cmdRegRefWithMode(proxyAddr string, args []string, operation string, tamper
 	}
 
 	// Send to proxy
-	protocol := queryProtocol(useTCP)
 	fmt.Printf("\nSending to proxy (%s) over %s\n", proxyAddr, protocol)
 
 	// Check message before packing
@@ -561,14 +564,13 @@ func flipOnePayloadBit(msg *dns.Msg) error {
 
 // cmdVerify checks if a key registration is active
 func cmdVerify(proxyAddr string, args []string) {
-	args, useTCP := extractTCPFlag(args)
+	args, protocol := extractProtocolFlag(args)
 	if len(args) < 1 {
-		fmt.Fprintf(os.Stderr, "Usage: sig0lease-client <proxy> verify <zone> [--tcp]\n")
+		fmt.Fprintf(os.Stderr, "Usage: sig0lease-client <proxy> verify <zone> [--tcp|--tls]\n")
 		os.Exit(1)
 	}
 
 	zone := args[0]
-	protocol := queryProtocol(useTCP)
 
 	fmt.Printf("=== Verifying Key Registration ===\n")
 	fmt.Printf("Proxy: %s\n", proxyAddr)
@@ -641,7 +643,7 @@ Usage:
   sig0lease-client <proxy> <command> [args...]
 
 Commands:
-	register <keyname> [lease] [key-lease] [rr-spec...] [--signer=update|additional|none] [--same-key] [--tcp] [--k=<algorithm>]
+	register <keyname> [lease] [key-lease] [rr-spec...] [--signer=update|additional|none] [--same-key] [--tcp|--tls] [--k=<algorithm>]
 		Send a sig0lease UPDATE-LEASE registration request
 
 		keyname: without --k, the exact filename of an existing key in the keystore
@@ -664,6 +666,10 @@ Commands:
 				the Update section; conflicts with an explicit KEY rr-spec for the same
 				name and with --signer=none.
 			--tcp: send the request over TCP instead of the default UDP.
+			--tls: send the request over DNS-over-TLS (RFC 7858) instead of the default
+				UDP; <proxy> must then be the proxy's DoT address (server.tls.address).
+				Opportunistic: encrypted, but the proxy's certificate is not checked.
+				Not with --tcp.
 			--k=<algorithm>: DNSSEC algorithm (13=ECDSAP256SHA256, 15=ED25519) to generate
 				a NEW signing key with if keyname (read as an owner name when --k is
 				given) doesn't have one in the keystore yet. Any existing key for that
@@ -698,11 +704,13 @@ Commands:
 		sig0lease-client 127.0.0.1:8053 register Ktest.dev.zenr.io.+015+05044 0 3600 --same-key "client.test.dev.zenr.io. 3600 IN KEY 512 3 15 c2yGNXxlrWu1LX/n9AqrCp+rIbm9FWcotgnMomlrM2E="
 		// Same request over TCP instead of UDP
 		sig0lease-client 127.0.0.1:8053 register Ktest.dev.zenr.io.+015+05044 0 3600 --same-key --tcp
+		// Same request over DNS-over-TLS, to the proxy's DoT listener
+		sig0lease-client 127.0.0.1:8853 register Ktest.dev.zenr.io.+015+05044 0 3600 --same-key --tls
 		// --k=13: keyname is an owner name here, not a filename -- generates an
 		// ECDSAP256SHA256 key on first run (reused on every later run for the same name)
 		sig0lease-client 127.0.0.1:8053 register test.dev.zenr.io. 0 3600 --same-key --k=13
 
-	refresh <keyname> [lease] [key-lease] [rr-spec...] [--signer=update|additional|none] [--same-key] [--tcp] [--k=<algorithm>]
+	refresh <keyname> [lease] [key-lease] [rr-spec...] [--signer=update|additional|none] [--same-key] [--tcp|--tls] [--k=<algorithm>]
 		Send a sig0lease UPDATE-LEASE refresh request (8-byte variant)
 
 		keyname: filename of the key in the keystore (e.g., Ktest.dev.zenr.io.+015+05044)
@@ -710,7 +718,7 @@ Commands:
 		key-lease: key-lease duration in seconds
 		--signer: see register above
 		--same-key: see register above
-		--tcp: see register above
+		--tcp, --tls: see register above
 		--k: see register above
 
 		Example:
@@ -726,10 +734,11 @@ Commands:
 		command name.
 
 
-  verify <zone> [--tcp]
+  verify <zone> [--tcp|--tls]
     Query if a key registration is active
 
     --tcp: send the query over TCP instead of the default UDP.
+    --tls: send the query over DNS-over-TLS to the proxy's DoT address (see register).
 
     Example:
       sig0lease-client 127.0.0.1:8053 verify test.dev.zenr.io.

@@ -105,7 +105,7 @@ func TestDiscover_DomainIsZoneApex(t *testing.T) {
 		srv:    map[string][]*dns.SRV{"_dnssd-srp._tcp.example.com.": {srvRR("registrar.example.com.", 0, 0, 853)}},
 		hosts:  registrarHosts,
 	}
-	addr, err := Discover(context.Background(), f.query, "example.com.", DiscoveryClosest)
+	addr, err := Discover(context.Background(), f.query, "example.com.", DiscoveryClosest, NetworkTCP)
 	if err != nil {
 		t.Fatalf("Discover: %v", err)
 	}
@@ -135,7 +135,7 @@ func subdomainRecordDNS() *fakeDNS {
 // domain itself over the apex's, and asks nothing further up once it has one.
 func TestDiscover_PrefersClosestRecord(t *testing.T) {
 	f := subdomainRecordDNS()
-	addr, err := Discover(context.Background(), f.query, "srp.dev.example.com.", DiscoveryClosest)
+	addr, err := Discover(context.Background(), f.query, "srp.dev.example.com.", DiscoveryClosest, NetworkTCP)
 	if err != nil {
 		t.Fatalf("Discover: %v", err)
 	}
@@ -153,7 +153,7 @@ func TestDiscover_PrefersClosestRecord(t *testing.T) {
 // never asked for.
 func TestDiscover_ApexOnlyIgnoresRecordsBelowApex(t *testing.T) {
 	f := subdomainRecordDNS()
-	addr, err := Discover(context.Background(), f.query, "srp.dev.example.com.", DiscoveryApexOnly)
+	addr, err := Discover(context.Background(), f.query, "srp.dev.example.com.", DiscoveryApexOnly, NetworkTCP)
 	if err != nil {
 		t.Fatalf("Discover: %v", err)
 	}
@@ -175,7 +175,7 @@ func TestDiscover_WalksUpToApex(t *testing.T) {
 		srv:    map[string][]*dns.SRV{"_dnssd-srp._tcp.example.com.": {srvRR("apex-registrar.example.com.", 0, 0, 853)}},
 		hosts:  registrarHosts,
 	}
-	addr, err := Discover(context.Background(), f.query, "srp.dev.example.com.", DiscoveryClosest)
+	addr, err := Discover(context.Background(), f.query, "srp.dev.example.com.", DiscoveryClosest, NetworkTCP)
 	if err != nil {
 		t.Fatalf("Discover: %v", err)
 	}
@@ -206,7 +206,7 @@ func TestDiscover_RecordCoversSubdomains(t *testing.T) {
 		},
 		hosts: registrarHosts,
 	}
-	addr, err := Discover(context.Background(), f.query, "srp.dev.example.com.", DiscoveryClosest)
+	addr, err := Discover(context.Background(), f.query, "srp.dev.example.com.", DiscoveryClosest, NetworkTCP)
 	if err != nil {
 		t.Fatalf("Discover: %v", err)
 	}
@@ -237,7 +237,7 @@ func TestDiscover_StopsAtZoneCut(t *testing.T) {
 		},
 		hosts: registrarHosts,
 	}
-	_, err := Discover(context.Background(), f.query, "lab.srp.dev.example.com.", DiscoveryClosest)
+	_, err := Discover(context.Background(), f.query, "lab.srp.dev.example.com.", DiscoveryClosest, NetworkTCP)
 	if err == nil {
 		t.Fatal("expected an error when the enclosing zone has no record")
 	}
@@ -266,7 +266,7 @@ func TestDiscover_QueryErrorStopsWalk(t *testing.T) {
 		err:       wantErr,
 		failQuery: "_dnssd-srp._tcp.srp.dev.example.com. SRV",
 	}
-	_, err := Discover(context.Background(), f.query, "srp.dev.example.com.", DiscoveryClosest)
+	_, err := Discover(context.Background(), f.query, "srp.dev.example.com.", DiscoveryClosest, NetworkTCP)
 	if !errors.Is(err, wantErr) {
 		t.Fatalf("expected the query error to propagate, got: %v", err)
 	}
@@ -281,7 +281,7 @@ func TestDiscover_QueryErrorStopsWalk(t *testing.T) {
 // discovery fails right away instead of asking for "_dnssd-srp._tcp.<name>" up to the root.
 func TestDiscover_RootZoneSOA(t *testing.T) {
 	f := &fakeDNS{apexes: []string{"."}}
-	_, err := Discover(context.Background(), f.query, "srp.test.", DiscoveryClosest)
+	_, err := Discover(context.Background(), f.query, "srp.test.", DiscoveryClosest, NetworkTCP)
 	if err == nil || !strings.Contains(err.Error(), "root zone") {
 		t.Fatalf("expected a root-zone error, got: %v", err)
 	}
@@ -292,7 +292,7 @@ func TestDiscover_RootZoneSOA(t *testing.T) {
 
 func TestDiscover_RejectsUnknownMode(t *testing.T) {
 	f := &fakeDNS{apexes: []string{"example.com."}}
-	_, err := Discover(context.Background(), f.query, "example.com.", DiscoveryMode(7))
+	_, err := Discover(context.Background(), f.query, "example.com.", DiscoveryMode(7), NetworkTCP)
 	if err == nil || !strings.Contains(err.Error(), "unknown DiscoveryMode") {
 		t.Fatalf("expected an unknown-mode error, got: %v", err)
 	}
@@ -349,7 +349,7 @@ func TestDiscover_ZoneCutBelowParent(t *testing.T) {
 		},
 		hosts: registrarHosts,
 	}
-	addr, err := Discover(context.Background(), f.query, "srp.dev.example.com.", DiscoveryClosest)
+	addr, err := Discover(context.Background(), f.query, "srp.dev.example.com.", DiscoveryClosest, NetworkTCP)
 	if err != nil {
 		t.Fatalf("Discover: %v", err)
 	}
@@ -368,7 +368,7 @@ func TestDiscover_StripsLabelsWithoutAuthoritySOA(t *testing.T) {
 		hosts:   registrarHosts,
 		minimal: true,
 	}
-	if _, err := Discover(context.Background(), f.query, "srp.dev.example.com.", DiscoveryApexOnly); err != nil {
+	if _, err := Discover(context.Background(), f.query, "srp.dev.example.com.", DiscoveryApexOnly, NetworkTCP); err != nil {
 		t.Fatalf("Discover: %v", err)
 	}
 	want := []string{"srp.dev.example.com. SOA", "dev.example.com. SOA", "example.com. SOA", "_dnssd-srp._tcp.example.com. SRV", "registrar.example.com. A"}
@@ -381,7 +381,7 @@ func TestDiscover_StripsLabelsWithoutAuthoritySOA(t *testing.T) {
 // name and never queries the TLD itself (RFC 8765 S6.1 step 4).
 func TestDiscover_GivesUpAboveTLD(t *testing.T) {
 	f := &fakeDNS{}
-	if _, err := Discover(context.Background(), f.query, "a.example.com.", DiscoveryClosest); err == nil {
+	if _, err := Discover(context.Background(), f.query, "a.example.com.", DiscoveryClosest, NetworkTCP); err == nil {
 		t.Fatal("expected an error when no SOA record is found")
 	}
 	want := []string{"a.example.com. SOA", "example.com. SOA"}
@@ -396,7 +396,7 @@ func TestDiscover_NoTrailingDotOnDomain(t *testing.T) {
 		srv:    map[string][]*dns.SRV{"_dnssd-srp._tcp.example.com.": {srvRR("registrar.example.com.", 0, 0, 853)}},
 		hosts:  registrarHosts,
 	}
-	if _, err := Discover(context.Background(), f.query, "example.com", DiscoveryClosest); err != nil {
+	if _, err := Discover(context.Background(), f.query, "example.com", DiscoveryClosest, NetworkTCP); err != nil {
 		t.Fatalf("Discover: %v", err)
 	}
 	want := []string{"example.com. SOA", "_dnssd-srp._tcp.example.com. SRV", "registrar.example.com. A"}
@@ -414,7 +414,7 @@ func TestDiscover_PicksLowestPriority(t *testing.T) {
 		}},
 		hosts: registrarHosts,
 	}
-	addr, err := Discover(context.Background(), f.query, "example.com.", DiscoveryClosest)
+	addr, err := Discover(context.Background(), f.query, "example.com.", DiscoveryClosest, NetworkTCP)
 	if err != nil {
 		t.Fatalf("Discover: %v", err)
 	}
@@ -432,7 +432,7 @@ func TestDiscover_TiebreaksOnHighestWeight(t *testing.T) {
 		}},
 		hosts: registrarHosts,
 	}
-	addr, err := Discover(context.Background(), f.query, "example.com.", DiscoveryClosest)
+	addr, err := Discover(context.Background(), f.query, "example.com.", DiscoveryClosest, NetworkTCP)
 	if err != nil {
 		t.Fatalf("Discover: %v", err)
 	}
@@ -448,7 +448,7 @@ func TestDiscover_FallsBackToAAAA(t *testing.T) {
 		srv:    map[string][]*dns.SRV{"_dnssd-srp._tcp.example.com.": {srvRR("v6.example.com.", 0, 0, 853)}},
 		hosts:  map[string][]netip.Addr{"v6.example.com.": {netip.MustParseAddr("2001:db8::53")}},
 	}
-	addr, err := Discover(context.Background(), f.query, "example.com.", DiscoveryClosest)
+	addr, err := Discover(context.Background(), f.query, "example.com.", DiscoveryClosest, NetworkTCP)
 	if err != nil {
 		t.Fatalf("Discover: %v", err)
 	}
@@ -466,7 +466,7 @@ func TestDiscover_TargetWithoutAddress(t *testing.T) {
 		apexes: []string{"example.com."},
 		srv:    map[string][]*dns.SRV{"_dnssd-srp._tcp.example.com.": {srvRR("nowhere.example.com.", 0, 0, 853)}},
 	}
-	_, err := Discover(context.Background(), f.query, "example.com.", DiscoveryClosest)
+	_, err := Discover(context.Background(), f.query, "example.com.", DiscoveryClosest, NetworkTCP)
 	if err == nil || !strings.Contains(err.Error(), "no A or AAAA record") {
 		t.Fatalf("expected a missing-address error, got: %v", err)
 	}
@@ -474,7 +474,7 @@ func TestDiscover_TargetWithoutAddress(t *testing.T) {
 
 func TestDiscover_NoRecords(t *testing.T) {
 	f := &fakeDNS{apexes: []string{"example.com."}}
-	if _, err := Discover(context.Background(), f.query, "example.com.", DiscoveryClosest); err == nil {
+	if _, err := Discover(context.Background(), f.query, "example.com.", DiscoveryClosest, NetworkTCP); err == nil {
 		t.Fatal("expected an error when no SRV records are found")
 	}
 }
@@ -482,7 +482,7 @@ func TestDiscover_NoRecords(t *testing.T) {
 func TestDiscover_QueryError(t *testing.T) {
 	wantErr := errors.New("network exploded")
 	f := &fakeDNS{err: wantErr}
-	_, err := Discover(context.Background(), f.query, "example.com.", DiscoveryClosest)
+	_, err := Discover(context.Background(), f.query, "example.com.", DiscoveryClosest, NetworkTCP)
 	if err == nil || !errors.Is(err, wantErr) {
 		t.Fatalf("expected the query error to propagate, got: %v", err)
 	}
@@ -533,5 +533,82 @@ func TestLiveDNSQuery_AllResolversFail(t *testing.T) {
 	query := LiveDNSQuery([]string{startTestResolver(t, dns.RcodeServerFailure), startTestResolver(t, dns.RcodeRefused)})
 	if _, err := query(context.Background(), "example.com.", dns.TypeSOA); err == nil {
 		t.Fatal("expected an error when every resolver fails")
+	}
+}
+
+// tlsAndPlainDNS serves example.com. with a registrar for each service: plain TCP
+// ("_dnssd-srp._tcp") at registrar.example.com., DNS-over-TLS ("_dnssd-srp-tls._tcp") at
+// apex-registrar.example.com., as RFC 9665 Appendix A's example zone publishes both.
+func tlsAndPlainDNS() *fakeDNS {
+	return &fakeDNS{
+		apexes: []string{"example.com."},
+		srv: map[string][]*dns.SRV{
+			"_dnssd-srp._tcp.example.com.":     {srvRR("registrar.example.com.", 0, 0, 53)},
+			"_dnssd-srp-tls._tcp.example.com.": {srvRR("apex-registrar.example.com.", 0, 0, 853)},
+		},
+		hosts: registrarHosts,
+	}
+}
+
+// TestDiscover_TLSLooksUpTLSService: with NetworkTLS, discovery asks for
+// "_dnssd-srp-tls._tcp" (RFC 9665 S3.1.1) and returns that record's registrar and port.
+func TestDiscover_TLSLooksUpTLSService(t *testing.T) {
+	f := tlsAndPlainDNS()
+	addr, err := Discover(context.Background(), f.query, "example.com.", DiscoveryClosest, NetworkTLS)
+	if err != nil {
+		t.Fatalf("Discover: %v", err)
+	}
+	if addr != "192.0.2.2:853" {
+		t.Fatalf("addr = %q, want %q", addr, "192.0.2.2:853")
+	}
+	want := []string{"example.com. SOA", "_dnssd-srp-tls._tcp.example.com. SRV", "apex-registrar.example.com. A"}
+	if !slices.Equal(f.queries, want) {
+		t.Fatalf("queries = %q, want %q", f.queries, want)
+	}
+}
+
+// TestDiscover_UDPLooksUpPlainService: NetworkUDP uses the same "_dnssd-srp._tcp" record as
+// NetworkTCP; only NetworkTLS has a service of its own.
+func TestDiscover_UDPLooksUpPlainService(t *testing.T) {
+	f := tlsAndPlainDNS()
+	addr, err := Discover(context.Background(), f.query, "example.com.", DiscoveryClosest, NetworkUDP)
+	if err != nil {
+		t.Fatalf("Discover: %v", err)
+	}
+	if addr != "192.0.2.1:53" {
+		t.Fatalf("addr = %q, want %q", addr, "192.0.2.1:53")
+	}
+}
+
+// TestDiscover_TLSDoesNotFallBackToPlainService: a zone that publishes only
+// "_dnssd-srp._tcp" has no registrar for a TLS requester. RFC 9665 S7: a requester able to
+// use TLS SHOULD NOT fall back to TCP, so discovery fails instead of returning the plain one.
+func TestDiscover_TLSDoesNotFallBackToPlainService(t *testing.T) {
+	f := &fakeDNS{
+		apexes: []string{"example.com."},
+		srv:    map[string][]*dns.SRV{"_dnssd-srp._tcp.example.com.": {srvRR("registrar.example.com.", 0, 0, 53)}},
+		hosts:  registrarHosts,
+	}
+	_, err := Discover(context.Background(), f.query, "srp.example.com.", DiscoveryClosest, NetworkTLS)
+	if err == nil {
+		t.Fatal("Discover found a registrar for TLS although only _dnssd-srp._tcp is published")
+	}
+	if !strings.Contains(err.Error(), "_dnssd-srp-tls._tcp.srp.example.com., _dnssd-srp-tls._tcp.example.com.") {
+		t.Fatalf("error does not name the TLS SRV names it tried: %v", err)
+	}
+	for _, q := range f.queries {
+		if strings.HasPrefix(q, "_dnssd-srp._tcp.") {
+			t.Fatalf("TLS discovery asked for the plain service: %q", f.queries)
+		}
+	}
+}
+
+func TestDiscover_RejectsUnknownNetwork(t *testing.T) {
+	f := tlsAndPlainDNS()
+	if _, err := Discover(context.Background(), f.query, "example.com.", DiscoveryClosest, Network(7)); err == nil {
+		t.Fatal("Discover accepted an unknown Network")
+	}
+	if len(f.queries) != 0 {
+		t.Fatalf("Discover queried DNS before rejecting the Network: %q", f.queries)
 	}
 }

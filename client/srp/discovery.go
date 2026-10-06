@@ -54,8 +54,7 @@ func LiveDNSQuery(resolvers []string) DNSQuery {
 	}
 }
 
-// DiscoveryMode selects the names Discover looks under for the registrar's
-// "_dnssd-srp._tcp" SRV record.
+// DiscoveryMode selects the names Discover looks under for the registrar's SRV record.
 type DiscoveryMode int
 
 const (
@@ -83,11 +82,14 @@ func (m DiscoveryMode) validate() error {
 	return fmt.Errorf("unknown DiscoveryMode %d", m)
 }
 
-// Discover finds the SRP registrar for domain. As RFC 9665 S3.1.1 specifies, it first finds
-// the apex of the closest DNS zone enclosing domain with SOA queries (RFC 8765 S6.1, see
-// zoneApex). It then looks up the SRV record at "_dnssd-srp._tcp.<name>." -- the service
-// name RFC 9665 S10.4.1 registers, in RFC 6763 S7's "_<service>._tcp" form -- for each name
-// mode selects (see DiscoveryMode), in order, and stops at the first name that has one. It
+// Discover finds the SRP registrar for domain that is reachable over network. As RFC 9665
+// S3.1.1 specifies, it first finds the apex of the closest DNS zone enclosing domain with SOA
+// queries (RFC 8765 S6.1, see zoneApex). It then looks up the SRV record at
+// "<service>.<name>.", where service is network's DiscoveryService -- "_dnssd-srp-tls._tcp"
+// for NetworkTLS, "_dnssd-srp._tcp" otherwise, the service names RFC 9665 S10.4 registers in
+// RFC 6763 S7's "_<service>._tcp" form -- for each name mode selects (see DiscoveryMode), in
+// order, and stops at the first name that has one. A NetworkTLS search never falls back to
+// "_dnssd-srp._tcp": S7 says a requester able to use TLS SHOULD NOT fall back to TCP. It
 // never looks above the apex: a zone cut separates authority, so a registrar named in the
 // parent zone speaks for nothing in the child. A failed query ends the search with its error
 // instead of moving on to the next name, since the name it could not ask about may hold the
@@ -97,11 +99,14 @@ func (m DiscoveryMode) validate() error {
 // Returns "address:port". A caller with an explicit registrar address configured should skip
 // this entirely (see Config.RegistrarAddr) -- discovery is the fallback, not the only path,
 // matching cmd/sig0lease-srp-client's own "dev/test tool" framing.
-func Discover(ctx context.Context, query DNSQuery, domain string, mode DiscoveryMode) (string, error) {
+func Discover(ctx context.Context, query DNSQuery, domain string, mode DiscoveryMode, network Network) (string, error) {
 	if query == nil {
 		return "", fmt.Errorf("srp/client: Discover called with a nil DNSQuery")
 	}
 	if err := mode.validate(); err != nil {
+		return "", fmt.Errorf("srp/client: %w", err)
+	}
+	if err := network.validate(); err != nil {
 		return "", fmt.Errorf("srp/client: %w", err)
 	}
 	domain = ensureFQDN(domain)
@@ -117,7 +122,7 @@ func Discover(ctx context.Context, query DNSQuery, domain string, mode Discovery
 	var srvs []*dns.SRV
 	var asked []string
 	for _, n := range names {
-		name := "_dnssd-srp._tcp." + n
+		name := network.DiscoveryService() + "." + n
 		resp, err := query(ctx, name, dns.TypeSRV)
 		if err != nil {
 			return "", fmt.Errorf("srp/client: discovery failed for %s: %w", domain, err)
@@ -208,7 +213,7 @@ func zoneApex(ctx context.Context, query DNSQuery, name string) (string, error) 
 	return "", fmt.Errorf("no SOA record found for %s or any parent name above the top-level domain (RFC 8765 S6.1 step 4)", ensureFQDN(name))
 }
 
-// registrarSearchNames returns the names Discover looks under for a "_dnssd-srp._tcp" SRV
+// registrarSearchNames returns the names Discover looks under for the registrar's SRV
 // record, in the order it asks: for DiscoveryClosest, domain and then each parent of domain
 // up to and including apex; for DiscoveryApexOnly, apex alone. Both names are fully
 // qualified, compared without regard to ASCII case (RFC 4343), and every name returned is

@@ -69,7 +69,9 @@ is_port_in_use() {
 #   - starting our own proxy: writes a scratch TMP_CONFIG_FILE with
 #     min_key_lease_sec/min_rr_lease_sec forced down to
 #     TEST_MIN_LEASE_SECONDS, so lease-cycle tests don't wait out the real
-#     policy minimums.
+#     policy minimums. With PROXY_PROTOCOL=tls it also turns on
+#     config.yaml's commented-out DoT listener at PROXY_TLS_URL, with a
+#     throwaway certificate in TMP_TLS_DIR.
 #   - reusing an already-running proxy: we don't control that process's
 #     config, so LEASE_CONFIG_FILE falls back to the real CONFIG_FILE
 #     (whatever policy it's actually enforcing).
@@ -97,6 +99,26 @@ prepare_lease_config() {
         -e "s|^      min_rr_lease_sec:.*$|      min_rr_lease_sec: ${TEST_MIN_LEASE_SECONDS}|" \
         "$TMP_CONFIG_FILE"
     rm -f "$TMP_CONFIG_FILE.bak"
+
+    if [ "$PROXY_PROTOCOL" = "tls" ]; then
+        TMP_TLS_DIR="$(mktemp -d /tmp/sig0lease-tls.XXXXXX)"
+        make_tls_cert "$TMP_TLS_DIR" || return 1
+        sed -i.bak \
+            -e "s|^    # - tls .*$|    - tls|" \
+            -e "s|^  # tls:$|  tls:|" \
+            -e "s|^  #   address:.*$|    address: \"$PROXY_TLS_URL\"|" \
+            -e "s|^  #   cert:.*$|    cert: \"$TMP_TLS_DIR/cert.pem\"|" \
+            -e "s|^  #   key:.*$|    key: \"$TMP_TLS_DIR/key.pem\"|" \
+            "$TMP_CONFIG_FILE"
+        rm -f "$TMP_CONFIG_FILE.bak"
+        if ! grep -q '^    - tls$' "$TMP_CONFIG_FILE" || ! grep -q '^  tls:$' "$TMP_CONFIG_FILE" \
+            || ! grep -qF "address: \"$PROXY_TLS_URL\"" "$TMP_CONFIG_FILE" \
+            || ! grep -qF "$TMP_TLS_DIR/cert.pem" "$TMP_CONFIG_FILE" \
+            || ! grep -qF "$TMP_TLS_DIR/key.pem" "$TMP_CONFIG_FILE"; then
+            log_error "Could not turn on the DoT listener in $TMP_CONFIG_FILE: $CONFIG_FILE no longer has the commented-out \"- tls\" and \"tls:\" lines this edits"
+            return 1
+        fi
+    fi
 
     LEASE_CONFIG_FILE="$TMP_CONFIG_FILE"
 }
