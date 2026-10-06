@@ -17,11 +17,11 @@ Configuration Sequence
 2. Wireguard server utility monitors _'service-name'._sub._wgpeer._udp for client connection configuration requests
 
 
-3. Wireguard client utility registers 'myclient'._'service-name'._sub._wgpeer._udp as request to connect to <service-name>
+3. Wireguard client utility registers 'myclient'._'service-name'._sub._wgpeer._udp as request to connect to 'service-name'
 	- SRV contains client FQDN and UDP port of 0
 	- TXT contains public key of Wireguard client
 
-4. Wireguard server utility now has sufficient information to configure the Wireguard server instance for <myclient> connectivity
+4. Wireguard server utility now has sufficient information to configure the Wireguard server instance for 'myclient' connectivity
 
 5. Wireguard client utility monitors 'service-name'._'myclient'._sub._wgpeer._udp for specifc configuration details
 	- SRV contains FQDN and UDP port number of service-name Wireguard instance
