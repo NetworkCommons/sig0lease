@@ -39,6 +39,9 @@ import (
 //     controls whether domain-enumeration tools are told to try. [OPTIONAL, defaults to false]
 //   - "lease_policy": bounds applied to granted LEASE/KEY-LEASE, same shape as the base
 //     handler's. [OPTIONAL]
+//   - "record_ttl_sec": TTL of every record this handler writes upstream, in place of the
+//     requester's (see parseRecordTTL and applyRecordTTL). [OPTIONAL, defaults to
+//     defaultRecordTTL]
 //   - "lease_manager" / "storage": same mutually-exclusive lease-store backend selection
 //     as UpdateHandler.Setup -- see that method's doc comment for the full shape.
 //     [OPTIONAL, defaults to an in-memory store with no persistence]
@@ -104,6 +107,12 @@ func (h *SRPHandler) Setup(cfg map[string]any) error {
 		}
 		h.LeasePolicy = policy
 	}
+
+	recordTTL, err := parseRecordTTL(cfg)
+	if err != nil {
+		return err
+	}
+	h.recordTTL = recordTTL
 
 	rawLeaseManager, lmPresent := cfg["lease_manager"]
 	lmPresent = lmPresent && rawLeaseManager != nil

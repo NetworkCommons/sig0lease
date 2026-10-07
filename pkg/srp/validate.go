@@ -13,10 +13,9 @@ import (
 // Validate runs Classify plus every remaining RFC 9665 S3.3.1/S3.3.2 structural check
 // that needs more than the Update section alone: a single Zone Section entry, no
 // prerequisites, a present and internally-consistent Update-Lease option, TTL consistency
-// (S4 -- a MUST, reject rather than normalize, unlike the base RFC 9664 handler's
-// pkg/updatecore.NormalizeTTLs), identical KEY RDATA across every KEY add, flags-0 KEY
-// adds (S3.2.5.1), and DNS-SD-shaped service names on every Service Discovery add (RFC 6763
-// S4.1/S7). It does not verify SIG(0) or FCFS -- those need the lease store and the
+// (S4 -- a MUST, reject rather than normalize), identical KEY RDATA across every KEY add,
+// flags-0 KEY adds (S3.2.5.1), and DNS-SD-shaped service names on every Service Discovery
+// add (RFC 6763 S4.1/S7). It does not verify SIG(0) or FCFS -- those need the lease store and the
 // SIG(0) signer identity, both outside this package's pure-logic scope (S4.3 steps 4-5).
 //
 // Assumes the caller has already confirmed msg.Opcode == dns.OpcodeUpdate (the router
@@ -147,8 +146,9 @@ func validateLeaseOption(msg *dns.Msg) error {
 }
 
 // validateTTLConsistency implements S4's TTL-consistency MUST for the SRP path: reject
-// rather than normalize (contrast pkg/updatecore.NormalizeTTLs, used by the base RFC 9664
-// handler). Runs across every add RR gathered during classification -- Host Description
+// rather than normalize. The registrar replaces these TTLs before writing them
+// (handlers.applyRecordTTL), but S4 makes the check on the requester's own TTLs a MUST
+// regardless. Runs across every add RR gathered during classification -- Host Description
 // addresses, every Service Instance's SRV/TXT, and every Service Discovery PTR add -- KEY
 // adds are checked as their own RRset too, even though S3.2.5.1 already requires them to be
 // byte-identical (which implies but doesn't by itself guarantee equal TTLs).

@@ -199,7 +199,7 @@ When a key expires, it can trigger a chain deletion, for example in the case key
 ## Implementation Notes
 
 The rules above are what the handler enforces; this section covers how, in terms of the actual
-code — file/function references, config keys, and detail (storage backends, TTL clamping, the
+code — file/function references, config keys, and detail (storage backends, lease clamping, the
 deferred-mutation write ordering) that goes beyond the rule statement itself.
 
 ### Signer Resolution (Three-Stage Fallback)
@@ -256,18 +256,24 @@ The proxy never mutates the local lease store before the corresponding upstream 
 
 This means the local lease store's view of the world and the authoritative DNS server's view can never diverge as a direct result of a single request's outcome. Case C's delete additionally cascades: deleting a KEY also removes its descendant subtree, with best-effort upstream cleanup for the descendants (they are not blocking — a single unreachable descendant does not fail the whole delete).
 
-### TTL Clamping and Response Echo
+### Lease Clamping, TTLs and Response Echo
 
-Before forwarding, the proxy clamps LEASE and KEY-LEASE (and, correspondingly, RR/KEY TTLs) to `LeasePolicy` bounds (`min_key_lease_sec`/`max_key_lease_sec`/`min_rr_lease_sec`/`max_rr_lease_sec`). Both handlers parse and clamp with the same code (`handlers/lease_policy.go`), and the proxy refuses to start with a policy whose non-KEY bounds are looser than its KEY bounds (`min_rr_lease_sec` above `min_key_lease_sec`, or `max_rr_lease_sec` unset or above a set `max_key_lease_sec`): clamping the two values separately would then grant a LEASE longer than the KEY-LEASE. The *actual* durations used after clamping — not the client's originally-requested values — are echoed back to the client in the response's UPDATE-LEASE option, so the client can detect when the proxy granted less than what was requested. Both handlers build that response with `handlers.leaseResponse`: it copies none of the request's sections (RFC 2136 §3.8) and carries exactly one OPT RR (RFC 6891 §6.1.1). Copying the request's header used to add a second OPT RR beside the one holding the lease, which strict parsers such as mDNSResponder's `srp-client` reject. `client.EffectiveLeaseDuration(resp, requestedLease, requestedKeyLease)` returns both the effective LEASE and KEY-LEASE from a response.
+Before forwarding, the proxy clamps LEASE and KEY-LEASE to `LeasePolicy` bounds (`min_key_lease_sec`/`max_key_lease_sec`/`min_rr_lease_sec`/`max_rr_lease_sec`). Both handlers parse and clamp with the same code (`handlers/lease_policy.go`), and the proxy refuses to start with a policy whose non-KEY bounds are looser than its KEY bounds (`min_rr_lease_sec` above `min_key_lease_sec`, or `max_rr_lease_sec` unset or above a set `max_key_lease_sec`): clamping the two values separately would then grant a LEASE longer than the KEY-LEASE. The *actual* durations used after clamping — not the client's originally-requested values — are echoed back to the client in the response's UPDATE-LEASE option, so the client can detect when the proxy granted less than what was requested. Both handlers build that response with `handlers.leaseResponse`: it copies none of the request's sections (RFC 2136 §3.8) and carries exactly one OPT RR (RFC 6891 §6.1.1). Copying the request's header used to add a second OPT RR beside the one holding the lease, which strict parsers such as mDNSResponder's `srp-client` reject. `client.EffectiveLeaseDuration(resp, requestedLease, requestedKeyLease)` returns both the effective LEASE and KEY-LEASE from a response.
 
 This handler's status notes (for example `record not found for delete: ...`) travel in that same OPT RR, one Extended DNS Error option (RFC 8914, INFO-CODE 0 "Other") per note, with the note as EXTRA-TEXT; `client.StatusNotes(resp)` returns them and `sig0lease-client` prints them as "Proxy notes". They used to be TXT records in the answer slot, next to an echo of the KEY RRs processed, but in an UPDATE reply that slot is the Prerequisite section, which a reply may only copy from the request. The KEY echo is gone; to see a registered KEY, query it (`sig0lease-client verify`) or `dig` it at the authoritative server.
 
-A related, shared TTL rule lives in `pkg/updatecore/ttl.go`: any RRset with inconsistent TTLs is
-normalized to its lowest TTL (RFC 2181 §5.2), run before `LeasePolicy` clamping. When adding to
-an already-existing RRset at the authoritative server, the new RR's TTL is forced to match the
-existing RRset's TTL. *(RFC 9665 SRP uses the same helper in a stricter mode: an inconsistent
-RRset is rejected outright rather than normalized, since RFC 9665 §4 makes consistency a MUST —
-see `docs/siglease_rfc9665.md` §4.)*
+TTLs are not leases, and the proxy does not forward the requester's. A requester may send its
+lease as the TTL, which would let resolvers cache a record for as long as its lease.
+(`sig0lease-client` does not: the KEY RRs it builds from the signing key carry `--ttl`, default
+300, and rr-spec records carry the TTL written in them.) Once
+SIG(0) verification passes, both handlers set every record they write upstream to
+`record_ttl_sec` (default 300, `handlers/record_ttl.go`), cut to the granted KEY-LEASE on KEYs
+and to the granted LEASE on everything else. The records are changed in place, so the lease
+store keeps the TTLs the zone gets, and every RRset in a request leaves with one TTL (RFC 2181
+§5.2) whatever the requester sent. A KEY re-registered from the lease store in Case B, where the
+request carries no KEY-LEASE, is cut to the remaining lease it is re-registered with. RFC 9664
+says nothing about TTLs; the rule follows RFC 9665 §4 and §5.1, where the SRP handler applies
+the same setting (see `docs/siglease_rfc9665.md` §6).
 
 ### Blacklisted RR Types
 

@@ -96,7 +96,9 @@ func parseStringSlice(raw any) []string {
 //   - "persistence_hook": Persistence function for leases [OPTIONAL]. Same
 //     Go-embedding-only caveat as lease_manager: a func value, not settable
 //     from config.yaml.
-//   - "lease_policy": Bounds applied to local lease durations and forwarded RR TTLs [OPTIONAL]
+//   - "lease_policy": Bounds applied to granted LEASE/KEY-LEASE [OPTIONAL]
+//   - "record_ttl_sec": TTL of every record this handler writes upstream, in place of the
+//     requester's (see parseRecordTTL) [OPTIONAL, defaults to defaultRecordTTL]
 //   - "prefer_4byte_variant": Enable 4-byte variant for backward compatibility [OPTIONAL, defaults to false]
 //   - "allow_online_key_registration": Allow a signer resolved only via authoritative DNS
 //     (not lease-managed, not present in the request) to register new KEY RRs [OPTIONAL, defaults to false]
@@ -168,7 +170,7 @@ func (h *UpdateHandler) Setup(cfg map[string]any) error {
 		h.logger.Debugf("Persistence hook configured for leases")
 	}
 
-	// Optional: Lease/TTL policy hook
+	// Optional: Lease policy
 	if raw, ok := cfg["lease_policy"]; ok {
 		policy, err := parseLeasePolicy(raw)
 		if err != nil {
@@ -178,6 +180,12 @@ func (h *UpdateHandler) Setup(cfg map[string]any) error {
 		h.logger.Debugf("Lease policy configured: key[min=%d,max=%d] rr[min=%d,max=%d]",
 			h.LeasePolicy.MinKeyLease, h.LeasePolicy.MaxKeyLease, h.LeasePolicy.MinRRLease, h.LeasePolicy.MaxRRLease)
 	}
+
+	recordTTL, err := parseRecordTTL(cfg)
+	if err != nil {
+		return err
+	}
+	h.recordTTL = recordTTL
 
 	// Optional: Custom upstream coordinator
 	if coordinator, ok := cfg["upstream_coordinator"].(UpstreamCoordinator); ok && coordinator != nil {

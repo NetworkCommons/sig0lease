@@ -22,6 +22,7 @@ func TestBuildUpdate_HostOnly_RoundTripsThroughClassifyAndValidate(t *testing.T)
 		Key:       testHostKey("myhost.example.com."),
 		Lease:     30,
 		KeyLease:  1209600,
+		TTL:       300,
 	}
 	msg, err := BuildUpdate(spec)
 	if err != nil {
@@ -62,6 +63,7 @@ func TestBuildUpdate_WithInstanceAndSubtype_RoundTrips(t *testing.T) {
 		},
 		Lease:    30,
 		KeyLease: 1209600,
+		TTL:      300,
 	}
 	msg, err := BuildUpdate(spec)
 	if err != nil {
@@ -122,6 +124,7 @@ func TestBuildUpdate_NoTXT_DefaultsToOneEmptyString(t *testing.T) {
 		},
 		Lease:    30,
 		KeyLease: 1209600,
+		TTL:      300,
 	}
 	msg, err := BuildUpdate(spec)
 	if err != nil {
@@ -150,6 +153,7 @@ func TestBuildUpdate_ExplicitInstanceKey_MustMatchHostMaterial(t *testing.T) {
 		},
 		Lease:    30,
 		KeyLease: 1209600,
+		TTL:      300,
 	}
 	msg, err := BuildUpdate(spec)
 	if err != nil {
@@ -178,6 +182,7 @@ func TestBuildUpdate_RemovalShapedInstance(t *testing.T) {
 		},
 		Lease:    30,
 		KeyLease: 1209600,
+		TTL:      300,
 	}
 	msg, err := BuildUpdate(spec)
 	if err != nil {
@@ -202,6 +207,7 @@ func TestBuildUpdate_HostRemoval_NoAddresses(t *testing.T) {
 		Key:      testHostKey("myhost.example.com."),
 		Lease:    30,
 		KeyLease: 1209600,
+		TTL:      300,
 	}
 	msg, err := BuildUpdate(spec)
 	if err != nil {
@@ -224,6 +230,7 @@ func TestBuildUpdate_IPv6Address(t *testing.T) {
 		Key:       testHostKey("myhost.example.com."),
 		Lease:     30,
 		KeyLease:  1209600,
+		TTL:       300,
 	}
 	msg, err := BuildUpdate(spec)
 	if err != nil {
@@ -244,7 +251,7 @@ func TestBuildUpdate_IPv6Address(t *testing.T) {
 func TestBuildUpdate_Rejections(t *testing.T) {
 	base := UpdateSpec{
 		Zone: "example.com.", Host: "myhost.example.com.", Key: testHostKey("myhost.example.com."),
-		Lease: 30, KeyLease: 1209600,
+		Lease: 30, KeyLease: 1209600, TTL: 300,
 	}
 
 	t.Run("missing zone", func(t *testing.T) {
@@ -266,6 +273,13 @@ func TestBuildUpdate_Rejections(t *testing.T) {
 		s.Key = nil
 		if _, err := BuildUpdate(s); err == nil {
 			t.Fatal("expected an error for a missing key")
+		}
+	})
+	t.Run("missing ttl", func(t *testing.T) {
+		s := base
+		s.TTL = 0
+		if _, err := BuildUpdate(s); err == nil {
+			t.Fatal("expected an error for a missing ttl")
 		}
 	})
 	t.Run("lease exceeds key-lease", func(t *testing.T) {
@@ -290,4 +304,42 @@ func TestBuildUpdate_Rejections(t *testing.T) {
 			t.Fatal("expected an error for a live instance with no service type")
 		}
 	})
+}
+
+// TestBuildUpdate_TTLIsIndependentOfLeases: every add, KEY included, carries spec.TTL --
+// neither LEASE nor KEY-LEASE (S5.1: a lease is not a TTL).
+func TestBuildUpdate_TTLIsIndependentOfLeases(t *testing.T) {
+	spec := UpdateSpec{
+		Zone:      "example.com.",
+		Host:      "myhost.example.com.",
+		Addresses: []netip.Addr{netip.MustParseAddr("192.0.2.1")},
+		Key:       testHostKey("myhost.example.com."),
+		Instances: []InstanceSpec{{
+			Name:        "Printer._ipps._tcp.example.com.",
+			ServiceType: "_ipps._tcp.example.com.",
+			Subtypes:    []string{"_universal._sub._ipps._tcp.example.com."},
+			Port:        631,
+		}},
+		Lease:    30,
+		KeyLease: 1209600,
+		TTL:      300,
+	}
+	msg, err := BuildUpdate(spec)
+	if err != nil {
+		t.Fatalf("BuildUpdate: %v", err)
+	}
+	adds := 0
+	for _, rr := range msg.Ns {
+		hdr := rr.Header()
+		if hdr.Class != dns.ClassINET {
+			continue // Delete All RRsets, TTL 0
+		}
+		adds++
+		if hdr.TTL != spec.TTL {
+			t.Errorf("%s: TTL %d, want %d", rr, hdr.TTL, spec.TTL)
+		}
+	}
+	if adds != 6 { // A, KEY, SRV, TXT, 2 PTRs
+		t.Fatalf("expected 6 adds, got %d", adds)
+	}
 }

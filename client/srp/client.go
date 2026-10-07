@@ -109,6 +109,10 @@ type Config struct {
 
 	RequestedLease    uint32 // default 3600 (1h)
 	RequestedKeyLease uint32 // default 1209600 (14d, S3.4's "typically 14 days")
+	// TTL is the TTL suggested for every record registered, KEYs included; the registrar may
+	// override it (RFC 9665 S4). Independent of the leases: a lease is not a TTL (S5.1).
+	// Default 300.
+	TTL uint32
 
 	// RegistrarAddr, if set, bypasses discovery entirely -- an explicit "host:port",
 	// matching every other test/dev client this project's test suite already uses.
@@ -194,6 +198,9 @@ func NewClient(cfg Config) (*Client, error) {
 	}
 	if cfg.RequestedKeyLease == 0 {
 		cfg.RequestedKeyLease = 1209600
+	}
+	if cfg.TTL == 0 {
+		cfg.TTL = 300
 	}
 	if cfg.RequestedLease > cfg.RequestedKeyLease {
 		return nil, fmt.Errorf("srp/client: RequestedLease (%d) must not exceed RequestedKeyLease (%d)", cfg.RequestedLease, cfg.RequestedKeyLease)
@@ -312,6 +319,7 @@ func (c *Client) buildSignSend(ctx context.Context, addresses []netip.Addr, inst
 		Instances: instances,
 		Lease:     lease,
 		KeyLease:  keyLease,
+		TTL:       c.cfg.TTL,
 	}
 	msg, err := pkgsrp.BuildUpdate(spec)
 	if err != nil {

@@ -13,12 +13,12 @@ import (
 // section, and signs it with signingKey. prereqs may be nil/empty -- most callers have none.
 //
 // Unlike the base RFC 9664 handler's constructUpstreamUpdate (handlers/
-// opcode5_update_helpers.go), this does no per-record-type branching or TTL clamping --
-// S4.3 step 7's SRP forward is simpler by construction: it's exactly "the same
-// adds/deletes [the requester sent], re-signed with proxy key" (plus, for a Service
-// Description, the pkg/srp-computed PTR-delete diff appended by the caller before this is
-// called -- see docs/siglease_rfc9665.md's lease-store mapping section). Any clamping SRP wants happens earlier, against the
-// classified instructions, not here.
+// opcode5_update_helpers.go), this does no per-record-type branching -- S4.3 step 7's SRP
+// forward is simpler by construction: it's exactly "the same adds/deletes [the requester
+// sent], re-signed with proxy key" (plus, for a Service Description, the pkg/srp-computed
+// PTR-delete diff appended by the caller before this is called -- see
+// docs/siglease_rfc9665.md's lease-store mapping section). The registrar's own TTLs are
+// set earlier, against the classified instructions (handlers.applyRecordTTL), not here.
 func BuildAndSign(upstreamZone string, prereqs, records []dns.RR, signingKey *keyrec.LoadedKey) (*dns.Msg, error) {
 	if signingKey == nil || signingKey.PublicKey == nil || signingKey.PrivateKey == nil {
 		return nil, fmt.Errorf("updatecore: signing key is not configured")

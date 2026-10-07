@@ -67,7 +67,8 @@ type UpdateHandler struct {
 	upstreamCoordinator UpstreamCoordinator
 	keystoreDir         string
 	LeasePolicy         LeasePolicy
-	prefer4ByteVariant  bool // When true, use 4-byte variant (legacy); default false uses 8-byte always.
+	recordTTL           uint32 // TTL of every record this handler writes upstream (see parseRecordTTL)
+	prefer4ByteVariant  bool   // When true, use 4-byte variant (legacy); default false uses 8-byte always.
 	// AllowOnlineKeyRegistration controls whether a signer resolved only via
 	// authoritative DNS (not in the lease store, not present anywhere in the
 	// request) may authorize registration of new KEY RRs. Such a signer can
@@ -89,6 +90,7 @@ func NewUpdateHandler() *UpdateHandler {
 		},
 		leaseManager:        NewInMemoryLeaseManager(),
 		upstreamCoordinator: nil, // Must be configured via Setup()
+		recordTTL:           defaultRecordTTL,
 		timers:              newExpiryTimers(),
 	}
 }
@@ -113,12 +115,12 @@ func copyRR(rr dns.RR) dns.RR {
 	return rr.Clone()
 }
 
-func clampTTL(ttl, min, max uint32) uint32 {
-	if min > 0 && ttl < min {
-		ttl = min
+func clampLease(lease, min, max uint32) uint32 {
+	if min > 0 && lease < min {
+		lease = min
 	}
-	if max > 0 && ttl > max {
-		ttl = max
+	if max > 0 && lease > max {
+		lease = max
 	}
-	return ttl
+	return lease
 }
