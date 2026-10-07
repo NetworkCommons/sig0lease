@@ -9,6 +9,7 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"strings"
 
 	"codeberg.org/miekg/dns"
 	"github.com/NetworkCommons/sig0lease/logging"
@@ -48,7 +49,9 @@ func GenerateKey(name string, algorithm uint8, flags uint16, bits int) (*LoadedK
 // Search is algorithm-agnostic (via FindKeysByZone's own "any algorithm, ED25519 preferred"
 // ordering): an existing key of ANY algorithm satisfies the lookup, since createAlgorithm
 // only says what to generate if nothing is found yet, not which algorithm to prefer among
-// what already exists. created reports whether a new key was generated, so callers can tell
+// what already exists. When several keys match, the first in FindKeysByZone's order is used,
+// so every run picks the same one, and logger (if non-nil) gets a warning naming them all.
+// created reports whether a new key was generated, so callers can tell
 // the user which happened. createAlgorithm == 0 means "never create" -- a missing key is then
 // an error, not silently generated, matching this package's existing strict-by-default
 // convention (see cmd/sig0lease-client's historical behavior, which this generalizes).
@@ -71,6 +74,9 @@ func ResolveOrCreateKey(dir, owner string, createAlgorithm uint8, logger *loggin
 	// that's routine on a brand-new identity's first-ever run (the create path below
 	// creates the directory itself via os.MkdirAll), not a real error.
 	if len(existing) > 0 {
+		if len(existing) > 1 && logger != nil {
+			logger.Warnf("%d keys in keystore %s match %s (%s); using %s", len(existing), dir, owner, strings.Join(existing, ", "), existing[0])
+		}
 		k, err := LoadKeyFromFile(dir, existing[0])
 		if err != nil {
 			return nil, false, fmt.Errorf("keyrec: load existing key %s: %w", existing[0], err)

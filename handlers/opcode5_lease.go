@@ -15,20 +15,6 @@ import (
 	leasepkg "github.com/NetworkCommons/sig0lease/pkg/lease"
 )
 
-func (h *UpdateHandler) clampLeaseDurations(leaseDuration, keyLeaseDuration uint32) (uint32, uint32) {
-	if leaseDuration != 0 {
-		leaseDuration = clampTTL(leaseDuration, h.LeasePolicy.MinRRLease, h.LeasePolicy.MaxRRLease)
-	}
-	if keyLeaseDuration != 0 {
-		keyLeaseDuration = clampTTL(keyLeaseDuration, h.LeasePolicy.MinKeyLease, h.LeasePolicy.MaxKeyLease)
-	}
-	if leaseDuration != 0 && keyLeaseDuration != 0 && leaseDuration > keyLeaseDuration {
-		// Preserve LEASE <= KEY-LEASE invariant when policy clamps tighten durations.
-		leaseDuration = keyLeaseDuration
-	}
-	return leaseDuration, keyLeaseDuration
-}
-
 // authorizeKeyRefresh verifies that signerID may refresh the already
 // -registered KEY RR clientKeyRR. Two things must hold: the resubmitted
 // RDATA must match what is on record (a KEY RR's name+algo+keytag identity

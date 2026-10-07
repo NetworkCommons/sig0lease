@@ -16,6 +16,7 @@ import (
 
 	"codeberg.org/miekg/dns"
 	clientsrp "github.com/NetworkCommons/sig0lease/client/srp"
+	"github.com/NetworkCommons/sig0lease/logging"
 	_ "github.com/NetworkCommons/sig0lease/pkg/dnscompat" // registers EDNS0 code 2 (UPDATE-LEASE); matches cmd/sig0lease/main.go and cmd/sig0lease-client/main.go's own convention (client/srp also self-registers this, so it's redundant here, not load-bearing)
 	"github.com/NetworkCommons/sig0lease/pkg/keyrec"
 	pkgsrp "github.com/NetworkCommons/sig0lease/pkg/srp"
@@ -30,20 +31,23 @@ func (r *repeatableFlag) Set(v string) error { *r = append(*r, v); return nil }
 func main() {
 	domain := flag.String("domain", "", "registration domain (required)")
 	host := flag.String("host", "", "base host label, e.g. \"myhost\" (required)")
-	server := flag.String("server", "", "explicit registrar \"host:port\"; empty triggers _dnssd-srp._tcp discovery")
+	server := flag.String("server", "", "explicit registrar \"host:port\"; empty triggers _dnssd-srp._tcp discovery (_dnssd-srp-tls._tcp with -tls)")
+	discovery := flag.String("discovery", "closest", `where discovery looks for the registrar's SRV: "closest" (the domain, then each parent up to its zone apex) or "apex" (the zone apex only, as RFC 9665 S3.1.1 specifies)`)
 	lease := flag.Uint("lease", 3600, "requested LEASE seconds")
 	keylease := flag.Uint("keylease", 1209600, "requested KEY-LEASE seconds")
 	udp := flag.Bool("udp", false, "use UDP instead of TCP (SRP requires TCP by default, S3.5)")
+	useTLS := flag.Bool("tls", false, "use DNS-over-TLS (RFC 7858, opportunistic: the registrar's certificate is not checked) instead of TCP; discovery then looks for _dnssd-srp-tls._tcp")
 	once := flag.Bool("once", false, "send exactly one registration and exit, instead of running the full refresh lifecycle")
 	deregister := flag.Bool("deregister", false, "send exactly one Deregister (withdraw host + every -instance) and exit, instead of registering; implies -once")
 	keystoreDir := flag.String("keystore", "", "directory to load this identity's signing key from; falls back to CLIENT_KEYSTORE_DIR if unset")
 	keyAlg := flag.Uint("k", 0, "DNSSEC algorithm (13=ECDSAP256SHA256, 15=ED25519) to generate a NEW signing key with if none exists yet; omit to require an existing key")
 	maxRenames := flag.Int("max-renames", 5, "rename-retry attempts on YXDOMAIN before giving up")
 
-	var addrs, instances, txts, subtypes, resolvers repeatableFlag
+	var addrs, instances, removes, txts, subtypes, resolvers repeatableFlag
 	flag.Var(&addrs, "addr", "host A/AAAA address to publish (repeatable)")
-	flag.Var(&resolvers, "resolver", "bootstrap resolver \"host:port\" for _dnssd-srp._tcp discovery (repeatable); default 8.8.8.8:53, 8.8.4.4:53")
+	flag.Var(&resolvers, "resolver", "resolver \"host:port\" for every discovery lookup -- zone apex SOA, registrar SRV, registrar address (repeatable); default 8.8.8.8:53, 8.8.4.4:53")
 	flag.Var(&instances, "instance", `service instance "Label:_svctype._proto:port" (repeatable)`)
+	flag.Var(&removes, "remove", `service instance "Label:_svctype._proto" to withdraw in this update (repeatable)`)
 	flag.Var(&txts, "txt", `TXT string for a declared instance, "Label:content" (repeatable)`)
 	flag.Var(&subtypes, "subtype", `DNS-SD subtype for a declared instance, "Label:subtypelabel" (repeatable)`)
 
@@ -53,6 +57,28 @@ func main() {
 	if *domain == "" || *host == "" {
 		fmt.Fprintln(os.Stderr, "ERROR: -domain and -host are required")
 		printUsage()
+		os.Exit(1)
+	}
+
+	network := clientsrp.NetworkTCP
+	switch {
+	case *udp && *useTLS:
+		fmt.Fprintln(os.Stderr, "ERROR: -udp and -tls are mutually exclusive")
+		os.Exit(1)
+	case *udp:
+		network = clientsrp.NetworkUDP
+	case *useTLS:
+		network = clientsrp.NetworkTLS
+	}
+
+	var discoveryMode clientsrp.DiscoveryMode
+	switch *discovery {
+	case "closest":
+		discoveryMode = clientsrp.DiscoveryClosest
+	case "apex":
+		discoveryMode = clientsrp.DiscoveryApexOnly
+	default:
+		fmt.Fprintf(os.Stderr, "ERROR: invalid -discovery %q, want \"closest\" or \"apex\"\n", *discovery)
 		os.Exit(1)
 	}
 
@@ -66,7 +92,7 @@ func main() {
 		parsedAddrs = append(parsedAddrs, addr)
 	}
 
-	instCfgs, err := parseInstances(instances, txts, subtypes)
+	instCfgs, err := parseInstances(instances, removes, txts, subtypes)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "ERROR: %v\n", err)
 		os.Exit(1)
@@ -88,8 +114,9 @@ func main() {
 		RequestedLease:    uint32(*lease),
 		RequestedKeyLease: uint32(*keylease),
 		RegistrarAddr:     *server,
+		Discovery:         discoveryMode,
 		Resolvers:         []string(resolvers),
-		UseTCP:            !*udp,
+		Network:           network,
 		MaxRenames:        *maxRenames,
 		OnRegistered: func(resp *dns.Msg) {
 			fmt.Printf("[%s] ", time.Now().Format(time.RFC3339))
@@ -112,9 +139,12 @@ func main() {
 	fmt.Printf("Key: %s (algorithm %d, keytag %d)\n", key.Name, key.PublicKey.Algorithm, key.PublicKey.KeyTag())
 	if *server != "" {
 		fmt.Printf("Registrar: %s (explicit)\n", *server)
+	} else if discoveryMode == clientsrp.DiscoveryApexOnly {
+		fmt.Printf("Registrar: discovered via %s.<zone apex enclosing %s>\n", network.DiscoveryService(), strings.TrimSuffix(*domain, "."))
 	} else {
-		fmt.Printf("Registrar: discovered via _dnssd-srp._tcp.%s\n", strings.TrimSuffix(*domain, "."))
+		fmt.Printf("Registrar: discovered via the closest %s SRV from %s up to its zone apex\n", network.DiscoveryService(), strings.TrimSuffix(*domain, "."))
 	}
+	fmt.Printf("Transport: %s\n", network)
 	fmt.Printf("Instances: %d\n\n", len(instCfgs))
 
 	if *deregister {
@@ -183,9 +213,10 @@ func resolveKeystoreDir(flagValue string) string {
 // algorithm is non-zero (the -k flag was passed) -- generates and persists a new one at that
 // algorithm. A missing key with no -k given is an error, matching sig0lease-client's own
 // strict default (see the keyrec.ResolveOrCreateKey doc comment for the shared logic).
+// The logger carries ResolveOrCreateKey's warning when more than one key in dir matches.
 func resolveKey(dir, host, domain string, algorithm uint8) (*keyrec.LoadedKey, error) {
 	name := ensureFQDN(host + "." + strings.TrimSuffix(domain, "."))
-	k, created, err := keyrec.ResolveOrCreateKey(dir, name, algorithm, nil)
+	k, created, err := keyrec.ResolveOrCreateKey(dir, name, algorithm, logging.NewLogger("info"))
 	if err != nil {
 		return nil, err
 	}
@@ -203,9 +234,9 @@ func ensureFQDN(name string) string {
 	return name + "."
 }
 
-// parseInstances assembles InstanceConfig entries from -instance/-txt/-subtype, matched by
-// label.
-func parseInstances(instances, txts, subtypes repeatableFlag) ([]clientsrp.InstanceConfig, error) {
+// parseInstances assembles InstanceConfig entries from -instance/-remove/-txt/-subtype,
+// matched by label.
+func parseInstances(instances, removes, txts, subtypes repeatableFlag) ([]clientsrp.InstanceConfig, error) {
 	byLabel := map[string]*clientsrp.InstanceConfig{}
 	var order []string
 
@@ -225,6 +256,18 @@ func parseInstances(instances, txts, subtypes repeatableFlag) ([]clientsrp.Insta
 		order = append(order, parts[0])
 	}
 
+	for _, spec := range removes {
+		label, svcType, ok := strings.Cut(spec, ":")
+		if !ok {
+			return nil, fmt.Errorf(`invalid -remove %q, want "Label:_svctype._proto"`, spec)
+		}
+		if _, exists := byLabel[label]; exists {
+			return nil, fmt.Errorf("duplicate instance label %q (an -instance and a -remove, or two -remove)", label)
+		}
+		byLabel[label] = &clientsrp.InstanceConfig{Label: label, ServiceType: svcType, Remove: true}
+		order = append(order, label)
+	}
+
 	for _, spec := range txts {
 		label, content, ok := strings.Cut(spec, ":")
 		if !ok {
@@ -233,6 +276,9 @@ func parseInstances(instances, txts, subtypes repeatableFlag) ([]clientsrp.Insta
 		inst, ok := byLabel[label]
 		if !ok {
 			return nil, fmt.Errorf("-txt references undeclared instance label %q (declare it with -instance first)", label)
+		}
+		if inst.Remove {
+			return nil, fmt.Errorf("-txt references instance label %q, which -remove withdraws", label)
 		}
 		inst.TXT = append(inst.TXT, content)
 	}
@@ -245,6 +291,9 @@ func parseInstances(instances, txts, subtypes repeatableFlag) ([]clientsrp.Insta
 		inst, ok := byLabel[label]
 		if !ok {
 			return nil, fmt.Errorf("-subtype references undeclared instance label %q (declare it with -instance first)", label)
+		}
+		if inst.Remove {
+			return nil, fmt.Errorf("-subtype references instance label %q, which -remove withdraws", label)
 		}
 		inst.Subtypes = append(inst.Subtypes, subtype)
 	}
@@ -270,13 +319,27 @@ Options:
   -addr value            host A/AAAA address to publish (repeatable)
   -instance value        service instance "Label:_svctype._proto:port" (repeatable); _proto is
                          _tcp or _udp -- to narrow a type further, add a -subtype instead of a label
+  -remove value           service instance "Label:_svctype._proto" to withdraw in this update,
+                         keeping the host and every -instance (repeatable)
   -txt value              TXT string for a declared instance, "Label:content" (repeatable)
   -subtype value          DNS-SD subtype for a declared instance, "Label:subtypelabel" (repeatable)
   -server string          explicit registrar "host:port"; empty triggers _dnssd-srp._tcp discovery
-  -resolver value          bootstrap resolver "host:port" for discovery (repeatable)
+                         (_dnssd-srp-tls._tcp with -tls)
+  -discovery string       where discovery looks for the registrar's SRV: "closest" (default:
+                         the domain, then each parent up to its zone apex; the first record
+                         wins) or "apex" (the zone apex only, as RFC 9665 S3.1.1 specifies --
+                         what a stock SRP client would find); ignored with -server
+  -resolver value          resolver "host:port" for every discovery lookup: zone apex SOA,
+                         registrar SRV, registrar address (repeatable; default 8.8.8.8:53,
+                         8.8.4.4:53); ignored with -server
   -lease uint              requested LEASE seconds (default 3600)
   -keylease uint            requested KEY-LEASE seconds (default 1209600)
   -udp                      use UDP instead of TCP (SRP requires TCP by default, S3.5)
+  -tls                      use DNS-over-TLS (RFC 7858) instead of TCP. Opportunistic, as RFC 9665
+                            S7 specifies: encrypted, but the registrar's certificate is not
+                            checked. Discovery looks for _dnssd-srp-tls._tcp instead of
+                            _dnssd-srp._tcp and never falls back to plain TCP; with -server, give
+                            the registrar's DoT port. Not with -udp
   -once                    send exactly one registration and exit, instead of running the full lifecycle
   -deregister               send exactly one Deregister (withdraw host + every -instance) and exit; implies -once
   -keystore string          directory holding this identity's signing key; falls back to the

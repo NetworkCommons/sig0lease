@@ -94,28 +94,11 @@ func (h *SRPHandler) Setup(cfg map[string]any) error {
 	}
 
 	if raw, ok := cfg["lease_policy"]; ok {
-		policy, ok := raw.(map[string]any)
-		if !ok {
-			return fmt.Errorf("lease_policy must be a map")
+		policy, err := parseLeasePolicy(raw)
+		if err != nil {
+			return err
 		}
-		if v, ok := toUint32(policy["min_key_lease_sec"]); ok {
-			h.LeasePolicy.MinKeyLease = v
-		}
-		if v, ok := toUint32(policy["max_key_lease_sec"]); ok {
-			h.LeasePolicy.MaxKeyLease = v
-		}
-		if v, ok := toUint32(policy["min_rr_lease_sec"]); ok {
-			h.LeasePolicy.MinRRLease = v
-		}
-		if v, ok := toUint32(policy["max_rr_lease_sec"]); ok {
-			h.LeasePolicy.MaxRRLease = v
-		}
-		if h.LeasePolicy.MaxKeyLease > 0 && h.LeasePolicy.MinKeyLease > 0 && h.LeasePolicy.MinKeyLease > h.LeasePolicy.MaxKeyLease {
-			return fmt.Errorf("lease_policy min_key_lease_sec cannot be greater than max_key_lease_sec")
-		}
-		if h.LeasePolicy.MaxRRLease > 0 && h.LeasePolicy.MinRRLease > 0 && h.LeasePolicy.MinRRLease > h.LeasePolicy.MaxRRLease {
-			return fmt.Errorf("lease_policy min_rr_lease_sec cannot be greater than max_rr_lease_sec")
-		}
+		h.LeasePolicy = policy
 	}
 
 	rawLeaseManager, lmPresent := cfg["lease_manager"]

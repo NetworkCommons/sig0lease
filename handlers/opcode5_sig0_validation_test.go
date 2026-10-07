@@ -4,12 +4,14 @@ import (
 	"context"
 	"fmt"
 	"net"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
 	"time"
 
 	"codeberg.org/miekg/dns"
+	"github.com/NetworkCommons/sig0lease/client"
 	"github.com/NetworkCommons/sig0lease/pkg/dnsname"
 	"github.com/NetworkCommons/sig0lease/pkg/keyrec"
 	leasepkg "github.com/NetworkCommons/sig0lease/pkg/lease"
@@ -952,18 +954,8 @@ func TestHandle_CaseCDelete_UnrelatedHierarchicalAncestorCannotDeleteChildKey(t 
 	}
 
 	wantNote := fmt.Sprintf("KEY %s not found for delete", childRR.Hdr.Name)
-	foundNote := false
-	for _, rr := range res.Message.Answer {
-		if txt, ok := rr.(*dns.TXT); ok {
-			for _, line := range txt.TXT.Txt {
-				if line == wantNote {
-					foundNote = true
-				}
-			}
-		}
-	}
-	if !foundNote {
-		t.Fatalf("expected note %q when a non-parent ancestor attempts delete, got answers=%+v", wantNote, res.Message.Answer)
+	if notes := client.StatusNotes(res.Message); !slices.Contains(notes, wantNote) {
+		t.Fatalf("expected note %q when a non-parent ancestor attempts delete, got notes=%q", wantNote, notes)
 	}
 }
 

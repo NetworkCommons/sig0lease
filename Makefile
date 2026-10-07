@@ -117,7 +117,7 @@ test-cover:
 test-update: build build-client
 	CLIENT_KEYSTORE_DIR=$(CLIENT_KEYSTORE_DIR) ./tests/test_update.sh run
 
-# Run the RFC 9665 SRP end-to-end suite (register/refresh/conflict/remove/expiry) against a
+# Run the RFC 9665 SRP end-to-end suite (register/refresh/conflict/remove/expiry/discovery) against a
 # real, disposable local BIND 9 -- no CLIENT_KEYSTORE_DIR needed, it generates its own
 # per-test identities.
 test-srp:

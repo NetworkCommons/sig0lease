@@ -258,7 +258,9 @@ This means the local lease store's view of the world and the authoritative DNS s
 
 ### TTL Clamping and Response Echo
 
-Before forwarding, the proxy clamps LEASE and KEY-LEASE (and, correspondingly, RR/KEY TTLs) to `LeasePolicy` bounds (`min_key_lease_sec`/`max_key_lease_sec`/`min_rr_lease_sec`/`max_rr_lease_sec`). The *actual* durations used after clamping — not the client's originally-requested values — are echoed back to the client in the response's UPDATE-LEASE option, so the client can detect when the proxy granted less than what was requested. `client.EffectiveLeaseDuration(resp, requestedLease, requestedKeyLease)` returns both the effective LEASE and KEY-LEASE from a response.
+Before forwarding, the proxy clamps LEASE and KEY-LEASE (and, correspondingly, RR/KEY TTLs) to `LeasePolicy` bounds (`min_key_lease_sec`/`max_key_lease_sec`/`min_rr_lease_sec`/`max_rr_lease_sec`). Both handlers parse and clamp with the same code (`handlers/lease_policy.go`), and the proxy refuses to start with a policy whose non-KEY bounds are looser than its KEY bounds (`min_rr_lease_sec` above `min_key_lease_sec`, or `max_rr_lease_sec` unset or above a set `max_key_lease_sec`): clamping the two values separately would then grant a LEASE longer than the KEY-LEASE. The *actual* durations used after clamping — not the client's originally-requested values — are echoed back to the client in the response's UPDATE-LEASE option, so the client can detect when the proxy granted less than what was requested. Both handlers build that response with `handlers.leaseResponse`: it copies none of the request's sections (RFC 2136 §3.8) and carries exactly one OPT RR (RFC 6891 §6.1.1). Copying the request's header used to add a second OPT RR beside the one holding the lease, which strict parsers such as mDNSResponder's `srp-client` reject. `client.EffectiveLeaseDuration(resp, requestedLease, requestedKeyLease)` returns both the effective LEASE and KEY-LEASE from a response.
+
+This handler's status notes (for example `record not found for delete: ...`) travel in that same OPT RR, one Extended DNS Error option (RFC 8914, INFO-CODE 0 "Other") per note, with the note as EXTRA-TEXT; `client.StatusNotes(resp)` returns them and `sig0lease-client` prints them as "Proxy notes". They used to be TXT records in the answer slot, next to an echo of the KEY RRs processed, but in an UPDATE reply that slot is the Prerequisite section, which a reply may only copy from the request. The KEY echo is gone; to see a registered KEY, query it (`sig0lease-client verify`) or `dig` it at the authoritative server.
 
 A related, shared TTL rule lives in `pkg/updatecore/ttl.go`: any RRset with inconsistent TTLs is
 normalized to its lowest TTL (RFC 2181 §5.2), run before `LeasePolicy` clamping. When adding to
@@ -335,6 +337,34 @@ server:
     cert: /path/to/cert.pem
     key: /path/to/key.pem
 ```
+
+The proxy uses this one certificate for as long as it runs; nothing generates one for it. A
+self-signed certificate is enough, since no client checks it (see below). Create it once and
+keep it, for example:
+
+```bash
+openssl ecparam -name prime256v1 -genkey -noout -out key.pem
+openssl req -new -x509 -key key.pem -out cert.pem -days 3650 -subj "/CN=proxy.example"
+```
+
+Generating a new certificate at every start would work for today's clients, but a long-lived
+one keeps the option of key pinning (RFC 7858 §4.2), where a client is configured with the
+proxy's key in advance, and pinning needs a key that does not change. RFC 9665 §6.5 mentions
+pinning for SRP registrars and leaves it out of scope; it is not implemented here.
+
+Both clients can send over DoT: `sig0lease-client <dot-address> ... --tls` and
+`sig0lease-srp-client -tls` (with `-server`, give the DoT address; without it, discovery uses the
+`_dnssd-srp-tls._tcp` record, see `docs/siglease_rfc9665.md`). Both use RFC 7858 §4.1's
+Opportunistic Privacy profile, the only one RFC 9665 §7 uses for SRP: the client encrypts but
+does not check the server's certificate, so it is protected against passive eavesdroppers but
+not against an active attacker in the path. Neither client falls back to plain TCP or UDP when
+TLS fails.
+
+The transport is tested at three levels. `server/transport_tls_test.go` sends a query from
+`client.New(..., "tls", ...)` to the real DoT listener. `PROXY_PROTOCOL=tls` runs the whole
+`tests/test_update.sh` suite over DoT, against a listener the script turns on in its scratch
+config with a throwaway certificate. `tests/test_srp.sh`'s TEST 9 discovers the registrar
+through `_dnssd-srp-tls._tcp` and registers over DoT.
 
 ## Project Layout
 
@@ -455,7 +485,7 @@ For the proxy this meant that an update carrying such a label, validly signed, w
 
 `TestLibraryReadsEveryDotAsLabelBoundary` fails the first time `go test ./...` runs against a library version that escapes dots inside labels, whether through the patch above or some other change, and its failure message points here. It is the only test that fails: that was checked by porting the patch onto v0.6.82 and running the whole suite against it. Everything else keeps passing because the refusal above still catches every dotted label, so a green run apart from this test does not mean nothing else needs changing.
 
-A release carrying the change will be newer than v0.6.117, which already removed `OPT.SetUDPSize` (used in [pkg/updatecore/forward.go](../pkg/updatecore/forward.go), [pkg/dnsmsg/update.go](../pkg/dnsmsg/update.go) and [tests/srp_client_tester/main.go](../tests/srp_client_tester/main.go)). Expect it to come as part of a larger upgrade; see [upgrade-miekg-dns.md](upgrade-miekg-dns.md).
+A release carrying the change will be newer than v0.6.117, which already removed `OPT.SetUDPSize` (used in [pkg/updatecore/forward.go](../pkg/updatecore/forward.go), [pkg/dnsmsg/update.go](../pkg/dnsmsg/update.go) and others). Expect it to come as part of a larger upgrade; see [upgrade-miekg-dns.md](upgrade-miekg-dns.md).
 
 Then work through these steps in order. **Do steps 1 and 2 before step 5**: both compare names as plain strings, and today the refusal is what keeps escaped names away from them.
 

@@ -34,3 +34,17 @@ func ExpiryFromResponse(now time.Time, requestedLease, requestedKeyLease uint32,
 	lease, keyLease := EffectiveLeaseDuration(resp, requestedLease, requestedKeyLease)
 	return now.Add(time.Duration(lease) * time.Second), now.Add(time.Duration(keyLease) * time.Second)
 }
+
+// StatusNotes returns the proxy's status notes from an UPDATE response: the EXTRA-TEXT of
+// each Extended DNS Error option (RFC 8914) it carries, in order. The RFC 9664 handler sends
+// one per note, such as "record not found for delete: ...", so a person can see what the
+// proxy did with each record; they are not meant for parsing.
+func StatusNotes(resp *dns.Msg) []string {
+	var notes []string
+	for _, rr := range resp.Pseudo {
+		if ede, ok := rr.(*dns.EDE); ok {
+			notes = append(notes, ede.ExtraText)
+		}
+	}
+	return notes
+}

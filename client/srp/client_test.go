@@ -21,13 +21,15 @@ import (
 type fakeTransport struct {
 	sent      []*dns.Msg
 	addrs     []string
+	networks  []Network
 	responses []*dns.Msg
 	err       error
 }
 
-func (f *fakeTransport) Send(ctx context.Context, addr string, useTCP bool, msg *dns.Msg) (*dns.Msg, error) {
+func (f *fakeTransport) Send(ctx context.Context, addr string, network Network, msg *dns.Msg) (*dns.Msg, error) {
 	f.sent = append(f.sent, msg)
 	f.addrs = append(f.addrs, addr)
+	f.networks = append(f.networks, network)
 	if f.err != nil {
 		return nil, f.err
 	}
@@ -84,6 +86,16 @@ func TestNewClient_RejectsMalformedServiceType(t *testing.T) {
 	cfg.Instances = []InstanceConfig{{Label: "vpnclient", ServiceType: "_wg._udp", Subtypes: []string{"_vpnserver"}, TXT: []string{"txtver=1"}}}
 	if _, err := NewClient(cfg); err != nil {
 		t.Fatalf("NewClient with a two-label type and a subtype: %v", err)
+	}
+}
+
+// TestNewClient_RejectsUnknownDiscoveryMode: a bad mode is a configuration error at
+// NewClient, not a discovery failure that Run would report and retry on every cycle.
+func TestNewClient_RejectsUnknownDiscoveryMode(t *testing.T) {
+	cfg := testConfig(t, &fakeTransport{})
+	cfg.Discovery = DiscoveryMode(7)
+	if _, err := NewClient(cfg); err == nil || !strings.Contains(err.Error(), "unknown DiscoveryMode") {
+		t.Fatalf("expected an unknown-mode error, got: %v", err)
 	}
 }
 
@@ -204,12 +216,15 @@ func TestClient_Deregister_SendsRemovalShapedUpdate(t *testing.T) {
 	}
 }
 
-func TestClient_Register_DiscoversWhenNoExplicitAddr(t *testing.T) {
+// TestClient_Register_WithdrawsOneInstance: an instance with Remove set goes out as a bare
+// Delete All RRsets (RFC 9665 S3.2.5.5.2), while the host keeps its addresses and the other
+// instance is registered as usual.
+func TestClient_Register_WithdrawsOneInstance(t *testing.T) {
 	transport := &fakeTransport{responses: []*dns.Msg{successResp(30, 1209600)}}
 	cfg := testConfig(t, transport)
-	cfg.RegistrarAddr = ""
-	cfg.Query = func(ctx context.Context, name string) ([]*dns.SRV, error) {
-		return []*dns.SRV{srvRR("registrar.example.com.", 0, 0, 8853)}, nil
+	cfg.Instances = []InstanceConfig{
+		{Label: "Screen", ServiceType: "_rfb._tcp", Remove: true},
+		{Label: "Shell", ServiceType: "_ssh._tcp", Port: 22},
 	}
 	c, err := NewClient(cfg)
 	if err != nil {
@@ -218,8 +233,77 @@ func TestClient_Register_DiscoversWhenNoExplicitAddr(t *testing.T) {
 	if _, _, err := c.Register(context.Background()); err != nil {
 		t.Fatalf("Register: %v", err)
 	}
-	if transport.addrs[0] != "registrar.example.com:8853" {
+
+	cu, err := pkgsrp.Validate(transport.sent[0])
+	if err != nil {
+		t.Fatalf("sent message failed Validate(): %v", err)
+	}
+	if len(cu.Host.Addresses) != 1 {
+		t.Fatalf("host has %d address adds, want 1 (withdrawing an instance keeps the host)", len(cu.Host.Addresses))
+	}
+	srvByName := map[string]*dns.SRV{}
+	for _, inst := range cu.Instances {
+		srvByName[inst.Name] = inst.SRV
+	}
+	if srv, ok := srvByName["screen._rfb._tcp.example.com."]; !ok || srv != nil {
+		t.Fatalf("Screen: present=%v SRV=%v, want a removal-shaped instance (SRV nil)", ok, srv)
+	}
+	if srv := srvByName["shell._ssh._tcp.example.com."]; srv == nil || srv.Port != 22 {
+		t.Fatalf("Shell: SRV=%v, want a live registration on port 22", srv)
+	}
+	for _, d := range cu.Discovery {
+		if d.Target == "screen._rfb._tcp.example.com." {
+			t.Fatalf("withdrawn instance still has a Service Discovery instruction: %+v", d)
+		}
+	}
+}
+
+func TestClient_Register_DiscoversWhenNoExplicitAddr(t *testing.T) {
+	transport := &fakeTransport{responses: []*dns.Msg{successResp(30, 1209600)}}
+	cfg := testConfig(t, transport)
+	cfg.RegistrarAddr = ""
+	cfg.Query = (&fakeDNS{
+		apexes: []string{"example.com."},
+		srv:    map[string][]*dns.SRV{"_dnssd-srp._tcp.example.com.": {srvRR("registrar.example.com.", 0, 0, 8853)}},
+		hosts:  registrarHosts,
+	}).query
+	c, err := NewClient(cfg)
+	if err != nil {
+		t.Fatalf("NewClient: %v", err)
+	}
+	if _, _, err := c.Register(context.Background()); err != nil {
+		t.Fatalf("Register: %v", err)
+	}
+	if transport.addrs[0] != "192.0.2.1:8853" {
 		t.Fatalf("sent to %q, want the discovered address", transport.addrs[0])
+	}
+}
+
+// TestClient_Register_DiscoveryApexOnly: Config.Discovery reaches Discover. With a record at
+// both the domain and its zone apex, DiscoveryApexOnly sends to the apex's registrar.
+func TestClient_Register_DiscoveryApexOnly(t *testing.T) {
+	transport := &fakeTransport{responses: []*dns.Msg{successResp(30, 1209600)}}
+	cfg := testConfig(t, transport)
+	cfg.Domain = "srp.example.com."
+	cfg.RegistrarAddr = ""
+	cfg.Discovery = DiscoveryApexOnly
+	cfg.Query = (&fakeDNS{
+		apexes: []string{"example.com."},
+		srv: map[string][]*dns.SRV{
+			"_dnssd-srp._tcp.example.com.":     {srvRR("apex-registrar.example.com.", 0, 0, 8853)},
+			"_dnssd-srp._tcp.srp.example.com.": {srvRR("domain-registrar.example.com.", 0, 0, 8853)},
+		},
+		hosts: registrarHosts,
+	}).query
+	c, err := NewClient(cfg)
+	if err != nil {
+		t.Fatalf("NewClient: %v", err)
+	}
+	if _, _, err := c.Register(context.Background()); err != nil {
+		t.Fatalf("Register: %v", err)
+	}
+	if transport.addrs[0] != "192.0.2.2:8853" {
+		t.Fatalf("sent to %q, want apex-registrar's address", transport.addrs[0])
 	}
 }
 
@@ -419,7 +503,7 @@ func TestClient_Run_RetriesOnDiscoveryFailure(t *testing.T) {
 	transport := &fakeTransport{}
 	cfg := testConfig(t, transport)
 	cfg.RegistrarAddr = ""
-	cfg.Query = func(ctx context.Context, name string) ([]*dns.SRV, error) { return nil, nil }
+	cfg.Query = (&fakeDNS{apexes: []string{"example.com."}}).query
 
 	var gotErrs []error
 	cfg.OnError = func(err error) { gotErrs = append(gotErrs, err) }
@@ -442,5 +526,60 @@ func TestClient_Run_RetriesOnDiscoveryFailure(t *testing.T) {
 	}
 	if len(gotErrs) == 0 {
 		t.Fatal("expected OnError to be called for the failed discovery attempts")
+	}
+}
+
+// TestClient_Register_DefaultNetworkIsTCP: a Config that leaves Network unset sends over TCP,
+// RFC 9665 S3.5's requirement on networks that are not constrained.
+func TestClient_Register_DefaultNetworkIsTCP(t *testing.T) {
+	transport := &fakeTransport{responses: []*dns.Msg{successResp(30, 1209600)}}
+	c, err := NewClient(testConfig(t, transport))
+	if err != nil {
+		t.Fatalf("NewClient: %v", err)
+	}
+	if _, _, err := c.Register(context.Background()); err != nil {
+		t.Fatalf("Register: %v", err)
+	}
+	if transport.networks[0] != NetworkTCP {
+		t.Fatalf("sent over %s, want tcp", transport.networks[0])
+	}
+}
+
+// TestClient_Register_TLSDiscoversTLSRegistrar: with Network set to NetworkTLS and no
+// explicit address, the update goes over TLS to the registrar named by
+// "_dnssd-srp-tls._tcp", not the "_dnssd-srp._tcp" one.
+func TestClient_Register_TLSDiscoversTLSRegistrar(t *testing.T) {
+	transport := &fakeTransport{responses: []*dns.Msg{successResp(30, 1209600)}}
+	cfg := testConfig(t, transport)
+	cfg.RegistrarAddr = ""
+	cfg.Network = NetworkTLS
+	cfg.Query = tlsAndPlainDNS().query
+	c, err := NewClient(cfg)
+	if err != nil {
+		t.Fatalf("NewClient: %v", err)
+	}
+	if _, _, err := c.Register(context.Background()); err != nil {
+		t.Fatalf("Register: %v", err)
+	}
+	if transport.addrs[0] != "192.0.2.2:853" || transport.networks[0] != NetworkTLS {
+		t.Fatalf("sent to %q over %s, want 192.0.2.2:853 over tls", transport.addrs[0], transport.networks[0])
+	}
+}
+
+func TestNewClient_RejectsUnknownNetwork(t *testing.T) {
+	cfg := testConfig(t, &fakeTransport{})
+	cfg.Network = Network(7)
+	if _, err := NewClient(cfg); err == nil {
+		t.Fatal("NewClient accepted an unknown Network")
+	}
+}
+
+// TestNetwork_String pins the protocol names liveTransport hands to the base client
+// package's client.New, which accepts exactly these.
+func TestNetwork_String(t *testing.T) {
+	for n, want := range map[Network]string{NetworkTCP: "tcp", NetworkTLS: "tls", NetworkUDP: "udp"} {
+		if got := n.String(); got != want {
+			t.Errorf("%d.String() = %q, want %q", int(n), got, want)
+		}
 	}
 }
