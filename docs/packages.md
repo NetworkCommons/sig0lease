@@ -560,10 +560,10 @@ type LeasePolicy struct {
 	MinRRLease  uint32
 	MaxRRLease  uint32
 }
-    LeasePolicy controls clamping for lease durations and forwarded RR TTLs.
-    A zero bound is no bound. UpdateHandler and SRPHandler each hold one,
-    read from their own "lease_policy" config by parseLeasePolicy, and clamp
-    every granted lease with LeasePolicy.clamp.
+    LeasePolicy controls clamping for lease durations. A zero bound is no
+    bound. UpdateHandler and SRPHandler each hold one, read from their own
+    "lease_policy" config by parseLeasePolicy, and clamp every granted lease
+    with LeasePolicy.clamp.
 
 type LeaseRecord = leasepkg.Record
     LeaseRecord is the shared lease state record used by handlers.
@@ -647,6 +647,9 @@ func (h *SRPHandler) Setup(cfg map[string]any) error
         try. [OPTIONAL, defaults to false]
       - "lease_policy": bounds applied to granted LEASE/KEY-LEASE, same shape as
         the base handler's. [OPTIONAL]
+      - "record_ttl_sec": TTL of every record this handler writes upstream,
+        in place of the requester's (see parseRecordTTL and applyRecordTTL).
+        [OPTIONAL, defaults to defaultRecordTTL]
       - "lease_manager" / "storage": same mutually-exclusive lease-store backend
         selection as UpdateHandler.Setup -- see that method's doc comment
         for the full shape. [OPTIONAL, defaults to an in-memory store with no
@@ -755,8 +758,10 @@ func (h *UpdateHandler) Setup(cfg map[string]any) error
       - "persistence_hook": Persistence function for leases [OPTIONAL]. Same
         Go-embedding-only caveat as lease_manager: a func value, not settable
         from config.yaml.
-      - "lease_policy": Bounds applied to local lease durations and forwarded RR
-        TTLs [OPTIONAL]
+      - "lease_policy": Bounds applied to granted LEASE/KEY-LEASE [OPTIONAL]
+      - "record_ttl_sec": TTL of every record this handler writes upstream,
+        in place of the requester's (see parseRecordTTL) [OPTIONAL, defaults to
+        defaultRecordTTL]
       - "prefer_4byte_variant": Enable 4-byte variant for backward compatibility
         [OPTIONAL, defaults to false]
       - "allow_online_key_registration": Allow a signer resolved only via
@@ -1819,12 +1824,11 @@ func Validate(msg *dns.Msg) (*ClassifiedUpdate, error)
     structural check that needs more than the Update section alone: a single
     Zone Section entry, no prerequisites, a present and internally-consistent
     Update-Lease option, TTL consistency (S4 -- a MUST, reject rather than
-    normalize, unlike the base RFC 9664 handler's pkg/updatecore.NormalizeTTLs),
-    identical KEY RDATA across every KEY add, flags-0 KEY adds (S3.2.5.1),
-    and DNS-SD-shaped service names on every Service Discovery add (RFC 6763
-    S4.1/S7). It does not verify SIG(0) or FCFS -- those need the lease store
-    and the SIG(0) signer identity, both outside this package's pure-logic scope
-    (S4.3 steps 4-5).
+    normalize), identical KEY RDATA across every KEY add, flags-0 KEY adds
+    (S3.2.5.1), and DNS-SD-shaped service names on every Service Discovery add
+    (RFC 6763 S4.1/S7). It does not verify SIG(0) or FCFS -- those need the
+    lease store and the SIG(0) signer identity, both outside this package's
+    pure-logic scope (S4.3 steps 4-5).
 
     Assumes the caller has already confirmed msg.Opcode == dns.OpcodeUpdate (the
     router dispatch layer's job, not this package's) and that msg has been fully
@@ -2060,22 +2064,22 @@ func BuildAndSign(upstreamZone string, prereqs, records []dns.RR, signingKey *ke
     prereqs may be nil/empty -- most callers have none.
 
     Unlike the base RFC 9664 handler's constructUpstreamUpdate (handlers/
-    opcode5_update_helpers.go), this does no per-record-type branching or
-    TTL clamping -- S4.3 step 7's SRP forward is simpler by construction:
-    it's exactly "the same adds/deletes [the requester sent], re-signed
-    with proxy key" (plus, for a Service Description, the pkg/srp-computed
-    PTR-delete diff appended by the caller before this is called -- see
-    docs/siglease_rfc9665.md's lease-store mapping section). Any clamping SRP
-    wants happens earlier, against the classified instructions, not here.
+    opcode5_update_helpers.go), this does no per-record-type branching --
+    S4.3 step 7's SRP forward is simpler by construction: it's exactly "the
+    same adds/deletes [the requester sent], re-signed with proxy key" (plus,
+    for a Service Description, the pkg/srp-computed PTR-delete diff appended
+    by the caller before this is called -- see docs/siglease_rfc9665.md's
+    lease-store mapping section). The registrar's own TTLs are set earlier,
+    against the classified instructions (handlers.applyRecordTTL), not here.
 
 func CheckConsistentTTLs(records []dns.RR) error
     CheckConsistentTTLs implements the RFC 9665 S4 MUST for the SRP path:
-    every RRset in an update must carry one TTL across all its RRs. Unlike
-    NormalizeTTLs, this never rewrites anything -- SRP requires rejecting a
-    violation outright (REFUSED), not silently correcting it. Returns the first
-    inconsistency found, naming the owner, type, and the conflicting TTL values,
-    or nil if every RRset present is consistent. Single-RR RRsets (the common
-    case) are trivially consistent and never inspected beyond membership.
+    every RRset in an update must carry one TTL across all its RRs. It never
+    rewrites anything -- SRP requires rejecting a violation outright (REFUSED),
+    not silently correcting it. Returns the first inconsistency found, naming
+    the owner, type, and the conflicting TTL values, or nil if every RRset
+    present is consistent. Single-RR RRsets (the common case) are trivially
+    consistent and never inspected beyond membership.
 
 func FindAuthorizedProxyKey(keystoreDir, zone string, logger *logging.Logger) (*keyrec.LoadedKey, string, error)
     FindAuthorizedProxyKey loads the proxy's own SIG(0) signing key
@@ -2084,17 +2088,6 @@ func FindAuthorizedProxyKey(keystoreDir, zone string, logger *logging.Logger) (*
     (*handlers.UpdateHandler).findAuthorizedProxyKeyForZone, now a standalone
     function so handlers/srp_handler.go can use it without depending on
     *handlers.UpdateHandler.
-
-func NormalizeTTLs(records []dns.RR) int
-    NormalizeTTLs implements the RFC 2181 S5.2 (erratum-corrected) guidance for
-    the base RFC 9664 handler: a resolver encountering an RRset with differing
-    TTLs should treat the lowest TTL as authoritative for the whole set.
-    Unlike CheckConsistentTTLs, this mutates each affected RR's Hdr.TTL in
-    place to its RRset's minimum, rather than rejecting the update -- the base
-    handler's policy is "normalize", not "refuse". Must run before LeasePolicy
-    clamping (S6) so clamping sees the already-uniform value. Returns the number
-    of distinct RRsets that needed rewriting, for caller logging; 0 means every
-    RRset present was already consistent and nothing was touched.
 
 func SetMaxInflightUpdates(max int) error
     SetMaxInflightUpdates sets how many UPDATEs this process may have in

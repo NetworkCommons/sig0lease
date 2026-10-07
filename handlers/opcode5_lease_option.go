@@ -25,7 +25,7 @@ func (h *UpdateHandler) hasUpdateLeaseOption(msg *dns.Msg) bool {
 // it is determined by the caller based on lease existence (Lookup).
 func (h *UpdateHandler) parseLease(msg *dns.Msg) (uint32, uint32, error) {
 	// Minimums come from the configured lease_policy (min_rr_lease_sec /
-	// min_key_lease_sec), matching clampTTL's convention elsewhere in this
+	// min_key_lease_sec), matching clampLease's convention elsewhere in this
 	// handler: 0 means "no minimum enforced", not "use some hardcoded RFC
 	// 9664 default". A proxy launched with a different policy (e.g. a lower
 	// floor for testing) must actually enforce that policy here, at parse

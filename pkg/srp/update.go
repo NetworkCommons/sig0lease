@@ -50,12 +50,16 @@ type UpdateSpec struct {
 	Addresses []netip.Addr
 	// Key is the Host Description's KEY RR. Only its algorithm/protocol/public-key
 	// material is used -- BuildUpdate overwrites Hdr.Name/Hdr.Class/Hdr.TTL to match Host
-	// and KeyLease, and unconditionally zeroes Flags (S3.2.5.1/S3.3.3: requesters MUST
+	// and TTL, and unconditionally zeroes Flags (S3.2.5.1/S3.3.3: requesters MUST
 	// send flags 0, regardless of what the caller's key material happens to carry).
 	Key       *dns.KEY
 	Instances []InstanceSpec
 	Lease     uint32
 	KeyLease  uint32
+	// TTL is the TTL of every record the update adds, KEYs included: the requester's
+	// suggestion, which a registrar may override (S4). It is not derived from Lease or
+	// KeyLease, since a lease is not a TTL (S5.1). Required.
+	TTL uint32
 }
 
 // BuildUpdate constructs an unsigned SRP UPDATE: the Host Description Instruction
@@ -79,6 +83,9 @@ func BuildUpdate(spec UpdateSpec) (*dns.Msg, error) {
 	if spec.Key == nil {
 		return nil, fmt.Errorf("srp: BuildUpdate: key is required")
 	}
+	if spec.TTL == 0 {
+		return nil, fmt.Errorf("srp: BuildUpdate: ttl is required")
+	}
 	if spec.Lease > spec.KeyLease {
 		return nil, fmt.Errorf("srp: BuildUpdate: lease (%d) must not exceed key-lease (%d)", spec.Lease, spec.KeyLease)
 	}
@@ -92,12 +99,12 @@ func BuildUpdate(spec UpdateSpec) (*dns.Msg, error) {
 	msg.Ns = append(msg.Ns, deleteAllRR(spec.Host))
 	for _, addr := range spec.Addresses {
 		if addr.Is4() {
-			msg.Ns = append(msg.Ns, &dns.A{Hdr: dns.Header{Name: spec.Host, Class: dns.ClassINET, TTL: spec.Lease}, A: rdata.A{Addr: addr}})
+			msg.Ns = append(msg.Ns, &dns.A{Hdr: dns.Header{Name: spec.Host, Class: dns.ClassINET, TTL: spec.TTL}, A: rdata.A{Addr: addr}})
 		} else {
-			msg.Ns = append(msg.Ns, &dns.AAAA{Hdr: dns.Header{Name: spec.Host, Class: dns.ClassINET, TTL: spec.Lease}, AAAA: rdata.AAAA{Addr: addr}})
+			msg.Ns = append(msg.Ns, &dns.AAAA{Hdr: dns.Header{Name: spec.Host, Class: dns.ClassINET, TTL: spec.TTL}, AAAA: rdata.AAAA{Addr: addr}})
 		}
 	}
-	msg.Ns = append(msg.Ns, hostKeyRR(spec.Key, spec.Host, spec.KeyLease))
+	msg.Ns = append(msg.Ns, hostKeyRR(spec.Key, spec.Host, spec.TTL))
 
 	for _, inst := range spec.Instances {
 		if inst.Name == "" {
@@ -112,7 +119,7 @@ func BuildUpdate(spec UpdateSpec) (*dns.Msg, error) {
 		}
 
 		srv := &dns.SRV{
-			Hdr: dns.Header{Name: inst.Name, Class: dns.ClassINET, TTL: spec.Lease},
+			Hdr: dns.Header{Name: inst.Name, Class: dns.ClassINET, TTL: spec.TTL},
 			SRV: rdata.SRV{Priority: 0, Weight: 0, Port: inst.Port, Target: spec.Host},
 		}
 		msg.Ns = append(msg.Ns, srv)
@@ -121,17 +128,17 @@ func BuildUpdate(spec UpdateSpec) (*dns.Msg, error) {
 		if len(txt) == 0 {
 			txt = []string{""}
 		}
-		txtRR := &dns.TXT{Hdr: dns.Header{Name: inst.Name, Class: dns.ClassINET, TTL: spec.Lease}}
+		txtRR := &dns.TXT{Hdr: dns.Header{Name: inst.Name, Class: dns.ClassINET, TTL: spec.TTL}}
 		txtRR.TXT.Txt = txt
 		msg.Ns = append(msg.Ns, txtRR)
 
 		if inst.Key != nil {
-			msg.Ns = append(msg.Ns, hostKeyRR(inst.Key, inst.Name, spec.KeyLease))
+			msg.Ns = append(msg.Ns, hostKeyRR(inst.Key, inst.Name, spec.TTL))
 		}
 
-		msg.Ns = append(msg.Ns, ptrAdd(inst.ServiceType, inst.Name, spec.Lease))
+		msg.Ns = append(msg.Ns, ptrAdd(inst.ServiceType, inst.Name, spec.TTL))
 		for _, subtype := range inst.Subtypes {
-			msg.Ns = append(msg.Ns, ptrAdd(subtype, inst.Name, spec.Lease))
+			msg.Ns = append(msg.Ns, ptrAdd(subtype, inst.Name, spec.TTL))
 		}
 	}
 
