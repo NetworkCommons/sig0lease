@@ -50,6 +50,18 @@ zone "srp.test." {
     };
 };
 
+// update.test. -- the RFC 9664 handler's zone in tests/test_update.sh's local mode
+// (AUTH_BACKEND=local). Same self-signing model, its own apex key
+// (tests/keystore-update-bind9/), so the update handler and srp_handler, which that mode also
+// runs on srp.test., each have their own zone and key.
+zone "update.test." {
+    type primary;
+    file "@RUNDIR@/update.test.zone";
+    update-policy {
+        grant update.test. zonesub ANY;
+    };
+};
+
 // default.service.arpa. -- tests/test_mdnsresponder_interop.sh's zone. Same self-signing
 // model, different apex key (tests/keystore-srp-bind9-default-arpa/): this name is forced
 // by mDNSResponder's own hardcoded client-side zone string, not a free choice (see

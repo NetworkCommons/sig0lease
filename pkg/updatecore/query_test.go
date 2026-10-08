@@ -66,7 +66,7 @@ func TestQueryRRs_FallsBackToTCPOnTruncation(t *testing.T) {
 		tcpQueries.Add(1)
 		return replyTo(query, dns.RcodeSuccess, txt)
 	})
-	c := NewCoordinator(testLogger(), nil, map[string]string{"example.": addr})
+	c := NewCoordinator(testLogger(), nil, &StaticUpstream{Zone: "example.", Addr: addr})
 
 	rrs, err := c.QueryRRs(context.Background(), "example.", "host.example.", dns.TypeTXT)
 	if err != nil {
@@ -84,7 +84,7 @@ func TestQueryRRs_NXDOMAINIsEmptyNotAnError(t *testing.T) {
 	addr := startTestAuthoritative(t, func(tcp bool, query *dns.Msg) *dns.Msg {
 		return replyTo(query, dns.RcodeNameError)
 	})
-	c := NewCoordinator(testLogger(), nil, map[string]string{"example.": addr})
+	c := NewCoordinator(testLogger(), nil, &StaticUpstream{Zone: "example.", Addr: addr})
 
 	rrs, err := c.QueryRRs(context.Background(), "example.", "missing.example.", dns.TypeKEY)
 	if err != nil || len(rrs) != 0 {
@@ -103,6 +103,77 @@ func TestParentZone(t *testing.T) {
 	for _, c := range cases {
 		if got := parentZone(c.in); got != c.want {
 			t.Errorf("parentZone(%q) = %q, want %q", c.in, got, c.want)
+		}
+	}
+}
+
+// soaAt builds the SOA of zone apex with primary server mname.
+func soaAt(t *testing.T, apex, mname string) dns.RR {
+	t.Helper()
+	soa, err := dns.New(apex + " 0 IN SOA " + mname + " root.example. 1 10800 900 604800 86400")
+	if err != nil {
+		t.Fatalf("build SOA: %v", err)
+	}
+	return soa
+}
+
+// TestDiscovery_OneSOAQuery: a resolver answers an SOA query for a name inside a zone with
+// that zone's SOA in the authority section, NXDOMAIN or NOERROR alike, and in the answer for
+// the apex itself. Discovery takes the zone and its primary server from that one answer, with
+// no further query per parent label.
+func TestDiscovery_OneSOAQuery(t *testing.T) {
+	zenr := soaAt(t, "zenr.io.", "ns1.free2air.org.")
+	var queries atomic.Int32
+	addr := startTestAuthoritative(t, func(tcp bool, query *dns.Msg) *dns.Msg {
+		queries.Add(1)
+		switch query.Question[0].Header().Name {
+		case "zenr.io.":
+			return replyTo(query, dns.RcodeSuccess, zenr)
+		case "dev.zenr.io.":
+			resp := replyTo(query, dns.RcodeSuccess)
+			resp.Ns = []dns.RR{zenr}
+			return resp
+		default:
+			resp := replyTo(query, dns.RcodeNameError)
+			resp.Ns = []dns.RR{zenr}
+			return resp
+		}
+	})
+	c := NewCoordinator(testLogger(), []string{addr}, nil)
+	ctx := context.Background()
+
+	for _, name := range []string{"test.dev.zenr.io.", "dev.zenr.io.", "zenr.io."} {
+		queries.Store(0)
+		server, zone, err := c.ResolveSOAMasterServer(ctx, name)
+		if err != nil {
+			t.Fatalf("ResolveSOAMasterServer(%q): %v", name, err)
+		}
+		if server != "ns1.free2air.org:53" || zone != "zenr.io." {
+			t.Errorf("ResolveSOAMasterServer(%q) = %q, %q; want ns1.free2air.org:53, zenr.io.", name, server, zone)
+		}
+		if n := queries.Load(); n != 1 {
+			t.Errorf("ResolveSOAMasterServer(%q) sent %d queries, want 1", name, n)
+		}
+		zone, err = c.ResolveAuthoritativeZone(ctx, name)
+		if err != nil || zone != "zenr.io." {
+			t.Errorf("ResolveAuthoritativeZone(%q) = %q, %v; want zenr.io.", name, zone, err)
+		}
+	}
+}
+
+// TestDiscovery_RejectsRootAndUnrelatedSOA: a name in no delegated zone gets the root's SOA
+// in the authority section, and a broken resolver may return the SOA of a zone that doesn't
+// hold the name at all; neither is a zone to send UPDATEs to.
+func TestDiscovery_RejectsRootAndUnrelatedSOA(t *testing.T) {
+	for _, soa := range []dns.RR{soaAt(t, ".", "a.root-servers.net."), soaAt(t, "other.example.", "ns.other.example.")} {
+		addr := startTestAuthoritative(t, func(tcp bool, query *dns.Msg) *dns.Msg {
+			resp := replyTo(query, dns.RcodeNameError)
+			resp.Ns = []dns.RR{soa}
+			return resp
+		})
+		c := NewCoordinator(testLogger(), []string{addr}, nil)
+		if server, zone, err := c.ResolveSOAMasterServer(context.Background(), "test.nosuchtld."); err == nil {
+			t.Errorf("SOA %s: expected an error, got %q, %q", soa.Header().Name, server, zone)
 		}
 	}
 }

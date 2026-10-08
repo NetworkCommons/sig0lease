@@ -314,7 +314,7 @@ Two backends are selectable via `handlers.update.storage` in `config.yaml` (see 
 
 - listening address and enabled transport networks;
 - default upstream resolvers;
-- handler-specific settings such as the upstream zone, keystore directory, lease policy bounds, blacklisted RR types, `allow_online_key_registration`, and the lease storage backend (`storage.type: memory|file`, see "Storage Backends and Expiry" above) for the update handler;
+- handler-specific settings such as the upstream zone, an optional static `upstream` server for it, keystore directory, lease policy bounds, blacklisted RR types, `allow_online_key_registration`, and the lease storage backend (`storage.type: memory|file`, see "Storage Backends and Expiry" above) for the update handler;
 - opcode-to-module routing (an ordered list per opcode — see `docs/siglease_rfc9665.md` §3 for
   how SRP's handler fits into the same list);
 - `authoritative.max_inflight_updates` (default 1, `0` for no limit): how many UPDATEs the proxy
@@ -323,7 +323,7 @@ Two backends are selectable via `handlers.update.storage` in `config.yaml` (see 
   (default 1) instead of queueing them, so set this to the upstream server's quota — see
   `docs/siglease_rfc9665.md` §6, "Concurrent UPDATEs".
 
-The update handler uses the configured zone to discover the authoritative server for the effective zone, then sends the rewritten UPDATE there.
+The update handler uses the configured zone to discover the authoritative server for the effective zone, then sends the rewritten UPDATE there. A static `upstream: "host:port"` replaces that discovery for the configured zone and every name below it, including the zones the requests name (`make test-update-local` uses it to point the handler at a local BIND 9).
 
 ## DNS-over-TLS
 
@@ -388,7 +388,7 @@ through `_dnssd-srp-tls._tcp` and registers over DoT.
   by both the RFC 9664 and RFC 9665 paths)
 - `pkg/sig0/` - SIG(0) signing and verification helpers (shared by both paths)
 - `pkg/updatecore/` - upstream forward/re-sign plumbing shared by both the RFC 9664 and
-  RFC 9665 (SRP) handlers (SOA/NS resolution, per-zone static `upstream` override, TTL
+  RFC 9665 (SRP) handlers (SOA-based discovery, static `upstream` override, TTL
   consistency checks)
 - `server/` - UDP/TCP/TLS (DNS-over-TLS, RFC 7858) listener and request dispatch
 
@@ -401,6 +401,7 @@ isn't covered above.
 ```bash
 CLIENT_KEYSTORE_DIR=${PWD}/keystore/client make test-unit
 CLIENT_KEYSTORE_DIR=${PWD}/keystore/client make test-update   # RFC 9664 lease flow, live against a real BIND 9
+make test-update-local                                         # same RFC 9664 suite against a disposable local BIND 9
 make test-srp                                                  # RFC 9665 SRP flow, see docs/siglease_rfc9665.md
 make test-mdnsresponder-interop                                 # RFC 9665 SRP interop, see docs/siglease_rfc9665.md
 make build

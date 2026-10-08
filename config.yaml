@@ -76,7 +76,6 @@ processing_rules:
 handlers:
   # handlers.srp_handler: RFC 9665 SRP config (only read if "srp_handler" appears in
   # processing_rules above). Same shape as handlers.update, plus:
-  #   upstream:                     static "host:port" override, skips SOA/NS discovery
   #   allow_udp:                    permit UDP for this zone (default false -- TCP required)
   #   refuse_on_foreign_data:       REFUSED when a name exists upstream with data but no KEY
   #                                 (default true)
@@ -94,6 +93,8 @@ handlers:
   #                                 choice.
   srp_handler:
     upstream_zone: "srp.dev.zenr.io."
+    # Optional static "host:port" of the authoritative server, as for handlers.update below.
+    # upstream: "127.0.0.1:53"
     keystore_dir: "./keystore/server"
     rewrite_default_service_arpa: true
     # mDNSResponder's srp-client sends SRP over UDP only (docs/srp-live-demo.md).
@@ -128,8 +129,14 @@ handlers:
       save_interval: "30s"                      # optional, default 30s
   update:
     # Upstream zone used to discover authoritative nameserver for UPDATE forwarding.
-    # Proxy resolves NS for this zone and sends UPDATE to that authoritative server.
+    # Proxy looks up the SOA of the zone holding this name and sends UPDATEs to its primary
+    # server (the SOA's MNAME).
     upstream_zone: "dev.zenr.io."
+
+    # Optional static "host:port" of the authoritative server for upstream_zone and every
+    # name below it, in place of the SOA discovery above -- e.g. a local BIND 9 on a port
+    # other than 53, as in tests/test_update.sh's local mode.
+    # upstream: "127.0.0.1:53"
 
     # Keystore directory containing DNSSEC keys in sig0namectl format
     keystore_dir: "./keystore/server"

@@ -46,6 +46,10 @@ PROXY_TLS_PORT="${PROXY_TLS_PORT:-8853}"
 PROXY_TLS_URL="$PROXY_ADDR:$PROXY_TLS_PORT"
 
 AUTH_SERVER="${AUTH_SERVER:-ns1.free2air.org}"
+# The zone AUTH_SERVER is authoritative for, which lib/dns.sh's direct nsupdate changes
+# (add_rr/delete_rr) name, signed with PROXY_KEY_NAME. test_update.sh's local mode replaces
+# AUTH_SERVER, AUTH_ZONE and PROXY_KEY_NAME with the local BIND 9's.
+AUTH_ZONE="zenr.io."
 PROXY_KEYSTORE_DIR="./keystore/server"
 PROXY_KEY_NAME="${PROXY_KEYSTORE_DIR}/Kdev.zenr.io.+015+35317.key"
 

@@ -4,6 +4,7 @@ package handlers
 import (
 	"context"
 	"fmt"
+	"net"
 	"strings"
 	"time"
 
@@ -12,6 +13,7 @@ import (
 	"github.com/NetworkCommons/sig0lease/pkg/dnsname"
 	"github.com/NetworkCommons/sig0lease/pkg/keyrec"
 	leasepkg "github.com/NetworkCommons/sig0lease/pkg/lease"
+	"github.com/NetworkCommons/sig0lease/pkg/updatecore"
 )
 
 // Handler is an interface for a DNS processing module.
@@ -182,7 +184,7 @@ type zoneResolver interface {
 
 // resolveUpstreamSigningContext returns what an UPDATE to the upstream server is signed with
 // and addressed to: the proxy's signing key, and upstreamZone resolved to its zone cut
-// (SOA/NS discovery, or a static override). Both handlers call it with their own fields. The
+// (SOA discovery, or a static upstream). Both handlers call it with their own fields. The
 // key is the one Setup loaded once, rather than re-read from the keystore directory on every
 // request and expiry tick; picking up a rotated key on disk needs a restart. A handler without
 // its coordinator or signing key is a programming error (requireUpstream panics); the error
@@ -195,6 +197,36 @@ func resolveUpstreamSigningContext(ctx context.Context, handler string, coordina
 	}
 	logger.Debugf("Resolved effective upstream zone: configured=%s effective=%s", upstreamZone, effectiveZone)
 	return signingKey, effectiveZone, nil
+}
+
+// buildCoordinatorFromConfig builds a handler's upstream coordinator from its config:
+// "bootstrap_resolvers", the resolvers discovery asks for a name's SOA, and "upstream", an
+// optional static "host:port" of upstreamZone's authoritative server, used in place of
+// discovery for upstreamZone and every name at or below it (updatecore.StaticUpstream).
+// Shared by UpdateHandler.Setup and SRPHandler.Setup. An "upstream" that is not a
+// "host:port" string is an error, not ignored: a proxy silently sending to the discovered
+// server instead of the configured one would update a different zone than intended.
+func buildCoordinatorFromConfig(cfg map[string]any, upstreamZone string, logger *logging.Logger) (*updatecore.Coordinator, error) {
+	var static *updatecore.StaticUpstream
+	if raw, ok := cfg["upstream"]; ok && raw != nil {
+		addr, ok := raw.(string)
+		if !ok {
+			return nil, fmt.Errorf(`"upstream" must be a "host:port" string, got %T`, raw)
+		}
+		addr = strings.TrimSpace(addr)
+		if _, _, err := net.SplitHostPort(addr); err != nil {
+			return nil, fmt.Errorf(`"upstream" must be "host:port": %w`, err)
+		}
+		static = &updatecore.StaticUpstream{Zone: upstreamZone, Addr: addr}
+		logger.Debugf("Zone %s and the names below it configured with static upstream: %s", upstreamZone, addr)
+	}
+	bootstrapResolvers := parseStringSlice(cfg["bootstrap_resolvers"])
+	if len(bootstrapResolvers) > 0 {
+		logger.Debugf("Upstream coordinator bootstrap resolvers: %v", bootstrapResolvers)
+	} else {
+		logger.Debugf("Upstream coordinator uses the built-in default bootstrap resolvers")
+	}
+	return updatecore.NewCoordinator(logger, bootstrapResolvers, static), nil
 }
 
 // buildLeaseManagerFromConfig builds a LeaseStorage backend from a handler's "storage"

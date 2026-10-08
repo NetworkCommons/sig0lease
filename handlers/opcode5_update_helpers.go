@@ -228,25 +228,6 @@ func extractSig0(msg *dns.Msg) (*dns.SIG, error) {
 	return sigRR, nil
 }
 
-// Check that candidate is above or at basename, and if mustBeAbove is true
-// it must be strictly above
-func isNameAtOrAbove(baseName, candidate string, mustBeAbove bool) bool {
-	base := dnsname.Normalize(baseName)
-	c := dnsname.Normalize(candidate)
-	if base == "" || c == "" {
-		return false
-	}
-	if c == base {
-		if mustBeAbove {
-			return false
-		} else {
-			return true
-		}
-
-	}
-	return strings.HasSuffix(base, "."+c)
-}
-
 // Verify that each RR in the Update section is at or below
 // signerAuthorizedForNewRegistration reports whether a signer may author new
 // lease-store state — a new KEY RR, or non-KEY RRs owned by itself. This is
@@ -278,7 +259,7 @@ func (h *UpdateHandler) validateSignerHierarchyForUpdateRecords(signerName strin
 			// Exception: signer self-KEY update is allowed.
 			continue
 		}
-		if !isNameAtOrAbove(keyOwnerCanon, signerCanon, false) {
+		if !dnsname.IsAtOrBelow(keyOwnerCanon, signerCanon) {
 			return fmt.Errorf("KEY RR owner %q is outside signer subtree %q", keyOwner, signerName)
 		}
 	}
@@ -289,7 +270,7 @@ func (h *UpdateHandler) validateSignerHierarchyForUpdateRecords(signerName strin
 		}
 		owner := rr.Header().Name
 		ownerCanon := dnsname.Normalize(owner)
-		if !isNameAtOrAbove(ownerCanon, signerCanon, false) {
+		if !dnsname.IsAtOrBelow(ownerCanon, signerCanon) {
 			return fmt.Errorf("non-KEY RR owner %q is outside signer subtree %q", owner, signerName)
 		}
 	}
@@ -378,7 +359,7 @@ func groupOtherRecordsByTargetKey(signerID keyID, updateKeyRRs []*dns.KEY, updat
 		ambiguous := false
 
 		for _, kid := range keyIDs {
-			if !isNameAtOrAbove(rrOwner, kid.Name, false) {
+			if !dnsname.IsAtOrBelow(rrOwner, kid.Name) {
 				continue
 			}
 			if len(kid.Name) > bestLen {
@@ -569,7 +550,7 @@ func (h *UpdateHandler) extractAndValidateSig0(ctx context.Context, msg *dns.Msg
 	if signerCanon == "" {
 		return nil, nil, signerKeySourceUnknown, fmt.Errorf("SIG(0) signer name is empty")
 	}
-	if !isNameAtOrAbove(downstreamZoneCanon, signerCanon, false) {
+	if !dnsname.IsAtOrBelow(downstreamZoneCanon, signerCanon) {
 		return nil, nil, signerKeySourceUnknown, fmt.Errorf("SIG(0) signer %q is outside allowed hierarchy for downstream zone %q", sigRR.SignerName, downstreamZone)
 	}
 
