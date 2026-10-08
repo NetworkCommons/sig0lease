@@ -5,13 +5,16 @@
 //
 //	2026/08/20 10:39:44.164+02:00 -- INFO -- "message"
 //
-// The only thing callers may vary between Logger instances is the minimum
-// level (e.g. to run one module at "debug" while the rest stay at "info");
-// the format itself is not configurable per instance.
+// The only things callers may vary between Logger instances are the minimum
+// level (e.g. to run one module at "debug" while the rest stay at "info") and
+// the output: stdout, the system log, or both (NewLoggerWithOutput). The system
+// log gets the same "message" part, with the time stamp left to syslog and the
+// level carried as the record's syslog severity.
 package logging
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -23,18 +26,60 @@ import (
 // timeFormat renders "2026/08/20 10:39:44.164+02:00".
 const timeFormat = "2006/01/02 15:04:05.000-07:00"
 
+// Values of NewLoggerWithOutput's output.
+const (
+	OutputStdout = "stdout"
+	OutputSyslog = "syslog"
+	OutputBoth   = "both"
+)
+
+// syslogTag names the proxy in the system log (e.g. journalctl -t sig0lease).
+const syslogTag = "sig0lease"
+
+// syslogSink sends one record to the system log. Each platform supplies its own
+// openSyslog (syslog_*.go).
+type syslogSink interface {
+	write(level slog.Level, msg string) error
+}
+
+// severity is a syslog severity (RFC 5424 S6.2.1); the values are the same in every
+// platform's syslog.
+type severity int
+
+const (
+	sevErr     severity = 3
+	sevWarning severity = 4
+	sevInfo    severity = 6
+	sevDebug   severity = 7
+)
+
+// syslogSeverity maps a record's level to the syslog severity it is sent at.
+func syslogSeverity(level slog.Level) severity {
+	switch {
+	case level >= slog.LevelError:
+		return sevErr
+	case level >= slog.LevelWarn:
+		return sevWarning
+	case level >= slog.LevelInfo:
+		return sevInfo
+	default:
+		return sevDebug
+	}
+}
+
 // uniformHandler is the sole slog.Handler implementation used by this
 // package. It exists so the log line format has exactly one definition,
-// shared by every Logger regardless of level or module.
+// shared by every Logger regardless of level, module or output.
 type uniformHandler struct {
 	mu    *sync.Mutex
-	w     io.Writer
+	w     io.Writer  // stdout; nil when logging to the system log only
+	sys   syslogSink // nil when logging to stdout only
 	level slog.Leveler
 	attrs []slog.Attr
 }
 
-func newUniformHandler(w io.Writer, level slog.Leveler) *uniformHandler {
-	return &uniformHandler{mu: &sync.Mutex{}, w: w, level: level}
+func newUniformHandler(w io.Writer, sys syslogSink, level slog.Leveler) *uniformHandler {
+	return &uniformHandler{mu: &sync.Mutex{}, w: w, sys: sys, level: level}
 }
 
 func (h *uniformHandler) Enabled(_ context.Context, level slog.Level) bool {
@@ -42,12 +87,13 @@ func (h *uniformHandler) Enabled(_ context.Context, level slog.Level) bool {
 }
 
 func (h *uniformHandler) Handle(_ context.Context, r slog.Record) error {
-	line := fmt.Sprintf("%s -- %s -- %s",
-		r.Time.Format(timeFormat), r.Level.String(), strconv.Quote(r.Message))
+	// Quoted, so text from the network (a client's TXT data, say) can't split one
+	// record into several lines in either output.
+	msg := strconv.Quote(r.Message)
 
 	appendAttr := func(a slog.Attr) bool {
 		if a.Key != "" {
-			line += fmt.Sprintf(" %s=%v", a.Key, a.Value.Any())
+			msg += fmt.Sprintf(" %s=%v", a.Key, a.Value.Any())
 		}
 		return true
 	}
@@ -58,15 +104,26 @@ func (h *uniformHandler) Handle(_ context.Context, r slog.Record) error {
 
 	h.mu.Lock()
 	defer h.mu.Unlock()
-	_, err := io.WriteString(h.w, line+"\n")
-	return err
+	var errs []error
+	if h.w != nil {
+		line := fmt.Sprintf("%s -- %s -- %s\n", r.Time.Format(timeFormat), r.Level.String(), msg)
+		if _, err := io.WriteString(h.w, line); err != nil {
+			errs = append(errs, err)
+		}
+	}
+	if h.sys != nil {
+		if err := h.sys.write(r.Level, msg); err != nil {
+			errs = append(errs, err)
+		}
+	}
+	return errors.Join(errs...)
 }
 
 func (h *uniformHandler) WithAttrs(attrs []slog.Attr) slog.Handler {
 	merged := make([]slog.Attr, 0, len(h.attrs)+len(attrs))
 	merged = append(merged, h.attrs...)
 	merged = append(merged, attrs...)
-	return &uniformHandler{mu: h.mu, w: h.w, level: h.level, attrs: merged}
+	return &uniformHandler{mu: h.mu, w: h.w, sys: h.sys, level: h.level, attrs: merged}
 }
 
 func (h *uniformHandler) WithGroup(_ string) slog.Handler {
@@ -99,8 +156,35 @@ func levelFromString(level string) slog.Level {
 // logger in the process stays uniformly formatted.
 func NewLogger(level string) *Logger {
 	return &Logger{
-		logger: slog.New(newUniformHandler(os.Stdout, levelFromString(level))),
+		logger: slog.New(newUniformHandler(os.Stdout, nil, levelFromString(level))),
 	}
+}
+
+// NewLoggerWithOutput creates a logger like NewLogger's, writing each record to output:
+// OutputStdout, OutputSyslog (the local system log) or OutputBoth. It fails for any other
+// output, and when the system log can't be opened -- including on a build that has no
+// working system log (syslog_unsupported.go).
+func NewLoggerWithOutput(level, output string) (*Logger, error) {
+	var w io.Writer
+	var sys syslogSink
+	switch output {
+	case OutputStdout:
+		w = os.Stdout
+	case OutputSyslog, OutputBoth:
+		s, err := openSyslog(syslogTag)
+		if err != nil {
+			return nil, fmt.Errorf("open syslog: %w", err)
+		}
+		sys = s
+		if output == OutputBoth {
+			w = os.Stdout
+		}
+	default:
+		return nil, fmt.Errorf("unknown log output %q (want %q, %q or %q)", output, OutputStdout, OutputSyslog, OutputBoth)
+	}
+	return &Logger{
+		logger: slog.New(newUniformHandler(w, sys, levelFromString(level))),
+	}, nil
 }
 
 // Debug logs a debug message.

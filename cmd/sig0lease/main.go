@@ -107,7 +107,16 @@ func main() {
 	if logLevel == "" {
 		logLevel = "info"
 	}
-	logger := logging.NewLogger(logLevel)
+	// LOG_OUTPUT picks where log lines go: stdout (the default), syslog, or both.
+	logOutput := os.Getenv("LOG_OUTPUT")
+	if logOutput == "" {
+		logOutput = logging.OutputStdout
+	}
+	logger, err := logging.NewLoggerWithOutput(logLevel, logOutput)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error setting up logging (LOG_OUTPUT=%s): %v\n", logOutput, err)
+		os.Exit(1)
+	}
 
 	// Load configuration
 	cfg, err := config.LoadConfig(cfgPath)
