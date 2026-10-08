@@ -5,7 +5,9 @@
 ;
 ; The apex KEY is the SRP test keystore's own key (tests/keystore-srp-bind9/), granted
 ; zonesub update rights in named.conf.in -- the proxy signs every forwarded UPDATE with this
-; same key (handlers.srp_handler's keystore_dir points at that directory in test_srp.sh).
+; same key (handlers.srp_handler's keystore_dir points at that directory in test_srp.sh, and
+; in test_update.sh's local mode, which runs srp_handler here alongside the RFC 9664 handler
+; on update.test.).
 $TTL 3600
 @       IN SOA  ns.srp.test. admin.srp.test. ( 1 3600 900 604800 3600 )
         IN NS   ns.srp.test.

@@ -14,10 +14,11 @@ import (
 //   - "upstream_zone": the one zone this handler instance serves (one zone, one
 //     protocol per handler instance) [REQUIRED]
 //   - "keystore_dir": directory holding this proxy's own SIG(0) signing keys [REQUIRED]
-//   - "upstream": a static "host:port" override for upstream_zone -- when set,
-//     skips SOA/NS discovery entirely for this zone. [OPTIONAL]
-//   - "bootstrap_resolvers": []string of resolver addresses used to resolve SOA/NS
-//     records when "upstream" is not set. [OPTIONAL]
+//   - "upstream": a static "host:port" for the authoritative server of upstream_zone and
+//     every name below it, in place of SOA discovery; anything but a "host:port" string
+//     is a Setup error (see buildCoordinatorFromConfig). [OPTIONAL]
+//   - "bootstrap_resolvers": []string of resolver addresses asked for SOA records when
+//     "upstream" is not set. [OPTIONAL]
 //   - "allow_udp": permit UDP for this zone (TCP is required by default,
 //     for non-CNN zones this proxy targets). [OPTIONAL, defaults to false]
 //   - "rewrite_default_service_arpa": accept requests whose Zone Section is literally
@@ -73,13 +74,11 @@ func (h *SRPHandler) Setup(cfg map[string]any) error {
 	h.upstreamKeyRecord = upstreamKey
 	h.logger.Debugf("Loaded upstream key for configured zone %s from key zone %s", h.upstreamZone, matchedZone)
 
-	staticUpstream := map[string]string{}
-	if addr, ok := cfg["upstream"].(string); ok && addr != "" {
-		staticUpstream[h.upstreamZone] = addr
-		h.logger.Debugf("SRP zone %s configured with static upstream override: %s", h.upstreamZone, addr)
+	coordinator, err := buildCoordinatorFromConfig(cfg, h.upstreamZone, h.logger)
+	if err != nil {
+		return fmt.Errorf("srp handler config: %w", err)
 	}
-	bootstrapResolvers := parseStringSlice(cfg["bootstrap_resolvers"])
-	h.coordinator = updatecore.NewCoordinator(h.logger, bootstrapResolvers, staticUpstream)
+	h.coordinator = coordinator
 
 	if allow, ok := cfg["allow_udp"].(bool); ok {
 		h.allowUDP = allow

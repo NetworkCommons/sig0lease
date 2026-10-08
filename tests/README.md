@@ -6,17 +6,18 @@ Orchestration scripts live directly in `tests/`; shared helpers live in `tests/l
 own header comment for the "no `set -e` in library files, `return` not `exit`" convention
 those files follow.
 
-Only `test_srp.sh` is self-contained: real proxy process, real client (`cmd/sig0lease-srp-client`), a local
+`test_srp.sh` is self-contained: real proxy process, real client (`cmd/sig0lease-srp-client`), a local
 disposable BIND 9 (`lib/bind9.sh`, zone `srp.test.`) — nothing outside this repo required
 beyond `go`, `named`/`named-checkconf`, `dig`, and `openssl` (for the throwaway certificate of
-the proxy's DNS-over-TLS listener, which TEST 9 registers through).
+the proxy's DNS-over-TLS listener, which TEST 9 registers through). So is `test_update.sh`
+with `AUTH_BACKEND=local` (below).
 
-`test_update.sh` and `test_forward.sh` run against the **real DNS**, not a local BIND 9. Both
-start the proxy from a copy of `main/config.yaml` (only the listen address and the minimum
-leases are rewritten), so they also use its lease-store files under `data/`.
+`test_update.sh` (by default) and `test_forward.sh` run against the **real DNS**, not a local
+BIND 9. Both start the proxy from a copy of `main/config.yaml` (only the listen address and the
+minimum leases are rewritten), so they also use its lease-store files under `data/`.
 
 - `test_update.sh` updates the live `test.dev.zenr.io.` records: the proxy finds the
-  authoritative server for `dev.zenr.io.` via SOA/NS lookup and signs with
+  authoritative server for `dev.zenr.io.` via an SOA lookup and signs with
   `keystore/server/Kdev.zenr.io.+015+35317`. The suite checks results with `dig` against
   `AUTH_SERVER` (default `ns1.free2air.org`) and adds/deletes some records there directly with
   `nsupdate` (needs a current BIND `nsupdate` with ED25519 support). Needs
@@ -27,6 +28,24 @@ leases are rewritten), so they also use its lease-store files under `data/`.
   `tcp`, or `tls`: with `tls` the client sends DNS-over-TLS to `PROXY_ADDR:PROXY_TLS_PORT`
   (default 8853). A proxy the script starts gets that listener turned on in its scratch config,
   with a throwaway certificate (needs `openssl`); a reused proxy must already serve DoT there.
+
+  With `AUTH_BACKEND=local` (`make test-update-local`) the same suite runs against the local
+  BIND 9 of `lib/bind9.sh` instead. The scratch copy of `config.yaml` is then localized for
+  that deployment (`localize_lease_config`): only what names a server, zone, key or file is
+  replaced, so every other setting, including ones `config.yaml` gains later, carries over.
+  The upstream resolvers become the local BIND 9; the RFC 9664 handler serves its own zone
+  `update.test.` (key in `keystore-update-bind9/`), and the client registers under
+  `test.update.test.`; `srp_handler` runs ahead of it, as in `config.yaml`, on `srp.test.`
+  (key in `keystore-srp-bind9/`). Each handler reaches the BIND 9 through its static
+  `upstream` (the commented-out `# upstream:` line of its section, turned on) and keeps its
+  leases in a scratch file. The run fails if `config.yaml` has a handler section this doesn't
+  localize, or if any zone, key, file or upstream server `config.yaml` names is left, so
+  nothing outside the run is touched. (SOA discovery is therefore only exercised by the live
+  run.) The two client keys are generated for the run with `dnssec-keygen`, so
+  `CLIENT_KEYSTORE_DIR` is not needed (and is ignored), nor is network access. The proxy must
+  be the script's own, not a reused one. At the end, as in `test_srp.sh`, any request `named`
+  rejected other than a SIG(0) quota refusal fails the run, even if a retry later hid it from
+  the suite's own checks.
 - `test_forward.sh` needs internet access: it resolves public names (google.com, gmail.com,
   ...) through the proxy's configured upstream resolvers.
 

@@ -59,7 +59,7 @@ func applyUpdateHandlerEnvOverrides(cfg map[string]any) map[string]any {
 
 // withBootstrapResolvers fills in "bootstrap_resolvers" for the update
 // handler from the top-level "upstreams" config, unless the handler config
-// already sets its own. Without this, the handler's own SOA/NS zone-
+// already sets its own. Without this, the handler's own SOA-based zone-
 // authority resolution (used to find where to forward signed UPDATEs, and
 // to check for pre-existing records upstream) has no configured resolver of
 // its own and falls back to a hardcoded default -- silently independent of
@@ -107,7 +107,16 @@ func main() {
 	if logLevel == "" {
 		logLevel = "info"
 	}
-	logger := logging.NewLogger(logLevel)
+	// LOG_OUTPUT picks where log lines go: stdout (the default), syslog, or both.
+	logOutput := os.Getenv("LOG_OUTPUT")
+	if logOutput == "" {
+		logOutput = logging.OutputStdout
+	}
+	logger, err := logging.NewLoggerWithOutput(logLevel, logOutput)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error setting up logging (LOG_OUTPUT=%s): %v\n", logOutput, err)
+		os.Exit(1)
+	}
 
 	// Load configuration
 	cfg, err := config.LoadConfig(cfgPath)

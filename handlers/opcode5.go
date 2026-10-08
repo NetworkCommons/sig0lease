@@ -34,18 +34,17 @@ func NewInMemoryLeaseManager() *InMemoryLeaseManager {
 }
 
 // UpstreamCoordinator handles communication with the upstream authoritative server.
-// pkg/updatecore.Coordinator is the production implementation, constructed directly in
-// Setup (below) via updatecore.NewCoordinator -- this interface exists so tests and
-// operators can substitute their own (config's "upstream_coordinator" option, or a test
-// stub; see handlers/opcode5_sig0_validation_test.go's stubUpstreamCoordinator). It covers
-// everything the handler asks of the upstream side, so a substitute is used the same way as
-// the production implementation, never bypassed.
+// pkg/updatecore.Coordinator is the production implementation, constructed in Setup via
+// buildCoordinatorFromConfig -- this interface exists so tests can set a stub in its place
+// (see handlers/opcode5_sig0_validation_test.go's stubUpstreamCoordinator). It covers
+// everything the handler asks of the upstream side, so a stub is used the same way as the
+// production implementation, never bypassed.
 type UpstreamCoordinator interface {
 	// SendUpdate sends a DNS UPDATE message to the upstream authoritative server.
 	// Returns the response message or an error.
 	SendUpdate(ctx context.Context, upstreamZone string, updateMsg *dns.Msg) (*dns.Msg, error)
-	// ResolveAuthoritativeZone returns the zone cut (the name that has NS records) for zone
-	// or one of its parents: the zone an UPDATE for names under zone must name.
+	// ResolveAuthoritativeZone returns the apex of the zone holding zone: the zone an UPDATE
+	// for names under zone must name.
 	ResolveAuthoritativeZone(ctx context.Context, zone string) (string, error)
 	// QueryRRs returns the rrType records at name from zoneHint's authoritative server --
 	// none for NXDOMAIN -- for the handler's checks of what is already published.

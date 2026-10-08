@@ -41,7 +41,7 @@ pkg/srp/            pure logic, no network, no DNS I/O
   response.go        RCODE mapping + granted-lease echo
 
 pkg/updatecore/       shared forwarding plumbing (RFC 9664 handler and SRP handler alike)
-  coordinator.go      SOA/NS resolution, per-zone static-upstream override,
+  coordinator.go      SOA-based discovery, static-upstream override,
                       construct/forward/re-sign, the tri-state QueryKeyAtName
   ttl.go              RRset TTL consistency check (SRP)
 

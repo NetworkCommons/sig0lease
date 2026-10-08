@@ -71,3 +71,24 @@ func TestEqualFold(t *testing.T) {
 		}
 	}
 }
+
+func TestIsAtOrBelow(t *testing.T) {
+	cases := []struct {
+		name, zone string
+		want       bool
+	}{
+		{"srp.test.", "srp.test.", true},
+		{"test.srp.test.", "srp.test.", true},
+		{"a.b.SRP.Test", "srp.test.", true},
+		{"evilsrp.test.", "srp.test.", false},
+		{"srp.test.", "test.srp.test.", false},
+		{"other.example.", "srp.test.", false},
+		{"anything.example.", ".", true},
+		{"anything.example.", "", true},
+	}
+	for _, c := range cases {
+		if got := IsAtOrBelow(c.name, c.zone); got != c.want {
+			t.Errorf("IsAtOrBelow(%q, %q) = %v, want %v", c.name, c.zone, got, c.want)
+		}
+	}
+}
