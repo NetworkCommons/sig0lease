@@ -1,12 +1,14 @@
 package handlers
 
 import (
+	"context"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 
 	leasepkg "github.com/NetworkCommons/sig0lease/pkg/lease"
+	"github.com/NetworkCommons/sig0lease/pkg/updatecore"
 )
 
 func baseSetupCfg(t *testing.T) map[string]interface{} {
@@ -173,5 +175,40 @@ func TestSetup_LeaseManagerWrongTypeErrors(t *testing.T) {
 	h := newTestHandler()
 	if err := h.Setup(cfg); err == nil {
 		t.Fatal("expected error for wrong-typed lease_manager")
+	}
+}
+
+// TestSetup_StaticUpstreamCoversRequestZones: "upstream" sends the handler's upstream_zone
+// and the names below it -- the zones its requests name, e.g. test.dev.zenr.io. -- to the
+// configured server, with no SOA/NS discovery.
+func TestSetup_StaticUpstreamCoversRequestZones(t *testing.T) {
+	cfg := baseSetupCfg(t)
+	cfg["upstream"] = "127.0.0.1:5300"
+	h := newTestHandler()
+	if err := h.Setup(cfg); err != nil {
+		t.Fatalf("Setup returned error: %v", err)
+	}
+	coordinator, ok := h.upstreamCoordinator.(*updatecore.Coordinator)
+	if !ok {
+		t.Fatalf("expected *updatecore.Coordinator, got %T", h.upstreamCoordinator)
+	}
+	for _, zone := range []string{"dev.zenr.io.", "test.dev.zenr.io."} {
+		server, effectiveZone, err := coordinator.ResolveSOAMasterServer(context.Background(), zone)
+		if err != nil {
+			t.Fatalf("ResolveSOAMasterServer(%q): %v", zone, err)
+		}
+		if server != "127.0.0.1:5300" || effectiveZone != "dev.zenr.io." {
+			t.Fatalf("ResolveSOAMasterServer(%q) = %q, %q; want the static upstream and dev.zenr.io.", zone, server, effectiveZone)
+		}
+	}
+}
+
+func TestSetup_StaticUpstreamInvalidErrors(t *testing.T) {
+	for _, upstream := range []any{5300, "", "127.0.0.1", "ns1.example."} {
+		cfg := baseSetupCfg(t)
+		cfg["upstream"] = upstream
+		if err := newTestHandler().Setup(cfg); err == nil {
+			t.Errorf("expected Setup to reject upstream %#v", upstream)
+		}
 	}
 }

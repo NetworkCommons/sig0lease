@@ -74,3 +74,14 @@ func fold(c byte) byte {
 	}
 	return c
 }
+
+// IsAtOrBelow reports whether name is zone itself or a name below it, comparing whole labels
+// under Fold: "test.srp.test." is below "srp.test.", "evilsrp.test." is not. Trailing dots
+// are optional on both. Every name is at or below the root zone ("." or "").
+func IsAtOrBelow(name, zone string) bool {
+	n, z := Normalize(name), Normalize(zone)
+	if z == "" {
+		return true
+	}
+	return n == z || strings.HasSuffix(n, "."+z)
+}

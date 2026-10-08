@@ -5,9 +5,13 @@
 # This suite runs real process-level update tests only:
 # - real proxy binary
 # - real client binary
-# - real DNS keys from keystore
-# - real authoritative path for zenr.io (via proxy update forwarding)
-#
+# - real DNS keys
+# - a real authoritative server, chosen by AUTH_BACKEND:
+#     live (default): the real zenr.io. zone, found by SOA discovery from dev.zenr.io., with
+#       config.yaml, keystore/server's proxy key and CLIENT_KEYSTORE_DIR's client keys
+#     local: a disposable local BIND 9 (lib/bind9.sh), with config.yaml localized for that
+#       deployment (localize_lease_config) and client keys generated for the run -- no
+#       network, CLIENT_KEYSTORE_DIR or dev.zenr.io. key needed
 #
 
 set -euo pipefail
@@ -17,17 +21,135 @@ source "$SCRIPT_DIR/lib/proxy.sh"
 source "$SCRIPT_DIR/lib/client.sh"
 source "$SCRIPT_DIR/lib/dns.sh"
 source "$SCRIPT_DIR/lib/leasestore.sh"
+source "$SCRIPT_DIR/lib/bind9.sh"
+
+AUTH_BACKEND="${AUTH_BACKEND:-live}"
+# Holds local mode's lease snapshots and client keys; removed by cleanup.
+LOCAL_SCRATCH_DIR=""
 
 # Zones
-UPSTREAM_ZONE="dev.zenr.io."
+case "$AUTH_BACKEND" in
+    live)
+        UPSTREAM_ZONE="dev.zenr.io."
+        ;;
+    local)
+        UPSTREAM_ZONE="$BIND9_UPDATE_ZONE"
+        AUTH_SERVER="${BIND9_ADDR}:${BIND9_PORT}"
+        AUTH_ZONE="$BIND9_UPDATE_ZONE"
+        PROXY_KEY_NAME="${BIND9_UPDATE_KEYSTORE_DIR}/${BIND9_UPDATE_KEY_NAME}.key"
+        ;;
+    *)
+        log_error "Unknown AUTH_BACKEND=$AUTH_BACKEND (want live or local)"
+        exit 1
+        ;;
+esac
 DOWNSTREAM_ZONE="test.${UPSTREAM_ZONE}"
 
-# Decide up front whether we'll run our own proxy (against a scratch config
-# with min_*_lease_sec floored to TEST_MIN_LEASE_SECONDS) or reuse one
-# already listening (whose real policy we read from CONFIG_FILE instead) --
-# must happen before the yaml_get_lease_time calls below, since they read
-# whichever file this settles on.
+################################
+# Local backend (AUTH_BACKEND=local)
+################################
+
+# localize_lease_config -- local mode: turns this run's scratch copy of config.yaml
+# (prepare_lease_config, which already set the listen address, the minimum leases and, with
+# PROXY_PROTOCOL=tls, the DoT listener) into a config for the local BIND 9 deployment, by
+# replacing only what names a server, zone, key or file: the upstream resolvers become the
+# local BIND 9, and each handler gets its own zone on it (srp_handler BIND9_ZONE, the update
+# handler BIND9_UPDATE_ZONE), reached through its static "upstream", with that zone's own key
+# and a lease file in LOCAL_SCRATCH_DIR. Everything else -- processing rules, lease policy,
+# blacklisted types, any setting config.yaml gains later -- stays config.yaml's. Fails if
+# config.yaml has a handler section this doesn't localize, or if any zone, key, file or server
+# config.yaml names is still in the result, so a local run cannot reach a live resource.
+localize_lease_config() {
+    if [ "$REUSED_PROXY" = true ]; then
+        log_error "AUTH_BACKEND=local starts its own proxy, but one already listens on port $PROXY_PORT. Re-run with a free port: PROXY_PORT=18053 AUTH_BACKEND=local tests/test_update.sh run"
+        return 1
+    fi
+
+    local handlers
+    handlers="$(awk '/^handlers:/ { in_h = 1; next } /^[^ #]/ { in_h = 0 } in_h && /^  [^ #][^ ]*:[ ]*$/ { sub(/^  /, ""); sub(/:.*/, ""); print }' "$CONFIG_FILE")"
+    if [ "$(printf '%s\n' "$handlers" | sort | tr '\n' ' ')" != "srp_handler update " ]; then
+        log_error "$CONFIG_FILE's handler sections are now: $(echo $handlers). The local deployment only localizes srp_handler and update -- give any other handler a local zone, keystore and lease file in localize_lease_config"
+        return 1
+    fi
+
+    LOCAL_SCRATCH_DIR="$(mktemp -d /tmp/sig0lease-update-local.XXXXXX)"
+    local upstream="${BIND9_ADDR}:${BIND9_PORT}"
+    # A handler's block: from "  <name>:" to the next line indented by two spaces or less
+    # (the next handler or top-level key), or to the end of the file.
+    local srp_block='/^  srp_handler:$/,/^ \{0,2\}[^ #]/'
+    local update_block='/^  update:$/,/^ \{0,2\}[^ #]/'
+
+    sed -i.bak \
+        -e "s|^  - address:.*$|  - address: \"${upstream}\"|" \
+        -e "s|^  max_inflight_updates:.*$|  max_inflight_updates: ${BIND9_SIG0_QUOTA}|" \
+        -e "${srp_block} s|^    upstream_zone:.*$|    upstream_zone: \"${BIND9_ZONE}\"|" \
+        -e "${srp_block} s|^    # upstream:.*$|    upstream: \"${upstream}\"|" \
+        -e "${srp_block} s|^    keystore_dir:.*$|    keystore_dir: \"${BIND9_SRP_KEYSTORE_DIR}\"|" \
+        -e "${srp_block} s|^      path:.*$|      path: \"${LOCAL_SCRATCH_DIR}/srp_lease_snapshot.json\"|" \
+        -e "${update_block} s|^    upstream_zone:.*$|    upstream_zone: \"${BIND9_UPDATE_ZONE}\"|" \
+        -e "${update_block} s|^    # upstream:.*$|    upstream: \"${upstream}\"|" \
+        -e "${update_block} s|^    keystore_dir:.*$|    keystore_dir: \"${BIND9_UPDATE_KEYSTORE_DIR}\"|" \
+        -e "${update_block} s|^      path:.*$|      path: \"${LOCAL_SCRATCH_DIR}/lease_snapshot.json\"|" \
+        "$TMP_CONFIG_FILE"
+    rm -f "$TMP_CONFIG_FILE.bak"
+
+    local expected
+    for expected in \
+        "  max_inflight_updates: ${BIND9_SIG0_QUOTA}" \
+        "    upstream_zone: \"${BIND9_ZONE}\"" \
+        "    keystore_dir: \"${BIND9_SRP_KEYSTORE_DIR}\"" \
+        "      path: \"${LOCAL_SCRATCH_DIR}/srp_lease_snapshot.json\"" \
+        "    upstream_zone: \"${BIND9_UPDATE_ZONE}\"" \
+        "    keystore_dir: \"${BIND9_UPDATE_KEYSTORE_DIR}\"" \
+        "      path: \"${LOCAL_SCRATCH_DIR}/lease_snapshot.json\""; do
+        if ! grep -qxF -- "$expected" "$TMP_CONFIG_FILE"; then
+            log_error "Could not localize $TMP_CONFIG_FILE: no line '$expected' after editing -- $CONFIG_FILE no longer has the lines localize_lease_config edits"
+            return 1
+        fi
+    done
+    if [ "$(grep -cxF -- "    upstream: \"${upstream}\"" "$TMP_CONFIG_FILE")" -ne 2 ]; then
+        log_error "Could not localize $TMP_CONFIG_FILE: each handler section of $CONFIG_FILE needs a commented-out '    # upstream:' line for localize_lease_config to turn on"
+        return 1
+    fi
+
+    # No zone, key, file or upstream server config.yaml names may survive (comments aside;
+    # the proxy's own listen address is not one of them).
+    local live_value
+    for live_value in $(grep -v '^ *#' "$CONFIG_FILE" \
+        | sed -n -E 's/^ *(- address|upstream_zone|upstream|keystore_dir|path): *"?([^" #]+).*/\2/p'); do
+        if grep -v '^ *#' "$TMP_CONFIG_FILE" | grep -qF -- "$live_value"; then
+            log_error "Could not localize $TMP_CONFIG_FILE: it still names $live_value from $CONFIG_FILE"
+            return 1
+        fi
+    done
+}
+
+# make_local_client_keys -- local mode's two client identities: fresh ED25519 KEYs at
+# DOWNSTREAM_ZONE in a scratch keystore, in place of keystore/client's test.dev.zenr.io.
+# ones. Different key tags, as the unauthorized-signer tests need. CLIENT_KEYSTORE_DIR is
+# exported because blacklisted_tester (go run) reads it from the environment.
+make_local_client_keys() {
+    require_command dnssec-keygen || return 1
+    local dir="${LOCAL_SCRATCH_DIR}/client-keys"
+    mkdir "$dir"
+    CLIENT_KEY_NAME="$(dnssec-keygen -q -K "$dir" -a ED25519 -n HOST -T KEY "$DOWNSTREAM_ZONE")"
+    WRONG_CLIENT_KEY_NAME="$(dnssec-keygen -q -K "$dir" -a ED25519 -n HOST -T KEY "$DOWNSTREAM_ZONE")"
+    if [ "$CLIENT_KEY_NAME" = "$WRONG_CLIENT_KEY_NAME" ]; then
+        log_error "dnssec-keygen gave both client keys the same key tag: $CLIENT_KEY_NAME"
+        return 1
+    fi
+    export CLIENT_KEYSTORE_DIR="$dir"
+}
+
+# Decide up front whether we'll run our own proxy (against a scratch copy of config.yaml with
+# min_*_lease_sec floored to TEST_MIN_LEASE_SECONDS, localized for the local BIND 9 in local
+# mode) or reuse one already listening (whose real policy we read from CONFIG_FILE instead) --
+# must happen before the yaml_get_lease_time calls below, since they read whichever file this
+# settles on.
 prepare_lease_config
+if [ "$AUTH_BACKEND" = "local" ]; then
+    localize_lease_config
+fi
 
 # Lease times
 POLICY_MIN_RR_LEASE_SECONDS="$(yaml_get_lease_time min_rr_lease_sec)"
@@ -880,7 +1002,11 @@ run_all_tests() {
     echo "  - real proxy process"
     echo "  - real client process"
     echo "  - real key files"
-    echo "  - real authoritative forwarding path for $UPSTREAM_ZONE"
+    if [ "$AUTH_BACKEND" = "local" ]; then
+        echo "  - real, disposable local BIND 9 authoritative for $UPSTREAM_ZONE at $AUTH_SERVER"
+    else
+        echo "  - real authoritative forwarding path for $UPSTREAM_ZONE"
+    fi
     echo ""
 
     trap cleanup EXIT
@@ -889,6 +1015,11 @@ run_all_tests() {
     require_command ls
     require_command dig
     build_binaries
+    if [ "$AUTH_BACKEND" = "local" ]; then
+        require_command nsupdate
+        make_local_client_keys
+        start_bind9
+    fi
     verify_keystore
     log_success "Using authoritative server for KEY checks: $AUTH_SERVER, key: $CLIENT_KEY_NAME, lease: $LEASE_SECONDS, key-lease: $KEY_LEASE_SECONDS"
     test_list_keys
@@ -909,7 +1040,7 @@ run_all_tests() {
         sub(/^ /, "", types)
         print types
         }
-    ' "$CONFIG_FILE")
+    ' "$LEASE_CONFIG_FILE")
 
 
     log_step "Black-listed types: $blacklisted_rrs"
@@ -955,6 +1086,11 @@ run_all_tests() {
     test_case_dump_vs_dig_consistency
     ensure_rr_absent KEY "$CLIENT_KEY_RR"
 
+    if [ "$AUTH_BACKEND" = "local" ]; then
+        bind9_report_rejections || return 1
+        BIND9_REJECTIONS_REPORTED=1
+    fi
+
     log_section "TEST RESULTS"
     echo -e "${GREEN}All integration tests completed successfully!${NC}"
     echo ""
@@ -967,6 +1103,9 @@ run_all_tests() {
         echo "Proxy process was exercised at $PROXY_URL over $PROXY_PROTOCOL"
     fi
     echo "Logs: $LOG_FILE"
+    if [ "$AUTH_BACKEND" = "local" ]; then
+        echo "BIND log: ${BIND9_RUNDIR}/named.log"
+    fi
 }
 
 cleanup() {
@@ -980,6 +1119,14 @@ cleanup() {
     fi
 
     stop_proxy
+
+    if [ "$AUTH_BACKEND" = "local" ]; then
+        # A run that failed before run_all_tests' own report still shows why named rejected
+        # anything -- often the reason a later wait_for_rr_state timed out.
+        [ -z "${BIND9_REJECTIONS_REPORTED:-}" ] && bind9_report_rejections
+        stop_bind9
+        [ -n "$LOCAL_SCRATCH_DIR" ] && rm -rf "$LOCAL_SCRATCH_DIR"
+    fi
 
     if [ -n "$TMP_TLS_DIR" ] && [ -d "$TMP_TLS_DIR" ]; then
         rm -rf "$TMP_TLS_DIR"

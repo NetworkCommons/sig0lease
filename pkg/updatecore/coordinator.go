@@ -16,7 +16,7 @@ import (
 )
 
 // Coordinator resolves the authoritative server for a zone (SOA MNAME, or a configured
-// per-zone static override) and performs the two things both handlers need against
+// static upstream) and performs the two things both handlers need against
 // it: sending a signed UPDATE, and a live KEY-at-name query (S3.3.3 FCFS).
 //
 // This is the extraction of what was previously handlers.DefaultUpstreamCoordinator's
@@ -24,14 +24,20 @@ import (
 // construct and hold a *Coordinator directly -- there is no per-package wrapper type.
 type Coordinator struct {
 	logger *logging.Logger
-	// bootstrapResolvers are the resolvers used to look up SOA/NS records to find the
-	// authoritative server for a zone not covered by staticUpstream.
+	// bootstrapResolvers are the resolvers asked for a name's SOA to find the zone holding
+	// it and that zone's primary server (discoverZone), for names static does not cover.
 	bootstrapResolvers []string
-	// staticUpstream maps a normalized (lower-cased, no trailing dot) zone name to a
-	// static "host:port" override: when a zone matches (exactly -- no parent-zone
-	// fallback, unlike SOA/NS resolution), both SOA and NS discovery are skipped
-	// entirely for it. nil or a zone with no entry falls through to normal resolution.
-	staticUpstream map[string]string
+	// static, when set, replaces discovery for its zone and every name below it.
+	static *StaticUpstream
+}
+
+// StaticUpstream is a configured authoritative server for one zone: for Zone and every
+// name at or below it, the Coordinator sends to Addr and takes Zone as the zone, with no
+// discovery. Configuring it is the operator's assertion that Addr serves Zone and that no
+// zone cut lies below Zone -- the handlers' "upstream" setting.
+type StaticUpstream struct {
+	Zone string // e.g. "srp.test."
+	Addr string // "host:port"
 }
 
 // defaultBootstrapResolvers is used only when no bootstrap resolver list was configured
@@ -41,111 +47,94 @@ type Coordinator struct {
 var defaultBootstrapResolvers = []string{"8.8.8.8:53", "8.8.4.4:53"}
 
 // NewCoordinator creates a Coordinator. bootstrapResolvers falls back to
-// defaultBootstrapResolvers when empty. staticUpstream may be nil (no overrides).
-func NewCoordinator(logger *logging.Logger, bootstrapResolvers []string, staticUpstream map[string]string) *Coordinator {
+// defaultBootstrapResolvers when empty. static may be nil (discovery for every name).
+func NewCoordinator(logger *logging.Logger, bootstrapResolvers []string, static *StaticUpstream) *Coordinator {
 	resolvers := bootstrapResolvers
 	if len(resolvers) == 0 {
 		resolvers = defaultBootstrapResolvers
 	}
-	normalized := make(map[string]string, len(staticUpstream))
-	for zone, addr := range staticUpstream {
-		normalized[dnsname.Normalize(zone)] = addr
+	if static != nil && !strings.HasSuffix(static.Zone, ".") {
+		static = &StaticUpstream{Zone: static.Zone + ".", Addr: static.Addr}
 	}
 	return &Coordinator{
 		logger:             logger,
 		bootstrapResolvers: resolvers,
-		staticUpstream:     normalized,
+		static:             static,
 	}
 }
 
-// ResolveSOAMasterServer returns the "host:port" of zone's SOA MNAME (walking up to
-// parent zones if the exact name has none) and the effective zone that answered, or --
-// if zone exactly matches a configured static upstream -- that override address
-// with zone itself as the effective zone, skipping the lookup entirely.
+// covers reports whether the static upstream applies to name: one is configured and name
+// is its zone or below it.
+func (c *Coordinator) covers(name string) bool {
+	return c.static != nil && dnsname.IsAtOrBelow(name, c.static.Zone)
+}
+
+// discoverZone returns the SOA of the zone holding name, from a single SOA query for name
+// to the bootstrap resolvers: the SOA is in the answer when name is that zone's apex, and in
+// the authority section otherwise, of a NOERROR (no data) or NXDOMAIN response alike. Its
+// owner is the zone's apex, its MNAME the zone's primary server. A root SOA (name is in no
+// delegated zone, e.g. under a TLD that doesn't exist) or an SOA whose owner is not at or
+// above name is not taken as an answer.
+func (c *Coordinator) discoverZone(ctx context.Context, name string) (*dns.SOA, error) {
+	fqdn := name
+	if !strings.HasSuffix(fqdn, ".") {
+		fqdn += "."
+	}
+	if dnsname.Normalize(fqdn) == "" {
+		return nil, fmt.Errorf("upstream zone is empty")
+	}
+	req := dns.NewMsg(fqdn, dns.TypeSOA)
+	if req == nil {
+		return nil, fmt.Errorf("failed to build SOA query for %q", fqdn)
+	}
+
+	for _, resolver := range c.bootstrapResolvers {
+		resp, err := dns.Exchange(ctx, req, "udp", resolver)
+		if err != nil || resp == nil || (resp.Rcode != dns.RcodeSuccess && resp.Rcode != dns.RcodeNameError) {
+			continue
+		}
+		for _, rr := range append(resp.Answer, resp.Ns...) {
+			soa, ok := rr.(*dns.SOA)
+			if !ok {
+				continue
+			}
+			apex := soa.Hdr.Name
+			if dnsname.Normalize(apex) == "" || !dnsname.IsAtOrBelow(fqdn, apex) || dnsname.Normalize(soa.Ns) == "" {
+				break
+			}
+			c.logger.Debugf("Zone of %s is %s, primary server %s (via bootstrap resolver %s)", fqdn, apex, soa.Ns, resolver)
+			return soa, nil
+		}
+	}
+	return nil, fmt.Errorf("no zone SOA found for %q via bootstrap resolvers %v", fqdn, c.bootstrapResolvers)
+}
+
+// ResolveSOAMasterServer returns the "host:port" of the primary server (SOA MNAME, port 53)
+// of the zone holding zone, and that zone (discoverZone) -- or, when the static upstream
+// covers zone, its address and zone, with no lookup.
 func (c *Coordinator) ResolveSOAMasterServer(ctx context.Context, zone string) (server, effectiveZone string, err error) {
-	if addr, ok := c.staticUpstream[dnsname.Normalize(zone)]; ok {
-		return addr, ensureFQDN(zone), nil
+	if c.covers(zone) {
+		return c.static.Addr, c.static.Zone, nil
 	}
-
-	trimmed := strings.TrimSuffix(zone, ".")
-	if trimmed == "" {
-		return "", "", fmt.Errorf("upstream zone is empty")
+	soa, err := c.discoverZone(ctx, zone)
+	if err != nil {
+		return "", "", err
 	}
-
-	for candidate := trimmed; candidate != ""; candidate = parentZone(candidate) {
-		candidateFQDN := candidate + "."
-		req := dns.NewMsg(candidateFQDN, dns.TypeSOA)
-		if req == nil {
-			continue
-		}
-
-		for _, bootstrapServer := range c.bootstrapResolvers {
-			resp, err := dns.Exchange(ctx, req, "udp", bootstrapServer)
-			if err != nil || resp == nil || resp.Rcode != dns.RcodeSuccess {
-				continue
-			}
-
-			for _, rr := range resp.Answer {
-				soa, ok := rr.(*dns.SOA)
-				if !ok {
-					continue
-				}
-				mname := strings.TrimSuffix(soa.Ns, ".")
-				if mname == "" {
-					break
-				}
-				c.logger.Debugf("Selected SOA MNAME %s for effective zone %s (via bootstrap resolver %s)", mname, candidateFQDN, bootstrapServer)
-				return net.JoinHostPort(mname, "53"), candidateFQDN, nil
-			}
-		}
-	}
-
-	return "", "", fmt.Errorf("no SOA master server found for %q", zone)
+	return net.JoinHostPort(strings.TrimSuffix(soa.Ns, "."), "53"), soa.Hdr.Name, nil
 }
 
-// ResolveAuthoritativeZone finds the zone cut (the name that actually has NS records)
-// for zone or one of its parents -- or, for a zone matching a static upstream override,
-// zone itself, with no NS lookup at all (the operator has already asserted the
-// zone cut by configuring the override).
+// ResolveAuthoritativeZone returns the apex of the zone holding zone -- the zone an UPDATE
+// for names under zone must name (discoverZone) -- or, when the static upstream covers
+// zone, its zone, with no lookup.
 func (c *Coordinator) ResolveAuthoritativeZone(ctx context.Context, zone string) (string, error) {
-	if _, ok := c.staticUpstream[dnsname.Normalize(zone)]; ok {
-		return ensureFQDN(zone), nil
+	if c.covers(zone) {
+		return c.static.Zone, nil
 	}
-
-	trimmed := strings.TrimSuffix(zone, ".")
-	if trimmed == "" {
-		return "", fmt.Errorf("upstream zone is empty")
+	soa, err := c.discoverZone(ctx, zone)
+	if err != nil {
+		return "", err
 	}
-
-	for candidate := trimmed; candidate != ""; candidate = parentZone(candidate) {
-		candidateFQDN := candidate + "."
-		req := dns.NewMsg(candidateFQDN, dns.TypeNS)
-		if req == nil {
-			continue
-		}
-
-		for _, bootstrapServer := range c.bootstrapResolvers {
-			resp, err := dns.Exchange(ctx, req, "udp", bootstrapServer)
-			if err != nil || resp == nil || resp.Rcode != dns.RcodeSuccess {
-				continue
-			}
-			for _, rr := range resp.Answer {
-				if _, ok := rr.(*dns.NS); ok {
-					c.logger.Debugf("Selected authoritative zone %s via NS lookup (bootstrap resolver %s)", candidateFQDN, bootstrapServer)
-					return candidateFQDN, nil
-				}
-			}
-		}
-	}
-
-	return "", fmt.Errorf("no authoritative zone with NS records found for %q", zone)
-}
-
-func ensureFQDN(zone string) string {
-	if zone == "" || strings.HasSuffix(zone, ".") {
-		return zone
-	}
-	return zone + "."
+	return soa.Hdr.Name, nil
 }
 
 func parentZone(zone string) string {
@@ -169,7 +158,7 @@ func (c *Coordinator) SendUpdate(ctx context.Context, upstreamZone string, updat
 	msgZone := updateMsg.Question[0].Header().Name
 	c.logger.Debugf("Message zone: %s", msgZone)
 	// Compare canonically: callers pass zone strings from several sources (config,
-	// resolved via live NS lookup with a trailing dot, or dnsname.Normalize()'d lease-store
+	// resolved via a live SOA lookup with a trailing dot, or dnsname.Normalize()'d lease-store
 	// values without one) that name the same zone but aren't byte-identical.
 	if dnsname.Normalize(msgZone) != dnsname.Normalize(upstreamZone) {
 		return nil, fmt.Errorf("update zone mismatch: message zone %q, expected upstream zone %q", msgZone, upstreamZone)

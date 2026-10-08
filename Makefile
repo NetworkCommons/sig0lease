@@ -10,7 +10,7 @@ VERSION ?= 0.1.0
 BUILD_DIR := ./bin/$(OS)
 CLIENT_KEYSTORE_DIR ?=
 
-.PHONY: all build build-all build-client build-client-all clean clean-binary deps docs fmt lint release run-server test-unit test-register test-srp test-mdnsresponder-interop vet
+.PHONY: all build build-all build-client build-client-all clean clean-binary deps docs fmt lint release run-server test-unit test-register test-update test-update-local test-srp test-mdnsresponder-interop vet
 
 all: build build-client test
 
@@ -116,6 +116,13 @@ test-cover:
 # Requires CLIENT_KEYSTORE_DIR for the client key, ex. CLIENT_KEYSTORE_DIR=${PWD}/keystore/client make test-update
 test-update: build build-client
 	CLIENT_KEYSTORE_DIR=$(CLIENT_KEYSTORE_DIR) ./tests/test_update.sh run
+
+# Run the same RFC 9664 suite against a real, disposable local BIND 9 (tests/lib/bind9.sh,
+# zone update.test.) instead of the live dev.zenr.io. zone, with config.yaml localized for
+# that deployment -- no CLIENT_KEYSTORE_DIR or network needed, it generates its own client
+# keys.
+test-update-local: build build-client
+	AUTH_BACKEND=local ./tests/test_update.sh run
 
 # Run the RFC 9665 SRP end-to-end suite (register/refresh/conflict/remove/expiry/discovery) against a
 # real, disposable local BIND 9 -- no CLIENT_KEYSTORE_DIR needed, it generates its own
