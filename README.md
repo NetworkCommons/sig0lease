@@ -34,6 +34,7 @@ Similar to sig0namectl, a SIG(0) KEY Resource Record (RR) is used as a secure DN
 
 * [Prepare](#-prepare)
 * [Install](#-install)
+* [Logging](#-logging)
 * [Quick start](#-quick-start)
 * [Links](#-links)
 * [Contributing](#-contributing)
@@ -61,6 +62,28 @@ make sig0client
 ## 💾 Install
 
 [TODO]
+
+## 📜 Logging
+
+The proxy logs to stdout by default. Two environment variables change that:
+
+| Variable | Values | Default |
+|---|---|---|
+| `DEBUG_LEVEL` | `debug`, `info`, `warn`, `error` | `info` |
+| `LOG_OUTPUT` | `stdout`, `syslog`, `both` | `stdout` |
+
+With `syslog` or `both`, each line also goes to the local system log, tagged `sig0lease` with facility `daemon`, at the severity matching its level:
+
+* Linux: `journalctl -t sig0lease`, or `/var/log/syslog`. Under systemd, stdout already reaches the journal, so use `syslog` rather than `both` to avoid duplicate lines.
+* macOS: Console.app (Action → Include Info Messages), or `log show --info --predicate 'process == "sig0lease"'`. Syslog on macOS needs a server built with cgo, which can only target macOS from a Mac: `make build` on a Mac gives one. For the same reason `make release`, which builds every platform, runs on macOS only.
+
+The proxy refuses to start if the system log can't be used, including on Windows, which has none.
+
+Every change the proxy makes in DNS is logged at `info`, one line per record, for example:
+
+```
+DNS update applied: zone=zenr.io. server=ns1.free2air.org:53 added test.dev.zenr.io. 10 IN TXT "hello"
+```
 
 ## 🎮 Quick start
 

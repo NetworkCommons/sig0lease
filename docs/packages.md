@@ -807,9 +807,21 @@ uniformHandler, so the on-disk format is defined in exactly one place:
 
     2026/08/20 10:39:44.164+02:00 -- INFO -- "message"
 
-The only thing callers may vary between Logger instances is the minimum level
-(e.g. to run one module at "debug" while the rest stay at "info"); the format
-itself is not configurable per instance.
+The only things callers may vary between Logger instances are the minimum
+level (e.g. to run one module at "debug" while the rest stay at "info") and the
+output: stdout, the system log, or both (NewLoggerWithOutput). The system log
+gets the same "message" part, with the time stamp left to syslog and the level
+carried as the record's syslog severity.
+
+CONSTANTS
+
+const (
+	OutputStdout = "stdout"
+	OutputSyslog = "syslog"
+	OutputBoth   = "both"
+)
+    Values of NewLoggerWithOutput's output.
+
 
 TYPES
 
@@ -823,6 +835,12 @@ func NewLogger(level string) *Logger
     canonical log format to stdout. level is the only setting that may differ
     between instances (e.g. a per-module override), so that every logger in the
     process stays uniformly formatted.
+
+func NewLoggerWithOutput(level, output string) (*Logger, error)
+    NewLoggerWithOutput creates a logger like NewLogger's, writing each record
+    to output: OutputStdout, OutputSyslog (the local system log) or OutputBoth.
+    It fails for any other output, and when the system log can't be opened --
+    including on a build that has no working system log (syslog_unsupported.go).
 
 func (l *Logger) Debug(msg string, keysAndValues ...any)
     Debug logs a debug message.
