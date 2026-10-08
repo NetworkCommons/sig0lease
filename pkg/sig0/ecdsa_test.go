@@ -240,3 +240,14 @@ func TestECDSAP256KnownAnswerFromOpenThread(t *testing.T) {
 		t.Fatalf("VerifySignature on real OpenThread srp-client capture: %v", err)
 	}
 }
+
+// TestAppendDomainName_KeepsLeadingSpace pins the signer name in the SIG(0) signed data to the
+// exact name sent, ASCII case folded only: a leading space is part of the first label, and
+// dropping it would sign a different name than the verifier (e.g. BIND) checks.
+func TestAppendDomainName_KeepsLeadingSpace(t *testing.T) {
+	got := appendDomainName(nil, " Lead.example.")
+	want := []byte("\x05 lead\x07example\x00")
+	if string(got) != string(want) {
+		t.Fatalf("appendDomainName(%q) = %q, want %q", " Lead.example.", got, want)
+	}
+}

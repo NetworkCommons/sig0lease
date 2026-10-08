@@ -2,9 +2,9 @@ package handlers
 
 import "fmt"
 
-// LeasePolicy controls clamping for lease durations and forwarded RR TTLs. A zero bound is no
-// bound. UpdateHandler and SRPHandler each hold one, read from their own "lease_policy" config
-// by parseLeasePolicy, and clamp every granted lease with LeasePolicy.clamp.
+// LeasePolicy controls clamping for lease durations. A zero bound is no bound. UpdateHandler
+// and SRPHandler each hold one, read from their own "lease_policy" config by parseLeasePolicy,
+// and clamp every granted lease with LeasePolicy.clamp.
 type LeasePolicy struct {
 	MinKeyLease uint32
 	MaxKeyLease uint32
@@ -73,10 +73,10 @@ func (p LeasePolicy) validate() error {
 // after clamping; the final check keeps it true for a request that broke it.
 func (p LeasePolicy) clamp(lease, keyLease uint32) (uint32, uint32) {
 	if lease != 0 {
-		lease = clampTTL(lease, p.MinRRLease, p.MaxRRLease)
+		lease = clampLease(lease, p.MinRRLease, p.MaxRRLease)
 	}
 	if keyLease != 0 {
-		keyLease = clampTTL(keyLease, p.MinKeyLease, p.MaxKeyLease)
+		keyLease = clampLease(keyLease, p.MinKeyLease, p.MaxKeyLease)
 	}
 	if lease != 0 && keyLease != 0 && lease > keyLease {
 		lease = keyLease

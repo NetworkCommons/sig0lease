@@ -43,7 +43,7 @@ pkg/srp/            pure logic, no network, no DNS I/O
 pkg/updatecore/       shared forwarding plumbing (RFC 9664 handler and SRP handler alike)
   coordinator.go      SOA/NS resolution, per-zone static-upstream override,
                       construct/forward/re-sign, the tri-state QueryKeyAtName
-  ttl.go              RRset TTL consistency: check (SRP) | normalize-to-min (base)
+  ttl.go              RRset TTL consistency check (SRP)
 
 pkg/dnssd/            RFC 6763 §9/§11 record logic (pure), separate from RFC 9665 protocol
                       logic since it's a distinct RFC
@@ -105,8 +105,8 @@ Hard requirements the handler enforces:
   exactly as received, without checking or modifying them; this is one-directional (a
   requester MUST send flags 0, the registrar MUST NOT enforce that).
 - **TTL consistency** within every RRset in the update (§4) — rejected with `REFUSED` if
-  violated; this is a MUST on the SRP path, unlike the base handler's normalize-to-minimum
-  behavior (both live in the shared `pkg/updatecore/ttl.go`, see `docs/siglease_rfc9664.md`).
+  violated (`pkg/updatecore/ttl.go`). The registrar then replaces these TTLs before writing
+  anything (§6, "TTLs"), but §4 requires the check on the requester's own TTLs regardless.
 - **DNS-SD service names** on every Service Discovery PTR add (RFC 6763 §4.1/§7): the PTR's
   base service type (the owner, or the base type under a `<sub>._sub.` subtype owner) must be
   exactly two labels, `_<service>._tcp` or `_<service>._udp`, and the PTR target must be
@@ -221,6 +221,17 @@ instances' discoverability. A PTR only ever moves via an individual add/delete i
 - A Service Discovery PTR is removed whenever its target service instance's data is removed.
 - The baseline refresh clock is 80% of the lease plus a 0–5% random offset (RFC 9664 §5.2, a
   MUST — shared with the base handler, see `docs/siglease_rfc9664.md`).
+
+**TTLs (§4, §5.1).** The registrar does not forward the requester's TTLs. They are advisory
+(§4), and requesters may send their lease as the TTL (OpenThread's client does by default),
+which would let resolvers cache a record for its whole lease: 14 days for a KEY. After SIG(0) verification, `applyRecordTTL` sets every add to
+`record_ttl_sec` (default 300), cut to the granted `KEY-LEASE` on KEYs and to the granted `LEASE`
+on `A`/`AAAA`/`SRV`/`TXT`, since a TTL SHOULD NOT be longer than the lease. Service Discovery PTRs
+keep the full value even when a registrant's lease is shorter: their owner is the shared service
+type, and §4 requires one TTL across all RRs of an RRset, which cutting to each registrant's
+lease would break. The RFC 6763 enumeration records (§10) use the same value. The records are
+changed in place in the request, so the lease store holds the TTLs the zone gets. The RFC 9664
+handler uses the same setting (`docs/siglease_rfc9664.md`).
 
 **How expiry runs.** Each KEY node has one timer, armed for its next lease event: its earliest
 data record's `LEASE` or its own `KEY-LEASE`, whichever comes first. The timer table and its
@@ -471,6 +482,9 @@ Capabilities:
   `docs/siglease_rfc9664.md`), so the updates the authoritative server receives follow RFC 2136. Real requesters use the field the same way:
   `mDNSResponder`'s and OpenThread's clients send `default.service.arpa.`, which is not a zone
   apex either.
+- **TTL** — every record the client adds, KEYs included, carries `Config.TTL` (`-ttl`, default
+  300), never a lease: a lease is not a TTL (§5.1). It is only a suggestion; a registrar may
+  override it (§4), and this proxy does (§6, "TTLs").
 - **Deregister** — withdraws the host and every configured instance in one message, requesting
   `LEASE=0`. RFC 9665's own removal signal is structural (zero address adds in the Host
   Description); some real-world registrars (`srp-mdns-proxy`) additionally require

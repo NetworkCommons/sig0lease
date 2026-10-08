@@ -1,11 +1,18 @@
 package lease
 
 import (
+	"bytes"
 	"context"
+	"crypto/sha256"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io/fs"
 	"os"
+	"path/filepath"
+	"runtime"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -32,7 +39,17 @@ const (
 // also folds the domain names inside RDATA. A v2 file would still unmarshal,
 // but its persisted NodeIDs could differ from what NodeKey/RecordKey compute
 // now, so it is rejected rather than loaded under IDs no lookup would find.
-const leaseSnapshotVersion = 3
+//
+// Bumped from 3 to 4 so names survive a reload byte for byte: every RR, KEY or
+// not, moved from presentation text (non-KEY rr_text) or per-field strings
+// (KEY rr_name, key_data, ...) to wire format (rr_wire, plus rr_display for
+// reading) -- the text form can't carry a name with a space in it, which
+// DNS-SD Instance names often have -- and node_id/parent_key_name are escaped
+// (quoteNodeKey) so a name that isn't valid UTF-8 survives JSON. Node IDs also
+// stopped dropping a name's leading whitespace (dnsname.Normalize). And the file
+// now wraps the snapshot with its SHA-256 (snapshotFile), so it can't be edited
+// by hand.
+const leaseSnapshotVersion = 4
 
 // BaseRecord is the shared lease node model used by KEY and non-KEY records.
 type BaseRecord struct {
@@ -190,8 +207,14 @@ type LeaseTreeSnapshot struct {
 // removed from the store, so it is never persisted; there is no "deleted"
 // flag to carry here.
 type NodeSnapshot struct {
-	NodeKind      NodeKind  `json:"node_kind"`
-	NodeID        string    `json:"node_id"` // composite identity: KEY -> NodeKey(keyRR), non-KEY -> RecordKey(rr)
+	NodeKind NodeKind `json:"node_kind"`
+	// NodeID is a KEY node's NodeKey(keyRR), the value its children's ParentKeyName holds. It
+	// is written so a reader can match the two up, and import checks it against the key in
+	// RRWire: the file's checksum (snapshotFile) refuses a hand edit, and this check refuses a
+	// file whose IDs aren't the ones the store computes. A non-KEY node's RecordKey(rr) is
+	// derived from RRWire instead; nothing refers to it. Both fields hold names, so any bytes,
+	// but a JSON string only valid UTF-8: they are written with quoteNodeKey's escapes.
+	NodeID        string    `json:"node_id,omitempty"`
 	ParentKeyName string    `json:"parent_key_name,omitempty"`
 	RRType        uint16    `json:"rr_type,omitempty"`
 	UpstreamZone  string    `json:"upstream_zone"`
@@ -201,16 +224,16 @@ type NodeSnapshot struct {
 
 	// KEY-only.
 	KeyLeaseDuration uint32 `json:"key_lease_duration,omitempty"`
-	RRName           string `json:"rr_name,omitempty"`
-	RRClass          uint16 `json:"rr_class,omitempty"`
-	RRTTL            uint32 `json:"rr_ttl,omitempty"`
-	KeyFlags         uint16 `json:"key_flags,omitempty"`
-	KeyProtocol      uint8  `json:"key_protocol,omitempty"`
-	KeyAlgorithm     uint8  `json:"key_algorithm,omitempty"`
-	KeyData          string `json:"key_data,omitempty"`
 
-	// non-KEY-only: full presentation-format RR, reparsed via dns.New on import.
-	RRText string `json:"rr_text,omitempty"`
+	// The node's RR, KEY or not. RRWire is the RR in DNS wire format (base64 in the JSON), and
+	// the only field import rebuilds the record from. Wire format keeps every octet of every
+	// name: a DNS-SD Instance label may hold spaces (RFC 6763 S4.1.1), which presentation text
+	// can't carry with this dns library (it neither escapes nor unescapes them), and a subtype
+	// label arbitrary 8-bit bytes (S7.1), which a JSON string can't carry. RRDisplay is the
+	// same RR as rr.String(), for people reading the file; it is never read back, though the
+	// file's checksum still covers it, so editing it fails the load like any other edit.
+	RRWire    []byte `json:"rr_wire"`
+	RRDisplay string `json:"rr_display"`
 }
 
 // InMemoryLeaseStore is an in-memory lease manager implementation.
@@ -646,23 +669,22 @@ func (m *InMemoryLeaseStore) ExportSnapshot() (*LeaseTreeSnapshot, error) {
 		if rec == nil || rec.KeyRR == nil {
 			continue
 		}
+		wire, err := rrToWire(rec.KeyRR)
+		if err != nil {
+			return nil, fmt.Errorf("key record %s: %w", rec.KeyRR.String(), err)
+		}
 		nodes = append(nodes, NodeSnapshot{
 			NodeKind:         NodeKindKEY,
-			NodeID:           id,
-			ParentKeyName:    rec.ParentKeyName,
+			NodeID:           quoteNodeKey(id),
+			ParentKeyName:    quoteNodeKey(rec.ParentKeyName),
 			RRType:           rec.RRType,
 			UpstreamZone:     rec.UpstreamZone,
 			LeaseDuration:    rec.LeaseDuration,
 			RegisteredAt:     rec.RegisteredAt,
 			ExpiresAt:        rec.ExpiresAt,
 			KeyLeaseDuration: rec.KeyLeaseDuration,
-			RRName:           rec.KeyRR.Hdr.Name,
-			RRClass:          rec.KeyRR.Hdr.Class,
-			RRTTL:            rec.KeyRR.Hdr.TTL,
-			KeyFlags:         rec.KeyRR.Flags,
-			KeyProtocol:      rec.KeyRR.Protocol,
-			KeyAlgorithm:     rec.KeyRR.Algorithm,
-			KeyData:          rec.KeyRR.PublicKey,
+			RRWire:           wire,
+			RRDisplay:        rec.KeyRR.String(),
 		})
 	}
 
@@ -676,16 +698,20 @@ func (m *InMemoryLeaseStore) ExportSnapshot() (*LeaseTreeSnapshot, error) {
 		if rec == nil || rec.RR == nil {
 			continue
 		}
+		wire, err := rrToWire(rec.RR)
+		if err != nil {
+			return nil, fmt.Errorf("non-key record %s: %w", rec.RR.String(), err)
+		}
 		nodes = append(nodes, NodeSnapshot{
 			NodeKind:      NodeKindNonKEY,
-			NodeID:        id,
-			ParentKeyName: rec.ParentKeyName,
+			ParentKeyName: quoteNodeKey(rec.ParentKeyName),
 			RRType:        rec.RRType,
 			UpstreamZone:  rec.UpstreamZone,
 			LeaseDuration: rec.LeaseDuration,
 			RegisteredAt:  rec.RegisteredAt,
 			ExpiresAt:     rec.ExpiresAt,
-			RRText:        rec.RR.String(),
+			RRWire:        wire,
+			RRDisplay:     rec.RR.String(),
 		})
 	}
 
@@ -710,19 +736,29 @@ func (m *InMemoryLeaseStore) ImportSnapshot(snapshot *LeaseTreeSnapshot) error {
 	for _, node := range snapshot.Nodes {
 		switch node.NodeKind {
 		case NodeKindKEY:
-			if strings.TrimSpace(node.KeyData) == "" {
-				return fmt.Errorf("snapshot key data is empty for %s", node.NodeID)
+			rr, err := rrFromWire(node.RRWire)
+			if err != nil {
+				return fmt.Errorf("snapshot key node %q has an invalid rr_wire: %w", node.RRDisplay, err)
 			}
-			nodeID := dnsname.Normalize(node.NodeID)
-			if nodeID == "" {
-				return fmt.Errorf("snapshot key node has empty node id")
+			keyRR, ok := rr.(*dns.KEY)
+			if !ok {
+				return fmt.Errorf("snapshot key node %q holds a %s RR, not a KEY", node.RRDisplay, dns.TypeToString[dns.RRToType(rr)])
 			}
-
-			keyRR := &dns.KEY{DNSKEY: dns.DNSKEY{Hdr: dns.Header{Name: node.RRName, Class: node.RRClass, TTL: node.RRTTL}}}
-			keyRR.Flags = node.KeyFlags
-			keyRR.Protocol = node.KeyProtocol
-			keyRR.Algorithm = node.KeyAlgorithm
-			keyRR.PublicKey = node.KeyData
+			if keyRR.PublicKey == "" {
+				return fmt.Errorf("snapshot key node %q has no public key", node.RRDisplay)
+			}
+			nodeID := NodeKey(keyRR)
+			storedID, err := unquoteNodeKey(node.NodeID)
+			if err != nil {
+				return fmt.Errorf("snapshot key node %q has an invalid node_id %q: %w", node.RRDisplay, node.NodeID, err)
+			}
+			if storedID != nodeID {
+				return fmt.Errorf("snapshot key node %q has node_id %q, but its key's is %q", node.RRDisplay, node.NodeID, quoteNodeKey(nodeID))
+			}
+			parent, err := unquoteNodeKey(node.ParentKeyName)
+			if err != nil {
+				return fmt.Errorf("snapshot key node %s has an invalid parent_key_name %q: %w", node.NodeID, node.ParentKeyName, err)
+			}
 
 			rrType := node.RRType
 			if rrType == 0 {
@@ -739,9 +775,9 @@ func (m *InMemoryLeaseStore) ImportSnapshot(snapshot *LeaseTreeSnapshot) error {
 					ExpiresAt:     node.ExpiresAt,
 					LeaseDuration: node.LeaseDuration,
 					RegisteredAt:  node.RegisteredAt,
-					ParentKeyName: dnsname.Normalize(node.ParentKeyName),
+					ParentKeyName: parent,
 				},
-				KeyName:          dnsname.Normalize(node.RRName),
+				KeyName:          dnsname.Normalize(keyRR.Hdr.Name),
 				KeyRR:            keyRR,
 				KeyLeaseDuration: node.KeyLeaseDuration,
 				UpstreamZone:     dnsname.Normalize(node.UpstreamZone),
@@ -752,17 +788,17 @@ func (m *InMemoryLeaseStore) ImportSnapshot(snapshot *LeaseTreeSnapshot) error {
 			newLeases[nodeID] = rec
 
 		case NodeKindNonKEY:
-			nodeID := node.NodeID
-			if nodeID == "" {
-				return fmt.Errorf("snapshot non-key node has empty node id")
+			rr, err := rrFromWire(node.RRWire)
+			if err != nil {
+				return fmt.Errorf("snapshot non-key node %q has an invalid rr_wire: %w", node.RRDisplay, err)
 			}
-			parent := dnsname.Normalize(node.ParentKeyName)
+			nodeID := RecordKey(rr)
+			parent, err := unquoteNodeKey(node.ParentKeyName)
+			if err != nil {
+				return fmt.Errorf("snapshot non-key node %s has an invalid parent_key_name %q: %w", nodeID, node.ParentKeyName, err)
+			}
 			if parent == "" {
 				return fmt.Errorf("snapshot non-key node %s has empty parent", nodeID)
-			}
-			rr, err := dns.New(node.RRText)
-			if err != nil {
-				return fmt.Errorf("invalid non-key RR for node %s: %w", nodeID, err)
 			}
 			rrType := node.RRType
 			if rrType == 0 {
@@ -818,19 +854,88 @@ func (m *InMemoryLeaseStore) ImportSnapshot(snapshot *LeaseTreeSnapshot) error {
 	return nil
 }
 
+// snapshotFile is the on-disk layout SaveSnapshot writes: the snapshot's JSON, and the
+// SHA-256 of exactly those bytes. The lease store is not meant to be edited by hand, and
+// LoadSnapshot enforces that: it accepts only a file identical, byte for byte, to what
+// snapshotFileBytes makes of the snapshot it holds, so any edit -- to a record, to a field
+// only shown for reading such as rr_display, to the whitespace, or to the layout -- is
+// refused. It is a checksum, not a signature: the proxy's keys sit on the same host as the
+// file, so a key would make the check no harder to get past on purpose.
+type snapshotFile struct {
+	SHA256   string          `json:"sha256"`
+	Snapshot json.RawMessage `json:"snapshot"`
+}
+
+// snapshotFileBytes is the file SaveSnapshot writes for body, the snapshot's JSON. It is
+// assembled here rather than by marshaling a snapshotFile, because encoding/json re-indents a
+// RawMessage: this way the snapshot's bytes in the file are exactly the bytes hashed.
+func snapshotFileBytes(body []byte) []byte {
+	return fmt.Appendf(nil, "{\n  \"sha256\": \"%x\",\n  \"snapshot\": %s\n}\n", sha256.Sum256(body), body)
+}
+
 func (m *InMemoryLeaseStore) SaveSnapshot(path string) error {
 	snapshot, err := m.ExportSnapshot()
 	if err != nil {
 		return err
 	}
-	data, err := json.MarshalIndent(snapshot, "", "  ")
+	// Indented one level deeper, as the value of snapshotFile's "snapshot" key.
+	body, err := json.MarshalIndent(snapshot, "  ", "  ")
 	if err != nil {
 		return fmt.Errorf("marshal snapshot: %w", err)
 	}
-	if err := os.WriteFile(path, data, 0o600); err != nil {
+	if err := writeFileAtomic(path, snapshotFileBytes(body)); err != nil {
 		return fmt.Errorf("write snapshot: %w", err)
 	}
 	return nil
+}
+
+// writeFileAtomic writes data to path so that path always holds either its previous content or
+// all of data, never part of it: a crash mid-save would otherwise leave a file that fails
+// LoadSnapshot's checksum and keeps the proxy from starting. data goes to a new temporary file
+// (mode 0600) in path's directory -- the same filesystem, so the rename is atomic -- which is
+// synced and then renamed over path; the directory is synced last so the rename itself survives
+// a power loss. A unique temporary name means two saves to the same path can't interleave into
+// one torn file. On failure the temporary file is removed.
+func writeFileAtomic(path string, data []byte) (err error) {
+	dir := filepath.Dir(path)
+	tmp, err := os.CreateTemp(dir, filepath.Base(path)+".*.tmp")
+	if err != nil {
+		return err
+	}
+	defer func() {
+		if err == nil {
+			return
+		}
+		if rmErr := os.Remove(tmp.Name()); rmErr != nil && !errors.Is(rmErr, fs.ErrNotExist) {
+			err = errors.Join(err, rmErr)
+		}
+	}()
+	if _, err = tmp.Write(data); err != nil {
+		return errors.Join(err, tmp.Close())
+	}
+	if err = tmp.Sync(); err != nil {
+		return errors.Join(err, tmp.Close())
+	}
+	if err = tmp.Close(); err != nil {
+		return err
+	}
+	if err = os.Rename(tmp.Name(), path); err != nil {
+		return err
+	}
+	return syncDir(dir)
+}
+
+// syncDir makes a rename in dir durable. Windows has no directory sync -- it can't open a
+// directory for it -- so there the rename is atomic but may not survive a power loss.
+func syncDir(dir string) error {
+	if runtime.GOOS == "windows" {
+		return nil
+	}
+	d, err := os.Open(dir)
+	if err != nil {
+		return err
+	}
+	return errors.Join(d.Sync(), d.Close())
 }
 
 func (m *InMemoryLeaseStore) LoadSnapshot(path string) error {
@@ -838,11 +943,56 @@ func (m *InMemoryLeaseStore) LoadSnapshot(path string) error {
 	if err != nil {
 		return fmt.Errorf("read snapshot: %w", err)
 	}
+	var file snapshotFile
+	if err := json.Unmarshal(data, &file); err != nil {
+		return fmt.Errorf("unmarshal snapshot file: %w", err)
+	}
+	if len(file.Snapshot) == 0 || file.SHA256 == "" {
+		return fmt.Errorf("snapshot file %s has no sha256/snapshot pair -- it was not written by this version", path)
+	}
+	if !bytes.Equal(data, snapshotFileBytes(file.Snapshot)) {
+		return fmt.Errorf("snapshot file %s is not as the proxy wrote it (its SHA-256 or layout doesn't match): the lease store must not be edited by hand", path)
+	}
 	var snapshot LeaseTreeSnapshot
-	if err := json.Unmarshal(data, &snapshot); err != nil {
+	if err := json.Unmarshal(file.Snapshot, &snapshot); err != nil {
 		return fmt.Errorf("unmarshal snapshot: %w", err)
 	}
 	return m.ImportSnapshot(&snapshot)
+}
+
+// quoteNodeKey carries a node key -- a name, so any bytes -- through a JSON string, which can
+// only hold valid UTF-8: it is strconv.Quote's escapes without the surrounding quotes, so a key
+// of printable UTF-8 with no '"' or '\' is written unchanged. unquoteNodeKey reverses it.
+func quoteNodeKey(key string) string {
+	q := strconv.Quote(key)
+	return q[1 : len(q)-1]
+}
+
+func unquoteNodeKey(s string) (string, error) {
+	return strconv.Unquote(`"` + s + `"`)
+}
+
+// rrToWire packs rr on its own, as the one Answer RR of an otherwise empty message: the dns
+// library exports no single-RR packer. rrFromWire reverses it.
+func rrToWire(rr dns.RR) ([]byte, error) {
+	m := new(dns.Msg)
+	m.Answer = []dns.RR{rr}
+	if err := m.Pack(); err != nil {
+		return nil, err
+	}
+	return m.Data, nil
+}
+
+func rrFromWire(data []byte) (dns.RR, error) {
+	m := &dns.Msg{Data: data}
+	if err := m.Unpack(); err != nil {
+		return nil, err
+	}
+	if len(m.Question) != 0 || len(m.Answer) != 1 || len(m.Ns) != 0 || len(m.Extra) != 0 {
+		return nil, fmt.Errorf("want one answer RR and nothing else, got %d question(s), %d answer(s), %d authority and %d additional RR(s)",
+			len(m.Question), len(m.Answer), len(m.Ns), len(m.Extra))
+	}
+	return m.Answer[0], nil
 }
 
 // Stop satisfies LeaseStorage.Stop(). InMemoryLeaseStore owns no background

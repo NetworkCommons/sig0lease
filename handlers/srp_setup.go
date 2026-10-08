@@ -2,6 +2,7 @@ package handlers
 
 import (
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/NetworkCommons/sig0lease/pkg/updatecore"
@@ -38,12 +39,18 @@ import (
 //     controls whether domain-enumeration tools are told to try. [OPTIONAL, defaults to false]
 //   - "lease_policy": bounds applied to granted LEASE/KEY-LEASE, same shape as the base
 //     handler's. [OPTIONAL]
+//   - "record_ttl_sec": TTL of every record this handler writes upstream, in place of the
+//     requester's (see parseRecordTTL and applyRecordTTL). [OPTIONAL, defaults to
+//     defaultRecordTTL]
 //   - "lease_manager" / "storage": same mutually-exclusive lease-store backend selection
 //     as UpdateHandler.Setup -- see that method's doc comment for the full shape.
 //     [OPTIONAL, defaults to an in-memory store with no persistence]
 func (h *SRPHandler) Setup(cfg map[string]any) error {
-	zone, ok := cfg["upstream_zone"].(string)
-	if !ok || zone == "" {
+	// Surrounding whitespace is trimmed here, where the name comes from configuration:
+	// dnsname.Normalize keeps it, since a DNS label may begin with a space.
+	zone, _ := cfg["upstream_zone"].(string)
+	zone = strings.TrimSpace(zone)
+	if zone == "" {
 		return fmt.Errorf("upstream_zone is required in config")
 	}
 	h.upstreamZone = zone
@@ -100,6 +107,12 @@ func (h *SRPHandler) Setup(cfg map[string]any) error {
 		}
 		h.LeasePolicy = policy
 	}
+
+	recordTTL, err := parseRecordTTL(cfg)
+	if err != nil {
+		return err
+	}
+	h.recordTTL = recordTTL
 
 	rawLeaseManager, lmPresent := cfg["lease_manager"]
 	lmPresent = lmPresent && rawLeaseManager != nil

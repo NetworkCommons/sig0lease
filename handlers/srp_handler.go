@@ -19,13 +19,6 @@ import (
 	"github.com/NetworkCommons/sig0lease/pkg/updatecore"
 )
 
-// serviceEnumerationTTL is the TTL used for the RFC 6763 S9 Service Type Enumeration PTR and
-// S11 Browse Domain PTR records this handler maintains (reconcileServiceEnumeration). These
-// are proxy-maintained infrastructure records with no single client lease to derive a TTL
-// from, unlike every other record this handler writes, which take their TTL from a specific
-// client's granted LEASE.
-const serviceEnumerationTTL = 3600
-
 // SRPHandler implements handlers.Handler for opcode 5 (UPDATE), the RFC 9665 SRP path --
 // a sibling to UpdateHandler, never a branch inside it: SRP's message shape and
 // authorization model (FCFS, delete-all-then-add, no per-record parent/key walk)
@@ -50,6 +43,7 @@ type SRPHandler struct {
 	refuseOnForeignData       bool // RFC 9665 S3.3.3's NOERROR-no-KEY case. Default true.
 	rewriteDefaultServiceARPA bool // accept default.service.arpa. as an alias for upstreamZone
 	LeasePolicy               LeasePolicy
+	recordTTL                 uint32 // TTL of every record this handler writes upstream (applyRecordTTL)
 
 	// serviceTypesMu guards serviceTypes, this process's own tracked view of the RFC 6763
 	// S9 enumeration record's contents -- see reconcileServiceEnumeration. Starts nil/empty
@@ -108,6 +102,7 @@ func NewSRPHandler() *SRPHandler {
 		},
 		leaseManager:        NewInMemoryLeaseManager(),
 		refuseOnForeignData: true,
+		recordTTL:           defaultRecordTTL,
 		timers:              newExpiryTimers(),
 	}
 }
@@ -345,11 +340,30 @@ func (h *SRPHandler) Handle(ctx context.Context, w dns.ResponseWriter, r *dns.Ms
 		}
 	}
 
+	// The granted LEASE/KEY-LEASE, needed from here on: applyRecordTTL cuts TTLs to them,
+	// step 8 stores them, step 10 echoes them.
+	lease, keyLease, err := h.parseLease(r)
+	if err != nil {
+		// Validate() already confirmed the option is present and internally
+		// consistent (LEASE<=KEY-LEASE); a failure here would be a coding error, not
+		// a client one, but fail closed rather than forward TTLs or mutate the store
+		// with zero values.
+		h.logger.Errorf("SRP handler: lease option re-parse failed after validation: %v", err)
+		msg := makeErrorResponse(r, dns.RcodeServerFailure, "internal error")
+		return NewErrorResult(msg, err.Error(), err)
+	}
+	lease, keyLease = h.LeasePolicy.clamp(lease, keyLease)
+
+	// After step 4, like step 5's rewrite: both change r.Ns in place, and the signature
+	// covers the requester's original TTLs.
+	applyRecordTTL(cu, h.recordTTL, lease, keyLease)
+
 	// Step 7: build the upstream UPDATE and forward it, before touching the local
 	// store at all (deferred-mutation pattern, reused from UpdateHandler). The outgoing
 	// message is the Update section's records, exactly as classified above -- the
-	// client's own bytes verbatim when it addressed h.upstreamZone directly, or the
-	// step-5 rewritten form when it addressed default.service.arpa. -- plus an explicit
+	// client's own records when it addressed h.upstreamZone directly, or the step-5
+	// rewritten form when it addressed default.service.arpa., with applyRecordTTL's
+	// TTLs in place of the client's either way -- plus an explicit
 	// delete for any PTR this update's Service Discovery instructions drop (plan
 	// S4.4/S4.5: upstream never delete-alls a PTR's owner name, so dropping a subtype
 	// needs its own instruction; the local store, by contrast, wipes the whole service
@@ -410,18 +424,6 @@ func (h *SRPHandler) Handle(ctx context.Context, w dns.ResponseWriter, r *dns.Ms
 	// uniformly (RemoveNonKEYRecords then UpsertNonKEYRecords, both pre-existing, no
 	// new store method needed). A node the update doesn't mention (an omitted
 	// service instance) is simply never touched here.
-	lease, keyLease, err := h.parseLease(r)
-	if err != nil {
-		// Validate() already confirmed the option is present and internally
-		// consistent (LEASE<=KEY-LEASE); a failure here would be a coding error, not
-		// a client one, but fail closed rather than mutate the store with zero
-		// values.
-		h.logger.Errorf("SRP handler: lease option re-parse failed after upstream success: %v", err)
-		msg := makeErrorResponse(r, dns.RcodeServerFailure, "internal error")
-		return NewErrorResult(msg, err.Error(), err)
-	}
-	lease, keyLease = h.LeasePolicy.clamp(lease, keyLease)
-
 	touchedNodeKeys, err := h.applyLocalMutations(ctx, cu, lease, keyLease, effectiveZone)
 	if err != nil {
 		// The upstream write already succeeded -- the two stores can only diverge
@@ -604,11 +606,11 @@ func (h *SRPHandler) reconcileServiceEnumeration(ctx context.Context) {
 	var domainEnumRecords []dns.RR
 	newDomainEnumPresent := make(map[string]bool, len(wantedDomainEnum))
 	for _, w := range wantedDomainEnum {
-		domainEnumRecords = append(domainEnumRecords, dnssd.DiffSelfPointingDomainRecord(w.prefix, h.upstreamZone, wasDomainEnumPresent[w.prefix], w.isPresent, serviceEnumerationTTL)...)
+		domainEnumRecords = append(domainEnumRecords, dnssd.DiffSelfPointingDomainRecord(w.prefix, h.upstreamZone, wasDomainEnumPresent[w.prefix], w.isPresent, h.recordTTL)...)
 		newDomainEnumPresent[w.prefix] = w.isPresent
 	}
 
-	records := dnssd.DiffEnumerationRecords(h.upstreamZone, previousForDiff, current, serviceEnumerationTTL)
+	records := dnssd.DiffEnumerationRecords(h.upstreamZone, previousForDiff, current, h.recordTTL)
 	records = append(records, domainEnumRecords...)
 	newState := func() map[string]bool {
 		state := make(map[string]bool, len(currentSet)+len(survivors))
@@ -658,6 +660,37 @@ func (h *SRPHandler) reconcileServiceEnumeration(ctx context.Context) {
 	h.serviceTypesMu.Unlock()
 
 	h.logger.Debugf("SRP handler: service-type enumeration reconciled for zone %s (%d change(s))", h.upstreamZone, len(records))
+}
+
+// applyRecordTTL sets the TTL of every add in cu to the one this handler writes upstream
+// (record_ttl_sec, see parseRecordTTL), replacing the requester's: ttl cut to the granted
+// KEY-LEASE on KEYs, cut to the granted LEASE on A/AAAA/SRV/TXT, and whole on Service
+// Discovery PTRs. A PTR's owner is a service type, shared by every instance of that type
+// whoever registered it, and RFC 9665 S4 requires one TTL across all RRs of an RRset, which
+// cutting to each registrant's own lease would break. cu's records are r.Ns's own (Classify
+// keeps pointers), so the new TTLs reach both the forwarded update and the lease store, and
+// the instance KEYs synthesizeOmittedInstanceKeys copies from the host's KEY.
+func applyRecordTTL(cu *srp.ClassifiedUpdate, ttl, lease, keyLease uint32) {
+	cu.Host.Key.Hdr.TTL = min(ttl, keyLease)
+	for _, rr := range cu.Host.Addresses {
+		rr.Header().TTL = min(ttl, lease)
+	}
+	for _, inst := range cu.Instances {
+		if inst.Key != nil {
+			inst.Key.Hdr.TTL = min(ttl, keyLease)
+		}
+		if inst.SRV != nil {
+			inst.SRV.Hdr.TTL = min(ttl, lease)
+		}
+		for _, txt := range inst.TXT {
+			txt.Hdr.TTL = min(ttl, lease)
+		}
+	}
+	for _, d := range cu.Discovery {
+		if d.IsAdd {
+			d.RR.Hdr.TTL = ttl
+		}
+	}
 }
 
 // synthesizeOmittedInstanceKeys returns an explicit "Add To An RRSet" KEY instruction (RFC

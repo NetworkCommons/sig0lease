@@ -30,6 +30,25 @@ func TestSetup_DefaultStorageIsInMemory(t *testing.T) {
 	}
 }
 
+// TestSetup_UpstreamZoneTrimmed pins where a configured zone's surrounding whitespace goes:
+// Setup trims it, since dnsname.Normalize no longer does (a label may begin with a space).
+func TestSetup_UpstreamZoneTrimmed(t *testing.T) {
+	cfg := baseSetupCfg(t)
+	cfg["upstream_zone"] = "  dev.zenr.io.\t"
+	h := newTestHandler()
+	if err := h.Setup(cfg); err != nil {
+		t.Fatalf("Setup returned error: %v", err)
+	}
+	if h.upstreamZone != "dev.zenr.io." {
+		t.Fatalf("upstreamZone = %q, want %q", h.upstreamZone, "dev.zenr.io.")
+	}
+
+	cfg["upstream_zone"] = "   "
+	if err := newTestHandler().Setup(cfg); err == nil {
+		t.Fatal("expected a whitespace-only upstream_zone to be rejected as missing")
+	}
+}
+
 func TestSetup_StorageTypeMemoryExplicit(t *testing.T) {
 	cfg := baseSetupCfg(t)
 	cfg["storage"] = map[string]any{"type": "memory"}

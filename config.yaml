@@ -105,6 +105,15 @@ handlers:
       min_rr_lease_sec: 30
       max_rr_lease_sec: 7200
 
+    # TTL of every record this handler writes upstream, in place of the one the requester
+    # sent (RFC 9665 S4: a requester's TTL is only advisory). The lease is not a TTL (S5.1):
+    # a requester may send its lease as the TTL, which would let resolvers cache a record
+    # for as long as its lease -- 14 days for a KEY. Cut to the granted LEASE
+    # (KEY-LEASE for KEYs) when that is shorter, except on Service Discovery PTRs: their
+    # RRset is shared by every instance of a service type, and S4 requires one TTL across it.
+    # Also the TTL of the RFC 6763 enumeration records. Optional, default 300.
+    record_ttl_sec: 300
+
     # Lease storage backend -- same "storage"/"lease_manager" option as handlers.update below
     # (both go through the identical file-backed LeaseStorage implementation, pkg/lease's
     # FileLeaseStore -- neither handler gets special treatment). Optional; when omitted,
@@ -141,6 +150,11 @@ handlers:
       max_key_lease_sec: 1800
       min_rr_lease_sec: 30
       max_rr_lease_sec: 900
+
+    # TTL of every record this handler writes upstream, in place of the one the requester
+    # sent, cut to the granted LEASE (KEY-LEASE for KEYs) when that is shorter. Same setting
+    # as handlers.srp_handler's record_ttl_sec. Optional, default 300.
+    record_ttl_sec: 300
 
     # Whether to use 4-byte variant for lease requests (backward compatibility).
     # Default is false: 8-byte variant is always used for ALL lease requests.
