@@ -42,20 +42,22 @@ build-all:
 	GOOS=windows GOARCH=amd64 CGO_ENABLED=0 go build -o $(RELEASE_DIR)/windows/$(BINARY_NAME)-windows-amd64.exe ./cmd/sig0lease
 	GOOS=windows GOARCH=arm64 CGO_ENABLED=0 go build -o $(RELEASE_DIR)/windows/$(BINARY_NAME)-windows-arm64.exe ./cmd/sig0lease
 
-# Cross-compile client for multiple platforms
+# Cross-compile client for multiple platforms. The clients have no C code, so cgo is off for
+# all of them: otherwise a Mac would build its own architecture with cgo and the other
+# without, and the release would depend on which Mac made it.
 build-client-all:
-	GOOS=linux GOARCH=amd64 go build -o $(RELEASE_DIR)/linux/$(CLIENT_9664)-linux-amd64 ./cmd/$(CLIENT_9664)
-	GOOS=linux GOARCH=arm64 go build -o $(RELEASE_DIR)/linux/$(CLIENT_9664)-linux-arm64 ./cmd/$(CLIENT_9664)
-	GOOS=darwin GOARCH=amd64 go build -o $(RELEASE_DIR)/darwin/$(CLIENT_9664)-darwin-amd64 ./cmd/$(CLIENT_9664)
-	GOOS=darwin GOARCH=arm64 go build -o $(RELEASE_DIR)/darwin/$(CLIENT_9664)-darwin-arm64 ./cmd/$(CLIENT_9664)
-	GOOS=windows GOARCH=amd64 go build -o $(RELEASE_DIR)/windows/$(CLIENT_9664)-windows-amd64.exe ./cmd/$(CLIENT_9664)
-	GOOS=windows GOARCH=arm64 go build -o $(RELEASE_DIR)/windows/$(CLIENT_9664)-windows-arm64.exe ./cmd/$(CLIENT_9664)
-	GOOS=linux GOARCH=amd64 go build -o $(RELEASE_DIR)/linux/$(CLIENT_9665)-linux-amd64 ./cmd/$(CLIENT_9665)
-	GOOS=linux GOARCH=arm64 go build -o $(RELEASE_DIR)/linux/$(CLIENT_9665)-linux-arm64 ./cmd/$(CLIENT_9665)
-	GOOS=darwin GOARCH=amd64 go build -o $(RELEASE_DIR)/darwin/$(CLIENT_9665)-darwin-amd64 ./cmd/$(CLIENT_9665)
-	GOOS=darwin GOARCH=arm64 go build -o $(RELEASE_DIR)/darwin/$(CLIENT_9665)-darwin-arm64 ./cmd/$(CLIENT_9665)
-	GOOS=windows GOARCH=amd64 go build -o $(RELEASE_DIR)/windows/$(CLIENT_9665)-windows-amd64.exe ./cmd/$(CLIENT_9665)
-	GOOS=windows GOARCH=arm64 go build -o $(RELEASE_DIR)/windows/$(CLIENT_9665)-windows-arm64.exe ./cmd/$(CLIENT_9665)
+	GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build -o $(RELEASE_DIR)/linux/$(CLIENT_9664)-linux-amd64 ./cmd/$(CLIENT_9664)
+	GOOS=linux GOARCH=arm64 CGO_ENABLED=0 go build -o $(RELEASE_DIR)/linux/$(CLIENT_9664)-linux-arm64 ./cmd/$(CLIENT_9664)
+	GOOS=darwin GOARCH=amd64 CGO_ENABLED=0 go build -o $(RELEASE_DIR)/darwin/$(CLIENT_9664)-darwin-amd64 ./cmd/$(CLIENT_9664)
+	GOOS=darwin GOARCH=arm64 CGO_ENABLED=0 go build -o $(RELEASE_DIR)/darwin/$(CLIENT_9664)-darwin-arm64 ./cmd/$(CLIENT_9664)
+	GOOS=windows GOARCH=amd64 CGO_ENABLED=0 go build -o $(RELEASE_DIR)/windows/$(CLIENT_9664)-windows-amd64.exe ./cmd/$(CLIENT_9664)
+	GOOS=windows GOARCH=arm64 CGO_ENABLED=0 go build -o $(RELEASE_DIR)/windows/$(CLIENT_9664)-windows-arm64.exe ./cmd/$(CLIENT_9664)
+	GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build -o $(RELEASE_DIR)/linux/$(CLIENT_9665)-linux-amd64 ./cmd/$(CLIENT_9665)
+	GOOS=linux GOARCH=arm64 CGO_ENABLED=0 go build -o $(RELEASE_DIR)/linux/$(CLIENT_9665)-linux-arm64 ./cmd/$(CLIENT_9665)
+	GOOS=darwin GOARCH=amd64 CGO_ENABLED=0 go build -o $(RELEASE_DIR)/darwin/$(CLIENT_9665)-darwin-amd64 ./cmd/$(CLIENT_9665)
+	GOOS=darwin GOARCH=arm64 CGO_ENABLED=0 go build -o $(RELEASE_DIR)/darwin/$(CLIENT_9665)-darwin-arm64 ./cmd/$(CLIENT_9665)
+	GOOS=windows GOARCH=amd64 CGO_ENABLED=0 go build -o $(RELEASE_DIR)/windows/$(CLIENT_9665)-windows-amd64.exe ./cmd/$(CLIENT_9665)
+	GOOS=windows GOARCH=arm64 CGO_ENABLED=0 go build -o $(RELEASE_DIR)/windows/$(CLIENT_9665)-windows-arm64.exe ./cmd/$(CLIENT_9665)
 
 # Create release archive from a fresh $(RELEASE_DIR), so it holds exactly what build-all
 # and build-client-all build -- never development builds or test tools left in ./bin.
