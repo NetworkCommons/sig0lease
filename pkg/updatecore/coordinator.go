@@ -10,6 +10,7 @@ import (
 	"strings"
 
 	"codeberg.org/miekg/dns"
+	"codeberg.org/miekg/dns/dnsutil"
 	"github.com/NetworkCommons/sig0lease/logging"
 	"github.com/NetworkCommons/sig0lease/pkg/dnsname"
 	"github.com/NetworkCommons/sig0lease/pkg/keyrec"
@@ -144,7 +145,8 @@ func parentZone(zone string) string {
 
 // SendUpdate sends updateMsg (already built and signed) to upstreamZone's authoritative
 // server, resolved via ResolveSOAMasterServer (so a static override is honored),
-// trying UDP then falling back to TCP.
+// trying UDP then falling back to TCP. Each change of an update the server accepts is
+// logged at INFO (logAppliedChanges).
 func (c *Coordinator) SendUpdate(ctx context.Context, upstreamZone string, updateMsg *dns.Msg) (*dns.Msg, error) {
 	if upstreamZone == "" {
 		return nil, fmt.Errorf("upstream zone is required")
@@ -181,6 +183,7 @@ func (c *Coordinator) SendUpdate(ctx context.Context, upstreamZone string, updat
 	resp, udpErr := dns.Exchange(ctx, updateMsg, "udp", soaServer)
 	if udpErr == nil {
 		c.logger.Debugf("Authoritative UPDATE over UDP succeeded: server=%s rcode=%d", soaServer, resp.Rcode)
+		c.logAppliedChanges(updateMsg, resp, soaServer)
 		return resp, nil
 	}
 
@@ -188,10 +191,45 @@ func (c *Coordinator) SendUpdate(ctx context.Context, upstreamZone string, updat
 	resp, tcpErr := dns.Exchange(ctx, updateMsg, "tcp", soaServer)
 	if tcpErr == nil {
 		c.logger.Debugf("Authoritative UPDATE over TCP succeeded: server=%s rcode=%d", soaServer, resp.Rcode)
+		c.logAppliedChanges(updateMsg, resp, soaServer)
 		return resp, nil
 	}
 
 	return nil, fmt.Errorf("authoritative update failed to SOA master %s (udp: %v, tcp: %v)", soaServer, udpErr, tcpErr)
+}
+
+// logAppliedChanges logs at INFO each add and delete in updateMsg's Update section, once
+// the authoritative server has accepted it (NOERROR). Every proxy write to DNS passes
+// through SendUpdate -- client updates under both RFCs, lease expiry, and the RFC 6763 S9
+// Service Type Enumeration record -- so these lines are the record of what the proxy
+// changed in DNS. A rejected update changed nothing; its caller logs the rejection.
+func (c *Coordinator) logAppliedChanges(updateMsg, resp *dns.Msg, server string) {
+	if resp.Rcode != dns.RcodeSuccess {
+		return
+	}
+	zone := updateMsg.Question[0].Header().Name
+	for _, rr := range updateMsg.Ns {
+		c.logger.Infof("DNS update applied: zone=%s server=%s %s", zone, server, describeUpdateChange(rr))
+	}
+}
+
+// describeUpdateChange renders an Update-section RR as the change it makes (RFC 2136
+// S2.5): an add carries the zone's class, a delete of one RR class NONE, and a delete of
+// an RRset, or of every RRset at a name, class ANY.
+func describeUpdateChange(rr dns.RR) string {
+	hdr := rr.Header()
+	rrType := dnsutil.TypeToString(dns.RRToType(rr))
+	switch hdr.Class {
+	case dns.ClassNONE:
+		return fmt.Sprintf("deleted %s %s %s", hdr.Name, rrType, rr.Data().String())
+	case dns.ClassANY:
+		if dns.RRToType(rr) == dns.TypeANY {
+			return "deleted all RRsets at " + hdr.Name
+		}
+		return fmt.Sprintf("deleted RRset %s %s", hdr.Name, rrType)
+	default:
+		return fmt.Sprintf("added %s %d %s %s %s", hdr.Name, hdr.TTL, dnsutil.ClassToString(hdr.Class), rrType, rr.Data().String())
+	}
 }
 
 // queryAuthoritative sends req to zoneHint's authoritative server (ResolveSOAMasterServer,
