@@ -66,7 +66,7 @@ func (h *SRPHandler) Setup(cfg map[string]any) error {
 	// Fail fast (matching UpdateHandler.Setup) rather than discovering a missing
 	// signing key on the first real request, and cache the result for the life of the
 	// handler instead of re-reading it from the keystore directory on every request and
-	// every lease-expiry tick (see resolveUpstreamSigningContext).
+	// every lease-expiry tick (see upstreamTarget.send).
 	upstreamKey, matchedZone, err := updatecore.FindAuthorizedProxyKey(h.keystoreDir, h.upstreamZone, h.logger)
 	if err != nil {
 		return fmt.Errorf("failed to resolve upstream signing key for zone %s: %w", h.upstreamZone, err)
@@ -113,33 +113,11 @@ func (h *SRPHandler) Setup(cfg map[string]any) error {
 	}
 	h.recordTTL = recordTTL
 
-	rawLeaseManager, lmPresent := cfg["lease_manager"]
-	lmPresent = lmPresent && rawLeaseManager != nil
-	rawStorage, storagePresent := cfg["storage"]
-	storagePresent = storagePresent && rawStorage != nil
-
-	switch {
-	case lmPresent && storagePresent:
-		return fmt.Errorf(`srp handler config: "lease_manager" and "storage" are mutually exclusive, got both`)
-
-	case lmPresent:
-		lm, ok := rawLeaseManager.(LeaseManager)
-		if !ok || lm == nil {
-			return fmt.Errorf("srp handler config: \"lease_manager\" must implement lease.LeaseStorage, got %T", rawLeaseManager)
-		}
-		h.leaseManager = lm
-
-	case storagePresent:
-		storageCfg, ok := rawStorage.(map[string]any)
-		if !ok {
-			return fmt.Errorf("srp handler config: \"storage\" must be a map, got %T", rawStorage)
-		}
-		lm, err := buildLeaseManagerFromConfig(storageCfg, h.logger)
-		if err != nil {
-			return fmt.Errorf("srp handler config: storage: %w", err)
-		}
-		h.leaseManager = lm
+	leaseManager, err := LeaseStoreFromConfig(cfg, h.logger, false)
+	if err != nil {
+		return fmt.Errorf("srp handler config: %w", err)
 	}
+	h.leaseManager = leaseManager
 
 	h.startLeaseReconciliation(30 * time.Second)
 

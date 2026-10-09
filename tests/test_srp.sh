@@ -5,7 +5,8 @@
 # Runs the real proxy process (srp_handler only) against a real, disposable local BIND 9
 # instance authoritative for srp.test. -- register -> dig -> refresh -> conflict (YXDOMAIN)
 # -> remove-one -> remove-all -> expiry -> LEASE-only expiry -> registrar discovery -> registrar
-# discovery and update over DNS-over-TLS. Every update is sent by the real requester,
+# discovery and update over DNS-over-TLS -> concurrent claims of one name -> foreign-data
+# takeover. Every update is sent by the real requester,
 # cmd/sig0lease-srp-client (client/srp), in -once mode -- no stubs/mocks.
 
 set -euo pipefail
@@ -30,6 +31,7 @@ SRP_EXPIRY_TIMEOUT=40 # covers the 30s reconciliation-retry path (see processExp
                        # the next reconciliation pass rather than corrupting local state)
 SRP_DATA_EXPIRY_LEASE_SECONDS=2
 SRP_DATA_EXPIRY_KEY_LEASE_SECONDS=120 # well past SRP_EXPIRY_TIMEOUT -- see test_lease_expiry_keeps_keys
+SRP_REFUSE_ON_FOREIGN_DATA=true # the default; test_foreign_data_takeover restarts the proxy with false
 
 SRP_PROXY_BIN="${TESTS_DIR}/../bin/${OS}/sig0lease"
 SRP_CLIENT_BIN="${TESTS_DIR}/../bin/${OS}/sig0lease-srp-client"
@@ -71,6 +73,7 @@ handlers:
     keystore_dir: "${SRP_KEYSTORE_DIR}"
     upstream: "${BIND9_ADDR}:${BIND9_PORT}"
     allow_udp: true
+    refuse_on_foreign_data: ${SRP_REFUSE_ON_FOREIGN_DATA}
     lease_policy:
       min_key_lease_sec: 1
       max_key_lease_sec: 1209600
@@ -93,7 +96,9 @@ start_srp_proxy() {
         return 1
     fi
 
-    "$SRP_PROXY_BIN" "$SRP_TMP_CONFIG" > "$SRP_PROXY_LOG" 2>&1 &
+    # Appended: test_foreign_data_takeover restarts the proxy, and run_all_tests empties the
+    # log once at the start.
+    "$SRP_PROXY_BIN" "$SRP_TMP_CONFIG" >> "$SRP_PROXY_LOG" 2>&1 &
     SRP_PROXY_PID=$!
     sleep 1
 
@@ -375,6 +380,73 @@ test_discovery_tls() {
     PERFORMED_TESTS="$PERFORMED_TESTS\n  [OK] $log_msg"
 }
 
+test_concurrent_claims() {
+    # Two identities claim one new host name at the same moment. FCFS gives it to exactly one:
+    # the proxy's node lock on the name makes the second wait for the first and then fail its
+    # FCFS check, and BIND's "name not in use" prerequisite backs that up against any writer
+    # outside the proxy. Either way: one NOERROR, one YXDOMAIN, and one KEY at the name.
+    local log_msg="TEST 10: Concurrent claims of one new name by two identities -> one NOERROR, one YXDOMAIN"
+    log_section "$log_msg"
+
+    local out_a out_b pid_a pid_b
+    out_a="$(mktemp /tmp/sig0lease-srp-race-a.XXXXXX)"
+    out_b="$(mktemp /tmp/sig0lease-srp-race-b.XXXXXX)"
+    run_srp_client id7-race-a -host=host7 -addr=192.0.2.71 \
+        -lease="$SRP_LEASE_SECONDS" -keylease="$SRP_KEY_LEASE_SECONDS" > "$out_a" 2>&1 &
+    pid_a=$!
+    run_srp_client id7-race-b -host=host7 -addr=192.0.2.72 \
+        -lease="$SRP_LEASE_SECONDS" -keylease="$SRP_KEY_LEASE_SECONDS" > "$out_b" 2>&1 &
+    pid_b=$!
+    wait "$pid_a" || true
+    wait "$pid_b" || true
+    cat "$out_a" "$out_b"
+
+    local ok yx keys
+    ok="$(cat "$out_a" "$out_b" | grep -c "Status: NOERROR (Rcode=0)" || true)"
+    yx="$(cat "$out_a" "$out_b" | grep -c "Status: YXDOMAIN (Rcode=6)" || true)"
+    rm -f "$out_a" "$out_b"
+    [ "$ok" = 1 ] && [ "$yx" = 1 ] || { log_error "expected one NOERROR and one YXDOMAIN, got $ok NOERROR and $yx YXDOMAIN"; return 1; }
+    keys="$(dig_srp host7.srp.test. KEY | grep -c . || true)"
+    [ "$keys" = 1 ] || { log_error "expected exactly one KEY at host7.srp.test., found $keys"; return 1; }
+    [ "$(dig_srp host7.srp.test. A | grep -c .)" = 1 ] || { log_error "expected only the winner's address at host7.srp.test."; return 1; }
+
+    log_success "Exactly one claim won the name; the other got YXDOMAIN; one KEY and one address published"
+    PERFORMED_TESTS="$PERFORMED_TESTS\n  [OK] $log_msg"
+}
+
+test_foreign_data_takeover() {
+    # With refuse_on_foreign_data: false the proxy may take over a name holding non-SRP data
+    # but no KEY (legacy.srp.test.'s A record, from the zone template), and its UPDATE then
+    # carries a "KEY RRset does not exist" prerequisite (RFC 2136 S2.4.3), sent as a generic
+    # RR with empty RDATA. BIND must accept it: a malformed prerequisite would be a FORMERR,
+    # and the claim would fail. Runs last: it restarts the proxy with that setting.
+    local log_msg="TEST 11: Foreign-data takeover (refuse_on_foreign_data: false) -> KEY prerequisite accepted by BIND"
+    log_section "$log_msg"
+
+    [ "$(dig_srp legacy.srp.test. A)" = "192.0.2.99" ] || { log_error "test premise: legacy.srp.test. should hold the zone template's A record"; return 1; }
+    [ -z "$(dig_srp legacy.srp.test. KEY)" ] || { log_error "test premise: legacy.srp.test. should have no KEY"; return 1; }
+
+    stop_srp_proxy
+    SRP_REFUSE_ON_FOREIGN_DATA=false
+    start_srp_proxy || return 1
+
+    local out
+    out="$(run_srp_client id8-takeover -host=legacy -addr=192.0.2.8 \
+        -lease="$SRP_LEASE_SECONDS" -keylease="$SRP_KEY_LEASE_SECONDS")"
+    echo "$out"
+    echo "$out" | grep -q "Status: NOERROR (Rcode=0)" || { log_error "takeover of non-SRP data did not return NOERROR"; return 1; }
+    [ "$(dig_srp legacy.srp.test. A)" = "192.0.2.8" ] || { log_error "expected the claimant's address to replace the non-SRP A record"; return 1; }
+    [ -n "$(dig_srp legacy.srp.test. KEY)" ] || { log_error "claimant's KEY not found at legacy.srp.test."; return 1; }
+
+    out="$(run_srp_client id8-takeover-late -host=legacy -addr=192.0.2.9 \
+        -lease="$SRP_LEASE_SECONDS" -keylease="$SRP_KEY_LEASE_SECONDS")" || true
+    echo "$out"
+    echo "$out" | grep -q "Status: YXDOMAIN (Rcode=6)" || { log_error "a second identity's claim after the takeover should get YXDOMAIN"; return 1; }
+
+    log_success "Non-SRP data taken over with the KEY prerequisite; a later claim by another key got YXDOMAIN"
+    PERFORMED_TESTS="$PERFORMED_TESTS\n  [OK] $log_msg"
+}
+
 ################################
 # Top level
 ################################
@@ -396,6 +468,7 @@ run_all_tests() {
 
     build_srp_binaries
     start_bind9
+    : > "$SRP_PROXY_LOG"
     start_srp_proxy
 
     test_register_and_dig
@@ -407,6 +480,8 @@ run_all_tests() {
     test_lease_expiry_keeps_keys
     test_discovery
     test_discovery_tls
+    test_concurrent_claims
+    test_foreign_data_takeover
 
     bind9_report_rejections || return 1
     BIND9_REJECTIONS_REPORTED=1

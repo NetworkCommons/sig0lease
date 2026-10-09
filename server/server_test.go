@@ -30,7 +30,7 @@ func TestServeReturnsErrorWhenAListenerCannotBind(t *testing.T) {
 	if err != nil {
 		t.Fatalf("new resolver: %v", err)
 	}
-	router, err := NewRouter(map[uint8][]string{}, logger, resolver)
+	router, err := NewRouter(map[uint8][]string{}, logger, resolver, 15*time.Second)
 	if err != nil {
 		t.Fatalf("new router: %v", err)
 	}

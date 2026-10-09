@@ -29,6 +29,34 @@ type FileLeaseStore struct {
 
 var _ LeaseStorage = (*FileLeaseStore)(nil)
 
+// CheckSaveInterval returns an error unless d, a file store's save interval, is positive.
+// NewFileLeaseStore checks it, and so does the handlers' storage-section parser, which reads it
+// from a handler's configuration even where no file store is built from it (cmd/sig0lease's
+// dump mode).
+func CheckSaveInterval(d time.Duration) error {
+	if d <= 0 {
+		return fmt.Errorf("save_interval must be positive, got %s", d)
+	}
+	return nil
+}
+
+// ReadSnapshotFile returns a store holding the snapshot saved at path, and whether there was a
+// file there; with none, the store is empty. It only reads: NewFileLeaseStore loads its
+// snapshot with it, and so does cmd/sig0lease's dump mode, which must not write. A file that is
+// there but corrupt or unreadable is an error, never an empty store.
+func ReadSnapshotFile(path string) (store *InMemoryLeaseStore, found bool, err error) {
+	store = NewInMemoryManager()
+	if _, err := os.Stat(path); os.IsNotExist(err) {
+		return store, false, nil
+	} else if err != nil {
+		return nil, false, fmt.Errorf("cannot stat %s: %w", path, err)
+	}
+	if err := store.LoadSnapshot(path); err != nil {
+		return nil, false, fmt.Errorf("existing snapshot %s is corrupt or unreadable: %w", path, err)
+	}
+	return store, true, nil
+}
+
 // NewFileLeaseStore creates a file-backed lease store.
 //
 //   - path's parent directory is created (including any missing ancestors)
@@ -49,8 +77,8 @@ func NewFileLeaseStore(path string, saveInterval time.Duration, onSaveError func
 	if path == "" {
 		return nil, fmt.Errorf("file lease store: path is empty")
 	}
-	if saveInterval <= 0 {
-		return nil, fmt.Errorf("file lease store: save_interval must be positive, got %s", saveInterval)
+	if err := CheckSaveInterval(saveInterval); err != nil {
+		return nil, fmt.Errorf("file lease store: %w", err)
 	}
 	if onSaveError == nil {
 		onSaveError = func(error) {}
@@ -62,13 +90,9 @@ func NewFileLeaseStore(path string, saveInterval time.Duration, onSaveError func
 		}
 	}
 
-	inner := NewInMemoryManager()
-	if _, statErr := os.Stat(path); statErr == nil {
-		if err := inner.LoadSnapshot(path); err != nil {
-			return nil, fmt.Errorf("file lease store: existing snapshot %s is corrupt or unreadable: %w", path, err)
-		}
-	} else if !os.IsNotExist(statErr) {
-		return nil, fmt.Errorf("file lease store: cannot stat %s: %w", path, statErr)
+	inner, _, err := ReadSnapshotFile(path)
+	if err != nil {
+		return nil, fmt.Errorf("file lease store: %w", err)
 	}
 
 	// Write probe: catches an unwritable path/directory now, not on the

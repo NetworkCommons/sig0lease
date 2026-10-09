@@ -1,10 +1,15 @@
 package config
 
-import "testing"
+import (
+	"os"
+	"path/filepath"
+	"testing"
+	"time"
+)
 
 func baseValidConfig() *Config {
 	return &Config{
-		Server:    ServerConfig{Address: ":8053", Networks: []string{"udp", "tcp"}},
+		Server:    ServerConfig{Address: ":8053", Networks: []string{"udp", "tcp"}, RequestTimeout: 15 * time.Second},
 		Upstreams: []UpstreamConfig{{Address: "8.8.8.8:53", Protocol: "udp", Timeout: 5}},
 	}
 }
@@ -67,5 +72,32 @@ func TestAuthoritativeMaxInflightUpdates_DefaultsToOneAndRejectsNegative(t *test
 	cfg.Authoritative.MaxInflightUpdates = -1
 	if err := cfg.Validate(); err == nil {
 		t.Fatalf("expected a negative limit to be rejected")
+	}
+}
+
+func TestServerRequestTimeout_DefaultsAndRejectsNonPositive(t *testing.T) {
+	cfg := NewDefaultConfig()
+	if cfg.Server.RequestTimeout != 15*time.Second {
+		t.Fatalf("expected a 15s default, got %s", cfg.Server.RequestTimeout)
+	}
+	for _, d := range []time.Duration{0, -time.Second} {
+		cfg.Server.RequestTimeout = d
+		if err := cfg.Validate(); err == nil {
+			t.Fatalf("expected request_timeout %s to be rejected", d)
+		}
+	}
+}
+
+func TestServerRequestTimeout_ReadFromYAML(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	if err := os.WriteFile(path, []byte("server:\n  address: \":8053\"\n  request_timeout: \"20s\"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := LoadConfig(path)
+	if err != nil {
+		t.Fatalf("LoadConfig: %v", err)
+	}
+	if cfg.Server.RequestTimeout != 20*time.Second {
+		t.Fatalf("expected request_timeout 20s from YAML, got %s", cfg.Server.RequestTimeout)
 	}
 }

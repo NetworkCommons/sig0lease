@@ -43,6 +43,10 @@ type ServerConfig struct {
 	// benefits every handler (base RFC 9664, SRP, plain forwarding alike), not just one
 	// protocol. Required when "tls" appears in Networks; ignored otherwise.
 	TLS *TLSConfig `yaml:"tls,omitempty"`
+	// RequestTimeout bounds how long the handlers may work on one request, including any
+	// wait for a lease-store node another request holds (docs/siglease_rfc9664.md, "Node
+	// Locks"). Must be positive: without a bound, a waiter could wait forever.
+	RequestTimeout time.Duration `yaml:"request_timeout"`
 }
 
 // TLSConfig holds the DNS-over-TLS listener's own address and certificate. A separate
@@ -91,6 +95,9 @@ func NewDefaultConfig() *Config {
 		Server: ServerConfig{
 			Address:  ":8053", // Use non-privileged port by default
 			Networks: []string{"udp", "tcp"},
+			// Above the worst case of one authoritative UPDATE: a UDP attempt, then a TCP
+			// fallback, at the dns library's default timeouts (about 11s).
+			RequestTimeout: 15 * time.Second,
 		},
 		ProcessingRules: []ProcessingConfig{},
 		Upstreams: []UpstreamConfig{
@@ -122,6 +129,10 @@ func (c *Config) Validate() error {
 
 	if len(c.Upstreams) == 0 {
 		return fmt.Errorf("at least one upstream must be configured")
+	}
+
+	if c.Server.RequestTimeout <= 0 {
+		return fmt.Errorf("server.request_timeout must be positive, got %s", c.Server.RequestTimeout)
 	}
 
 	for _, network := range c.Server.Networks {

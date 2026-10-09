@@ -5,6 +5,7 @@ import (
 	"fmt"
 
 	"codeberg.org/miekg/dns"
+	"codeberg.org/miekg/dns/rdata"
 	"github.com/NetworkCommons/sig0lease/pkg/updatecore"
 )
 
@@ -85,21 +86,24 @@ func (r FCFSResult) String() string {
 // reasoning) -- a live query only runs for a name the store has no opinion on.
 //
 // The second return value is an RFC 2136 prerequisite RR the caller should attach to the
-// upstream UPDATE it forwards for an FCFSProceed name (nil for a Conflict/ForeignData
-// result, and also nil for a store-trusted refresh -- see below), or nil if none is needed.
-// This closes the gap between this function's own check and the caller's later, separate
-// upstream write: without it, two concurrent first-time registrations of the same
-// never-before-seen name can both observe AuthNXDomain here (neither has forwarded its own
-// UPDATE yet) and both go on to be accepted upstream, breaking the FCFS guarantee this
-// function exists to provide. Attaching a "Name is not in use" prerequisite (RFC 2136
-// S2.4.4) to the forwarded UPDATE makes the authoritative server itself re-check, and
-// enforce, the same condition atomically at write time -- which a second, separate
-// pre-forward query from this function can never fully guarantee no matter how recently it
-// ran. Deliberately narrow in scope: only the AuthNXDomain case gets a prerequisite (the
-// one the concurrent-first-registration race above actually needs); a store-trusted
-// "already ours" refresh gets none, preserving this store's pre-existing behavior of
-// silently re-establishing a record that disappeared from authoritative DNS while still
-// locally unexpired.
+// upstream UPDATE it forwards for an FCFSProceed name, or nil if none is needed. It closes
+// the gap between this function's own check and the caller's later, separate upstream write:
+// without it, two concurrent first-time claims of the same name -- through another process,
+// since the caller's node locks serialize its own -- can both pass this check (neither has
+// forwarded its UPDATE yet) and both be accepted upstream, breaking FCFS. The prerequisite
+// makes the authoritative server itself re-check, atomically at write time, what the policy
+// requires of a first-time claim:
+//
+//	refuseOnForeignData true:  nothing at the name    -> "Name is not in use" (RFC 2136 S2.4.4)
+//	refuseOnForeignData false: no KEY at the name      -> "RRset does not exist" for KEY (S2.4.3)
+//
+// With refuseOnForeignData false, non-SRP data at the name may be taken over, so only a KEY
+// appearing must stop the claim; "Name is not in use" would also stop it on non-SRP data the
+// policy allows. Only a first-time claim gets one: a name that already holds this key (in the
+// store, or live) needs none, since a competing key fails this check with a conflict. A
+// store-trusted refresh getting none also preserves the store's behavior of silently
+// re-establishing a record that disappeared from authoritative DNS while still locally
+// unexpired.
 func Evaluate(ctx context.Context, view StoreView, query AuthoritativeKeyQuery, zoneHint, name string, updateKey *dns.KEY, refuseOnForeignData bool) (FCFSResult, dns.RR, error) {
 	if view == nil {
 		return 0, nil, fmt.Errorf("srp: FCFS Evaluate called with a nil StoreView")
@@ -125,13 +129,16 @@ func Evaluate(ctx context.Context, view StoreView, query AuthoritativeKeyQuery, 
 
 	switch state {
 	case AuthNXDomain:
-		return FCFSProceed, nameNotInUsePrerequisite(name), nil
+		if refuseOnForeignData {
+			return FCFSProceed, nameNotInUsePrerequisite(name), nil
+		}
+		return FCFSProceed, keyRRsetDoesNotExistPrerequisite(name), nil
 
 	case AuthNoKey:
 		if refuseOnForeignData {
 			return FCFSForeignData, nil, nil
 		}
-		return FCFSProceed, nil, nil
+		return FCFSProceed, keyRRsetDoesNotExistPrerequisite(name), nil
 
 	case AuthKeyPresent:
 		for _, k := range keys {
@@ -147,13 +154,20 @@ func Evaluate(ctx context.Context, view StoreView, query AuthoritativeKeyQuery, 
 }
 
 // nameNotInUsePrerequisite builds an RFC 2136 S2.4.4 "Name is not in use" prerequisite RR
-// for name: TYPE=ANY, CLASS=NONE, RDLENGTH=0. dns.ANY carries no RDATA fields of its own
-// (unlike, say, dns.KEY, which always wire-encodes its flags/protocol/algorithm/public-key
-// fields even when zero-valued), so this is the one prerequisite shape this package can
-// build with confidence that it reliably wire-encodes with an empty RDATA section as RFC
-// 2136 requires -- see Evaluate's doc comment for why only the AuthNXDomain case gets one.
+// for name: TYPE=ANY, CLASS=NONE, RDLENGTH=0. dns.ANY carries no RDATA fields of its own, so
+// it wire-encodes with the empty RDATA section RFC 2136 S3.2.2 requires. The authoritative
+// server answers YXDOMAIN when it fails.
 func nameNotInUsePrerequisite(name string) dns.RR {
 	return &dns.ANY{Hdr: dns.Header{Name: name, Class: dns.ClassNONE, TTL: 0}}
+}
+
+// keyRRsetDoesNotExistPrerequisite builds an RFC 2136 S2.4.3 "RRset does not exist"
+// prerequisite RR for name's KEY RRset: TYPE=KEY, CLASS=NONE, RDLENGTH=0. Built as an RFC
+// 3597 generic RR, because dns.KEY always wire-encodes its flags, protocol and algorithm
+// fields, even zero-valued, which would make RDLENGTH 4 and the prerequisite a FORMERR (RFC
+// 2136 S3.2.2). The authoritative server answers YXRRSET when it fails.
+func keyRRsetDoesNotExistPrerequisite(name string) dns.RR {
+	return &dns.RFC3597{Hdr: dns.Header{Name: name, Class: dns.ClassNONE, TTL: 0}, RFC3597: rdata.RFC3597{RRType: dns.TypeKEY}}
 }
 
 // Names returns every name Evaluate must be called for to authorize cu (S3.3's "the

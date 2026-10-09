@@ -1,6 +1,7 @@
 package srp
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"testing"
@@ -62,16 +63,16 @@ func TestFCFS_LiveQueryTriState(t *testing.T) {
 		keys                []*dns.KEY
 		refuseOnForeignData bool
 		want                FCFSResult
-		wantPrereq          bool
+		// wantPrereqType is the TYPE of the prerequisite a first-time claim gets, 0 for none:
+		// ANY for "Name is not in use", KEY for "KEY RRset does not exist" -- whatever the
+		// policy requires to still hold at write time, so a second concurrent claim racing
+		// this same query is still caught by the authoritative server itself.
+		wantPrereqType uint16
 	}{
-		// NXDOMAIN is the "never-before-seen name" case a live query alone can't
-		// atomically protect: it gets a "Name is not in use" prerequisite attached to
-		// the caller's later upstream forward, so a second concurrent registration
-		// racing this same query is still caught -- by the authoritative server itself,
-		// atomically -- even though both requests observed NXDOMAIN here.
-		{name: "NXDOMAIN: first come", state: AuthNXDomain, want: FCFSProceed, wantPrereq: true},
+		{name: "NXDOMAIN, refuse=true: first come, name not in use", state: AuthNXDomain, refuseOnForeignData: true, want: FCFSProceed, wantPrereqType: dns.TypeANY},
+		{name: "NXDOMAIN, refuse=false: first come, no KEY", state: AuthNXDomain, refuseOnForeignData: false, want: FCFSProceed, wantPrereqType: dns.TypeKEY},
 		{name: "NOERROR no KEY, refuse=true: foreign data", state: AuthNoKey, refuseOnForeignData: true, want: FCFSForeignData},
-		{name: "NOERROR no KEY, refuse=false: proceed (clobber)", state: AuthNoKey, refuseOnForeignData: false, want: FCFSProceed},
+		{name: "NOERROR no KEY, refuse=false: proceed (clobber), no KEY", state: AuthNoKey, refuseOnForeignData: false, want: FCFSProceed, wantPrereqType: dns.TypeKEY},
 		{name: "NOERROR KEY matches: proceed", state: AuthKeyPresent, keys: []*dns.KEY{fcfsTestKey("AAAA")}, want: FCFSProceed},
 		{name: "NOERROR KEY differs: conflict", state: AuthKeyPresent, keys: []*dns.KEY{fcfsTestKey("BBBB")}, want: FCFSConflict},
 	}
@@ -88,12 +89,12 @@ func TestFCFS_LiveQueryTriState(t *testing.T) {
 			if got != tc.want {
 				t.Fatalf("got %s, want %s", got, tc.want)
 			}
-			if gotPrereq := prereq != nil; gotPrereq != tc.wantPrereq {
-				t.Fatalf("prereq != nil = %v, want %v (prereq=%v)", gotPrereq, tc.wantPrereq, prereq)
+			if gotPrereq, wantPrereq := prereq != nil, tc.wantPrereqType != 0; gotPrereq != wantPrereq {
+				t.Fatalf("prereq != nil = %v, want %v (prereq=%v)", gotPrereq, wantPrereq, prereq)
 			}
-			if tc.wantPrereq {
+			if tc.wantPrereqType != 0 {
 				hdr := prereq.Header()
-				if hdr.Name != "myhost.example." || hdr.Class != dns.ClassNONE || dns.RRToType(prereq) != dns.TypeANY {
+				if hdr.Name != "myhost.example." || hdr.Class != dns.ClassNONE || dns.RRToType(prereq) != tc.wantPrereqType {
 					t.Fatalf("unexpected prerequisite shape: %+v", prereq)
 				}
 			}
@@ -216,4 +217,31 @@ func TestFCFS_KeyForPanicsOnUnknownName(t *testing.T) {
 		}
 	}()
 	KeyFor(cu, "nobody.example.com.")
+}
+
+// Both prerequisites must reach the wire with RDLENGTH 0 (RFC 2136 S3.2.2: anything else is
+// a FORMERR): NAME, then TYPE, CLASS=NONE(254), TTL=0, RDLENGTH=0.
+func TestFCFS_PrerequisitesWireEncodeWithEmptyRDATA(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		prereq dns.RR
+		typ    uint16
+	}{
+		{"name not in use", nameNotInUsePrerequisite("printer.example."), dns.TypeANY},
+		{"KEY RRset does not exist", keyRRsetDoesNotExistPrerequisite("printer.example."), dns.TypeKEY},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			m := new(dns.Msg)
+			m.Opcode = dns.OpcodeUpdate
+			m.Question = []dns.RR{&dns.SOA{Hdr: dns.Header{Name: "example.", Class: dns.ClassINET}}}
+			m.Answer = []dns.RR{tc.prereq}
+			if err := m.Pack(); err != nil {
+				t.Fatalf("pack: %v", err)
+			}
+			want := []byte{byte(tc.typ >> 8), byte(tc.typ), 0x00, 0xfe, 0, 0, 0, 0, 0x00, 0x00}
+			if got := m.Data[len(m.Data)-len(want):]; !bytes.Equal(got, want) {
+				t.Fatalf("prerequisite ends % x on the wire, want % x", got, want)
+			}
+		})
+	}
 }
