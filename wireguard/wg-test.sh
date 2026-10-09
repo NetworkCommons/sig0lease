@@ -110,28 +110,10 @@ echo "Server can construct specific configuration TXT record (outside of SRP for
 SERVER_HOSTNAME="vpn"
 echo "${GITDIR}/bin/${DIR}/sig0lease-client 127.0.0.1:8053 register ${SERVER_HOSTNAME}.${DOMAIN} ${LEASE} ${KEYLEASE} \"${CLIENT_SERVICE_NAME}.${SERVER_SERVICE_NAME}.${SERVER_HOSTNAME}.${DOMAIN} 120 IN TXT \\\"Addr=10.10.10.10\\\"\""
 
-# this looks suss
-# CLIENT_KEYSTORE_DIR="${GITDIR}/keystore/client" ${GITDIR}/bin/${DIR}/sig0lease-client 127.0.0.1:8053 register ${SERVER_HOSTNAME}.${DOMAIN}. ${LEASE} ${KEYLEASE} "${CLIENT_SERVICE_NAME}.${SERVER_SERVICE_NAME}.${SERVER_HOSTNAME}.${DOMAIN} 120 IN TXT \"Addr=10.10.10.10\"" --k=15  --same-key
-
-# let's remove the SERVER_SERVICE_NAME ...
-CLIENT_KEYSTORE_DIR="${GITDIR}/keystore/client" ${GITDIR}/bin/${DIR}/sig0lease-client 127.0.0.1:8053 register ${SERVER_HOSTNAME}.${DOMAIN}. ${LEASE} ${KEYLEASE} "${CLIENT_SERVICE_NAME}.${SERVER_HOSTNAME}.${DOMAIN} 120 IN TXT \"Addr=10.10.10.10\"" --k=15  --same-key
+# this fails with  Step -1 commented out?
+CLIENT_KEYSTORE_DIR="${GITDIR}/keystore/client" ${GITDIR}/bin/${DIR}/sig0lease-client 127.0.0.1:8053 register ${SERVER_HOSTNAME}.${DOMAIN}. ${LEASE} ${KEYLEASE} "${CLIENT_SERVICE_NAME}.${SERVER_SERVICE_NAME}.${SERVER_HOSTNAME}.${DOMAIN} 120 IN TXT \"Addr=10.10.10.10\"" --k=15  --same-key
 
 echo "TXT record should be at ${CLIENT_SERVICE_NAME}.${SERVER_SERVICE_NAME}.${SERVER_HOSTNAME}.${DOMAIN}"
 
 dig @ns1.free2air.org ${CLIENT_SERVICE_NAME}.${SERVER_SERVICE_NAME}.${SERVER_HOSTNAME}.${DOMAIN} TXT
 
-## Following gives error:
-## -- INFO -- "SRP UPDATE for zone srp.dev.zenr.io.: host=myclient.myserver.srp.dev.zenr.io. instances=1 discovery=2"
-## -- "SRP handler: FCFS conflict for myclient._wgpeer._udp.srp.dev.zenr.io. -- name held by a different key"
-
-# CLIENT_KEYSTORE_DIR="${GITDIR}/keystore/client" ${GITDIR}/bin/${DIR}/sig0lease-srp-client \
-#   -domain="${DOMAIN}" \
-#   -server=127.0.0.1:8053 \
-#   -host="${CLIENT_HOSTNAME}.${SERVER_SERVICE_NAME}" \
-#   -addr="${HOST_IP}" \
-#   -instance=${CLIENT_SERVICE_NAME}:${SD_TYPE}:0 \
-#   -subtype="${CLIENT_SERVICE_NAME}:${SUBTYPE}" \
-#   -txt=${CLIENT_SERVICE_NAME}:"txtver=1 Address=WOOHOO" \
-#   -lease=${LEASE} -keylease=${KEYLEASE} \
-#   -keystore="${GITDIR}/keystore/client" -k=15 \
-#   -once
