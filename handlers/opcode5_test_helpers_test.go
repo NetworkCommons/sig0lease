@@ -6,7 +6,9 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"sync"
 	"testing"
+	"time"
 
 	"codeberg.org/miekg/dns"
 	"github.com/NetworkCommons/sig0lease/logging"
@@ -96,4 +98,42 @@ func withDottedLabel(t *testing.T, msg *dns.Msg, from, to string) *dns.Msg {
 		t.Fatalf("unpack: %v", err)
 	}
 	return out
+}
+
+// waitUntil polls cond until it holds, failing the test after 5s; what says what it waits for.
+func waitUntil(t *testing.T, what string, cond func() bool) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for !cond() {
+		if time.Now().After(deadline) {
+			t.Fatalf("timed out waiting for %s", what)
+		}
+		time.Sleep(time.Millisecond)
+	}
+}
+
+// sentUpdates records the UPDATEs a test's upstream stub is asked to send, in call order; both
+// handlers' stubs embed it. A handler's expiry timers send from their own goroutines, so a test
+// that lets them run reads it through sentSnapshot or sentCount.
+type sentUpdates struct {
+	sentMu sync.Mutex
+	sent   []*dns.Msg
+}
+
+func (s *sentUpdates) recordSent(updateMsg *dns.Msg) {
+	s.sentMu.Lock()
+	defer s.sentMu.Unlock()
+	s.sent = append(s.sent, updateMsg)
+}
+
+func (s *sentUpdates) sentSnapshot() []*dns.Msg {
+	s.sentMu.Lock()
+	defer s.sentMu.Unlock()
+	return append([]*dns.Msg(nil), s.sent...)
+}
+
+func (s *sentUpdates) sentCount() int {
+	s.sentMu.Lock()
+	defer s.sentMu.Unlock()
+	return len(s.sent)
 }

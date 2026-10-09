@@ -5,6 +5,7 @@ import (
 	"context"
 	"fmt"
 	"strings"
+	"time"
 
 	"codeberg.org/miekg/dns"
 	"github.com/NetworkCommons/sig0lease/forward"
@@ -22,15 +23,22 @@ type Router struct {
 	handlers  map[string]handlers.Handler
 	logger    *logging.Logger
 	resolver  *forward.Resolver
+	// requestTimeout is the deadline Route gives the handlers for one request
+	// (server.request_timeout).
+	requestTimeout time.Duration
 }
 
 // NewRouter creates a new router instance.
-func NewRouter(opcodeMap map[uint8][]string, logger *logging.Logger, resolver *forward.Resolver) (*Router, error) {
+func NewRouter(opcodeMap map[uint8][]string, logger *logging.Logger, resolver *forward.Resolver, requestTimeout time.Duration) (*Router, error) {
+	if requestTimeout <= 0 {
+		return nil, fmt.Errorf("request timeout must be positive, got %s", requestTimeout)
+	}
 	return &Router{
-		opcodeMap: opcodeMap,
-		handlers:  make(map[string]handlers.Handler),
-		logger:    logger,
-		resolver:  resolver,
+		opcodeMap:      opcodeMap,
+		handlers:       make(map[string]handlers.Handler),
+		logger:         logger,
+		resolver:       resolver,
+		requestTimeout: requestTimeout,
 	}, nil
 }
 
@@ -70,6 +78,11 @@ func (r *Router) Route(ctx context.Context, w dns.ResponseWriter, rMsg *dns.Msg)
 		r.logger.Debugf("No handler for opcode %d, forwarding to upstream", rMsg.Opcode)
 		return r.forwardToUpstream(rMsg)
 	}
+
+	// One deadline for the request, whichever handlers it passes through: it bounds their
+	// upstream exchanges and any wait for a lease-store node another request holds.
+	ctx, cancel := context.WithTimeout(ctx, r.requestTimeout)
+	defer cancel()
 
 	for _, moduleName := range moduleNames {
 		handler, ok := r.handlers[moduleName]

@@ -135,7 +135,10 @@ Compressed SRV target names (§3.2.5.4) are accepted, matching real client behav
 1. The message is a syntactically valid RFC 2136 UPDATE.
 2. **Structural validation** (`pkg/srp.Validate`) — classify every instruction and confirm the
    whole-update requirements in §4 above.
-3. **FCFS name check** (`pkg/srp.Evaluate`, RFC 9665 §3.3.3) — for the hostname and each
+3. **SIG(0) verify** against the KEY in the Host Description (§3.3.3) — always present in the
+   request, so no three-stage signer resolution (as used by the base handler) is needed. Fail
+   ⇒ `REFUSED`.
+4. **FCFS name check** (`pkg/srp.Evaluate`, RFC 9665 §3.3.3) — for the hostname and each
    service-instance name, look up the lease store; if the store has no entry, issue one live
    `KEY`-at-name query. The result is tri-state:
 
@@ -147,14 +150,8 @@ Compressed SRV target names (§3.2.5.4) are accepted, matching real client behav
    | `NOERROR`, KEY present, RDATA differs | different owner | `YXDOMAIN` |
 
    This is the same query used for the pre-forward cost described in `docs/siglease_rfc9664.md`
-   — reading its RCODE is free. Because a real, independent write can land between this
-   read and the eventual forwarded UPDATE (a TOCTOU window), the forwarded UPDATE for a
-   never-before-seen name also carries an RFC 2136 prerequisite ("Name is not in use"), so the
-   authoritative server itself atomically re-enforces FCFS at write time; a prerequisite
-   failure maps to the same `YXDOMAIN` a normal FCFS conflict would produce.
-4. **SIG(0) verify** against the KEY in the Host Description (§3.3.3) — always present in the
-   request, so no three-stage signer resolution (as used by the base handler) is needed. Fail
-   ⇒ `REFUSED`.
+   — reading its RCODE is free. A write can land between this check and the forwarded UPDATE;
+   "Closing the check-to-write window" below covers how the proxy closes that window.
 5. Apply as a normal RFC 2136 update via the shared forward path (`docs/siglease_rfc9664.md`).
    After applying, every updated Service Description carries a KEY equal to the Host
    Description KEY (see §7 below — the registrar synthesizes this when a client omits it).
@@ -163,7 +160,52 @@ Compressed SRV target names (§3.2.5.4) are accepted, matching real client behav
    (RFC 2136 §3.8), and one OPT RR. mDNSResponder's `srp-client` reads the granted lease only
    from that exact shape, and otherwise refreshes on the lease it asked for.
 
-**Authorization for SRP is steps 2 and 3, nothing more.** Once structural validation confirms
+**Closing the check-to-write window.** Between the FCFS check and the forwarded UPDATE,
+another request could claim the same name. Two mechanisms close that window.
+
+- **Name locks, within this proxy.** A request takes the lock table's locks
+  (`docs/siglease_rfc9664.md`, "Node Locks") right after SIG(0) verification and the
+  `default.service.arpa.` rewrite (§9), so an unverified request never holds one and the names
+  locked are the final ones. It holds them through the FCFS check, the forward, the local apply
+  and timer scheduling, and releases them before the RFC 6763 enumeration reconcile (§10), which
+  goes upstream again. A request whose names are held waits, holding nothing, up to
+  `server.request_timeout`, then gets `SERVFAIL`. The locks are the host's name, each
+  instance's name, and the name of every KEY node in the host's current subtree
+  (`SRPHandler.lockNames`). SRP locks names where the RFC 9664 handler locks NodeKeys: under
+  FCFS the name is the identity, so two different keys claiming one name, with two different
+  NodeKeys, must contend for one lock. A name lock excludes everything a NodeKey lock would,
+  since one NodeKey always means one name. A node's non-KEY records need no locks of their own:
+  every operation on them locks their owner. The RFC 9664 handler keeps NodeKeys, because
+  several KEYs at one name are legitimate there.
+- **FCFS prerequisites, against other writers.** The locks only cover requests through this
+  proxy. For each name being claimed for the first time, `srp.Evaluate` attaches an RFC 2136
+  prerequisite to the forwarded UPDATE, which the authoritative server tests in the same step as
+  the write. (The client's own SRP update never carries prerequisites: RFC 9665 §3.2.3, §3.3.2.)
+  The prerequisite states what the policy requires at write time, not just what the check saw:
+
+  | `refuse_on_foreign_data` | name at the check | prerequisite | authoritative answer if it fails |
+  |---|---|---|---|
+  | `true` (default) | does not exist | "Name is not in use" (RFC 2136 §2.4.4) | `YXDOMAIN` |
+  | `true` (default) | data, no KEY | none: `REFUSED`, nothing forwarded | — |
+  | `false` | does not exist | "RRset does not exist" for KEY (§2.4.3) | `YXRRSET` |
+  | `false` | data, no KEY | "RRset does not exist" for KEY | `YXRRSET` |
+
+  A refresh, or a name already holding the same KEY, needs none: a competing key fails the
+  check. With the default, "Name is not in use" is right: between check and write, another
+  claimant's KEY or non-SRP data may appear, and the default must take over neither (the
+  update's Delete All RRsets at the host name would wipe that data). With `false`, taking over
+  non-SRP data is allowed, so only a KEY must not appear; "Name is not in use" would turn
+  newly appeared non-SRP data into a needless conflict.
+
+  The KEY prerequisite is built as an RFC 3597 generic RR of type KEY
+  (`keyRRsetDoesNotExistPrerequisite`): the library's `dns.KEY` always packs its flags,
+  protocol and algorithm fields, giving RDLENGTH 4 where a prerequisite must have 0, and the
+  authoritative server answers `FORMERR`. `prerequisiteFailed` reads a failed prerequisite as a
+  lost FCFS race, answered `YXDOMAIN` like a conflict found in step 4: `YXDOMAIN` only when
+  "Name is not in use" was sent, `YXRRSET` only when the KEY prerequisite was. Anything else,
+  including either rcode without its prerequisite, is `SERVFAIL`.
+
+**Authorization for SRP is steps 2 and 4, nothing more.** Once structural validation confirms
 every KEY in the update equals the signing key, per-name FCFS is the entire ownership check —
 there is no per-record parent/key walk. PTRs are authorized transitively: each targets a
 service instance with a Service Description in the same update, and that instance is
@@ -234,21 +276,39 @@ changed in place in the request, so the lease store holds the TTLs the zone gets
 handler uses the same setting (`docs/siglease_rfc9664.md`).
 
 **How expiry runs.** Each KEY node has one timer, armed for its next lease event: its earliest
-data record's `LEASE` or its own `KEY-LEASE`, whichever comes first. The timer table and its
-retry policy (`expiryTimers`), the timer arithmetic (`nextLeaseEvent`) and the per-record,
-upstream-first data expiry (`expireNonKEYRecords`) are the same code `UpdateHandler` uses for
-RFC 9664 records, so both handlers age the lease store the same way. A `LEASE` event deletes each
-due record upstream with an individual `Delete An RR From An RRSet`, never a `Delete All RRsets`
-at the node's name, which would take the KEY with it. This also reaches PTRs at the shared
-service-type name exactly. Each record is forgotten locally only once its upstream delete is
-confirmed. A `KEY-LEASE` event sends `Delete All RRsets` for every name in the subtree, plus
-explicit PTR deletes, and then drops the subtree locally. Either way, an attempt that leaves
-anything pending (a delete that failed or was refused) is retried after a backoff of 1s,
-doubling up to 16s (`expiryRetryDelay`). No standard sets this; it keeps the window in which
-an expired record is still published upstream short (RFC 9664 §7's "MUST NOT return that RR").
-The 30-second reconciliation pass only re-arms a node that has no timer at all. A handler
-without its upstream coordinator or signing key (a state `Setup` refuses to produce) panics
-rather than expiring anything (`requireUpstream`).
+data record's `LEASE` or its own `KEY-LEASE`, whichever comes first. Both handlers run lease
+events through the same engine (`leaseExpirer`), with the same timer table and retry policy
+(`expiryTimers`) and timer arithmetic (`nextLeaseEvent`), so they age the lease store the same
+way. One lease event is one UPDATE, which deletes every record it ends one by one, each with
+an individual `Delete An RR From An RRSet`:
+- A `LEASE` event deletes the node's due data. For a host, that includes the data of every
+  service instance under it (`dataCascade`, the only difference from the RFC 9664 handler: the
+  §5.1 rule above). The KEYs stay.
+- A `KEY-LEASE` event deletes the node's whole subtree, KEYs included.
+
+The event never uses `Delete All RRsets` at a name. That instruction belongs to the requester's
+own update, and at expiry it would also delete records that other writers put at the same name
+and that the store never tracked. The individual deletes also reach PTRs at the shared
+service-type name exactly. Because the event is one UPDATE, a host and its services go "at the
+same time" (§5.1). Nothing is forgotten locally before that UPDATE is confirmed. If it fails or
+is refused, nothing is forgotten, and the whole event is retried after a backoff of 1s, doubling
+up to 16s (`expiryRetryDelay`). No standard sets this backoff; it keeps the window in which an
+expired record is still published upstream short (RFC 9664 §7's "MUST NOT return that RR").
+
+An expiry first takes the locks on its node's name and every name in its subtree, the same
+locks a request takes (§5), and releases them before its enumeration reconcile (§10). A timer
+that finds one held (a request or another expiry is working on that node) does nothing and
+backs off the same way, so a refresh and an expiry never race upstream. A host and its
+instances, registered with one lease, expire within milliseconds of each other on their own
+timers, and whichever timer loses the lock retries 1s later. When the instance's wins, the
+host's own records stay published up to that 1s past their lease; when the host's wins, it
+takes the instances' data along, and their retries find nothing due. Each expiry attempt has a
+10s deadline (`expiryTimeout`). A node found refreshed after its expiry's upstream delete would
+mean the locks had failed, and that the refresh's add and the expiry's delete raced upstream
+with no way to tell which one landed last: the engine panics instead of deleting the node
+locally. The 30-second reconciliation pass only re-arms a node that has no timer at all. A
+handler without its upstream coordinator or signing key (a state `Setup` refuses to produce)
+panics rather than expiring anything (`requireUpstream`).
 
 **Concurrent UPDATEs.** Every UPDATE the proxy sends is SIG(0)-signed, and BIND 9.20 verifies at
 most `sig0checks-quota` SIG(0) signatures at a time (default 1), answering REFUSED to the rest
@@ -379,6 +439,9 @@ off of.
 
 ## 11. Known limitations and possible future work
 
+- **Several proxy processes writing one zone.** The name locks (§5) are in memory, so between
+  two processes only the FCFS prerequisites protect a name; nothing makes replicas sharing
+  lease state safe.
 - **Source-address filtering** (§3.1.3) — the config option and check point exist, but the
   allow-list is always empty in practice (allow-all); real prefix-based filtering has not been
   implemented.
@@ -413,11 +476,21 @@ off of.
 ## 12. Testing and interop
 
 - `make test-srp` runs a full register → refresh → conflict → remove-one → remove-all → expiry → discovery
-  suite against a disposable local BIND 9, with no external dependency — this is the CI gate.
-  Every update in it is sent by `cmd/sig0lease-srp-client`, the same requester users run. The
-  last test discovers the registrar through `_dnssd-srp-tls._tcp` and registers over
-  DNS-over-TLS, against the proxy's DoT listener with a throwaway certificate generated for the
-  run.
+  → concurrent claims → foreign-data takeover suite against a disposable local BIND 9, with no
+  external dependency — this is the CI gate. Every update in it is sent by
+  `cmd/sig0lease-srp-client`, the same requester users run. The discovery tests find the
+  registrar through `_dnssd-srp._tcp` and `_dnssd-srp-tls._tcp`, the latter registering over
+  DNS-over-TLS against the proxy's DoT listener with a throwaway certificate generated for the
+  run. Two identities then claim one new name at once (one `NOERROR`, one `YXDOMAIN`), and
+  the proxy, restarted with `refuse_on_foreign_data: false`, takes over a name holding non-SRP
+  data with the KEY prerequisite, which BIND must accept.
+- The unit tests for the window in §5 hold one operation inside its upstream send while a
+  second runs against the same names (`handlers/node_locks_test.go`): two keys claiming one
+  name get one `NOERROR` and one `YXDOMAIN`, leaving one KEY node, which NodeKey-keyed locks
+  would not achieve; an expiry while a refresh holds the host sends nothing and re-arms its
+  timer. `handlers/srp_handler_test.go` pins the prerequisite rcode mapping, and
+  `pkg/srp/fcfs_test.go` the prerequisite for each state and policy and both prerequisites'
+  wire encoding.
 - `make test-mdnsresponder-interop` runs the same registrar, plus `client/srp`, against the
   real, unmodified Apple `mDNSResponder/ServiceRegistration` binaries (a sibling checkout, not
   vendored — see `tests/README.md` for setup and the exact pinned commit). It covers plain

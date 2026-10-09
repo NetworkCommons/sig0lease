@@ -9,7 +9,6 @@ import (
 	"net"
 	"strconv"
 	"strings"
-	"sync"
 	"testing"
 	"time"
 
@@ -37,10 +36,7 @@ type fakeSRPCoordinator struct {
 
 	sendResp *dns.Msg
 	sendErr  error
-	sent     []*dns.Msg // every updateMsg passed to SendUpdate, in call order
-	// sentMu guards sent against SendUpdate calls from the handler's own expiry timers; a
-	// test that lets those timers run reads sent through sentSnapshot.
-	sentMu sync.Mutex
+	sentUpdates
 
 	// onSendUpdate, if set, runs synchronously inside SendUpdate before it returns --
 	// standing in for "something else mutated the lease store while our own upstream round
@@ -63,19 +59,11 @@ func (f *fakeSRPCoordinator) QueryKeyAtName(ctx context.Context, zoneHint, name 
 }
 
 func (f *fakeSRPCoordinator) SendUpdate(ctx context.Context, upstreamZone string, updateMsg *dns.Msg) (*dns.Msg, error) {
-	f.sentMu.Lock()
-	f.sent = append(f.sent, updateMsg)
-	f.sentMu.Unlock()
+	f.recordSent(updateMsg)
 	if f.onSendUpdate != nil {
 		f.onSendUpdate()
 	}
 	return f.sendResp, f.sendErr
-}
-
-func (f *fakeSRPCoordinator) sentSnapshot() []*dns.Msg {
-	f.sentMu.Lock()
-	defer f.sentMu.Unlock()
-	return append([]*dns.Msg(nil), f.sent...)
 }
 
 func (f *fakeSRPCoordinator) ResolveAuthoritativeZone(ctx context.Context, zone string) (string, error) {
@@ -237,7 +225,7 @@ func newSRPTestHandler(t *testing.T) (*SRPHandler, *fakeSRPCoordinator) {
 	// This harness constructs the handler's fields directly rather than calling Setup
 	// (which would also need a real/fake coordinator's ResolveAuthoritativeZone wired up
 	// before it returns), so it has to populate the signing-key cache Setup would
-	// otherwise populate itself -- resolveUpstreamSigningContext relies on it being set.
+	// otherwise populate itself -- upstreamTarget.send relies on it being set.
 	upstreamKey, _, err := updatecore.FindAuthorizedProxyKey(keystoreDir, srpTestZone, h.logger)
 	if err != nil {
 		t.Fatalf("resolve test upstream signing key: %v", err)
@@ -648,17 +636,17 @@ func TestSRPHandle_FreshRegistration_CarriesNameNotInUsePrerequisite(t *testing.
 	}
 }
 
-// TestSRPHandle_UpstreamYXRRSet_MapsToYXDomainConflict pins the other half of the same
-// fix: when a step-6 prerequisite no longer holds by the time the authoritative server
-// itself evaluates it (a genuine race lost), the server rejects the UPDATE with
-// YXRRSET/NXRRSET -- this must be reported to the client as a normal FCFS conflict
-// (YXDOMAIN), the same as a conflict caught locally, not as a generic SERVFAIL, and must
-// not mutate local state (the deferred-mutation pattern: nothing is written locally until
-// after an upstream success).
-func TestSRPHandle_UpstreamYXRRSet_MapsToYXDomainConflict(t *testing.T) {
+// TestSRPHandle_UpstreamYXDomain_MapsToYXDomainConflict pins the other half of the same
+// fix: when a step-6 "name not in use" prerequisite no longer holds by the time the
+// authoritative server itself evaluates it (a genuine race lost), the server rejects the
+// UPDATE with YXDOMAIN (RFC 2136 S3.2.2) -- this must be reported to the client as a normal
+// FCFS conflict (YXDOMAIN), the same as a conflict caught locally, not as a generic
+// SERVFAIL, and must not mutate local state (the deferred-mutation pattern: nothing is
+// written locally until after an upstream success).
+func TestSRPHandle_UpstreamYXDomain_MapsToYXDomainConflict(t *testing.T) {
 	h, coord := newSRPTestHandler(t)
 	coord.keyState = srp.AuthNXDomain
-	coord.sendResp = &dns.Msg{MsgHeader: dns.MsgHeader{Rcode: dns.RcodeYXRrset}}
+	coord.sendResp = &dns.Msg{MsgHeader: dns.MsgHeader{Rcode: dns.RcodeYXDomain}}
 	id := newSRPTestIdentity(t)
 	const host = "srptest6c.dev.zenr.io."
 
@@ -669,6 +657,116 @@ func TestSRPHandle_UpstreamYXRRSet_MapsToYXDomainConflict(t *testing.T) {
 	}
 	if rec := h.leaseManager.Get(leasepkg.NodeKey(id.keyAt(host))); rec != nil {
 		t.Fatalf("deferred-mutation violated: local store was written despite the upstream UPDATE being rejected: %+v", rec)
+	}
+}
+
+// TestSRPHandle_UpstreamRRsetRcodes_AreFailures: with the default refuse_on_foreign_data,
+// a first-time claim carries only "name not in use" prerequisites, which fail with YXDOMAIN.
+// YXRRSET (the KEY prerequisite's answer) and NXRRSET (no prerequisite of ours) are then not
+// a lost FCFS race -- they must come back as SERVFAIL, not be reported as a name conflict.
+func TestSRPHandle_UpstreamRRsetRcodes_AreFailures(t *testing.T) {
+	for _, rcode := range []uint16{dns.RcodeYXRrset, dns.RcodeNXRrset} {
+		t.Run(dns.RcodeToString[rcode], func(t *testing.T) {
+			h, coord := newSRPTestHandler(t)
+			coord.keyState = srp.AuthNXDomain
+			coord.sendResp = &dns.Msg{MsgHeader: dns.MsgHeader{Rcode: rcode}}
+			id := newSRPTestIdentity(t)
+			const host = "srptest6d.dev.zenr.io."
+
+			msg := buildSRPUpdate(t, srpTestZone, id, host, []string{"192.0.2.1"}, oneWidgetInstance(), 30, 1209600, host)
+			res := h.Handle(context.Background(), stubTCPResponseWriter{}, msg)
+			if res.Status != StatusError || res.Message == nil || res.Message.Rcode != dns.RcodeServerFailure {
+				t.Fatalf("expected SERVFAIL, got status=%s message=%+v", res.Status, res.Message)
+			}
+			if rec := h.leaseManager.Get(leasepkg.NodeKey(id.keyAt(host))); rec != nil {
+				t.Fatalf("deferred-mutation violated: local store was written despite the upstream UPDATE being rejected: %+v", rec)
+			}
+		})
+	}
+}
+
+// TestSRPHandle_ForeignDataTakeover_CarriesKeyRRsetDoesNotExistPrerequisite: with
+// refuse_on_foreign_data=false, non-SRP data at a name may be taken over, so what must still
+// hold at write time is only "no KEY at the name" -- each first-time claim carries an RFC
+// 2136 "RRset does not exist" prerequisite for KEY, whether the name held data or nothing.
+func TestSRPHandle_ForeignDataTakeover_CarriesKeyRRsetDoesNotExistPrerequisite(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		state srp.AuthoritativeKeyState
+	}{{"data but no KEY", srp.AuthNoKey}, {"name does not exist", srp.AuthNXDomain}} {
+		t.Run(tc.name, func(t *testing.T) {
+			h, coord := newSRPTestHandler(t)
+			h.refuseOnForeignData = false
+			coord.keyState = tc.state
+			id := newSRPTestIdentity(t)
+			const host = "srptest6f.dev.zenr.io."
+			const inst = "widget._http._tcp.dev.zenr.io."
+
+			msg := buildSRPUpdate(t, srpTestZone, id, host, []string{"192.0.2.1"}, oneWidgetInstance(), 30, 1209600, host)
+			if res := h.Handle(context.Background(), stubTCPResponseWriter{}, msg); res.Status != StatusProcessed {
+				t.Fatalf("expected Processed, got %s: %v", res.Status, res.Error)
+			}
+			prereqs := coord.sentSnapshot()[0].Answer
+			if len(prereqs) != 2 {
+				t.Fatalf("expected one prerequisite each for %s and %s, got %v", host, inst, prereqs)
+			}
+			for _, rr := range prereqs {
+				hdr := rr.Header()
+				if hdr.Class != dns.ClassNONE || dns.RRToType(rr) != dns.TypeKEY {
+					t.Fatalf("prerequisite for %s: expected KEY RRset does not exist, got class=%v type=%v", hdr.Name, hdr.Class, dns.RRToType(rr))
+				}
+			}
+		})
+	}
+}
+
+// TestSRPHandle_UpstreamYXRRSet_MapsToYXDomainConflict: a KEY prerequisite that no longer
+// holds when the authoritative server evaluates it (another writer's KEY landed at the name in
+// between) fails with YXRRSET -- the same lost FCFS race as a failed "name not in use", so it
+// must reach the client as YXDOMAIN, with no local mutation.
+func TestSRPHandle_UpstreamYXRRSet_MapsToYXDomainConflict(t *testing.T) {
+	h, coord := newSRPTestHandler(t)
+	h.refuseOnForeignData = false
+	coord.keyState = srp.AuthNoKey
+	coord.sendResp = &dns.Msg{MsgHeader: dns.MsgHeader{Rcode: dns.RcodeYXRrset}}
+	id := newSRPTestIdentity(t)
+	const host = "srptest6g.dev.zenr.io."
+
+	msg := buildSRPUpdate(t, srpTestZone, id, host, []string{"192.0.2.1"}, oneWidgetInstance(), 30, 1209600, host)
+	res := h.Handle(context.Background(), stubTCPResponseWriter{}, msg)
+	if res.Status != StatusError || res.Message == nil || res.Message.Rcode != dns.RcodeYXDomain {
+		t.Fatalf("expected YXDOMAIN (FCFS conflict caught atomically by upstream), got status=%s message=%+v", res.Status, res.Message)
+	}
+	if rec := h.leaseManager.Get(leasepkg.NodeKey(id.keyAt(host))); rec != nil {
+		t.Fatalf("deferred-mutation violated: local store was written despite the upstream UPDATE being rejected: %+v", rec)
+	}
+}
+
+// TestSRPHandle_UpstreamYXDomainWithoutNameNotInUse_IsFailure: only a "name not in use"
+// prerequisite makes the authoritative server answer YXDOMAIN, so YXDOMAIN to an UPDATE that
+// carried none (here, a takeover carrying only KEY prerequisites) is an impossible answer --
+// it must come back as SERVFAIL, not be absorbed as a name conflict.
+func TestSRPHandle_UpstreamYXDomainWithoutNameNotInUse_IsFailure(t *testing.T) {
+	h, coord := newSRPTestHandler(t)
+	h.refuseOnForeignData = false
+	coord.keyState = srp.AuthNoKey
+	coord.sendResp = &dns.Msg{MsgHeader: dns.MsgHeader{Rcode: dns.RcodeYXDomain}}
+	id := newSRPTestIdentity(t)
+	const host = "srptest6e.dev.zenr.io."
+
+	msg := buildSRPUpdate(t, srpTestZone, id, host, []string{"192.0.2.1"}, oneWidgetInstance(), 30, 1209600, host)
+	res := h.Handle(context.Background(), stubTCPResponseWriter{}, msg)
+	sent := coord.sentSnapshot()
+	if len(sent) != 1 {
+		t.Fatalf("test premise: expected one forwarded UPDATE, got %d", len(sent))
+	}
+	for _, rr := range sent[0].Answer {
+		if dns.RRToType(rr) == dns.TypeANY {
+			t.Fatalf("test premise: expected no \"name not in use\" prerequisite, got %v", rr)
+		}
+	}
+	if res.Status != StatusError || res.Message == nil || res.Message.Rcode != dns.RcodeServerFailure {
+		t.Fatalf("expected SERVFAIL, got status=%s message=%+v", res.Status, res.Message)
 	}
 }
 
@@ -1452,31 +1550,18 @@ func TestSRPHandle_ExpiryDeletesUpstreamThenLocally(t *testing.T) {
 	}
 	// The reconcile that follows the expiry delete is last; the delete itself is
 	// second-to-last.
-	lastSent := coord.sent[len(coord.sent)-2]
-	foundDeleteAll := false
-	for _, rr := range lastSent.Ns {
-		// processExpiredNode sends a Delete All RRsets (class ANY) at the node's own name,
-		// not a single-RR KEY delete -- the latter (this function's original
-		// implementation) left the host's A record permanently orphaned upstream once the
-		// local subtree was gone locally, a real bug caught by the local BIND 9 test
-		// harness.
-		if any, ok := rr.(*dns.ANY); ok && any.Hdr.Class == dns.ClassANY && dnsname.Normalize(any.Hdr.Name) == dnsname.Normalize(host) {
-			foundDeleteAll = true
-		}
-	}
-	if !foundDeleteAll {
-		t.Fatalf("expected the expiry's upstream message to Delete All RRsets at the host's name, got Ns: %+v", lastSent.Ns)
-	}
+	// One UPDATE deletes, record by record, everything the expiry ends -- never a Delete All
+	// RRsets at a name, which would also take records other writers put there.
+	requireRecordDeletes(t, coord.sent[len(coord.sent)-2], rrAt{dns.TypeKEY, host}, rrAt{dns.TypeA, host})
 	if h.leaseManager.Get(hostNodeKey) != nil {
 		t.Fatalf("expected the host node to be removed from the local store after a successful upstream expiry-delete")
 	}
 }
 
-// TestSRPHandle_ExpiryPTRCleanup confirms processExpiredNode's PTR handling: a service
-// instance's own delete-all can't reach a PTR at the (possibly shared) service-type name
-// so every PTR the expiring instance currently holds needs its own
-// explicit delete alongside the delete-all -- mirroring ptrDeleteDiff's reasoning for the
-// live-update path.
+// TestSRPHandle_ExpiryPTRCleanup confirms processExpiredNode's PTR handling: an expiring
+// instance's PTR lives at the (possibly shared) service-type name, and is deleted record by
+// record in the same UPDATE as the instance's own KEY, SRV and TXT -- mirroring
+// ptrDeleteDiff's reasoning for the live-update path.
 func TestSRPHandle_ExpiryPTRCleanup(t *testing.T) {
 	h, coord := newSRPTestHandler(t)
 	id := newSRPTestIdentity(t)
@@ -1501,22 +1586,7 @@ func TestSRPHandle_ExpiryPTRCleanup(t *testing.T) {
 
 	// The expiry delete is followed by one more upstream call (reconcileServiceEnumeration,
 	// RFC 6763 S9), so it's second-to-last, not last.
-	lastSent := coord.sent[len(coord.sent)-2]
-	var foundDeleteAll, foundPTRDelete bool
-	for _, rr := range lastSent.Ns {
-		if any, ok := rr.(*dns.ANY); ok && dnsname.Normalize(any.Hdr.Name) == dnsname.Normalize(inst) {
-			foundDeleteAll = true
-		}
-		if ptr, ok := rr.(*dns.PTR); ok && ptr.Hdr.Class == dns.ClassNONE && dnsname.Normalize(ptr.Ptr) == dnsname.Normalize(inst) {
-			foundPTRDelete = true
-		}
-	}
-	if !foundDeleteAll {
-		t.Fatalf("expected a Delete All RRsets at the instance's own name, got Ns: %+v", lastSent.Ns)
-	}
-	if !foundPTRDelete {
-		t.Fatalf("expected an explicit PTR delete at the shared service-type name, got Ns: %+v", lastSent.Ns)
-	}
+	requireRecordDeletes(t, coord.sent[len(coord.sent)-2], rrAt{dns.TypeKEY, inst}, rrAt{dns.TypeSRV, inst}, rrAt{dns.TypeTXT, inst}, rrAt{dns.TypePTR, "_http._tcp.dev.zenr.io."})
 }
 
 // TestSRPHandle_ExpiryCoversWholeSubtree pins a fourth real bug found via the local BIND 9
@@ -1528,8 +1598,9 @@ func TestSRPHandle_ExpiryPTRCleanup(t *testing.T) {
 // milliseconds later, DeleteSubtree(hostNodeKey) would cascade-remove that still-pending
 // child from the local store anyway, permanently losing track of its unresolved upstream
 // state (no later reconciliation pass would ever see it again). The fix: the expiring node's
-// upstream delete now covers its WHOLE subtree, so by the time DeleteSubtree cascades
-// locally, every descendant really has just been deleted upstream too. This test calls
+// one upstream UPDATE covers its WHOLE subtree, record by record, so by the time
+// DeleteSubtree cascades locally, every descendant really has just been deleted upstream
+// too. This test calls
 // processExpiredNode directly on the HOST node (skipping the instance's own timer entirely,
 // simulating exactly that ordering) and asserts the single resulting upstream message
 // already includes deletes for both the host and the instance (+ its PTR).
@@ -1558,30 +1629,9 @@ func TestSRPHandle_ExpiryCoversWholeSubtree(t *testing.T) {
 	// (reconcileServiceEnumeration, RFC 6763 S9 -- the now-empty zone's enumeration record
 	// is republished after the subtree is gone), so the delete itself is second-to-last,
 	// not last.
-	lastSent := coord.sent[len(coord.sent)-2]
-	var foundHostDelete, foundInstDelete, foundPTRDelete bool
-	for _, rr := range lastSent.Ns {
-		if any, ok := rr.(*dns.ANY); ok {
-			switch dnsname.Normalize(any.Hdr.Name) {
-			case dnsname.Normalize(host):
-				foundHostDelete = true
-			case dnsname.Normalize(inst):
-				foundInstDelete = true
-			}
-		}
-		if ptr, ok := rr.(*dns.PTR); ok && ptr.Hdr.Class == dns.ClassNONE && dnsname.Normalize(ptr.Ptr) == dnsname.Normalize(inst) {
-			foundPTRDelete = true
-		}
-	}
-	if !foundHostDelete {
-		t.Fatalf("expected a Delete All RRsets at the host's own name, got Ns: %+v", lastSent.Ns)
-	}
-	if !foundInstDelete {
-		t.Fatalf("expected the host's own expiry to ALSO cover its child instance's Delete All RRsets, got Ns: %+v", lastSent.Ns)
-	}
-	if !foundPTRDelete {
-		t.Fatalf("expected the host's own expiry to ALSO cover its child instance's PTR delete, got Ns: %+v", lastSent.Ns)
-	}
+	requireRecordDeletes(t, coord.sent[len(coord.sent)-2],
+		rrAt{dns.TypeKEY, host}, rrAt{dns.TypeA, host},
+		rrAt{dns.TypeKEY, inst}, rrAt{dns.TypeSRV, inst}, rrAt{dns.TypeTXT, inst}, rrAt{dns.TypePTR, "_http._tcp.dev.zenr.io."})
 	if h.leaseManager.Get(instNodeKey) != nil {
 		t.Fatalf("expected the cascaded-away instance node to be gone from the local store too")
 	}
@@ -1623,19 +1673,14 @@ func TestSRPHandle_ExpiryUpstreamRejection_NoLocalMutation(t *testing.T) {
 	}
 }
 
-// TestSRPHandle_ExpiryConcurrentRefreshRace_StillDeletesLocally pins the deliberately
-// detection-only fix for the race a user identified: applyLocalMutations only runs after a
-// refresh's OWN upstream write is independently confirmed, so a refresh landing while this
-// node's own expiry-delete is in flight upstream leaves the node no-longer-expired by the
-// time processExpiredNode checks again -- but that refresh's write and this function's
-// delete are two independent, uncoordinated upstream transactions, so which one the
-// authoritative server actually applied last is genuinely unknowable from here. Skipping
-// DeleteSubtree in that case would be no more likely correct than not skipping it (see the
-// function's own doc comment), so this only logs for operator visibility -- it does NOT
-// change behavior. This test pins exactly that: DeleteSubtree still runs regardless of the
-// detected race. (The log line itself isn't asserted here: logging.Logger always writes to
-// os.Stdout with no injectable writer, so there's no clean capture point from a test.)
-func TestSRPHandle_ExpiryConcurrentRefreshRace_StillDeletesLocally(t *testing.T) {
+// TestSRPHandle_ExpiryRefreshedUnderItsLocks_FailsHard: a refresh can no longer land while
+// a node's expiry is deleting it upstream, because both take the node's lock
+// (TestNodeLocks_SRPHandler_ExpiryBacksOffWhileRefreshHoldsNode shows the real path). If the
+// node is refreshed anyway -- simulated here by writing to the store directly, bypassing the
+// locks, during the expiry's upstream delete -- the locking is broken and the two upstream
+// writes raced with no way to tell which landed last, so processExpiredNode must fail hard
+// rather than delete the node locally regardless.
+func TestSRPHandle_ExpiryRefreshedUnderItsLocks_FailsHard(t *testing.T) {
 	h, _ := newSRPTestHandler(t)
 	id := newSRPTestIdentity(t)
 	const host = "srptest14f.dev.zenr.io."
@@ -1650,31 +1695,22 @@ func TestSRPHandle_ExpiryConcurrentRefreshRace_StillDeletesLocally(t *testing.T)
 	time.Sleep(1100 * time.Millisecond)
 
 	fake := h.coordinator.(*fakeSRPCoordinator)
-	// Simulate a concurrent client refresh landing (and being locally applied) WHILE this
-	// expiry's own upstream delete is in flight -- exactly the window Handle()'s own
-	// upstream-then-local ordering leaves open to a completely independent goroutine. Fires
-	// once only: processExpiredNode's own upstream delete is followed by a second upstream
-	// call (reconcileServiceEnumeration, RFC 6763 S9), by which point DeleteSubtree has
-	// already run and there is no longer a lease to renew -- this callback simulates the
-	// race during the expiry delete specifically, not every subsequent upstream call.
-	var fired bool
 	fake.onSendUpdate = func() {
-		if fired {
-			return
-		}
-		fired = true
 		if err := h.leaseManager.RenewLease(context.Background(), id.keyAt(host), 3600, 3600); err != nil {
-			t.Fatalf("simulated concurrent refresh: RenewLease: %v", err)
+			t.Errorf("simulated refresh: RenewLease: %v", err)
 		}
 	}
 
-	h.processExpiredNode(context.Background(), hostNodeKey)
-
-	// Detection-only: the local cascade still runs unconditionally, exactly as it would
-	// without the race -- this test's job is to confirm the new detection code path adds
-	// no behavior change, only visibility.
-	if h.leaseManager.Get(hostNodeKey) != nil {
-		t.Fatalf("expected DeleteSubtree to still run regardless of the detected race (detection-only, no behavior change)")
+	func() {
+		defer func() {
+			if recover() == nil {
+				t.Fatal("expected processExpiredNode to panic on a node refreshed under its locks")
+			}
+		}()
+		h.processExpiredNode(context.Background(), hostNodeKey)
+	}()
+	if h.leaseManager.Get(hostNodeKey) == nil {
+		t.Fatal("expected the refreshed node to be left in the store, not deleted after the impossible refresh")
 	}
 }
 
@@ -1763,7 +1799,9 @@ func TestSRPHandle_LeaseExpiry_DeletesDataKeepsKEYsUntilKeyLease(t *testing.T) {
 	hostNodeKey := leasepkg.NodeKey(id.keyAt(host))
 	instNodeKey := leasepkg.NodeKey(id.keyAt(spec.name))
 
-	time.Sleep(1600 * time.Millisecond) // past LEASE, well before KEY-LEASE
+	// The host's and the instance's timers fire together, and whichever loses the node lock
+	// retries after expiryRetryDelay(1) = 1s, so each check waits past one such retry.
+	time.Sleep(2400 * time.Millisecond) // past LEASE and one retry, before KEY-LEASE
 
 	for _, nk := range []string{hostNodeKey, instNodeKey} {
 		if h.leaseManager.Get(nk) == nil {
@@ -1785,7 +1823,7 @@ func TestSRPHandle_LeaseExpiry_DeletesDataKeepsKEYsUntilKeyLease(t *testing.T) {
 		}
 	}
 
-	time.Sleep(2200 * time.Millisecond) // past KEY-LEASE
+	time.Sleep(2200 * time.Millisecond) // past KEY-LEASE and one retry
 
 	for _, nk := range []string{hostNodeKey, instNodeKey} {
 		if h.leaseManager.Get(nk) != nil {
@@ -1925,13 +1963,7 @@ func TestSRPHandle_ExpiryRetriesAfterRejection(t *testing.T) {
 		t.Fatalf("expected a retry armed after the REFUSED expiry-delete")
 	}
 
-	deadline := time.Now().Add(3 * time.Second)
-	for h.leaseManager.Get(hostNodeKey) != nil {
-		if time.Now().After(deadline) {
-			t.Fatalf("expected the retry to complete the expiry within 3s")
-		}
-		time.Sleep(100 * time.Millisecond)
-	}
+	waitUntil(t, "the retry to complete the expiry", func() bool { return h.leaseManager.Get(hostNodeKey) == nil })
 }
 
 // TestSRPHandler_FailsHardWithoutUpstream is the SRP side of requireUpstream: once a request

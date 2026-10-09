@@ -132,39 +132,13 @@ func (h *UpdateHandler) Setup(cfg map[string]any) error {
 	h.upstreamKeyRecord = upstreamKey
 	h.logger.Debugf("Loaded upstream key for configured zone %s from key zone %s: %s", h.upstreamZone, matchedZone, upstreamKey)
 
-	// Optional: exactly one of "lease_manager" (Go-embedding only) or
-	// "storage" (config-file-selectable) may be given. Both present at once
-	// is ambiguous. Neither present keeps the default in-memory,
-	// no-persistence store NewUpdateHandler() already set.
-	rawLeaseManager, lmPresent := cfg["lease_manager"]
-	lmPresent = lmPresent && rawLeaseManager != nil
-	rawStorage, storagePresent := cfg["storage"]
-	storagePresent = storagePresent && rawStorage != nil
-
-	switch {
-	case lmPresent && storagePresent:
-		return fmt.Errorf(`update handler config: "lease_manager" and "storage" are mutually exclusive, got both`)
-
-	case lmPresent:
-		lm, ok := rawLeaseManager.(LeaseManager)
-		if !ok || lm == nil {
-			return fmt.Errorf("update handler config: \"lease_manager\" must implement lease.LeaseStorage, got %T", rawLeaseManager)
-		}
-		h.leaseManager = lm
-		h.logger.Debugf("Custom lease manager configured")
-
-	case storagePresent:
-		storageCfg, ok := rawStorage.(map[string]any)
-		if !ok {
-			return fmt.Errorf("update handler config: \"storage\" must be a map, got %T", rawStorage)
-		}
-		lm, err := buildLeaseManagerFromConfig(storageCfg, h.logger)
-		if err != nil {
-			return fmt.Errorf("update handler config: storage: %w", err)
-		}
-		h.leaseManager = lm
-		h.logger.Debugf("Storage backend configured from config: %+v", storageCfg)
+	// Optional: exactly one of "lease_manager" (Go-embedding only) or "storage"
+	// (config-file-selectable); neither keeps the in-memory, no-persistence default.
+	leaseManager, err := LeaseStoreFromConfig(cfg, h.logger, false)
+	if err != nil {
+		return fmt.Errorf("update handler config: %w", err)
 	}
+	h.leaseManager = leaseManager
 
 	// Optional: Persistence hook for leases (Go-embedding only, see Setup doc comment).
 	if hook, ok := cfg["persistence_hook"].(func(context.Context, string, *LeaseRecord) error); ok {

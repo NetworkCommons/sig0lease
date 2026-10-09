@@ -126,16 +126,18 @@ func TestSetup_StorageNotAMapErrors(t *testing.T) {
 }
 
 func TestSetup_StorageSaveIntervalInvalidDurationErrors(t *testing.T) {
-	cfg := baseSetupCfg(t)
-	cfg["storage"] = map[string]any{
-		"type":          "file",
-		"path":          filepath.Join(t.TempDir(), "lease_snapshot.json"),
-		"save_interval": "not-a-duration",
-	}
+	for _, interval := range []string{"not-a-duration", "0s", "-1s"} {
+		cfg := baseSetupCfg(t)
+		cfg["storage"] = map[string]any{
+			"type":          "file",
+			"path":          filepath.Join(t.TempDir(), "lease_snapshot.json"),
+			"save_interval": interval,
+		}
 
-	h := newTestHandler()
-	if err := h.Setup(cfg); err == nil {
-		t.Fatal("expected error for invalid save_interval")
+		h := newTestHandler()
+		if err := h.Setup(cfg); err == nil {
+			t.Fatalf("expected error for save_interval %q", interval)
+		}
 	}
 }
 

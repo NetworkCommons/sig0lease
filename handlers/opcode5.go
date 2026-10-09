@@ -40,9 +40,9 @@ func NewInMemoryLeaseManager() *InMemoryLeaseManager {
 // everything the handler asks of the upstream side, so a stub is used the same way as the
 // production implementation, never bypassed.
 type UpstreamCoordinator interface {
-	// SendUpdate sends a DNS UPDATE message to the upstream authoritative server.
-	// Returns the response message or an error.
-	SendUpdate(ctx context.Context, upstreamZone string, updateMsg *dns.Msg) (*dns.Msg, error)
+	// updateSender sends a DNS UPDATE to the upstream authoritative server; the handler sends
+	// every UPDATE through upstreamTarget.send.
+	updateSender
 	// ResolveAuthoritativeZone returns the apex of the zone holding zone: the zone an UPDATE
 	// for names under zone must name.
 	ResolveAuthoritativeZone(ctx context.Context, zone string) (string, error)
@@ -76,8 +76,11 @@ type UpdateHandler struct {
 	// false (fail closed).
 	AllowOnlineKeyRegistration bool
 	timers                     *expiryTimers
-	blacklistedTypes           map[uint16]struct{} // RR types blocked from registration (type code -> empty)
-	reconcileTicker            *time.Ticker
+	// nodeLocks serializes the requests and lease expiries that touch the same lease-store
+	// nodes (docs/siglease_rfc9664.md, "Node Locks"). Ids are NodeKey/RecordKey values.
+	nodeLocks        *leasepkg.NodeLocks
+	blacklistedTypes map[uint16]struct{} // RR types blocked from registration (type code -> empty)
+	reconcileTicker  *time.Ticker
 }
 
 // NewUpdateHandler creates a new handler for opcode 5 (UPDATE) queries.
@@ -91,6 +94,7 @@ func NewUpdateHandler() *UpdateHandler {
 		upstreamCoordinator: nil, // Must be configured via Setup()
 		recordTTL:           defaultRecordTTL,
 		timers:              newExpiryTimers(),
+		nodeLocks:           leasepkg.NewNodeLocks(),
 	}
 }
 

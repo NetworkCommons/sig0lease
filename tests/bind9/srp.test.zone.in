@@ -25,3 +25,8 @@ _dnssd-srp._tcp IN SRV 0 0 @SRP_REGISTRAR_PORT@ proxy.srp.test.
 ; BIND9_SRP_REGISTRAR_TLS_PORT, which test_srp.sh sets to that listener's port.
 _dnssd-srp-tls._tcp IN SRV 0 0 @SRP_REGISTRAR_TLS_PORT@ proxy.srp.test.
 proxy   IN A    127.0.0.1
+
+; Non-SRP data at a name with no KEY: test_srp.sh's foreign-data takeover test claims this
+; name with refuse_on_foreign_data: false, which makes the proxy forward a "KEY RRset does
+; not exist" prerequisite (RFC 2136 S2.4.3) that BIND must accept.
+legacy  IN A    192.0.2.99

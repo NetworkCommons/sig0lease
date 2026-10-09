@@ -19,7 +19,7 @@ import (
 // the shipped config.yaml ended up with a "storage" block under handlers.update but none
 // under handlers.srp_handler -- nothing ever exercised (or would have caught) SRPHandler
 // actually wiring the same "storage"/"lease_manager" options UpdateHandler.Setup already has
-// thorough coverage for via the shared buildLeaseManagerFromConfig (handlers.go).
+// thorough coverage for via the shared LeaseStoreFromConfig (handlers.go).
 func baseSRPSetupCfg(t *testing.T) map[string]any {
 	keystoreDir, err := createTestKeystore(t)
 	if err != nil {
