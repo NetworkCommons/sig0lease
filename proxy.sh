@@ -1,2 +1,2 @@
 #!/bin/bash
-KEYSTORE_DIR=$PWD/keystore/server ./bin/linux/sig0lease
+DEBUG_LEVEL=debug KEYSTORE_DIR=$PWD/keystore/server ./bin/linux/sig0lease
