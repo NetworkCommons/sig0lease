@@ -129,6 +129,18 @@ func (h *UpdateHandler) Handle(ctx context.Context, w dns.ResponseWriter, r *dns
 		h.logger.Debugf("Extracted request KEY RR[%d]: %s", i, keyRR.String())
 	}
 
+	// From here to the local apply, this request reads lease-store nodes, writes upstream, and
+	// then changes those nodes: hold their locks throughout, waiting while another request or
+	// a lease expiry holds any of them (docs/siglease_rfc9664.md, "Node Locks"). Taken only
+	// now, after SIG(0) verification, so an unverified request can never hold a lock.
+	locks, err := h.nodeLocks.Acquire(ctx, h.requestLockSet(leaseDuration, keyLeaseDuration, signerID, updateKeyRRs, updateOtherRRs))
+	if err != nil {
+		h.logger.Warnf("UPDATE for zone %s: %v", zone, err)
+		msg := makeErrorResponse(r, dns.RcodeServerFailure, "lease store busy, try again")
+		return NewErrorResult(msg, "lease-store node lock contention", err)
+	}
+	defer locks.Release()
+
 	// KEY-LEASE!=0, LEASE!=0 requires at least one KEY RR and a Non-KEY RRs.
 
 	var allNotes []string
@@ -449,77 +461,40 @@ func (h *UpdateHandler) Handle(ctx context.Context, w dns.ResponseWriter, r *dns
 			return NewProcessedResult(h.buildSuccessResponse(r, allNotes, leaseDuration, keyLeaseDuration))
 		}
 
-		signingKey, effectiveUpstreamZone, err := resolveUpstreamSigningContext(ctx, h.Name(), h.upstreamCoordinator, h.upstreamKeyRecord, h.upstreamZone, h.logger)
-		if err != nil {
+		// One UPDATE deletes the records named here and, for each named KEY, everything at and
+		// below it -- a KEY's delete takes its subtree along, exactly as its expiry does
+		// (subtreeLeases, leaseExpirer). Nothing is forgotten locally before that UPDATE is
+		// confirmed; if it is not, the request fails and nothing has changed.
+		deletes := asDeletes(recordsToDelete...)
+		for _, keyRR := range keysToDelete {
+			keys, records := subtreeLeases(h.leaseManager, leasepkg.NodeKey(keyRR))
+			deletes = append(deletes, asDeletes(keys...)...)
+			deletes = append(deletes, recordDeletes(records)...)
+		}
+		if _, err := h.upstream().send(ctx, nil, deletes); err != nil {
 			msg := makeErrorResponse(r, dns.RcodeServerFailure, err.Error())
 			return NewErrorResult(msg, err.Error(), err)
 		}
 
-		deleteMsg, err := h.constructUpstreamDeleteForKeysAndRecords(keysToDelete, recordsToDelete, signingKey, effectiveUpstreamZone)
-		if err != nil {
-			msg := makeErrorResponse(r, dns.RcodeServerFailure, fmt.Sprintf("upstream delete construction failed: %v", err))
-			return NewErrorResult(msg, "upstream delete construction failed", err)
-		}
-		upstreamResp, err := h.upstreamCoordinator.SendUpdate(ctx, effectiveUpstreamZone, deleteMsg)
-		if err != nil {
-			msg := makeErrorResponse(r, dns.RcodeServerFailure, fmt.Sprintf("upstream delete failed: %v", err))
-			return NewErrorResult(msg, fmt.Sprintf("upstream delete failed: %v", err), err)
-		}
-		if upstreamResp == nil {
-			msg := makeErrorResponse(r, dns.RcodeServerFailure, "upstream delete returned nil response")
-			return NewErrorResult(msg, "upstream delete returned nil response", fmt.Errorf("nil upstream response"))
-		}
-		if upstreamResp.Rcode != dns.RcodeSuccess {
-			msg := makeErrorResponse(r, dns.RcodeServerFailure,
-				fmt.Sprintf("upstream rejected delete: rcode=%d (%s)", upstreamResp.Rcode, dns.RcodeToString[upstreamResp.Rcode]))
-			return NewErrorResult(msg,
-				fmt.Sprintf("upstream rejected delete: rcode=%d (%s)", upstreamResp.Rcode, dns.RcodeToString[upstreamResp.Rcode]), nil)
-		}
-
-		// Upstream confirmed: apply local deletes now. Descendants of a
-		// deleted KEY are cascaded and cleaned up upstream best-effort
-		// (mirroring the lease-expiry cascade in processExpiredLease); the
-		// records explicitly named in this request are the ones the request
-		// is accountable for, so their upstream delete was already confirmed
-		// above before any local state changed.
-		for _, keyRR := range keysToDelete {
-			nodeKey := leasepkg.NodeKey(keyRR)
-			// ListSubtreeKeys now yields both KEY and non-KEY descendant
-			// identities (non-KEY nodes are tree nodes too). deleteNodeUpstream/
-			// RemoveNonKEYRecords both operate on "the records this identity
-			// owns," which is empty-and-a-safe-no-op for a non-KEY identity
-			// (it can never own children) -- that descendant is still fully
-			// cleaned up, just via its owning KEY's own iteration below.
-			for _, childKey := range h.leaseManager.ListSubtreeKeys(nodeKey) {
-				h.deleteNodeUpstream(ctx, childKey, signingKey)
-				h.leaseManager.RemoveNonKEYRecords(childKey)
-				h.timers.disarm(childKey)
-			}
-			// The KEY's own directly-owned non-KEY data (not just descendant
-			// KEY nodes) must be cleaned up upstream here too, or it is
-			// forgotten locally but never removed from the authoritative DNS
-			// server -- the same divergence processExpiredLease already
-			// guards against on lease-expiry. Non-KEY-only, not the full
-			// deleteNodeUpstream: the KEY RR was already deleted upstream
-			// above, so re-deleting it here would just be a second, redundant
-			// round trip to the real authoritative server for no benefit.
-			h.deleteNodeNonKeyUpstream(ctx, nodeKey, signingKey)
-			if err := h.leaseManager.Delete(nodeKey); err != nil {
-				h.logger.Warnf("Failed to delete key lease for %s: %v (upstream delete already succeeded, local state may now diverge)", keyRR.Hdr.Name, err)
-			}
-			h.leaseManager.RemoveNonKEYRecords(nodeKey)
-			h.timers.disarm(nodeKey)
-			h.logger.Debugf("Deleted key for %s (KEY-LEASE=0, LEASE=0)", keyRR.Hdr.Name)
-		}
-		// Remove only the specific records that were actually deleted
-		// upstream above -- h.leaseManager.RemoveNonKEYRecords(signerOwnerKey)
-		// would wipe the owner's *entire* non-KEY record set locally, silently
-		// forgetting (and thus orphaning upstream forever) any other records
-		// under the same owner that this request never asked to delete.
+		// Upstream confirmed. Remove only the records named here --
+		// h.leaseManager.RemoveNonKEYRecords(signerOwnerKey) would wipe the owner's *entire*
+		// non-KEY record set locally, silently forgetting (and thus orphaning upstream forever)
+		// any other records under the same owner that this request never asked to delete --
+		// and each named KEY's subtree.
 		for _, rr := range recordsToDelete {
 			if err := h.leaseManager.RemoveSingleNonKEYRecord(signerOwnerKey, leasepkg.RecordKey(rr)); err != nil {
-				h.logger.Warnf("Failed to remove deleted non-KEY record %s locally: %v", rr.String(), err)
+				panic(fmt.Sprintf("Case C delete of %s: %v", rr.String(), err))
 			}
+		}
+		for _, keyRR := range keysToDelete {
+			nodeKey := leasepkg.NodeKey(keyRR)
+			for _, descendant := range append([]string{nodeKey}, h.leaseManager.ListSubtreeKeys(nodeKey)...) {
+				h.timers.disarm(descendant)
+			}
+			if err := h.leaseManager.DeleteSubtree(nodeKey); err != nil {
+				panic(fmt.Sprintf("Case C delete of %s: %v", nodeKey, err))
+			}
+			h.logger.Debugf("Deleted key for %s (KEY-LEASE=0, LEASE=0)", keyRR.Hdr.Name)
 		}
 
 		return NewProcessedResult(h.buildSuccessResponse(r, allNotes, leaseDuration, keyLeaseDuration))
@@ -620,15 +595,13 @@ func (h *UpdateHandler) Handle(ctx context.Context, w dns.ResponseWriter, r *dns
 					// request never named, silently orphaning them upstream
 					// forever. The upstream delete for these records was
 					// already confirmed successful before apply() ever runs
-					// (see the shared upstream-forwarding block below), so a
-					// failure removing the local bookkeeping entry is logged,
-					// not propagated as a request failure -- the important,
-					// externally-visible fact (the record is gone from DNS)
-					// already happened; matches every other post-confirmed-
-					// delete local cleanup in this handler (Case C, processExpiredLease).
+					// (see the shared upstream-forwarding block below), and
+					// this request holds their node locks, so a failure here
+					// (the record owned by another node) is impossible: it
+					// fails hard, as in Case C and lease expiry.
 					for _, rr := range pendingRecordsToRemove {
 						if err := h.leaseManager.RemoveSingleNonKEYRecord(leasepkg.NodeKey(pendingKeyRR), leasepkg.RecordKey(rr)); err != nil {
-							h.logger.Warnf("Failed to remove deleted non-KEY record %s locally for %s: %v", rr.String(), pendingKeyName, err)
+							panic(fmt.Sprintf("Case D delete of %s for %s: %v", rr.String(), pendingKeyName, err))
 						}
 					}
 					h.scheduleLeaseExpiry(leasepkg.NodeKey(pendingKeyRR))
@@ -648,52 +621,15 @@ func (h *UpdateHandler) Handle(ctx context.Context, w dns.ResponseWriter, r *dns
 	// the add and delete halves of a single request are confirmed or
 	// rejected together rather than racing across two separate round trips.
 	if len(upstreamKeys) > 0 || len(acceptedRecordsForUpstream) > 0 || len(recordsToDeleteForUpstream) > 0 {
-		signingKey, effectiveUpstreamZone, err := resolveUpstreamSigningContext(ctx, h.Name(), h.upstreamCoordinator, h.upstreamKeyRecord, h.upstreamZone, h.logger)
+		h.logger.Debugf("Sending UPDATE to upstream (configured zone=%s), keys=%d", h.upstreamZone, len(upstreamKeys))
+		upstreamResp, err := h.upstream().send(ctx, nil, upstreamUpdateRecords(upstreamKeys, acceptedRecordsForUpstream, recordsToDeleteForUpstream))
 		if err != nil {
+			h.logger.Debugf("UPDATE for zone=%s keys=%d: %v", h.upstreamZone, len(upstreamKeys), err)
 			msg := makeErrorResponse(r, dns.RcodeServerFailure, err.Error())
 			return NewErrorResult(msg, err.Error(), err)
 		}
-
-		upstreamUpdate, err := h.constructUpstreamUpdate(upstreamKeys, acceptedRecordsForUpstream, recordsToDeleteForUpstream, signingKey, effectiveUpstreamZone)
-		if err != nil {
-			h.logger.Debugf("Failed to construct upstream UPDATE: %v", err)
-			msg := makeErrorResponse(r, dns.RcodeServerFailure, fmt.Sprintf("upstream construction failed: %v", err))
-			return NewErrorResult(msg, fmt.Sprintf("upstream construction failed: %v", err), err)
-		}
-		if len(upstreamUpdate.Ns) == 0 {
-			// No records to forward, just return success.
-			return NewProcessedResult(h.buildSuccessResponse(r, allNotes, leaseDuration, keyLeaseDuration))
-		}
-
-		// Send UPDATE to upstream and fail-closed if upstream does not accept it.
-
-		h.logger.Debugf("Sending UPDATE to upstream zone=%s (configured=%s), keys=%d",
-			effectiveUpstreamZone, h.upstreamZone, len(upstreamKeys))
-		upstreamResp, err := h.upstreamCoordinator.SendUpdate(ctx, effectiveUpstreamZone, upstreamUpdate)
-		if err != nil {
-			h.logger.Debugf("Upstream UPDATE transport/processing error for zone=%s keys=%d: %v",
-				h.upstreamZone, len(upstreamKeys), err)
-			msg := makeErrorResponse(r, dns.RcodeServerFailure, fmt.Sprintf("upstream update failed: %v", err))
-			return NewErrorResult(msg, fmt.Sprintf("upstream update failed: %v", err), err)
-		}
-		if upstreamResp == nil {
-			h.logger.Debugf("Upstream UPDATE returned nil response for zone=%s keys=%d",
-				h.upstreamZone, len(upstreamKeys))
-			msg := makeErrorResponse(r, dns.RcodeServerFailure, "upstream update returned nil response")
-			return NewErrorResult(msg, "upstream update returned nil response", fmt.Errorf("nil upstream response"))
-		}
-
-		h.logger.Debugf("Upstream UPDATE response: Rcode=%d (%s), Answers=%d, Ns=%d, Extra=%d",
-			upstreamResp.Rcode, dns.RcodeToString[upstreamResp.Rcode],
+		h.logger.Debugf("Upstream UPDATE response: Answers=%d, Ns=%d, Extra=%d",
 			len(upstreamResp.Answer), len(upstreamResp.Ns), len(upstreamResp.Extra))
-		if upstreamResp.Rcode != dns.RcodeSuccess {
-			msg := makeErrorResponse(r, dns.RcodeServerFailure,
-				fmt.Sprintf("upstream rejected update: rcode=%d (%s)",
-					upstreamResp.Rcode, dns.RcodeToString[upstreamResp.Rcode]))
-			return NewErrorResult(msg,
-				fmt.Sprintf("upstream rejected update: rcode=%d (%s)",
-					upstreamResp.Rcode, dns.RcodeToString[upstreamResp.Rcode]), nil)
-		}
 	}
 
 	for _, mutation := range pendingMutations {
@@ -706,6 +642,35 @@ func (h *UpdateHandler) Handle(ctx context.Context, w dns.ResponseWriter, r *dns
 
 	h.logger.Debugf("Sending success response (%d status notes)", len(allNotes))
 	return NewProcessedResult(h.buildSuccessResponse(r, allNotes, leaseDuration, keyLeaseDuration))
+}
+
+// requestLockSet returns the lease-store nodes Handle locks for one request
+// (docs/siglease_rfc9664.md, "Node Locks"). A delete (Case C: LEASE=0, KEY-LEASE=0) locks each
+// KEY it names together with that KEY's whole current subtree, which the delete cascades
+// into, and each non-KEY record it names. Every other case may register what it names, so it
+// locks each named KEY and non-KEY record together with the signer's node, their only
+// possible parent: a new KEY is registered under its signer, and non-KEY records always
+// belong to the signer. A refresh would not need the parent, but whether an RR is a refresh
+// is only known from the checks this lock protects.
+func (h *UpdateHandler) requestLockSet(leaseDuration, keyLeaseDuration uint32, signerID keyID, keyRRs []*dns.KEY, otherRRs []dns.RR) func() []string {
+	deleting := leaseDuration == 0 && keyLeaseDuration == 0
+	return func() []string {
+		ids := make([]string, 0, 1+len(keyRRs)+len(otherRRs))
+		if !deleting {
+			ids = append(ids, leasepkg.NodeKeyFromSIG(signerID.Name, signerID.Algorithm, signerID.KeyTag))
+		}
+		for _, keyRR := range keyRRs {
+			nodeKey := leasepkg.NodeKey(keyRR)
+			ids = append(ids, nodeKey)
+			if deleting {
+				ids = append(ids, h.leaseManager.ListSubtreeKeys(nodeKey)...)
+			}
+		}
+		for _, rr := range otherRRs {
+			ids = append(ids, leasepkg.RecordKey(rr))
+		}
+		return ids
+	}
 }
 
 // buildSuccessResponse builds a successful UPDATE response: leaseResponse (the LEASE and

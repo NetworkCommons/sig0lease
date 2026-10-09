@@ -2,8 +2,13 @@
 package main
 
 import (
+	"errors"
 	"fmt"
+	"io"
+	"io/fs"
 	"os"
+	"path/filepath"
+	"slices"
 	"strconv"
 
 	"codeberg.org/miekg/dns"
@@ -84,6 +89,149 @@ func withBootstrapResolvers(handlerCfg map[string]any, appCfg *config.Config) ma
 	return out
 }
 
+// checkSeparateLeaseStores fails when update_handler and srp_handler are both enabled and
+// their storage sections name the same snapshot file: the two handlers must never share a
+// lease store. A file store loads its snapshot and writes it straight back while Setup builds
+// it, so with one shared file the second handler would start from the first handler's tree,
+// and from then on each would overwrite the other's saves. It runs before any Setup, so
+// nothing has touched the file yet, and in dump mode too, where such a configuration would
+// print one tree as both handlers'.
+//
+// An in-memory store (no storage section, or type memory) is never shared: each Setup builds
+// its own.
+func checkSeparateLeaseStores(cfg *config.Config) error {
+	enabled := enabledModules(cfg)
+	if !slices.Contains(enabled, "update_handler") || !slices.Contains(enabled, "srp_handler") {
+		return nil
+	}
+
+	updatePath, err := handlers.LeaseSnapshotPath(cfg.Handlers["update"])
+	if err != nil {
+		return fmt.Errorf("handlers.update: %w", err)
+	}
+	srpPath, err := handlers.LeaseSnapshotPath(cfg.Handlers["srp_handler"])
+	if err != nil {
+		return fmt.Errorf("handlers.srp_handler: %w", err)
+	}
+	if updatePath == "" || srpPath == "" {
+		return nil
+	}
+	same, err := sameFile(updatePath, srpPath)
+	if err != nil {
+		return err
+	}
+	if same {
+		return fmt.Errorf("handlers.update.storage.path %q and handlers.srp_handler.storage.path %q are the same file: update_handler and srp_handler must each have their own lease store", updatePath, srpPath)
+	}
+	return nil
+}
+
+// sameFile reports whether paths a and b name the same file: the same absolute path or, when
+// both files already exist, the same file reached another way -- a symlink, a hard link, or a
+// different spelling on a case-insensitive file system.
+func sameFile(a, b string) (bool, error) {
+	absA, err := filepath.Abs(a)
+	if err != nil {
+		return false, err
+	}
+	absB, err := filepath.Abs(b)
+	if err != nil {
+		return false, err
+	}
+	if absA == absB {
+		return true, nil
+	}
+
+	infoA, err := os.Stat(absA)
+	if errors.Is(err, fs.ErrNotExist) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	infoB, err := os.Stat(absB)
+	if errors.Is(err, fs.ErrNotExist) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	return os.SameFile(infoA, infoB), nil
+}
+
+// enabledModules returns the handler module names the opcode routing enables, each once,
+// sorted.
+func enabledModules(cfg *config.Config) []string {
+	var names []string
+	for _, moduleNames := range cfg.GetOpcodeMap() {
+		names = append(names, moduleNames...)
+	}
+	slices.Sort(names)
+	return slices.Compact(names)
+}
+
+// proxyHandler is a handler module as cmd/sig0lease uses it: served, and dumped by --dump.
+type proxyHandler interface {
+	handlers.Handler
+	DumpLeasesLevel(level string) string
+}
+
+// newHandler returns the handler module moduleName names, with its logger set but not yet
+// Setup, and the config its Setup takes: a copy of its section under handlers in config.yaml,
+// with the environment overrides and bootstrap resolvers applied, which the caller may change.
+// ok is false for a name that is no handler module.
+func newHandler(moduleName string, cfg *config.Config, logger *logging.Logger) (h proxyHandler, handlerCfg map[string]any, ok bool) {
+	switch moduleName {
+	case "update_handler":
+		uh := handlers.NewUpdateHandler()
+		uh.SetLogger(logger)
+		return uh, withBootstrapResolvers(applyUpdateHandlerEnvOverrides(cfg.Handlers["update"]), cfg), true
+	case "srp_handler":
+		sh := handlers.NewSRPHandler()
+		sh.SetLogger(logger)
+		return sh, withBootstrapResolvers(cfg.Handlers["srp_handler"], cfg), true
+	default:
+		return nil, nil, false
+	}
+}
+
+// dumpLeases writes the lease store of every configured handler to w, at level ("info" for a
+// summary, "debug" for everything). It writes nothing else anywhere: the file store Setup would
+// build from a "storage" section creates the snapshot's directory, writes the snapshot straight
+// back and keeps saving it, so each handler is Setup with its store read once instead
+// (handlers.LeaseStoreFromConfig, read-only), passed as "lease_manager". A dump never changes
+// the snapshot of a proxy running beside it. Setup's other effect is a reconciliation ticker
+// whose first tick, 30s away, a dump never reaches.
+func dumpLeases(w io.Writer, cfg *config.Config, level string, logger *logging.Logger) error {
+	printed := false
+	for _, moduleName := range enabledModules(cfg) {
+		h, handlerCfg, ok := newHandler(moduleName, cfg, logger)
+		if !ok {
+			continue
+		}
+		store, err := handlers.LeaseStoreFromConfig(handlerCfg, logger, true)
+		if err != nil {
+			return fmt.Errorf("failed to read the lease store of %s: %w", moduleName, err)
+		}
+		delete(handlerCfg, "storage")
+		handlerCfg["lease_manager"] = store
+		if err := h.Setup(handlerCfg); err != nil {
+			return fmt.Errorf("failed to setup %s: %w", moduleName, err)
+		}
+		// DumpLeasesLevel's returned string already starts with its own "=== ... ===" header
+		// line.
+		if _, err := io.WriteString(w, h.DumpLeasesLevel(level)); err != nil {
+			return err
+		}
+		printed = true
+	}
+	if !printed {
+		_, err := fmt.Fprintln(w, "(no dump-capable handlers configured)")
+		return err
+	}
+	return nil
+}
+
 func main() {
 	cfgPath := "config.yaml"
 	dumpMode := false
@@ -128,53 +276,15 @@ func main() {
 		logger.Errorf("Error applying authoritative.max_inflight_updates: %v", err)
 		os.Exit(1)
 	}
+	if err := checkSeparateLeaseStores(cfg); err != nil {
+		logger.Errorf("Error in lease storage configuration: %v", err)
+		os.Exit(1)
+	}
 
 	if dumpMode {
-		// Dump mode: create every configured handler, print combined lease state, exit.
-		opcodeMap := cfg.GetOpcodeMap()
-		printed := false
-		seen := make(map[string]bool)
-		for _, moduleNames := range opcodeMap {
-			for _, moduleName := range moduleNames {
-				if seen[moduleName] {
-					continue
-				}
-				seen[moduleName] = true
-
-				switch moduleName {
-				case "update_handler":
-					h := handlers.NewUpdateHandler()
-					h.SetLogger(logger)
-					handlerCfg := withBootstrapResolvers(applyUpdateHandlerEnvOverrides(cfg.Handlers["update"]), cfg)
-					if handlerCfg != nil {
-						if err := h.Setup(handlerCfg); err != nil {
-							logger.Errorf("Failed to setup %s: %v", moduleName, err)
-							os.Exit(1)
-						}
-					}
-					// DumpLeasesLevel's returned string already starts with its own
-					// "=== ... ===" header line; printing it again here would
-					// duplicate it, misplaced at the end instead of the start.
-					fmt.Print(h.DumpLeasesLevel(dumpLevel))
-					printed = true
-
-				case "srp_handler":
-					h := handlers.NewSRPHandler()
-					h.SetLogger(logger)
-					handlerCfg := withBootstrapResolvers(cfg.Handlers["srp_handler"], cfg)
-					if handlerCfg != nil {
-						if err := h.Setup(handlerCfg); err != nil {
-							logger.Errorf("Failed to setup %s: %v", moduleName, err)
-							os.Exit(1)
-						}
-					}
-					fmt.Print(h.DumpLeasesLevel(dumpLevel))
-					printed = true
-				}
-			}
-		}
-		if !printed {
-			fmt.Println("(no dump-capable handlers configured)")
+		if err := dumpLeases(os.Stdout, cfg, dumpLevel, logger); err != nil {
+			logger.Errorf("%v", err)
+			os.Exit(1)
 		}
 		return
 	}
@@ -211,48 +321,23 @@ func main() {
 				continue
 			}
 
-			switch moduleName {
-			case "update_handler":
-				h := handlers.NewUpdateHandler()
-				h.SetLogger(logger)
-
-				// Setup handler with configuration for upstream coordination.
-				// Coordinator resolves authoritative NS from upstream_zone and sends UPDATE directly.
-				handlerCfg := withBootstrapResolvers(applyUpdateHandlerEnvOverrides(cfg.Handlers["update"]), cfg)
-				if handlerCfg != nil {
-					if err := h.Setup(handlerCfg); err != nil {
-						logger.Errorf("Failed to setup %s: %v", moduleName, err)
-						os.Exit(1)
-					}
-					logger.Infof("Upstream coordination configured for %s", moduleName)
-				}
-
-				srv.RegisterHandler(h)
-				registered[moduleName] = true
-				logger.Infof("Registered %s for opcode %d (%s)",
-					moduleName, opcode, dns.OpcodeToString[opcode])
-
-			case "srp_handler":
-				h := handlers.NewSRPHandler()
-				h.SetLogger(logger)
-
-				handlerCfg := withBootstrapResolvers(cfg.Handlers["srp_handler"], cfg)
-				if handlerCfg != nil {
-					if err := h.Setup(handlerCfg); err != nil {
-						logger.Errorf("Failed to setup %s: %v", moduleName, err)
-						os.Exit(1)
-					}
-					logger.Infof("Upstream coordination configured for %s", moduleName)
-				}
-
-				srv.RegisterHandler(h)
-				registered[moduleName] = true
-				logger.Infof("Registered %s for opcode %d (%s)",
-					moduleName, opcode, dns.OpcodeToString[opcode])
-
-			default:
+			h, handlerCfg, ok := newHandler(moduleName, cfg, logger)
+			if !ok {
 				logger.Warnf("Unknown handler module: %s", moduleName)
+				continue
 			}
+			// Setup configures upstream coordination too: the coordinator resolves the
+			// authoritative server from upstream_zone and sends UPDATEs to it directly.
+			if err := h.Setup(handlerCfg); err != nil {
+				logger.Errorf("Failed to setup %s: %v", moduleName, err)
+				os.Exit(1)
+			}
+			logger.Infof("Upstream coordination configured for %s", moduleName)
+
+			srv.RegisterHandler(h)
+			registered[moduleName] = true
+			logger.Infof("Registered %s for opcode %d (%s)",
+				moduleName, opcode, dns.OpcodeToString[opcode])
 		}
 	}
 

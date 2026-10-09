@@ -8,7 +8,6 @@ import (
 
 	"codeberg.org/miekg/dns"
 	"github.com/NetworkCommons/sig0lease/pkg/dnsname"
-	"github.com/NetworkCommons/sig0lease/pkg/keyrec"
 	"github.com/NetworkCommons/sig0lease/pkg/sig0"
 )
 
@@ -44,118 +43,6 @@ func summarizeRRTypes(keyRRs []*dns.KEY, otherRRs []dns.RR) string {
 		parts = append(parts, fmt.Sprintf("%s:%d", t, counts[t]))
 	}
 	return strings.Join(parts, " ")
-}
-
-func newUnsignedUpstreamUpdate(upstreamZone string) (*dns.Msg, error) {
-	msg := dns.NewMsg(upstreamZone, dns.TypeSOA)
-	if msg == nil {
-		return nil, fmt.Errorf("failed to create DNS message")
-	}
-
-	msg.Opcode = dns.OpcodeUpdate
-	msg.RecursionDesired = false
-	msg.Answer = nil
-	msg.Ns = nil
-
-	return msg, nil
-}
-
-func (h *UpdateHandler) signUpstreamUpdate(msg *dns.Msg, opName string, signingKey *keyrec.LoadedKey) (*dns.Msg, error) {
-	if signingKey == nil || signingKey.PrivateKey == nil || signingKey.PublicKey == nil {
-		return nil, fmt.Errorf("upstream SIG(0) key is not configured")
-	}
-
-	signedMsg, err := sig0.SignMessage(msg, signingKey.PublicKey, signingKey.PrivateKey)
-	if err != nil {
-		return nil, fmt.Errorf("failed to sign upstream %s with SIG(0): %w", opName, err)
-	}
-
-	return signedMsg, nil
-}
-
-func (h *UpdateHandler) constructUpstreamDelete(clientKeyRR *dns.KEY, signingKey *keyrec.LoadedKey, upstreamZone string) (*dns.Msg, error) {
-	msg, err := newUnsignedUpstreamUpdate(upstreamZone)
-	if err != nil {
-		return nil, fmt.Errorf("failed to create DNS delete message: %w", err)
-	}
-
-	deleteRR := *clientKeyRR
-	deleteRR.Hdr.Class = dns.ClassNONE
-	deleteRR.Hdr.TTL = 0
-	msg.Ns = append(msg.Ns, &deleteRR)
-
-	opt := &dns.OPT{Hdr: dns.Header{Name: "."}}
-	opt.SetUDPSize(uint16(dns.DefaultMsgSize))
-	msg.Extra = append(msg.Extra, opt)
-
-	return h.signUpstreamUpdate(msg, "DELETE", signingKey)
-}
-
-func (h *UpdateHandler) constructUpstreamDeleteForRecords(records []dns.RR, signingKey *keyrec.LoadedKey, upstreamZone string) (*dns.Msg, error) {
-	msg, err := newUnsignedUpstreamUpdate(upstreamZone)
-	if err != nil {
-		return nil, fmt.Errorf("failed to create DNS delete message: %w", err)
-	}
-
-	for _, rr := range records {
-		if rr == nil {
-			continue
-		}
-		hdr := rr.Header()
-		if hdr == nil {
-			continue
-		}
-
-		// RFC 2136 delete: class NONE + TTL 0 with full RDATA for RR delete.
-		cpy := copyRR(rr)
-		cpyHdr := cpy.Header()
-		cpyHdr.Class = dns.ClassNONE
-		cpyHdr.TTL = 0
-		msg.Ns = append(msg.Ns, cpy)
-	}
-
-	opt := &dns.OPT{Hdr: dns.Header{Name: "."}}
-	opt.SetUDPSize(uint16(dns.DefaultMsgSize))
-	msg.Extra = append(msg.Extra, opt)
-
-	return h.signUpstreamUpdate(msg, "DELETE", signingKey)
-}
-
-// constructUpstreamDeleteForKeysAndRecords builds a single combined RFC 2136
-// delete UPDATE for both KEY RRs and non-KEY RRs, used by Case C so a
-// multi-record delete request is confirmed upstream in one round-trip before
-// any local lease-store state is touched.
-func (h *UpdateHandler) constructUpstreamDeleteForKeysAndRecords(keyRRs []*dns.KEY, records []dns.RR, signingKey *keyrec.LoadedKey, upstreamZone string) (*dns.Msg, error) {
-	msg, err := newUnsignedUpstreamUpdate(upstreamZone)
-	if err != nil {
-		return nil, fmt.Errorf("failed to create DNS delete message: %w", err)
-	}
-
-	for _, keyRR := range keyRRs {
-		if keyRR == nil {
-			continue
-		}
-		deleteRR := *keyRR
-		deleteRR.Hdr.Class = dns.ClassNONE
-		deleteRR.Hdr.TTL = 0
-		msg.Ns = append(msg.Ns, &deleteRR)
-	}
-	for _, rr := range records {
-		if rr == nil || rr.Header() == nil {
-			continue
-		}
-		cpy := copyRR(rr)
-		cpyHdr := cpy.Header()
-		cpyHdr.Class = dns.ClassNONE
-		cpyHdr.TTL = 0
-		msg.Ns = append(msg.Ns, cpy)
-	}
-
-	opt := &dns.OPT{Hdr: dns.Header{Name: "."}}
-	opt.SetUDPSize(uint16(dns.DefaultMsgSize))
-	msg.Extra = append(msg.Extra, opt)
-
-	return h.signUpstreamUpdate(msg, "DELETE", signingKey)
 }
 
 func extractUpdateRecords(msg *dns.Msg, blacklistedTypes map[uint16]struct{}) ([]*dns.KEY, []dns.RR, error) {
@@ -639,61 +526,19 @@ func (h *UpdateHandler) extractAndValidateSig0(ctx context.Context, msg *dns.Msg
 	return nil, nil, signerKeySourceUnknown, fmt.Errorf("no matching KEY candidate found for signer %q in request, lease store, or authoritative DNS", sigRR.SignerName)
 }
 
-// constructUpstreamUpdate builds an UPDATE message for the upstream zone.
-// This UPDATE will be sent to the authoritative server for the upstream zone.
-// If upstream key is loaded, it will be signed with SIG(0).
-//
-// recordsToDelete are included in the same message as RFC 2136 deletes
-// (class NONE, TTL 0) alongside clientKeyRRs/otherRecords' adds -- used by
-// Case D, which both registers/refreshes a KEY and (optionally) deletes
-// non-KEY records it owns in one request. Combining both into a single
-// signed UPDATE means one round trip is either fully confirmed or not, so
-// there is no window where the accompanying delete could succeed upstream
-// while the KEY add/refresh it was staged alongside never gets sent, or vice
-// versa. Callers with nothing to delete pass nil.
-func (h *UpdateHandler) constructUpstreamUpdate(clientKeyRRs []*dns.KEY, otherRecords []dns.RR, recordsToDelete []dns.RR, signingKey *keyrec.LoadedKey, upstreamZone string) (*dns.Msg, error) {
-	msg, err := newUnsignedUpstreamUpdate(upstreamZone)
-	if err != nil {
-		return nil, err
+// upstreamUpdateRecords returns the Update section of the UPDATE Cases A, B and D forward:
+// the KEYs and non-KEY records to add, carrying the TTLs Handle already set (record_ttl_sec),
+// then as RFC 2136 deletes (class NONE, TTL 0) the non-KEY records Case D asked to remove.
+// Combining both into a single signed UPDATE means one round trip is either fully confirmed or
+// not, so there is no window where the accompanying delete could succeed upstream while the
+// KEY add/refresh it was staged alongside never gets sent, or vice versa.
+func upstreamUpdateRecords(keyRRs []*dns.KEY, otherRecords []dns.RR, recordsToDelete []dns.RR) []dns.RR {
+	records := make([]dns.RR, 0, len(keyRRs)+len(otherRecords)+len(recordsToDelete))
+	for _, keyRR := range keyRRs {
+		records = append(records, keyRR)
 	}
-
-	// Update section: optional KEYs plus supported non-KEY records, carrying the TTLs
-	// Handle already set (record_ttl_sec).
-	for _, keyRR := range clientKeyRRs {
-		msg.Ns = append(msg.Ns, keyRR)
-	}
-	msg.Ns = append(msg.Ns, otherRecords...)
-
-	// RFC 2136 deletes (class NONE, TTL 0) for accompanying non-KEY records
-	// Case D asked to remove.
-	for _, rr := range recordsToDelete {
-		if rr == nil || rr.Header() == nil {
-			continue
-		}
-		cpy := copyRR(rr)
-		cpyHdr := cpy.Header()
-		cpyHdr.Class = dns.ClassNONE
-		cpyHdr.TTL = 0
-		msg.Ns = append(msg.Ns, cpy)
-	}
-
-	if len(msg.Ns) == 0 {
-		return msg, nil
-	}
-
-	// Add OPT for EDNS support
-	opt := &dns.OPT{Hdr: dns.Header{Name: "."}}
-	opt.SetUDPSize(uint16(dns.DefaultMsgSize))
-	msg.Extra = append(msg.Extra, opt)
-
-	signedMsg, err := h.signUpstreamUpdate(msg, "UPDATE", signingKey)
-	if err != nil {
-		return nil, err
-	}
-	msg = signedMsg
-	h.logger.Debugf("Signed upstream UPDATE with key: %s", signingKey)
-
-	return msg, nil
+	records = append(records, otherRecords...)
+	return append(records, asDeletes(recordsToDelete...)...)
 }
 
 // makeErrorResponse creates a properly formatted error response.

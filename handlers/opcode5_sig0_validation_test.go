@@ -6,7 +6,6 @@ import (
 	"net"
 	"slices"
 	"strings"
-	"sync"
 	"testing"
 	"time"
 
@@ -25,15 +24,23 @@ type stubUpstreamCoordinator struct {
 	resolveErr error
 	// query, if set, answers QueryRRs -- the authoritative data a test needs the handler to see.
 	query func(ctx context.Context, zoneHint, name string, rrType uint16) ([]dns.RR, error)
-	sent  []*dns.Msg // every updateMsg passed to SendUpdate, in call order
-	// sentMu guards sent against SendUpdate calls from the handler's own expiry timers.
-	sentMu sync.Mutex
+	sentUpdates
+	// onSend, if set, runs at the start of every SendUpdate: a concurrency test blocks in it
+	// to hold a request inside its upstream round trip.
+	onSend func(updateMsg *dns.Msg)
+	// respond, if set, answers each UPDATE in place of resp. It may be called from the
+	// handler's expiry timers, so a respond keeping state guards it itself.
+	respond func(updateMsg *dns.Msg) *dns.Msg
 }
 
 func (s *stubUpstreamCoordinator) SendUpdate(ctx context.Context, upstreamZone string, updateMsg *dns.Msg) (*dns.Msg, error) {
-	s.sentMu.Lock()
-	s.sent = append(s.sent, updateMsg)
-	s.sentMu.Unlock()
+	if s.onSend != nil {
+		s.onSend(updateMsg)
+	}
+	s.recordSent(updateMsg)
+	if s.respond != nil {
+		return s.respond(updateMsg), s.err
+	}
 	return s.resp, s.err
 }
 
@@ -51,12 +58,6 @@ func (s *stubUpstreamCoordinator) QueryRRs(ctx context.Context, zoneHint, name s
 		return nil, fmt.Errorf("stubUpstreamCoordinator: no authoritative data for %s", name)
 	}
 	return s.query(ctx, zoneHint, name, rrType)
-}
-
-func (s *stubUpstreamCoordinator) sentCount() int {
-	s.sentMu.Lock()
-	defer s.sentMu.Unlock()
-	return len(s.sent)
 }
 
 type stubResponseWriter struct{}
