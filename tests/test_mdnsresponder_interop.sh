@@ -22,6 +22,11 @@
 # same checkout and started here; needs root), so both calls must return NOERROR, its log
 # must confirm the update, and mDNSResponder's dns-sd must then find (and, after Deregister,
 # no longer find) the service on the local link.
+#
+# Direction 3: an application advertises a service through mdnsd (dns-sd -P), and OUR client
+# in -mdns mode, which learns it from mdnsd's client socket like any DNS-SD application,
+# registers it with OUR registrar (the Direction-1 proxy), so it must appear at BIND. When the
+# application stops advertising, and when the bridge stops, the records must go again.
 
 set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -47,6 +52,16 @@ D2_MDNS_PROXY_LOG="/tmp/srp-mdns-proxy_interop.log"
 D2_MDNS_PROXY_PID=""
 D2_MDNS_PROXY_PORT=""
 D2_KEY_DIR=""
+
+D3_HOST="d3-host"
+D3_ADDR="192.0.2.33"
+D3_INSTANCE="Bridge Demo"
+D3_INSTANCE_DNS='Bridge\032Demo' # D3_INSTANCE as dig takes and prints it
+D3_ADVERT_LOG="/tmp/sig0lease_d3_advert.log"
+D3_ADVERT_PID=""
+D3_BRIDGE_LOG="/tmp/sig0lease_d3_bridge.log"
+D3_BRIDGE_PID=""
+D3_KEY_DIR=""
 
 PERFORMED_TESTS=""
 
@@ -396,6 +411,140 @@ test_d2_deregister() {
 }
 
 ################################
+# Direction 3: mdnsd's advertisement -> our client's -mdns bridge -> our registrar
+################################
+
+# dig_d1_until <seconds> <name> <type> <present|absent> -- polls BIND until <name> <type> has
+# an answer (present) or none (absent), and prints the last answer. The bridge needs a few
+# seconds per change: resolve and address lookups, its 1s settle time, and the client's
+# initial 0-3s delay before a registration.
+dig_d1_until() {
+    local seconds="$1" name="$2" rr_type="$3" want="$4"
+    local start got
+    start=$(date +%s)
+    while true; do
+        got="$(dig_d1 "$name" "$rr_type")"
+        if { [ "$want" = present ] && [ -n "$got" ]; } || { [ "$want" = absent ] && [ -z "$got" ]; }; then
+            echo "$got"
+            return 0
+        fi
+        if [ $(( $(date +%s) - start )) -ge "$seconds" ]; then
+            echo "$got"
+            return 1
+        fi
+        sleep 0.5
+    done
+}
+
+# start_d3_advert advertises D3_INSTANCE through mdnsd as an application would. dns-sd -P is
+# a proxy registration: it names its own host, d3-host.local., and address, so what the bridge
+# finds does not depend on this machine's interfaces.
+start_d3_advert() {
+    LD_LIBRARY_PATH="$MDNSRESPONDER_LIB_DIR" stdbuf -oL "$MDNSRESPONDER_DNSSD_BIN" -P "$D3_INSTANCE" _http._tcp local. 8080 \
+        "${D3_HOST}.local." "$D3_ADDR" "path=/d3" > "$D3_ADVERT_LOG" 2>&1 &
+    D3_ADVERT_PID=$!
+    local start
+    start=$(date +%s)
+    while ! grep -q "Got a reply for service ${D3_INSTANCE}._http._tcp.local.: Name now registered and active" "$D3_ADVERT_LOG" 2>/dev/null; do
+        if [ $(( $(date +%s) - start )) -ge 10 ]; then
+            log_error "dns-sd -P did not get ${D3_INSTANCE} registered:"
+            cat "$D3_ADVERT_LOG"
+            return 1
+        fi
+        sleep 0.2
+    done
+}
+
+stop_d3_advert() {
+    if [ -n "${D3_ADVERT_PID:-}" ] && kill -0 "$D3_ADVERT_PID" 2>/dev/null; then
+        kill "$D3_ADVERT_PID" || true
+        wait "$D3_ADVERT_PID" 2>/dev/null || true
+    fi
+    D3_ADVERT_PID=""
+}
+
+start_d3_bridge() {
+    "$D2_CLIENT_BIN" -mdns -mdns-socket="$MDNSRESPONDER_MDNSD_SOCKET" -mdns-host="${D3_HOST}.local." -mdns-type=_http._tcp \
+        -domain="$D1_ZONE" -server="$D1_PROXY_URL" -keystore="$D3_KEY_DIR" -k=13 > "$D3_BRIDGE_LOG" 2>&1 &
+    D3_BRIDGE_PID=$!
+    sleep 0.5
+    if ! kill -0 "$D3_BRIDGE_PID" 2>/dev/null; then
+        log_error "the -mdns bridge exited at once:"
+        cat "$D3_BRIDGE_LOG"
+        return 1
+    fi
+}
+
+# stop_d3_bridge stops the bridge the way Ctrl-C does and returns its exit status.
+stop_d3_bridge() {
+    local status=0
+    if [ -n "${D3_BRIDGE_PID:-}" ] && kill -0 "$D3_BRIDGE_PID" 2>/dev/null; then
+        kill -TERM "$D3_BRIDGE_PID" || true
+        wait "$D3_BRIDGE_PID" || status=$?
+    fi
+    D3_BRIDGE_PID=""
+    return "$status"
+}
+
+test_d3_mirror() {
+    local log_msg="D3-TEST 1: a service advertised through mdnsd is mirrored by our -mdns bridge into the zone"
+    log_section "$log_msg"
+
+    start_d3_advert || return 1
+    start_d3_bridge || return 1
+
+    local srv a txt ptr
+    srv="$(dig_d1_until 20 "${D3_INSTANCE_DNS}._http._tcp.${D1_ZONE}" SRV present)" \
+        || { log_error "no SRV for ${D3_INSTANCE} at BIND; bridge log:"; cat "$D3_BRIDGE_LOG"; return 1; }
+    echo "SRV: $srv"
+    [ "$srv" = "0 0 8080 ${D3_HOST}.${D1_ZONE}" ] || { log_error "SRV is \"$srv\", want \"0 0 8080 ${D3_HOST}.${D1_ZONE}\""; return 1; }
+    a="$(dig_d1 "${D3_HOST}.${D1_ZONE}" A)"
+    [ "$a" = "$D3_ADDR" ] || { log_error "A ${D3_HOST}.${D1_ZONE} is \"$a\", want $D3_ADDR"; return 1; }
+    txt="$(dig_d1 "${D3_INSTANCE_DNS}._http._tcp.${D1_ZONE}" TXT)"
+    [ "$txt" = '"path=/d3"' ] || { log_error "TXT is $txt, want \"path=/d3\""; return 1; }
+    ptr="$(dig_d1 "_http._tcp.${D1_ZONE}" PTR)"
+    echo "$ptr" | grep -qxF "${D3_INSTANCE_DNS}._http._tcp.${D1_ZONE}" \
+        || { log_error "PTR _http._tcp.${D1_ZONE} does not list ${D3_INSTANCE}: $ptr"; return 1; }
+
+    log_success "mdnsd's ${D3_INSTANCE} is at BIND as ${D3_HOST}.${D1_ZONE}:8080, address $D3_ADDR, TXT path=/d3"
+    PERFORMED_TESTS="$PERFORMED_TESTS\n  [OK] $log_msg"
+}
+
+test_d3_withdraw() {
+    local log_msg="D3-TEST 2: the application stops advertising -> the bridge deregisters the host"
+    log_section "$log_msg"
+
+    stop_d3_advert
+    dig_d1_until 20 "${D3_INSTANCE_DNS}._http._tcp.${D1_ZONE}" SRV absent > /dev/null \
+        || { log_error "SRV for ${D3_INSTANCE} still at BIND after dns-sd -P stopped; bridge log:"; cat "$D3_BRIDGE_LOG"; return 1; }
+    dig_d1_until 5 "${D3_HOST}.${D1_ZONE}" A absent > /dev/null \
+        || { log_error "A ${D3_HOST}.${D1_ZONE} still at BIND after the host was deregistered"; return 1; }
+    grep -q "${D3_HOST}: deregistered \"${D3_INSTANCE}\" _http._tcp\$" "$D3_BRIDGE_LOG" \
+        || { log_error "the bridge did not log the deregistration:"; cat "$D3_BRIDGE_LOG"; return 1; }
+
+    log_success "the instance and its host left the zone when mdnsd stopped advertising them"
+    PERFORMED_TESTS="$PERFORMED_TESTS\n  [OK] $log_msg"
+}
+
+test_d3_stop() {
+    local log_msg="D3-TEST 3: the bridge stops (SIGTERM) -> it deregisters what it registered and exits 0"
+    log_section "$log_msg"
+
+    start_d3_advert || return 1
+    dig_d1_until 20 "${D3_INSTANCE_DNS}._http._tcp.${D1_ZONE}" SRV present > /dev/null \
+        || { log_error "the bridge did not register ${D3_INSTANCE} again; bridge log:"; cat "$D3_BRIDGE_LOG"; return 1; }
+    stop_d3_bridge || { log_error "the bridge exited non-zero; log:"; cat "$D3_BRIDGE_LOG"; return 1; }
+    dig_d1_until 5 "${D3_INSTANCE_DNS}._http._tcp.${D1_ZONE}" SRV absent > /dev/null \
+        || { log_error "SRV for ${D3_INSTANCE} still at BIND after the bridge stopped"; return 1; }
+    dig_d1_until 5 "${D3_HOST}.${D1_ZONE}" A absent > /dev/null \
+        || { log_error "A ${D3_HOST}.${D1_ZONE} still at BIND after the bridge stopped"; return 1; }
+    stop_d3_advert
+
+    log_success "stopping the bridge removed ${D3_INSTANCE} and ${D3_HOST} from the zone"
+    PERFORMED_TESTS="$PERFORMED_TESTS\n  [OK] $log_msg"
+}
+
+################################
 # Top level
 ################################
 run_all_tests() {
@@ -413,6 +562,7 @@ run_all_tests() {
     require_command stdbuf
 
     D2_KEY_DIR="$(mktemp -d /tmp/sig0lease-d2-identities.XXXXXX)"
+    D3_KEY_DIR="$(mktemp -d /tmp/sig0lease-d3-identities.XXXXXX)"
 
     build_interop_binaries
     start_bind9
@@ -430,6 +580,10 @@ run_all_tests() {
     test_d2_register
     test_d2_deregister
 
+    test_d3_mirror
+    test_d3_withdraw
+    test_d3_stop
+
     bind9_report_rejections || return 1
     BIND9_REJECTIONS_REPORTED=1
 
@@ -439,6 +593,7 @@ run_all_tests() {
     echo ""
     echo "Direction-1 proxy log: $D1_PROXY_LOG"
     echo "srp-mdns-proxy log: $D2_MDNS_PROXY_LOG"
+    echo "-mdns bridge log: $D3_BRIDGE_LOG"
     echo "mdnsd log: $MDNSD_LOG"
     echo "BIND log: ${BIND9_RUNDIR}/named.log"
 }
@@ -448,12 +603,15 @@ cleanup() {
     log_section "CLEANUP"
     # See test_srp.sh's cleanup: a failed run still shows why named rejected anything.
     [ -z "${BIND9_REJECTIONS_REPORTED:-}" ] && bind9_report_rejections
+    stop_d3_bridge
+    stop_d3_advert
     stop_d1_proxy
     stop_d2_mdns_proxy
     stop_mdnsd
     stop_bind9
     pkill -f "$MDNSRESPONDER_SRP_CLIENT_BIN" 2>/dev/null
     [ -n "$D2_KEY_DIR" ] && rm -rf "$D2_KEY_DIR"
+    [ -n "$D3_KEY_DIR" ] && rm -rf "$D3_KEY_DIR"
     rm -rf /tmp/sig0lease-srpclient.*
     set -e
 }

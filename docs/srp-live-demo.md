@@ -209,6 +209,60 @@ waiting for the short demo lease to expire:
 Then confirm it's gone (the `dig`s from step 3 should return no answer), and `Ctrl-C` the
 proxy.
 
+## 7. Publish a Mac's own services (optional)
+
+Here macOS supplies the services. With `-mdns`, `sig0lease-srp-client` asks the Mac's running
+mDNSResponder what is advertised on the local link, through the same socket every Bonjour
+application uses, and registers the chosen host and its instances through the proxy, one SRP
+key per host. Turn a sharing service on or off in System Settings and it enters or leaves the
+public zone.
+
+On the Mac, from `./main`, with the proxy from step 1 running on the same Mac:
+
+```bash
+make build build-client
+# What the daemon sees; * marks what would be published. Registers nothing.
+./bin/darwin/sig0lease-srp-client -mdns -mdns-list -mdns-host=$(scutil --get LocalHostName).local.
+
+./bin/darwin/sig0lease-srp-client -mdns -mdns-host=$(scutil --get LocalHostName).local. \
+  -mdns-type=_ssh._tcp -mdns-type=_smb._tcp -mdns-type=_rfb._tcp \
+  -domain=srp.dev.zenr.io. -server=127.0.0.1:8053 -keystore=./mdns-identities -k=13
+```
+
+Then, in System Settings > General > Sharing, turn on Remote Login (`_ssh._tcp`), File
+Sharing (`_smb._tcp`) or Screen Sharing (`_rfb._tcp`). A few seconds later the client logs
+`registered`, and from any machine:
+
+```bash
+dig @ns1.free2air.org PTR _ssh._tcp.srp.dev.zenr.io. +short
+dns-sd -B _ssh._tcp srp.dev.zenr.io
+```
+
+Turn the service off and the client withdraws it; `Ctrl-C` deregisters everything it
+registered. The client does not follow subtypes, nor address or TXT changes after an instance
+first appears.
+
+- On first use macOS may ask whether Terminal may find devices on the local network. If that
+  is refused, the daemon answers `PolicyDenied` and the client stops with that error.
+- The records carry the Mac's LAN addresses and computer name, in a public zone. Keep
+  `-mdns-type` to what you mean to show. `-mdns-all-hosts` publishes every device on the
+  network: not on a shared network.
+- An instance name containing `.` is skipped with a log line: codeberg.org/miekg/dns cannot
+  carry such a label (see `pkg/dnsname/labels.go`).
+
+A second Mac can also list these instances among its ordinary Bonjour results, without being
+told the domain. Once the proxy has a live registration it publishes
+`lb._dns-sd._udp.srp.dev.zenr.io. PTR srp.dev.zenr.io.`, and mDNSResponder looks for that
+record in each DNS search domain (`mDNSCore/uDNS.c`, RFC 6763 §11) and browses what it
+names. On macOS 26.7, `dns-sd -F` then lists `srp.dev.zenr.io` as a recommended and default
+browsing domain, and a browse without a domain returns its instances beside the `local.` ones.
+The search domain must be the registration domain itself, where those records are.
+
+```bash
+sudo networksetup -setsearchdomains Wi-Fi srp.dev.zenr.io   # undo: ... Wi-Fi Empty
+dns-sd -B _ssh._tcp      # no domain: local. and srp.dev.zenr.io. instances together
+```
+
 ## Background
 
 - `docs/siglease_rfc9665.md` covers the CLI/config, protocol behavior, and known
