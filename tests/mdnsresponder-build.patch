@@ -1,0 +1,102 @@
+diff --git a/ServiceRegistration/Makefile b/ServiceRegistration/Makefile
+index 517fe80..221f1b5 100644
+--- a/ServiceRegistration/Makefile
++++ b/ServiceRegistration/Makefile
+@@ -36,7 +36,10 @@ TLSOBJS      = $(OBJDIR)/tls-macos.o
+ IOOBJS       = $(OBJDIR)/ioloop.o $(OBJDIR)/posix.o $(OBJDIR)/ioloop-common.o
+ IOWOTLSOBJS  = $(OBJDIR)/ioloop.o $(OBJDIR)/posix.o
+ else ifeq ($(os), linux)
+-SRPCFLAGS = -DMDNS_UDS_SERVERPATH=\"/var/run/mdnsd\" -O0 -g -Wall -Werror -DSTANDALONE -I../mDNSCore -I/usr/local/include -I. -I../mDNSMacOSX/Private $(INCLUDEDIRS) -I../DSO -MMD -MF .depfile-${notdir $@} -DNOT_HAVE_SA_LEN -DUSE_SELECT -DUSE_INOTIFY -DGENKEY_PROGRAM=$(GENKEY) -DCERTWRITE_PROGRAM=$(CERTWRITE) -DLINUX -DSRP_CRYPTO_MBEDTLS -DPOSIX_BUILD -DMDNS_NO_STRICT
++# -DSRP_FEATURE_REPLICATION=0: as of mDNSResponder-2881.120.11, srp-replication.c uses symbols that are not
++# in the open-source tree (thread_device_network_state_changed, srpl_is_in_routine_state, ...). Local build
++# patch, see main/tests/README.md (mDNSResponder section).
++SRPCFLAGS = -DMDNS_UDS_SERVERPATH=\"/var/run/mdnsd\" -O0 -g -Wall -Werror -DSTANDALONE -I../mDNSCore -I/usr/local/include -I. -I../mDNSMacOSX/Private $(INCLUDEDIRS) -I../DSO -MMD -MF .depfile-${notdir $@} -DNOT_HAVE_SA_LEN -DUSE_SELECT -DUSE_INOTIFY -DGENKEY_PROGRAM=$(GENKEY) -DCERTWRITE_PROGRAM=$(CERTWRITE) -DLINUX -DSRP_CRYPTO_MBEDTLS -DPOSIX_BUILD -DMDNS_NO_STRICT -DSRP_FEATURE_REPLICATION=0
+ #SRPLDOPTS = /usr/local/lib/libmbedtls.a /usr/local/lib/libmbedx509.a /usr/local/lib/libmbedcrypto.a -lbsd
+ SRPLDOPTS = -lmbedcrypto -lmbedtls -lmbedx509
+ HMACOBJS     = $(OBJDIR)/hmac-mbedtls.o
+@@ -97,7 +100,10 @@ clean:
+ 
+ SIMPLEOBJS   = $(OBJDIR)/towire.o $(SIGNOBJS) $(OBJDIR)/srp-log.o
+ DSOOBJS      = $(OBJDIR)/dso.o $(OBJDIR)/dso-utils.o
+-MDNSOBJS     = $(OBJDIR)/dnssd_clientstub.o $(OBJDIR)/dnssd_ipc.o $(OBJDIR)/dnssd_clientlib.o
++# srp-clientstub.c #includes ../mDNSShared/dnssd_clientstub.c and adds the two functions srp-dnssd.h
++# needs, so it replaces dnssd_clientstub.o here. Local build patch (mDNSResponder-2881.120.11), see
++# main/tests/README.md (mDNSResponder section).
++MDNSOBJS     = $(OBJDIR)/srp-clientstub.o $(OBJDIR)/dnssd_ipc.o $(OBJDIR)/dnssd_clientlib.o
+ FROMWIREOBJS = $(OBJDIR)/fromwire.o $(VERIFYOBJS) $(OBJDIR)/wireutils.o
+ CFOBJS       = $(OBJDIR)/config-parse.o
+ $(BUILDDIR)/dnssd-relay:  $(OBJDIR)/dnssd-relay.o $(DSOOBJS) $(IOOBJS) $(CFOBJS)
+@@ -124,6 +130,9 @@ $(OBJDIR)/dso.o:	../DSO/dso.c
+ $(OBJDIR)/dnssd_clientstub.o:  ../mDNSShared/dnssd_clientstub.c
+ 	$(CC) -o $@ $(SRPCFLAGS) $(CFLAGS) -c -I. $(INCLUDEDIRS) $<
+ 
++$(OBJDIR)/srp-clientstub.o:  srp-clientstub.c ../mDNSShared/dnssd_clientstub.c
++	$(CC) -o $@ $(SRPCFLAGS) $(CFLAGS) -c -I. $(INCLUDEDIRS) $<
++
+ $(OBJDIR)/dnssd_clientlib.o:  ../mDNSShared/dnssd_clientlib.c
+ 	$(CC) -o $@ $(SRPCFLAGS) $(CFLAGS) -c -I. $(INCLUDEDIRS) $<
+ 
+diff --git a/ServiceRegistration/srp-dnssd.h b/ServiceRegistration/srp-dnssd.h
+index 53aed1d..d455dd3 100644
+--- a/ServiceRegistration/srp-dnssd.h
++++ b/ServiceRegistration/srp-dnssd.h
+@@ -76,6 +76,11 @@ void dns_service_record_set_callback(srp_server_t UNUSED *NULLABLE srp_server, D
+ bool dns_service_record_validate(srp_server_t UNUSED *NULLABLE srp_server, DNSServiceRef NONNULL sdref,
+                                  DNSRecordRef NONNULL rref);
+ #else
++// srp-clientstub.h declares DNSServiceRecordValidate/DNSServiceRecordSetCallback, which the two macros at
++// the end of this block call. As of mDNSResponder-2881.120.11 nothing in the open-source tree includes it,
++// so a POSIX build of srp-mdns-proxy fails on implicit declarations. Local build patch, see
++// main/tests/README.md (mDNSResponder section).
++#include "srp-clientstub.h"
+ #define dns_service_ref_deallocate(srp_server, ...)      DNSServiceRefDeallocate(__VA_ARGS__)
+ #define dns_service_register_record(srp_server, ...)     DNSServiceRegisterRecord(__VA_ARGS__)
+ #define dns_service_register_record_wa(srp_server, ...)  DNSServiceRegisterRecordWithAttribute(__VA_ARGS__)
+diff --git a/ServiceRegistration/srp-log.c b/ServiceRegistration/srp-log.c
+index 2b870d2..9ea448a 100644
+--- a/ServiceRegistration/srp-log.c
++++ b/ServiceRegistration/srp-log.c
+@@ -176,6 +176,27 @@ srp_log_timestamp(char *buf, size_t bufsize)
+ }
+ #endif
+ 
++// srp_log_ref_check / srp_log_ref_final: declared in srp.h (next to the RELEASE_BASE /
++// RETAIN_HERE_LOG family of macros) and called directly by srp-mdns-proxy.c's object
++// finalizers, but never defined anywhere in this open-source snapshot
++// (mDNSResponder-2881.0.25, still so in 2881.120.11) -- linking srp-mdns-proxy fails without them. Minimal stubs
++// added here purely to unblock a local build for use as an SRP wire-protocol interop
++// reference (see main/tests/README.md, mDNSResponder section); not otherwise part
++// of our SRP work. srp_log_ref_check gates a fault-check in RELEASE_BASE and must return
++// true for normal (non-faulted) operation; srp_log_ref_final is a debug-logging hook only.
++bool
++srp_log_ref_check(void *x, const char *object_type, const char *file, int line, bool fault)
++{
++    (void)x; (void)object_type; (void)file; (void)line; (void)fault;
++    return true;
++}
++
++void
++srp_log_ref_final(void *x, unsigned ref_count, const char *object_type, const char *file, int line)
++{
++    (void)x; (void)ref_count; (void)object_type; (void)file; (void)line;
++}
++
+ // Local Variables:
+ // mode: C
+ // tab-width: 4
+diff --git a/mDNSShared/uds_daemon.c b/mDNSShared/uds_daemon.c
+index 6486f1e..0250aee 100644
+--- a/mDNSShared/uds_daemon.c
++++ b/mDNSShared/uds_daemon.c
+@@ -3626,7 +3626,10 @@ mDNSlocal void resolve_result_callback(mDNS *const m, DNSQuestion *question, con
+     request_state *const req = question->QuestionContext;
+     const mDNSu32 name_hash = mDNS_DomainNameFNV1aHash(&question->qname);
+     const mDNSBool isMDNSQuestion = mDNSOpaque16IsZero(question->TargetQID);
+-    const mDNSBool is_split_awdl_query = (req->resolve_awdl && question->InterfaceID == AWDLInterfaceID);
++    // Local build patch (mDNSResponder-2881.120.11): request_state.resolve_awdl and AWDLInterfaceID are not in
++    // the open-source tree, so mDNSPosix fails to build. Like has_split_awdl_query in the two resolve-start
++    // functions, it is always false here. See main/tests/README.md (mDNSResponder section).
++    const mDNSBool is_split_awdl_query = mDNSfalse;
+     UDS_LOG_ANSWER_EVENT(isMDNSQuestion ? MDNS_LOG_CATEGORY_MDNS : MDNS_LOG_CATEGORY_DEFAULT, MDNS_LOG_DEFAULT,
+         req, question, answer, mDNSfalse, "DNSServiceResolve result", AddRecord);
+ 

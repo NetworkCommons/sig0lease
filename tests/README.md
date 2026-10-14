@@ -76,17 +76,24 @@ run as root: it starts `mdnsd`, which creates `/var/run/mdnsd` and binds UDP 535
 refuses to start if another mDNS daemon already listens on that socket.
 
 ```
-git clone https://github.com/apple/mDNSResponder.git ../mDNSResponder
-cd ../mDNSResponder && git checkout mDNSResponder-2881.0.25   # commit actually tested; a later tag should also work
+git clone https://github.com/apple-oss-distributions/mDNSResponder.git ../mDNSResponder
+cd ../mDNSResponder && git checkout -b rel/mDNSResponder-2881 --track origin/rel/mDNSResponder-2881
+git apply ../main/tests/mdnsresponder-build.patch   # tested at mDNSResponder-2881.120.11
 ```
 
-Needs `mbedtls` dev libraries on Linux (`apt-get install libmbedtls-dev`) and requires two
-small local patches to build in this snapshot — both are pre-existing gaps in this
-checkout's own reference-counting/replication debug instrumentation, unrelated to SRP or to
-anything in this repo, and already applied in the checkout this test suite expects (see the
-docs/siglease_rfc9665.md's mDNSResponder reference section for the exact two-patch diff and reasoning if you need to
-reapply them on a fresh clone: `srp-replication.c`'s missing `srpl_current_domain()`
-declaration, and `srp-log.c`'s missing `srp_log_ref_check`/`srp_log_ref_final` definitions).
+Needs `mbedtls` dev libraries on Linux (`apt-get install libmbedtls-dev`). The open-source
+snapshot does not build on Linux as published; `tests/mdnsresponder-build.patch` holds the
+four local fixes, none of which touches SRP message handling:
+
+- `srp-log.c`: defines `srp_log_ref_check`/`srp_log_ref_final`, which `srp.h` declares and
+  `srp-mdns-proxy.c` calls but nothing defines.
+- `ServiceRegistration/Makefile`: links `srp-clientstub.o` (new in 2881.40.18, never added to
+  the POSIX Makefile) in place of `dnssd_clientstub.o`, and builds the Linux target with
+  `-DSRP_FEATURE_REPLICATION=0`: `srp-replication.c` uses symbols that are only in Apple's
+  internal tree. The suites never use registrar-to-registrar replication.
+- `srp-dnssd.h`: includes `srp-clientstub.h`, which declares the two functions it calls.
+- `mDNSShared/uds_daemon.c`: one AWDL-only expression that refers to stripped code becomes
+  `mDNSfalse`, as the file's two other split-AWDL flags already are. Needed for `mdnsd`.
 
 `make` (from `ServiceRegistration/`) builds `build/srp-client`, `build/srp-mdns-proxy`, and a
 couple of supporting tools. `build/srp-dns-proxy` does **not** build in this snapshot

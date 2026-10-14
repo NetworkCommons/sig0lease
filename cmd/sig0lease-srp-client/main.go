@@ -1,5 +1,6 @@
 // Package main implements sig0lease-srp-client, a thin CLI over client/srp -- a dev/test tool,
-// not a shipped product. The library is the deliverable; this just exercises it.
+// not a shipped product. The library is the deliverable; this just exercises it. With -mdns it
+// runs client/mdnsbridge instead, registering what the local mDNSResponder sees.
 package main
 
 import (
@@ -15,6 +16,8 @@ import (
 	"time"
 
 	"codeberg.org/miekg/dns"
+	"github.com/NetworkCommons/sig0lease/client/mdnsbridge"
+	"github.com/NetworkCommons/sig0lease/client/mdnsresponder"
 	clientsrp "github.com/NetworkCommons/sig0lease/client/srp"
 	"github.com/NetworkCommons/sig0lease/logging"
 	_ "github.com/NetworkCommons/sig0lease/pkg/dnscompat" // registers EDNS0 code 2 (UPDATE-LEASE); matches cmd/sig0lease/main.go and cmd/sig0lease-client/main.go's own convention (client/srp also self-registers this, so it's redundant here, not load-bearing)
@@ -44,18 +47,59 @@ func main() {
 	keyAlg := flag.Uint("k", 0, "DNSSEC algorithm (13=ECDSAP256SHA256, 15=ED25519) to generate a NEW signing key with if none exists yet; omit to require an existing key")
 	maxRenames := flag.Int("max-renames", 5, "rename-retry attempts on YXDOMAIN before giving up")
 
-	var addrs, instances, removes, txts, subtypes, resolvers repeatableFlag
+	mdns := flag.Bool("mdns", false, "mirror the services the local mDNSResponder sees, one SRP host per mDNS host, instead of registering -host")
+	mdnsSocket := flag.String("mdns-socket", mdnsresponder.DefaultSocketPath(), "the mDNSResponder daemon's client socket (with -mdns)")
+	mdnsAllHosts := flag.Bool("mdns-all-hosts", false, "with -mdns, mirror every host on the link instead of the -mdns-host ones")
+	mdnsList := flag.Bool("mdns-list", false, "with -mdns, only print what the daemon sees, marking with * what would be mirrored; registers nothing")
+
+	var addrs, instances, removes, txts, subtypes, resolvers, mdnsHosts, mdnsTypes repeatableFlag
 	flag.Var(&addrs, "addr", "host A/AAAA address to publish (repeatable)")
 	flag.Var(&resolvers, "resolver", "resolver \"host:port\" for every discovery lookup -- zone apex SOA, registrar SRV, registrar address (repeatable); default 8.8.8.8:53, 8.8.4.4:53")
 	flag.Var(&instances, "instance", `service instance "Label:_svctype._proto:port" (repeatable)`)
 	flag.Var(&removes, "remove", `service instance "Label:_svctype._proto" to withdraw in this update (repeatable)`)
 	flag.Var(&txts, "txt", `TXT string for a declared instance, "Label:content" (repeatable)`)
 	flag.Var(&subtypes, "subtype", `DNS-SD subtype for a declared instance, "Label:subtypelabel" (repeatable)`)
+	flag.Var(&mdnsHosts, "mdns-host", `with -mdns, an mDNS host to mirror, e.g. "mymac.local." (repeatable)`)
+	flag.Var(&mdnsTypes, "mdns-type", `with -mdns, a service type to mirror, e.g. "_ssh._tcp" (repeatable; default every type the daemon enumerates)`)
 
 	flag.Usage = printUsage
 	flag.Parse()
 
-	if *domain == "" || *host == "" {
+	if *mdns {
+		var conflicting []string
+		flag.Visit(func(f *flag.Flag) {
+			switch f.Name {
+			case "host", "addr", "instance", "remove", "txt", "subtype", "once", "deregister":
+				conflicting = append(conflicting, "-"+f.Name)
+			}
+		})
+		if len(conflicting) > 0 {
+			fmt.Fprintf(os.Stderr, "ERROR: -mdns takes hosts and instances from mDNSResponder; drop %s\n", strings.Join(conflicting, " "))
+			os.Exit(1)
+		}
+	} else if *mdnsList || *mdnsAllHosts || len(mdnsHosts) > 0 || len(mdnsTypes) > 0 {
+		fmt.Fprintln(os.Stderr, "ERROR: -mdns-host, -mdns-type, -mdns-all-hosts and -mdns-list need -mdns")
+		os.Exit(1)
+	}
+
+	if *mdns && *mdnsList {
+		// Nothing is registered, so no registrar, domain or keystore is needed.
+		runBridge(mdnsbridge.Config{
+			Source:       mdnsbridge.DaemonSource(*mdnsSocket),
+			ServiceTypes: []string(mdnsTypes),
+			Hosts:        []string(mdnsHosts),
+			AllHosts:     *mdnsAllHosts,
+			List:         true,
+		}, *mdnsSocket)
+		return
+	}
+
+	if *mdns && *domain == "" {
+		fmt.Fprintln(os.Stderr, "ERROR: -domain is required")
+		printUsage()
+		os.Exit(1)
+	}
+	if !*mdns && (*domain == "" || *host == "") {
 		fmt.Fprintln(os.Stderr, "ERROR: -domain and -host are required")
 		printUsage()
 		os.Exit(1)
@@ -86,6 +130,35 @@ func main() {
 	default:
 		fmt.Fprintf(os.Stderr, "ERROR: invalid -discovery %q, want \"closest\" or \"apex\"\n", *discovery)
 		os.Exit(1)
+	}
+
+	if *mdns {
+		if !*mdnsAllHosts && len(mdnsHosts) == 0 {
+			fmt.Fprintln(os.Stderr, "ERROR: -mdns needs -mdns-host (repeatable) or -mdns-all-hosts; -mdns-list shows the hosts on the link")
+			os.Exit(1)
+		}
+		dir := resolveKeystoreDir(*keystoreDir)
+		runBridge(mdnsbridge.Config{
+			Source:       mdnsbridge.DaemonSource(*mdnsSocket),
+			ServiceTypes: []string(mdnsTypes),
+			Hosts:        []string(mdnsHosts),
+			AllHosts:     *mdnsAllHosts,
+			SRP: clientsrp.Config{
+				Domain:            *domain,
+				RequestedLease:    uint32(*lease),
+				RequestedKeyLease: uint32(*keylease),
+				TTL:               uint32(*ttl),
+				RegistrarAddr:     *server,
+				Discovery:         discoveryMode,
+				Resolvers:         []string(resolvers),
+				Network:           network,
+				MaxRenames:        *maxRenames,
+			},
+			Key: func(owner string) (*keyrec.LoadedKey, error) {
+				return resolveKeyFor(dir, owner, uint8(*keyAlg))
+			},
+		}, *mdnsSocket)
+		return
 	}
 
 	var parsedAddrs []netip.Addr
@@ -222,8 +295,12 @@ func resolveKeystoreDir(flagValue string) string {
 // strict default (see the keyrec.ResolveOrCreateKey doc comment for the shared logic).
 // The logger carries ResolveOrCreateKey's warning when more than one key in dir matches.
 func resolveKey(dir, host, domain string, algorithm uint8) (*keyrec.LoadedKey, error) {
-	name := ensureFQDN(host + "." + strings.TrimSuffix(domain, "."))
-	k, created, err := keyrec.ResolveOrCreateKey(dir, name, algorithm, logging.NewLogger("info"))
+	return resolveKeyFor(dir, ensureFQDN(host+"."+strings.TrimSuffix(domain, ".")), algorithm)
+}
+
+// resolveKeyFor is resolveKey for an already-joined owner name, which -mdns gets per host.
+func resolveKeyFor(dir, owner string, algorithm uint8) (*keyrec.LoadedKey, error) {
+	k, created, err := keyrec.ResolveOrCreateKey(dir, owner, algorithm, logging.NewLogger("info"))
 	if err != nil {
 		return nil, err
 	}
@@ -231,6 +308,35 @@ func resolveKey(dir, host, domain string, algorithm uint8) (*keyrec.LoadedKey, e
 		fmt.Printf("Generated new signing key: %s (algorithm %d)\n", k.Name, k.PublicKey.Algorithm)
 	}
 	return k, nil
+}
+
+// runBridge runs -mdns until Ctrl-C or SIGTERM, then exits; a failure exits 1.
+func runBridge(cfg mdnsbridge.Config, socket string) {
+	cfg.Logf = func(format string, args ...any) {
+		fmt.Printf("[%s] %s\n", time.Now().Format("15:04:05"), fmt.Sprintf(format, args...))
+	}
+	fmt.Printf("=== sig0lease-srp-client -mdns ===\n")
+	fmt.Printf("mDNSResponder: %s\n", socket)
+	if cfg.List {
+		fmt.Println("Listing only; * marks what would be mirrored. Ctrl-C to stop.")
+	} else {
+		fmt.Printf("Domain: %s\n", cfg.SRP.Domain)
+		if cfg.SRP.RegistrarAddr != "" {
+			fmt.Printf("Registrar: %s (explicit)\n", cfg.SRP.RegistrarAddr)
+		} else {
+			fmt.Printf("Registrar: discovered via %s\n", cfg.SRP.Network.DiscoveryService())
+		}
+		fmt.Println("Mirroring. Ctrl-C or SIGTERM deregisters every host and stops.")
+	}
+	fmt.Println()
+
+	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer cancel()
+	if err := mdnsbridge.Run(ctx, cfg); err != nil && ctx.Err() == nil {
+		fmt.Fprintf(os.Stderr, "ERROR: %v\n", err)
+		os.Exit(1)
+	}
+	fmt.Println("Stopped.")
 }
 
 // ensureFQDN appends a trailing dot if name doesn't already have one.
@@ -317,6 +423,8 @@ func printUsage() {
 
 Usage:
   sig0lease-srp-client -domain=<domain> -host=<label> [options]
+  sig0lease-srp-client -mdns -domain=<domain> (-mdns-host=<name> ... | -mdns-all-hosts) [options]
+  sig0lease-srp-client -mdns -mdns-list
 
 Required:
   -domain string       registration domain, e.g. srp.dev.zenr.io.
@@ -361,6 +469,26 @@ Options:
                             missing) -- same convention as sig0lease-client's -k
   -max-renames int           rename-retry attempts on YXDOMAIN before giving up (default 5)
 
+Mirroring what mDNSResponder sees (-mdns):
+  -mdns                     ask the running mDNSResponder daemon, over its client socket, for
+                            the services on the link, and register each selected mDNS host
+                            ("mymac.local." becomes mymac.<domain>) with its addresses and
+                            instances. An instance the daemon reports gone is withdrawn; a host
+                            with none left, and every host when this stops, is deregistered.
+                            Each host gets its own key in the keystore (-k to create them).
+                            Not with -host, -addr, -instance, -remove, -txt, -subtype, -once,
+                            -deregister. Subtypes, and later address or TXT changes, are not
+                            followed
+  -mdns-host value          mDNS host to mirror, e.g. mymac.local. (repeatable); on a Mac,
+                            scutil --get LocalHostName prints this machine's
+  -mdns-all-hosts           mirror every host on the link instead
+  -mdns-type value          service type to mirror, e.g. _ssh._tcp (repeatable); default every
+                            type the daemon enumerates
+  -mdns-list                print the instances the daemon sees, * marking those that would be
+                            mirrored, and register nothing; needs no -domain or keystore
+  -mdns-socket string       the daemon's socket (default /var/run/mDNSResponder on macOS,
+                            /var/run/mdnsd, mDNSPosix's mdnsd, elsewhere)
+
 Examples:
   // One-shot registration of a host with one service instance, against an explicit registrar;
   // -k 13 generates an ECDSAP256SHA256 key on first run, reused on every later run
@@ -371,5 +499,11 @@ Examples:
   // -host.myhost's key to already exist in ./srp-identity, since -k is not given here
   sig0lease-srp-client -domain=srp.dev.zenr.io. -host=myhost -addr=192.0.2.1 \
     -instance=Widget:_http._tcp:8080 -keystore=./srp-identity
+
+  // On a Mac: publish its Remote Login, File Sharing and Screen Sharing services, as macOS
+  // advertises them, under srp.dev.zenr.io. through a registrar at 192.0.2.10:8053
+  sig0lease-srp-client -mdns -mdns-host=$(scutil --get LocalHostName).local. \
+    -mdns-type=_ssh._tcp -mdns-type=_smb._tcp -mdns-type=_rfb._tcp \
+    -domain=srp.dev.zenr.io. -server=192.0.2.10:8053 -keystore=./mdns-identities -k=13
 `)
 }
