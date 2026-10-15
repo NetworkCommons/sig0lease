@@ -16,7 +16,7 @@ import (
 // graceful shutdown. errgroup cancels the shared context as soon as the
 // failing listener returns, so the guard this replaced
 // (err != nil && ctx.Err() == nil) was never true and Serve() returned nil
-// on every bind failure.
+// on every bind failure. Serve has started the registered handlers by then, and shuts them down.
 func TestServeReturnsErrorWhenAListenerCannotBind(t *testing.T) {
 	// Hold a UDP port open so the server's bind to the same address fails.
 	occupied, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: 0})
@@ -43,6 +43,8 @@ func TestServeReturnsErrorWhenAListenerCannotBind(t *testing.T) {
 		resolver: resolver,
 		router:   router,
 	}
+	var starts, shutdowns int
+	srv.RegisterHandler(&stubHandler{name: "stub", startHits: &starts, shutdownHits: &shutdowns})
 
 	done := make(chan error, 1)
 	go func() { done <- srv.Serve() }()
@@ -51,6 +53,9 @@ func TestServeReturnsErrorWhenAListenerCannotBind(t *testing.T) {
 	case err := <-done:
 		if err == nil {
 			t.Fatal("Serve() returned nil despite the UDP listener failing to bind")
+		}
+		if starts != 1 || shutdowns != 1 {
+			t.Fatalf("handler started %d and shut down %d time(s), want once each", starts, shutdowns)
 		}
 	case <-time.After(5 * time.Second):
 		t.Fatal("Serve() did not return after the listener failed to bind")

@@ -3,8 +3,6 @@ package handlers
 import (
 	"strings"
 	"testing"
-
-	"github.com/NetworkCommons/sig0lease/logging"
 )
 
 func leasePolicyCfg(minKey, maxKey, minRR, maxRR int) map[string]any {
@@ -77,26 +75,5 @@ func TestLeasePolicyClamp_KeepsLeaseWithinKeyLease(t *testing.T) {
 		if lease > keyLease {
 			t.Fatalf("clamp(%d, %d) = %d/%d, LEASE above KEY-LEASE", req[0], req[1], lease, keyLease)
 		}
-	}
-}
-
-// TestSetup_BothHandlersRejectContradictoryLeasePolicy: both handlers read lease_policy through
-// parseLeasePolicy, so a contradictory policy stops either one's Setup -- and the proxy --
-// at startup.
-func TestSetup_BothHandlersRejectContradictoryLeasePolicy(t *testing.T) {
-	bad := leasePolicyCfg(30, 3600, 60, 900) // min_rr above min_key
-
-	updateCfg := baseSetupCfg(t)
-	updateCfg["lease_policy"] = bad
-	if err := newTestHandler().Setup(updateCfg); err == nil || !strings.Contains(err.Error(), "min_rr_lease_sec (60)") {
-		t.Fatalf("UpdateHandler.Setup error = %v, want the lease_policy contradiction", err)
-	}
-
-	srpCfg := baseSRPSetupCfg(t)
-	srpCfg["lease_policy"] = bad
-	h := NewSRPHandler()
-	h.SetLogger(logging.NewLogger("error"))
-	if err := h.Setup(srpCfg); err == nil || !strings.Contains(err.Error(), "min_rr_lease_sec (60)") {
-		t.Fatalf("SRPHandler.Setup error = %v, want the lease_policy contradiction", err)
 	}
 }

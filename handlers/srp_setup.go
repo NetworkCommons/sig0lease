@@ -1,24 +1,8 @@
 package handlers
 
-import (
-	"fmt"
-	"strings"
-	"time"
-
-	"github.com/NetworkCommons/sig0lease/pkg/updatecore"
-)
-
-// Setup initializes the SRP handler configuration.
-//
-// Configuration options:
-//   - "upstream_zone": the one zone this handler instance serves (one zone, one
-//     protocol per handler instance) [REQUIRED]
-//   - "keystore_dir": directory holding this proxy's own SIG(0) signing keys [REQUIRED]
-//   - "upstream": a static "host:port" for the authoritative server of upstream_zone and
-//     every name below it, in place of SOA discovery; anything but a "host:port" string
-//     is a Setup error (see buildCoordinatorFromConfig). [OPTIONAL]
-//   - "bootstrap_resolvers": []string of resolver addresses asked for SOA records when
-//     "upstream" is not set. [OPTIONAL]
+// Setup initializes the SRP handler configuration: the options both UPDATE handlers read
+// (upstream_zone, keystore_dir, upstream, bootstrap_resolvers, lease_policy, record_ttl_sec,
+// lease_manager or storage; see leaseHandler.setup), and these of its own:
 //   - "allow_udp": permit UDP for this zone (TCP is required by default,
 //     for non-CNN zones this proxy targets). [OPTIONAL, defaults to false]
 //   - "rewrite_default_service_arpa": accept requests whose Zone Section is literally
@@ -38,88 +22,21 @@ import (
 //     open target for direct RFC 2136 Dynamic Update registration (not just SRP) is a
 //     deployment policy choice -- SIG(0)/FCFS still gate who can actually write, but this
 //     controls whether domain-enumeration tools are told to try. [OPTIONAL, defaults to false]
-//   - "lease_policy": bounds applied to granted LEASE/KEY-LEASE, same shape as the base
-//     handler's. [OPTIONAL]
-//   - "record_ttl_sec": TTL of every record this handler writes upstream, in place of the
-//     requester's (see parseRecordTTL and applyRecordTTL). [OPTIONAL, defaults to
-//     defaultRecordTTL]
-//   - "lease_manager" / "storage": same mutually-exclusive lease-store backend selection
-//     as UpdateHandler.Setup -- see that method's doc comment for the full shape.
-//     [OPTIONAL, defaults to an in-memory store with no persistence]
 func (h *SRPHandler) Setup(cfg map[string]any) error {
-	// Surrounding whitespace is trimmed here, where the name comes from configuration:
-	// dnsname.Normalize keeps it, since a DNS label may begin with a space.
-	zone, _ := cfg["upstream_zone"].(string)
-	zone = strings.TrimSpace(zone)
-	if zone == "" {
-		return fmt.Errorf("upstream_zone is required in config")
-	}
-	h.upstreamZone = zone
-	h.logger.Debugf("SRPHandler upstream zone: %s", zone)
-
-	keystoreDir, ok := cfg["keystore_dir"].(string)
-	if !ok || keystoreDir == "" {
-		return fmt.Errorf("keystore_dir is required in config handlers.srp_handler section")
-	}
-	h.keystoreDir = keystoreDir
-
-	// Fail fast (matching UpdateHandler.Setup) rather than discovering a missing
-	// signing key on the first real request, and cache the result for the life of the
-	// handler instead of re-reading it from the keystore directory on every request and
-	// every lease-expiry tick (see upstreamTarget.send).
-	upstreamKey, matchedZone, err := updatecore.FindAuthorizedProxyKey(h.keystoreDir, h.upstreamZone, h.logger)
-	if err != nil {
-		return fmt.Errorf("failed to resolve upstream signing key for zone %s: %w", h.upstreamZone, err)
-	}
-	h.upstreamKeyRecord = upstreamKey
-	h.logger.Debugf("Loaded upstream key for configured zone %s from key zone %s", h.upstreamZone, matchedZone)
-
-	coordinator, err := buildCoordinatorFromConfig(cfg, h.upstreamZone, h.logger)
-	if err != nil {
-		return fmt.Errorf("srp handler config: %w", err)
-	}
-	h.coordinator = coordinator
-
-	if allow, ok := cfg["allow_udp"].(bool); ok {
-		h.allowUDP = allow
-	}
-
-	if rewrite, ok := cfg["rewrite_default_service_arpa"].(bool); ok {
-		h.rewriteDefaultServiceARPA = rewrite
-	}
-
-	// Default true (fail closed against foreign/orphaned data) unless explicitly
-	// disabled -- see pkg/srp.Evaluate's doc comment for what this actually gates.
-	h.refuseOnForeignData = true
-	if refuse, ok := cfg["refuse_on_foreign_data"].(bool); ok {
-		h.refuseOnForeignData = refuse
-	}
-
-	if advertise, ok := cfg["advertise_registration_domain"].(bool); ok {
-		h.advertiseRegistrationDomain = advertise
-	}
-
-	if raw, ok := cfg["lease_policy"]; ok {
-		policy, err := parseLeasePolicy(raw)
-		if err != nil {
-			return err
-		}
-		h.LeasePolicy = policy
-	}
-
-	recordTTL, err := parseRecordTTL(cfg)
-	if err != nil {
+	var err error
+	if h.allowUDP, err = boolOption(cfg, "allow_udp", false); err != nil {
 		return err
 	}
-	h.recordTTL = recordTTL
-
-	leaseManager, err := LeaseStoreFromConfig(cfg, h.logger, false)
-	if err != nil {
-		return fmt.Errorf("srp handler config: %w", err)
+	if h.rewriteDefaultServiceARPA, err = boolOption(cfg, "rewrite_default_service_arpa", false); err != nil {
+		return err
 	}
-	h.leaseManager = leaseManager
-
-	h.startLeaseReconciliation(30 * time.Second)
-
-	return nil
+	// Default true (fail closed against foreign/orphaned data) unless explicitly
+	// disabled -- see pkg/srp.Evaluate's doc comment for what this actually gates.
+	if h.refuseOnForeignData, err = boolOption(cfg, "refuse_on_foreign_data", true); err != nil {
+		return err
+	}
+	if h.advertiseRegistrationDomain, err = boolOption(cfg, "advertise_registration_domain", false); err != nil {
+		return err
+	}
+	return h.setup(cfg)
 }

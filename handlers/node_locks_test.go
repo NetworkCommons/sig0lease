@@ -116,7 +116,7 @@ func lockTestHandler(t *testing.T, signers ...*keyrec.LoadedKey) (*UpdateHandler
 	}
 	h.upstreamCoordinator = stub
 	for _, k := range signers {
-		if err := h.leaseManager.Register(context.Background(), k.PublicKey.Clone().(*dns.KEY), 120, 120, "dev.zenr.io."); err != nil {
+		if err := h.leaseManager.Register(k.PublicKey.Clone().(*dns.KEY), 120, 120, "dev.zenr.io."); err != nil {
 			t.Fatalf("register signer: %v", err)
 		}
 	}
@@ -269,7 +269,7 @@ func TestNodeLocks_SRPHandler_ExpiryBacksOffWhileRefreshHoldsNode(t *testing.T) 
 	hostKey := id.keyAt(host)
 	nodeKey := leasepkg.NodeKey(hostKey)
 	// Already past its KEY-LEASE: an expiry that ignored the lock would delete it upstream.
-	if err := h.leaseManager.RegisterWithParent(context.Background(), "", hostKey, 0, 0, srpTestZone); err != nil {
+	if err := h.leaseManager.RegisterWithParent("", hostKey, 0, 0, srpTestZone); err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { h.timers.disarm(nodeKey) })

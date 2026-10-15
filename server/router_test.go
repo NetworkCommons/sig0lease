@@ -14,6 +14,7 @@ import (
 // verify Router.Shutdown() fans out to every registered handler.
 type stubHandler struct {
 	name         string
+	startHits    *int
 	shutdownHits *int
 }
 
@@ -23,6 +24,7 @@ func (s *stubHandler) Setup(cfg map[string]any) error { return nil }
 func (s *stubHandler) Handle(ctx context.Context, w dns.ResponseWriter, r *dns.Msg) *handlers.HandlerResult {
 	return handlers.NewNotRelevantResult("stub")
 }
+func (s *stubHandler) Start()    { *s.startHits++ }
 func (s *stubHandler) Shutdown() { *s.shutdownHits++ }
 
 func TestRouter_Shutdown_CallsShutdownOnEveryRegisteredHandler(t *testing.T) {
@@ -32,12 +34,16 @@ func TestRouter_Shutdown_CallsShutdownOnEveryRegisteredHandler(t *testing.T) {
 		t.Fatalf("NewRouter: %v", err)
 	}
 
-	var hitsA, hitsB int
-	router.RegisterHandler(&stubHandler{name: "a", shutdownHits: &hitsA})
-	router.RegisterHandler(&stubHandler{name: "b", shutdownHits: &hitsB})
+	var startA, startB, hitsA, hitsB int
+	router.RegisterHandler(&stubHandler{name: "a", startHits: &startA, shutdownHits: &hitsA})
+	router.RegisterHandler(&stubHandler{name: "b", startHits: &startB, shutdownHits: &hitsB})
 
+	router.Start()
 	router.Shutdown()
 
+	if startA != 1 || startB != 1 {
+		t.Fatalf("expected each handler's Start() called once, got a=%d b=%d", startA, startB)
+	}
 	if hitsA != 1 || hitsB != 1 {
 		t.Fatalf("expected each handler's Shutdown() called once, got a=%d b=%d", hitsA, hitsB)
 	}
@@ -52,6 +58,7 @@ type deadlineHandler struct {
 func (d *deadlineHandler) Name() string                   { return "deadline" }
 func (d *deadlineHandler) CanHandle(opcode uint8) bool    { return opcode == dns.OpcodeUpdate }
 func (d *deadlineHandler) Setup(cfg map[string]any) error { return nil }
+func (d *deadlineHandler) Start()                         {}
 func (d *deadlineHandler) Shutdown()                      {}
 func (d *deadlineHandler) Handle(ctx context.Context, w dns.ResponseWriter, r *dns.Msg) *handlers.HandlerResult {
 	d.deadline, d.ok = ctx.Deadline()

@@ -50,7 +50,11 @@ pkg/dnssd/            RFC 6763 §9/§11 record logic (pure), separate from RFC 9
 
 handlers/
   srp_handler.go       implements handlers.Handler for opcode 5 (SRP path)
-  srp_setup.go         config parsing for the srp_handler block
+  srp_setup.go         the srp_handler block's own options, then leaseHandler.setup
+  lease_handler.go     what both handlers share: the config they read the same way
+                       (setup), upstream, and the lease runtime
+  lease_runtime.go     lease store, timers, locks, reconciliation pass and Shutdown,
+                       embedded by leaseHandler
 
 server/
   router.go            opcode -> ordered list of handlers, tried in turn
@@ -205,6 +209,12 @@ another request could claim the same name. Two mechanisms close that window.
   "Name is not in use" was sent, `YXRRSET` only when the KEY prerequisite was. Anything else,
   including either rcode without its prerequisite, is `SERVFAIL`.
 
+**The local apply cannot fail.** FCFS is also what lets the store writes after the forward
+(`applyLocalMutations`) succeed: every record SRP stores sits at a name the check covered, or
+names one (a Service Discovery PTR names its instance), so no other node holds it. A store write
+failing after the forward is a bug, and the handler panics
+(`docs/siglease_rfc9664.md`, "Upstream Forwarding and Write Ordering").
+
 **Authorization for SRP is steps 2 and 4, nothing more.** Once structural validation confirms
 every KEY in the update equals the signing key, per-name FCFS is the entire ownership check —
 there is no per-record parent/key walk. PTRs are authorized transitively: each targets a
@@ -279,7 +289,9 @@ handler uses the same setting (`docs/siglease_rfc9664.md`).
 data record's `LEASE` or its own `KEY-LEASE`, whichever comes first. Both handlers run lease
 events through the same engine (`leaseExpirer`), with the same timer table and retry policy
 (`expiryTimers`) and timer arithmetic (`nextLeaseEvent`), so they age the lease store the same
-way. One lease event is one UPDATE, which deletes every record it ends one by one, each with
+way. Both also embed the same `leaseRuntime` (`handlers/lease_runtime.go`, through `leaseHandler`), which owns the store,
+timers and locks, the reconciliation pass and `Shutdown`; SRP adds its enumeration reconcile
+(§10) after each expiry and on each pass. One lease event is one UPDATE, which deletes every record it ends one by one, each with
 an individual `Delete An RR From An RRSet`:
 - A `LEASE` event deletes the node's due data. For a host, that includes the data of every
   service instance under it (`dataCascade`, the only difference from the RFC 9664 handler: the
@@ -306,7 +318,8 @@ takes the instances' data along, and their retries find nothing due. Each expiry
 10s deadline (`expiryTimeout`). A node found refreshed after its expiry's upstream delete would
 mean the locks had failed, and that the refresh's add and the expiry's delete raced upstream
 with no way to tell which one landed last: the engine panics instead of deleting the node
-locally. The 30-second reconciliation pass only re-arms a node that has no timer at all. A
+locally. The 30-second reconciliation pass only arms a node that has no timer at all, which is
+a bug it logs as an error (`docs/siglease_rfc9664.md`, "Start and the reconciliation backstop"). A
 handler without its upstream coordinator or signing key (a state `Setup` refuses to produce)
 panics rather than expiring anything (`requireUpstream`).
 

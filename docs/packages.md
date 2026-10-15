@@ -44,6 +44,154 @@ func (c *Client) Query(msg *dns.Msg) (*dns.Msg, error)
 
 ```
 
+## github.com/NetworkCommons/sig0lease/client/mdnsbridge
+```
+package mdnsbridge // import "github.com/NetworkCommons/sig0lease/client/mdnsbridge"
+
+Package mdnsbridge mirrors services that a running mDNSResponder sees on the
+local link into a DNS zone through an SRP registrar. It learns them from the
+daemon itself (browse, resolve and address lookups over its client socket,
+see client/mdnsresponder) and registers each selected host, with its addresses
+and its instances, through client/srp: one SRP identity, so one signing key,
+per mDNS host.
+
+When the daemon reports an instance gone, the bridge withdraws it; when a host
+has no instance left, or the bridge stops, it deregisters the host. What it does
+not follow: subtypes (a browse does not report them), and a host's later address
+or TXT changes (it resolves an instance and looks up its host's addresses when
+they first appear).
+
+FUNCTIONS
+
+func Run(ctx context.Context, cfg Config) error
+    Run mirrors until ctx ends, then deregisters every host it registered and
+    returns ctx's error. A browse that fails, such as one macOS refuses for lack
+    of Local Network permission, stops it the same way, returning that error.
+
+
+TYPES
+
+type Config struct {
+	Source Source
+
+	// ServiceTypes lists the types to mirror, e.g. "_ssh._tcp". Empty mirrors every type the
+	// daemon enumerates (RFC 6763 S9, _services._dns-sd._udp.local.).
+	ServiceTypes []string
+	// Hosts lists the mDNS hosts whose instances are mirrored, as "name.local." or "name".
+	// AllHosts mirrors every host on the link instead. Unless List is set, one of the two is
+	// required: copying a whole network into a public zone has to be asked for.
+	Hosts    []string
+	AllHosts bool
+	// List only reports what the daemon sees, marking the hosts that would be mirrored, and
+	// registers nothing.
+	List bool
+
+	// SRP is the template for every host's SRP client: Domain, registrar, transport, leases.
+	// Run sets HostLabel, Addresses, Instances and Key per host.
+	SRP clientsrp.Config
+	// Key returns the signing key for a host's name in SRP.Domain, e.g. from a keystore
+	// (keyrec.ResolveOrCreateKey), so that a restarted bridge keeps its names.
+	Key func(owner string) (*keyrec.LoadedKey, error)
+
+	// Settle is how long a host's changes are collected before its registration is sent
+	// again; default 1s.
+	Settle time.Duration
+	// StopTimeout bounds the deregistrations sent when Run stops; default 10s.
+	StopTimeout time.Duration
+	Logf        func(format string, args ...any)
+}
+    Config configures Run.
+
+type Source interface {
+	Browse(ctx context.Context, serviceType, domain string, events chan<- mdnsresponder.BrowseEvent) error
+	Resolve(ctx context.Context, interfaceIndex uint32, name, serviceType, domain string) (mdnsresponder.ResolveResult, error)
+	Addresses(ctx context.Context, host string) ([]netip.Addr, error)
+}
+    Source is the daemon's side of the bridge. DaemonSource is the real one.
+
+func DaemonSource(path string) Source
+    DaemonSource is the mDNSResponder daemon listening on the Unix socket at
+    path.
+
+```
+
+## github.com/NetworkCommons/sig0lease/client/mdnsresponder
+```
+package mdnsresponder // import "github.com/NetworkCommons/sig0lease/client/mdnsresponder"
+
+Package mdnsresponder talks to a running mDNSResponder daemon over its own
+client socket: the Unix-domain socket every DNS-SD application reaches
+through dns_sd.h (mDNSShared/dnssd_clientstub.c on the client side,
+mDNSShared/uds_daemon.c in the daemon). It implements the three read-only
+operations a bridge needs -- browse, resolve and address lookup -- in pure Go,
+so one binary talks to the system daemon on macOS and to mDNSPosix's mdnsd on
+Linux without cgo.
+
+Each operation gets its own connection, as DNSServiceBrowse and friends do
+without kDNSServiceFlagsShareConnection. The daemon then returns the request's
+status as four bytes on that same socket (no separate error socket is passed),
+followed by the replies; closing the connection cancels the operation.
+
+FUNCTIONS
+
+func Addresses(ctx context.Context, socketPath string, interfaceIndex uint32, host string, settle time.Duration) ([]netip.Addr, error)
+    Addresses returns host's IPv4 and IPv6 addresses on interfaceIndex (0 for
+    any), as the daemon reports them through DNSServiceGetAddrInfo. The daemon
+    sends each address as its own reply and nothing marks the last, so Addresses
+    collects replies until none has arrived for settle, or until ctx ends.
+    It fails if no address arrived.
+
+func Browse(ctx context.Context, socketPath, serviceType, domain string, events chan<- BrowseEvent) error
+    Browse browses for instances of serviceType ("_http._tcp") in domain
+    ("local.") on every interface and sends each reply to events until ctx ends,
+    when it returns ctx's error. A failed reply, including a policy denial,
+    ends it with that error.
+
+func DefaultSocketPath() string
+    DefaultSocketPath is where the daemon listens on this OS:
+    /var/run/mDNSResponder on macOS (dnssd_ipc.h's MDNS_UDS_SERVERPATH default),
+    /var/run/mdnsd elsewhere (the path mDNSPosix/Makefile compiles into mdnsd).
+
+
+TYPES
+
+type BrowseEvent struct {
+	Add            bool
+	InterfaceIndex uint32
+	Name           string // instance name as UTF-8 text, unescaped, e.g. "Living Room"
+	Type           string // e.g. "_http._tcp."
+	Domain         string // e.g. "local."
+}
+    BrowseEvent is one browse reply: an instance appeared (Add) or went away on
+    one interface. The same instance is reported once per interface it is seen
+    on.
+
+type Error int32
+    Error is a DNSServiceErrorType the daemon returned, as a request status or
+    in a reply.
+
+const (
+	ErrNoSuchRecord Error = -65554 // kDNSServiceErr_NoSuchRecord
+	ErrNoAuth       Error = -65555 // kDNSServiceErr_NoAuth
+	ErrPolicyDenied Error = -65570 // kDNSServiceErr_PolicyDenied
+)
+func (e Error) Error() string
+
+type ResolveResult struct {
+	FullName string // escaped, e.g. `Living\032Room._http._tcp.local.`
+	Target   string // host name, e.g. "printer.local."
+	Port     uint16
+	// TXT holds the instance's TXT strings as raw bytes, in order (RFC 6763 S6).
+	TXT [][]byte
+}
+    ResolveResult is a resolved service instance.
+
+func Resolve(ctx context.Context, socketPath string, interfaceIndex uint32, name, serviceType, domain string) (ResolveResult, error)
+    Resolve resolves the instance a browse reply named (its Name, Type and
+    Domain, unchanged) on interfaceIndex, and returns the first answer.
+
+```
+
 ## github.com/NetworkCommons/sig0lease/client/srp
 ```
 package srp // import "github.com/NetworkCommons/sig0lease/client/srp"
@@ -163,6 +311,10 @@ type Config struct {
 
 	RequestedLease    uint32 // default 3600 (1h)
 	RequestedKeyLease uint32 // default 1209600 (14d, S3.4's "typically 14 days")
+	// TTL is the TTL suggested for every record registered, KEYs included; the registrar may
+	// override it (RFC 9665 S4). Independent of the leases: a lease is not a TTL (S5.1).
+	// Default 300.
+	TTL uint32
 
 	// RegistrarAddr, if set, bypasses discovery entirely -- an explicit "host:port",
 	// matching every other test/dev client this project's test suite already uses.
@@ -297,7 +449,8 @@ with SIG(0) authentication to the sig0lease proxy.
 ```
 Package main implements sig0lease-srp-client, a thin CLI over client/srp -- a
 dev/test tool, not a shipped product. The library is the deliverable; this just
-exercises it.
+exercises it. With -mdns it runs client/mdnsbridge instead, registering what the
+local mDNSResponder sees.
 ```
 
 ## github.com/NetworkCommons/sig0lease/config
@@ -380,6 +533,10 @@ type ServerConfig struct {
 	// benefits every handler (base RFC 9664, SRP, plain forwarding alike), not just one
 	// protocol. Required when "tls" appears in Networks; ignored otherwise.
 	TLS *TLSConfig `yaml:"tls,omitempty"`
+	// RequestTimeout bounds how long the handlers may work on one request, including any
+	// wait for a lease-store node another request holds (docs/siglease_rfc9664.md, "Node
+	// Locks"). Must be positive: without a bound, a waiter could wait forever.
+	RequestTimeout time.Duration `yaml:"request_timeout"`
 }
     ServerConfig holds server listening configuration.
 
@@ -455,6 +612,15 @@ Package handlers provides opcode-specific processing modules.
 
 Package handlers provides result types for handler responses.
 
+FUNCTIONS
+
+func LeaseSnapshotPath(cfg map[string]any) (string, error)
+    LeaseSnapshotPath returns the snapshot file of the file store a handler's
+    Setup config selects (selectLeaseStore), or "" if it selects none.
+    cmd/sig0lease checks the handlers' snapshot files with it before any Setup
+    runs.
+
+
 TYPES
 
 type BaseHandler struct {
@@ -470,10 +636,6 @@ func (b *BaseHandler) Name() string
 
 func (b *BaseHandler) SetLogger(logger *logging.Logger)
     SetLogger sets the logger for this handler.
-
-func (b *BaseHandler) Shutdown()
-    Shutdown is a no-op default; handlers that own no resources needing release
-    on shutdown do not need to override it.
 
 type Handler interface {
 	// Name returns the unique name of this handler
@@ -491,6 +653,10 @@ type Handler interface {
 
 	// Setup initializes the handler with configuration
 	Setup(cfg map[string]any) error
+
+	// Start begins the handler's background work, such as lease expiry. The server calls it
+	// once, after Setup and before it serves; a dump never calls it.
+	Start()
 
 	// Shutdown releases any resources this handler owns (background
 	// goroutines, open files). Called exactly once during server shutdown.
@@ -554,6 +720,17 @@ func NewInMemoryLeaseManager() *InMemoryLeaseManager
 type LeaseManager = leasepkg.LeaseStorage
     LeaseManager is the shared lease manager abstraction.
 
+func LeaseStoreFromConfig(cfg map[string]any, logger *logging.Logger, readOnly bool) (LeaseManager, error)
+    LeaseStoreFromConfig returns the lease store a handler's Setup
+    config selects (selectLeaseStore): the "lease_manager" given,
+    one built from the "storage" section, or the in-memory default.
+    A "file" store loads its snapshot, writes it straight back and keeps
+    saving it (leasepkg.NewFileLeaseStore); logger receives its save errors.
+    With readOnly, a "file" store is instead its snapshot as it is now,
+    read into an in-memory store that never saves, and nothing is created or
+    written: cmd/sig0lease's dump mode hands that to Setup as "lease_manager".
+    leaseHandler.setup uses it with readOnly false, for both handlers.
+
 type LeasePolicy struct {
 	MinKeyLease uint32
 	MaxKeyLease uint32
@@ -577,9 +754,7 @@ type NonKEYLeaseRecord = leasepkg.NonKEYRecordSet
     wherever a single entry is needed, rather than a second alias.
 
 type SRPHandler struct {
-	BaseHandler
-
-	LeasePolicy LeasePolicy
+	leaseHandler[srpCoordinator]
 
 	// Has unexported fields.
 }
@@ -611,17 +786,10 @@ func (h *SRPHandler) Handle(ctx context.Context, w dns.ResponseWriter, r *dns.Ms
     so a rejected request leaves no trace to clean up.
 
 func (h *SRPHandler) Setup(cfg map[string]any) error
-    Setup initializes the SRP handler configuration.
-
-    Configuration options:
-      - "upstream_zone": the one zone this handler instance serves (one zone,
-        one protocol per handler instance) [REQUIRED]
-      - "keystore_dir": directory holding this proxy's own SIG(0) signing keys
-        [REQUIRED]
-      - "upstream": a static "host:port" override for upstream_zone -- when set,
-        skips SOA/NS discovery entirely for this zone. [OPTIONAL]
-      - "bootstrap_resolvers": []string of resolver addresses used to resolve
-        SOA/NS records when "upstream" is not set. [OPTIONAL]
+    Setup initializes the SRP handler configuration: the options both UPDATE
+    handlers read (upstream_zone, keystore_dir, upstream, bootstrap_resolvers,
+    lease_policy, record_ttl_sec, lease_manager or storage; see
+    leaseHandler.setup), and these of its own:
       - "allow_udp": permit UDP for this zone (TCP is required by default,
         for non-CNN zones this proxy targets). [OPTIONAL, defaults to false]
       - "rewrite_default_service_arpa": accept requests whose Zone Section
@@ -645,20 +813,27 @@ func (h *SRPHandler) Setup(cfg map[string]any) error
         a deployment policy choice -- SIG(0)/FCFS still gate who can actually
         write, but this controls whether domain-enumeration tools are told to
         try. [OPTIONAL, defaults to false]
-      - "lease_policy": bounds applied to granted LEASE/KEY-LEASE, same shape as
-        the base handler's. [OPTIONAL]
-      - "record_ttl_sec": TTL of every record this handler writes upstream,
-        in place of the requester's (see parseRecordTTL and applyRecordTTL).
-        [OPTIONAL, defaults to defaultRecordTTL]
-      - "lease_manager" / "storage": same mutually-exclusive lease-store backend
-        selection as UpdateHandler.Setup -- see that method's doc comment
-        for the full shape. [OPTIONAL, defaults to an in-memory store with no
-        persistence]
+
+func (r SRPHandler) Shutdown()
+    Shutdown stops the lease machinery and has the store save once more. After
+    it begins, no timer callback or reconciliation pass starts. It cancels the
+    context of the callbacks and the pass already running and waits for them to
+    return; then it stops every timer, including a retry a cut-short lease event
+    armed, and stops the lease store, which for a file store is the final save.
+    A cut-short lease event forgets nothing: the store changes only once its
+    upstream UPDATE is confirmed, so its leases are in that save and expire
+    after a restart. Safe to call more than once: only the first call does
+    anything.
+
+func (b *SRPHandler) Start()
+    Start begins the handler's lease expiry: it arms an expiry timer for every
+    lease owner in the store -- the leases Setup loaded from a snapshot -- and
+    starts the reconciliation pass. The server calls it once, before it serves.
+    A dump runs Setup alone, so nothing in its store expires and nothing is
+    written upstream.
 
 type UpdateHandler struct {
-	BaseHandler
-
-	LeasePolicy LeasePolicy
+	leaseHandler[UpstreamCoordinator]
 
 	// AllowOnlineKeyRegistration controls whether a signer resolved only via
 	// authoritative DNS (not in the lease store, not present anywhere in the
@@ -667,7 +842,6 @@ type UpdateHandler struct {
 	// gates whether it may also be used to create new managed state. Default
 	// false (fail closed).
 	AllowOnlineKeyRegistration bool
-
 	// Has unexported fields.
 }
     UpdateHandler handles DNS opcode 5 (UPDATE queries).
@@ -675,7 +849,7 @@ type UpdateHandler struct {
     This implementation supports the following features:
       - Basic key registration with 8-byte lease EDNS(0) option (RFC 9664)
       - SIG(0) client authentication (RFC 2931)
-      - In-memory lease tracking with configurable persistence hooks
+      - Lease tracking in a memory or file lease store
       - Future SRP support
 
 func NewUpdateHandler() *UpdateHandler
@@ -716,83 +890,61 @@ func (h *UpdateHandler) DumpLeasesLevel(level string) string
         Key: <keyName>  KEY=<active|expired|absent>  NonKEY=<count>  Status=<active|empty|absent>
 
     Keys that appear only in the KEY lease (no non-KEY lease) represent KEY-only
-    registrations. Keys that appear only in the non-KEY lease (no KEY lease)
-    represent non-KEY-only refreshes. Keys that appear in both have an active
-    KEY + non-KEY RR lease.
+    registrations. Keys that appear only in the non-KEY lease (KEY=absent) own
+    data but have no KEY record in the store, such as a signer that registered
+    data without being lease-managed itself. Keys that appear in both have an
+    active KEY + non-KEY RR lease.
 
 func (h *UpdateHandler) Handle(ctx context.Context, w dns.ResponseWriter, r *dns.Msg) *HandlerResult
 
 func (h *UpdateHandler) Setup(cfg map[string]any) error
-    Setup initializes the handler configuration.
-
-    Configuration options:
-      - "upstream_zone": Authoritative zone (e.g., "dev.zenr.io.") [REQUIRED]
-      - "upstream_key": Path to upstream private key file [OPTIONAL, needed for
-        upstream UPDATE signing]
-      - "upstream_coordinator": Custom UpstreamCoordinator implementation
-        [OPTIONAL]
-      - "bootstrap_resolvers": []string of resolver addresses (e.g.
-        "8.8.8.8:53") used by the default upstream coordinator to look up SOA/NS
-        records when locating the authoritative server for a zone [OPTIONAL,
-        ignored when "upstream_coordinator" is set]. cmd/sig0lease/main.go
-        populates this from the top-level "upstreams" config when not
-        set explicitly here, so zone-authority resolution uses the same
-        operator-configured resolvers as generic forwarding. Falls back to a
-        small built-in default if unset.
-      - "lease_manager": Custom LeaseManager implementation [OPTIONAL, defaults
-        to InMemoryLeaseManager]. Go-embedding only: a LeaseManager value,
-        not expressible in YAML, so this can only be set by code constructing
-        the cfg map directly, never via config.yaml. A present-but-wrong-type
-        value is a Setup error, not a silently-ignored one. Mutually exclusive
-        with "storage" below.
-      - "storage": Selects the lease storage backend [OPTIONAL,
-        config-file-settable, defaults to an in-memory store with no
-        persistence]. Mutually exclusive with "lease_manager". Shape: {"type":
-        "memory"|"file", "path": "...", "save_interval": "30s"}. "type" defaults
-        to "memory" if omitted -- identical to today's default behavior,
-        leases are lost on restart. "file" additionally requires "path" and
-        persists a human-readable JSON snapshot there: loaded once on Setup
-        (a corrupt existing file is a hard Setup error), saved periodically on
-        "save_interval" (default 30s), and flushed once more on Shutdown().
-        Any unrecognized "type", or "file" missing "path", is a Setup error.
-      - "persistence_hook": Persistence function for leases [OPTIONAL]. Same
-        Go-embedding-only caveat as lease_manager: a func value, not settable
-        from config.yaml.
-      - "lease_policy": Bounds applied to granted LEASE/KEY-LEASE [OPTIONAL]
-      - "record_ttl_sec": TTL of every record this handler writes upstream,
-        in place of the requester's (see parseRecordTTL) [OPTIONAL, defaults to
-        defaultRecordTTL]
+    Setup initializes the handler configuration: the options both UPDATE
+    handlers read (upstream_zone, keystore_dir, upstream, bootstrap_resolvers,
+    lease_policy, record_ttl_sec, lease_manager or storage; see
+    leaseHandler.setup), and these of its own:
       - "prefer_4byte_variant": Enable 4-byte variant for backward compatibility
         [OPTIONAL, defaults to false]
       - "allow_online_key_registration": Allow a signer resolved only via
         authoritative DNS (not lease-managed, not present in the request) to
         register new KEY RRs [OPTIONAL, defaults to false]
+      - "blacklisted_types": RR type names this handler refuses to register
+        [OPTIONAL]
 
-func (h *UpdateHandler) Shutdown()
-    Shutdown stops the reconciliation ticker and releases the lease storage
-    backend's own resources (e.g. a file-backed store's periodic-save goroutine,
-    which also performs one final synchronous save here). Safe to call once
-    during server shutdown; overrides BaseHandler's no-op default.
+func (r UpdateHandler) Shutdown()
+    Shutdown stops the lease machinery and has the store save once more. After
+    it begins, no timer callback or reconciliation pass starts. It cancels the
+    context of the callbacks and the pass already running and waits for them to
+    return; then it stops every timer, including a retry a cut-short lease event
+    armed, and stops the lease store, which for a file store is the final save.
+    A cut-short lease event forgets nothing: the store changes only once its
+    upstream UPDATE is confirmed, so its leases are in that save and expire
+    after a restart. Safe to call more than once: only the first call does
+    anything.
+
+func (b *UpdateHandler) Start()
+    Start begins the handler's lease expiry: it arms an expiry timer for every
+    lease owner in the store -- the leases Setup loaded from a snapshot -- and
+    starts the reconciliation pass. The server calls it once, before it serves.
+    A dump runs Setup alone, so nothing in its store expires and nothing is
+    written upstream.
 
 type UpstreamCoordinator interface {
-	// SendUpdate sends a DNS UPDATE message to the upstream authoritative server.
-	// Returns the response message or an error.
-	SendUpdate(ctx context.Context, upstreamZone string, updateMsg *dns.Msg) (*dns.Msg, error)
-	// ResolveAuthoritativeZone returns the zone cut (the name that has NS records) for zone
-	// or one of its parents: the zone an UPDATE for names under zone must name.
+
+	// ResolveAuthoritativeZone returns the apex of the zone holding zone: the zone an UPDATE
+	// for names under zone must name.
 	ResolveAuthoritativeZone(ctx context.Context, zone string) (string, error)
 	// QueryRRs returns the rrType records at name from zoneHint's authoritative server --
 	// none for NXDOMAIN -- for the handler's checks of what is already published.
 	QueryRRs(ctx context.Context, zoneHint, name string, rrType uint16) ([]dns.RR, error)
+	// Has unexported methods.
 }
-    UpstreamCoordinator handles communication with the upstream authoritative
-    server. pkg/updatecore.Coordinator is the production implementation,
-    constructed directly in Setup (below) via updatecore.NewCoordinator
-    -- this interface exists so tests and operators can substitute
-    their own (config's "upstream_coordinator" option, or a test stub;
-    see handlers/opcode5_sig0_validation_test.go's stubUpstreamCoordinator).
-    It covers everything the handler asks of the upstream side, so a substitute
-    is used the same way as the production implementation, never bypassed.
+    UpstreamCoordinator handles communication with the upstream
+    authoritative server. pkg/updatecore.Coordinator is the production
+    implementation, constructed in Setup via buildCoordinatorFromConfig
+    -- this interface exists so tests can set a stub in its place (see
+    handlers/opcode5_sig0_validation_test.go's stubUpstreamCoordinator).
+    It covers everything the handler asks of the upstream side, so a stub is
+    used the same way as the production implementation, never bypassed.
 
 ```
 
@@ -960,6 +1112,12 @@ func EqualFold(a, b string) bool
 func Fold(name string) string
     Fold returns name with the US-ASCII letters A-Z replaced by a-z and every
     other byte unchanged. The result always has the same length as name.
+
+func IsAtOrBelow(name, zone string) bool
+    IsAtOrBelow reports whether name is zone itself or a name below it,
+    comparing whole labels under Fold: "test.srp.test." is below "srp.test.",
+    "evilsrp.test." is not. Trailing dots are optional on both. Every name is at
+    or below the root zone ("." or "").
 
 func Labels(name string) []string
     Labels splits name into its labels. A fully-qualified name's last
@@ -1243,6 +1401,12 @@ const (
 
 FUNCTIONS
 
+func CheckSaveInterval(d time.Duration) error
+    CheckSaveInterval returns an error unless d, a file store's save interval,
+    is positive. NewFileLeaseStore checks it, and so does the handlers'
+    storage-section parser, which reads it from a handler's configuration even
+    where no file store is built from it (cmd/sig0lease's dump mode).
+
 func FindOption(msg *dns.Msg) (*dns.ERFC3597, bool)
     FindOption scans msg's Pseudo and Extra sections for the raw UPDATE-LEASE
     EDNS(0) option (RFC 9664 Section 4, option code 2), accepting both a bare
@@ -1257,6 +1421,11 @@ func NodeKey(k *dns.KEY) string
 func NodeKeyFromSIG(signerName string, algorithm uint8, keyTag uint16) string
     NodeKeyFromSIG computes the composite lease-store key from SIG(0) signer
     fields.
+
+func NodeKeyName(nodeKey string) string
+    NodeKeyName extracts the DNS name portion of a KEY node's composite key
+    (NodeKey): the name as dnsname.Normalize returns it. Only meaningful for a
+    KEY node's key, not a non-KEY record's RecordKey.
 
 func RecordKey(rr dns.RR) string
     RecordKey returns the canonical, globally unique identity for a non-KEY
@@ -1350,14 +1519,21 @@ type InMemoryLeaseStore struct {
 
     The store never deletes anything on its own initiative: expiry is
     a handler-level concern, because only the handler can also send the
-    corresponding upstream DNS delete. A store-driven timer here would race
-    the handler's own precise per-node timer and — whichever fired first —
-    silently erase local state without ever notifying the authoritative server.
-    See UpdateHandler.reconcileLeaseTimers for the single, upstream- aware path
-    that owns expiry.
+    corresponding upstream DNS delete. A store-driven timer here would race the
+    handler's own precise per-node timer and — whichever fired first — silently
+    erase local state without ever notifying the authoritative server. See
+    the handlers package's per-node expiry timers (expiryTimers), the single,
+    upstream-aware path that owns expiry.
 
 func NewInMemoryManager() *InMemoryLeaseStore
     NewInMemoryManager creates a new in-memory lease manager.
+
+func ReadSnapshotFile(path string) (store *InMemoryLeaseStore, found bool, err error)
+    ReadSnapshotFile returns a store holding the snapshot saved at path,
+    and whether there was a file there; with none, the store is empty.
+    It only reads: NewFileLeaseStore loads its snapshot with it, and so does
+    cmd/sig0lease's dump mode, which must not write. A file that is there but
+    corrupt or unreadable is an error, never an empty store.
 
 func (m *InMemoryLeaseStore) ChildrenOf(nodeKey string) []string
     ChildrenOf returns the composite node keys of direct children (KEY or
@@ -1384,6 +1560,9 @@ func (m *InMemoryLeaseStore) ImportSnapshot(snapshot *LeaseTreeSnapshot) error
 
 func (m *InMemoryLeaseStore) ListAll() []*Record
 
+func (m *InMemoryLeaseStore) ListOwners() []string
+    ListOwners implements LeaseStorage.ListOwners.
+
 func (m *InMemoryLeaseStore) ListSubtreeKeys(nodeKey string) []string
     ListSubtreeKeys returns composite node keys of all descendants (KEY and
     non-KEY alike) of nodeKey, deepest first.
@@ -1398,11 +1577,11 @@ func (m *InMemoryLeaseStore) LookupNonKEYRecord(rr dns.RR) *NonKEYRecord
     LookupNonKEYRecord returns the record matching rr's RFC 2136 identity
     anywhere in the store, regardless of owner, or nil if none exists.
 
-func (m *InMemoryLeaseStore) Register(ctx context.Context, keyRR *dns.KEY, leaseDuration uint32, keyLeaseDuration uint32, upstreamZone string) error
+func (m *InMemoryLeaseStore) Register(keyRR *dns.KEY, leaseDuration uint32, keyLeaseDuration uint32, upstreamZone string) error
     Register creates or updates a KEY lease. Node identity is derived from
     keyRR.
 
-func (m *InMemoryLeaseStore) RegisterWithParent(ctx context.Context, parentNodeKey string, keyRR *dns.KEY, leaseDuration uint32, keyLeaseDuration uint32, upstreamZone string) error
+func (m *InMemoryLeaseStore) RegisterWithParent(parentNodeKey string, keyRR *dns.KEY, leaseDuration uint32, keyLeaseDuration uint32, upstreamZone string) error
     RegisterWithParent creates or updates a KEY lease with an optional parent
     composite node key.
 
@@ -1421,15 +1600,13 @@ func (m *InMemoryLeaseStore) RemoveSingleNonKEYRecord(ownerNodeKey, rrKey string
     bug worth surfacing loudly rather than silently deleting nothing (or, worse,
     the wrong thing).
 
-func (m *InMemoryLeaseStore) RenewLease(ctx context.Context, keyRR *dns.KEY, leaseDuration uint32, keyLeaseDuration uint32) error
+func (m *InMemoryLeaseStore) RenewLease(keyRR *dns.KEY, leaseDuration uint32, keyLeaseDuration uint32) error
     RenewLease extends an already-registered KEY lease's timers in place.
     Unlike Register/RegisterWithParent, it never rebuilds the node: it leaves
     ParentKeyName, RegisteredAt, and the node's position in the tree completely
     untouched, since renewing a lease is not re-creating it.
 
 func (m *InMemoryLeaseStore) SaveSnapshot(path string) error
-
-func (m *InMemoryLeaseStore) SetPersistenceHook(hook func(ctx context.Context, op string, record *Record) error)
 
 func (m *InMemoryLeaseStore) Stop()
     Stop satisfies LeaseStorage.Stop(). InMemoryLeaseStore owns no background
@@ -1492,13 +1669,13 @@ func (lo *LeaseOption) Validate() error
 type LeaseStorage interface {
 
 	// Register creates or updates a KEY lease. The node identity is derived from keyRR.
-	Register(ctx context.Context, keyRR *dns.KEY, leaseDuration uint32, keyLeaseDuration uint32, upstreamZone string) error
+	Register(keyRR *dns.KEY, leaseDuration uint32, keyLeaseDuration uint32, upstreamZone string) error
 	// RenewLease extends an already-registered KEY lease's timers in place.
 	// The node identity is derived from keyRR; it is an error if no such
 	// node is already registered. Unlike Register, it never touches
 	// ParentKeyName, RegisteredAt, or the node's position in the tree --
 	// renewing a lease is not re-creating the node.
-	RenewLease(ctx context.Context, keyRR *dns.KEY, leaseDuration uint32, keyLeaseDuration uint32) error
+	RenewLease(keyRR *dns.KEY, leaseDuration uint32, keyLeaseDuration uint32) error
 	// FindByName returns all non-expired records at the given DNS name.
 	FindByName(dnsName string) []*Record
 	// LookupByKEY returns the non-expired record matching k's exact identity (name+algo+tag).
@@ -1510,12 +1687,17 @@ type LeaseStorage interface {
 	// Delete removes the subtree rooted at the composite nodeKey.
 	Delete(nodeKey string) error
 	ListAll() []*Record
-	SetPersistenceHook(hook func(ctx context.Context, op string, record *Record) error)
+	// ListOwners returns, sorted, the node key of every node that holds a lease: each KEY
+	// node, and each owner of non-KEY records -- also an owner with no KEY record of its own,
+	// such as a signer that registered data without being lease-managed itself. A handler
+	// times each owner's lease events with one expiry timer, so this is what its
+	// reconciliation walks.
+	ListOwners() []string
 
 	// RegisterWithParent creates or updates a KEY lease with an optional
 	// parent composite node key. Fails if parentNodeKey already identifies a
 	// non-KEY record -- a non-KEY node can never be a parent.
-	RegisterWithParent(ctx context.Context, parentNodeKey string, keyRR *dns.KEY, leaseDuration uint32, keyLeaseDuration uint32, upstreamZone string) error
+	RegisterWithParent(parentNodeKey string, keyRR *dns.KEY, leaseDuration uint32, keyLeaseDuration uint32, upstreamZone string) error
 	DeleteSubtree(nodeKey string) error
 	ChildrenOf(nodeKey string) []string
 	// ListSubtreeKeys returns composite node keys of all descendants
@@ -1579,6 +1761,53 @@ const (
 	NodeKindKEY    NodeKind = "key"
 	NodeKindNonKEY NodeKind = "non-key"
 )
+type NodeLockSet struct {
+	// Has unexported fields.
+}
+    NodeLockSet is a set of ids taken by TryAcquire or Acquire.
+
+func (s *NodeLockSet) IDs() []string
+    IDs returns the ids s holds, sorted.
+
+func (s *NodeLockSet) Release()
+    Release frees every id in s and wakes the waiting Acquires. Releasing a set
+    twice would free ids that another caller may have taken since, so it panics.
+
+type NodeLocks struct {
+	// Has unexported fields.
+}
+    NodeLocks serializes the operations that read lease-store nodes, write
+    upstream, and then change those nodes -- a handler's request, or a node's
+    lease expiry -- so that two of them on the same node never interleave across
+    the upstream round trip. The store's own mutex only makes each single store
+    call atomic. See docs/siglease_rfc9664.md, "Node Locks".
+
+    A lock is an id in held, nothing more: there is no mutex per node,
+    so nothing outlives its holder. A set of ids is taken all or nothing,
+    under mu, and nobody waits while holding any id, so overlapping sets can
+    never deadlock, whatever order they overlap in. Ids are opaque strings: each
+    handler decides what it locks (NodeKey/RecordKey for the RFC 9664 handler,
+    names for SRP).
+
+func NewNodeLocks() *NodeLocks
+    NewNodeLocks returns an empty lock table.
+
+func (n *NodeLocks) Acquire(ctx context.Context, lockSet func() []string) (*NodeLockSet, error)
+    Acquire is TryAcquire that waits, holding nothing, while any id is held.
+    It calls lockSet again after every release, since the set may have changed
+    (a subtree grown or gone), until it takes the whole set or ctx is done;
+    the error then names the ids still held.
+
+func (n *NodeLocks) TryAcquire(lockSet func() []string) (*NodeLockSet, error)
+    TryAcquire takes every id lockSet returns, or none of them if any is held;
+    the error then names the held ones.
+
+    lockSet runs with n's mutex held, so the ids it reads from the lease store
+    -- a node's current subtree, say -- are exactly the ones taken: nothing
+    can attach a new node under one of them in between, because attaching a
+    node takes its parent's lock too. Lock order is therefore always n's mutex,
+    then the store's. lockSet must not call back into n.
+
 type NodeSnapshot struct {
 	NodeKind NodeKind `json:"node_kind"`
 	// NodeID is a KEY node's NodeKey(keyRR), the value its children's ParentKeyName holds. It
@@ -1890,23 +2119,26 @@ func Evaluate(ctx context.Context, view StoreView, query AuthoritativeKeyQuery, 
     store has no opinion on.
 
     The second return value is an RFC 2136 prerequisite RR the caller should
-    attach to the upstream UPDATE it forwards for an FCFSProceed name (nil for
-    a Conflict/ForeignData result, and also nil for a store-trusted refresh
-    -- see below), or nil if none is needed. This closes the gap between this
-    function's own check and the caller's later, separate upstream write:
-    without it, two concurrent first-time registrations of the same
-    never-before-seen name can both observe AuthNXDomain here (neither has
-    forwarded its own UPDATE yet) and both go on to be accepted upstream,
-    breaking the FCFS guarantee this function exists to provide. Attaching a
-    "Name is not in use" prerequisite (RFC 2136 S2.4.4) to the forwarded UPDATE
-    makes the authoritative server itself re-check, and enforce, the same
-    condition atomically at write time -- which a second, separate pre-forward
-    query from this function can never fully guarantee no matter how recently
-    it ran. Deliberately narrow in scope: only the AuthNXDomain case gets a
-    prerequisite (the one the concurrent-first-registration race above actually
-    needs); a store-trusted "already ours" refresh gets none, preserving this
-    store's pre-existing behavior of silently re-establishing a record that
-    disappeared from authoritative DNS while still locally unexpired.
+    attach to the upstream UPDATE it forwards for an FCFSProceed name, or nil
+    if none is needed. It closes the gap between this function's own check and
+    the caller's later, separate upstream write: without it, two concurrent
+    first-time claims of the same name -- through another process, since the
+    caller's node locks serialize its own -- can both pass this check (neither
+    has forwarded its UPDATE yet) and both be accepted upstream, breaking FCFS.
+    The prerequisite makes the authoritative server itself re-check, atomically
+    at write time, what the policy requires of a first-time claim:
+
+        refuseOnForeignData true:  nothing at the name    -> "Name is not in use" (RFC 2136 S2.4.4)
+        refuseOnForeignData false: no KEY at the name      -> "RRset does not exist" for KEY (S2.4.3)
+
+    With refuseOnForeignData false, non-SRP data at the name may be taken over,
+    so only a KEY appearing must stop the claim; "Name is not in use" would also
+    stop it on non-SRP data the policy allows. Only a first-time claim gets one:
+    a name that already holds this key (in the store, or live) needs none,
+    since a competing key fails this check with a conflict. A store-trusted
+    refresh getting none also preserves the store's behavior of silently
+    re-establishing a record that disappeared from authoritative DNS while still
+    locally unexpired.
 
 func (r FCFSResult) String() string
 
@@ -2035,12 +2267,16 @@ type UpdateSpec struct {
 	Addresses []netip.Addr
 	// Key is the Host Description's KEY RR. Only its algorithm/protocol/public-key
 	// material is used -- BuildUpdate overwrites Hdr.Name/Hdr.Class/Hdr.TTL to match Host
-	// and KeyLease, and unconditionally zeroes Flags (S3.2.5.1/S3.3.3: requesters MUST
+	// and TTL, and unconditionally zeroes Flags (S3.2.5.1/S3.3.3: requesters MUST
 	// send flags 0, regardless of what the caller's key material happens to carry).
 	Key       *dns.KEY
 	Instances []InstanceSpec
 	Lease     uint32
 	KeyLease  uint32
+	// TTL is the TTL of every record the update adds, KEYs included: the requester's
+	// suggestion, which a registrar may override (S4). It is not derived from Lease or
+	// KeyLease, since a lease is not a TTL (S5.1). Required.
+	TTL uint32
 }
     UpdateSpec is everything BuildUpdate needs to construct one SRP UPDATE.
 
@@ -2077,18 +2313,13 @@ func AsDelete(rr dns.RR) dns.RR
 
 func BuildAndSign(upstreamZone string, prereqs, records []dns.RR, signingKey *keyrec.LoadedKey) (*dns.Msg, error)
     BuildAndSign constructs a new UPDATE message for upstreamZone containing
-    prereqs (in the given order) as the Prerequisite section and records (in
-    the given order) as the Update section, and signs it with signingKey.
-    prereqs may be nil/empty -- most callers have none.
-
-    Unlike the base RFC 9664 handler's constructUpstreamUpdate (handlers/
-    opcode5_update_helpers.go), this does no per-record-type branching --
-    S4.3 step 7's SRP forward is simpler by construction: it's exactly "the
-    same adds/deletes [the requester sent], re-signed with proxy key" (plus,
-    for a Service Description, the pkg/srp-computed PTR-delete diff appended
-    by the caller before this is called -- see docs/siglease_rfc9665.md's
-    lease-store mapping section). The registrar's own TTLs are set earlier,
-    against the classified instructions (handlers.applyRecordTTL), not here.
+    prereqs (in the given order) as the Prerequisite section and records (in the
+    given order) as the Update section, and signs it with signingKey. prereqs
+    may be nil/empty -- most callers have none. Every UPDATE both handlers send
+    is built here (handlers' upstreamTarget.send); it does no per-record-type
+    branching, the callers assemble the records. The registrar's own TTLs are
+    set earlier, against the classified instructions (handlers.applyRecordTTL),
+    not here.
 
 func CheckConsistentTTLs(records []dns.RR) error
     CheckConsistentTTLs implements the RFC 9665 S4 MUST for the SRP path:
@@ -2158,20 +2389,20 @@ const (
 type Coordinator struct {
 	// Has unexported fields.
 }
-    Coordinator resolves the authoritative server for a zone (SOA MNAME,
-    or a configured per-zone static override) and performs the two things both
-    handlers need against it: sending a signed UPDATE, and a live KEY-at-name
-    query (S3.3.3 FCFS).
+    Coordinator resolves the authoritative server for a zone (SOA MNAME, or a
+    configured static upstream) and performs the two things both handlers need
+    against it: sending a signed UPDATE, and a live KEY-at-name query (S3.3.3
+    FCFS).
 
     This is the extraction of what was previously
     handlers.DefaultUpstreamCoordinator's entire body. Both handlers/opcode5.go
     (RFC 9664) and handlers/srp_handler.go (RFC 9665) construct and hold a
     *Coordinator directly -- there is no per-package wrapper type.
 
-func NewCoordinator(logger *logging.Logger, bootstrapResolvers []string, staticUpstream map[string]string) *Coordinator
-    NewCoordinator creates a Coordinator. bootstrapResolvers falls back
-    to defaultBootstrapResolvers when empty. staticUpstream may be nil (no
-    overrides).
+func NewCoordinator(logger *logging.Logger, bootstrapResolvers []string, static *StaticUpstream) *Coordinator
+    NewCoordinator creates a Coordinator. bootstrapResolvers falls back to
+    defaultBootstrapResolvers when empty. static may be nil (discovery for every
+    name).
 
 func (c *Coordinator) QueryKeyAtName(ctx context.Context, zoneHint, name string) (AuthoritativeKeyState, []*dns.KEY, error)
     QueryKeyAtName is the real implementation of AuthoritativeKeyQuery (S3.3.3
@@ -2201,22 +2432,31 @@ func (c *Coordinator) QueryRRs(ctx context.Context, zoneHint, name string, rrTyp
     published (signer KEYs, duplicate registrations).
 
 func (c *Coordinator) ResolveAuthoritativeZone(ctx context.Context, zone string) (string, error)
-    ResolveAuthoritativeZone finds the zone cut (the name that actually has NS
-    records) for zone or one of its parents -- or, for a zone matching a static
-    upstream override, zone itself, with no NS lookup at all (the operator has
-    already asserted the zone cut by configuring the override).
+    ResolveAuthoritativeZone returns the apex of the zone holding zone -- the
+    zone an UPDATE for names under zone must name (discoverZone) -- or, when the
+    static upstream covers zone, its zone, with no lookup.
 
 func (c *Coordinator) ResolveSOAMasterServer(ctx context.Context, zone string) (server, effectiveZone string, err error)
-    ResolveSOAMasterServer returns the "host:port" of zone's SOA MNAME (walking
-    up to parent zones if the exact name has none) and the effective zone that
-    answered, or -- if zone exactly matches a configured static upstream -- that
-    override address with zone itself as the effective zone, skipping the lookup
-    entirely.
+    ResolveSOAMasterServer returns the "host:port" of the primary server (SOA
+    MNAME, port 53) of the zone holding zone, and that zone (discoverZone) --
+    or, when the static upstream covers zone, its address and zone, with no
+    lookup.
 
 func (c *Coordinator) SendUpdate(ctx context.Context, upstreamZone string, updateMsg *dns.Msg) (*dns.Msg, error)
     SendUpdate sends updateMsg (already built and signed) to upstreamZone's
     authoritative server, resolved via ResolveSOAMasterServer (so a static
-    override is honored), trying UDP then falling back to TCP.
+    override is honored), trying UDP then falling back to TCP. Each change of an
+    update the server accepts is logged at INFO (logAppliedChanges).
+
+type StaticUpstream struct {
+	Zone string // e.g. "srp.test."
+	Addr string // "host:port"
+}
+    StaticUpstream is a configured authoritative server for one zone: for Zone
+    and every name at or below it, the Coordinator sends to Addr and takes Zone
+    as the zone, with no discovery. Configuring it is the operator's assertion
+    that Addr serves Zone and that no zone cut lies below Zone -- the handlers'
+    "upstream" setting.
 
 ```
 
@@ -2236,7 +2476,7 @@ type Router struct {
     Router routes DNS requests based on opcode to appropriate handlers or
     forwarder.
 
-func NewRouter(opcodeMap map[uint8][]string, logger *logging.Logger, resolver *forward.Resolver) (*Router, error)
+func NewRouter(opcodeMap map[uint8][]string, logger *logging.Logger, resolver *forward.Resolver, requestTimeout time.Duration) (*Router, error)
     NewRouter creates a new router instance.
 
 func (r *Router) RegisterHandler(h handlers.Handler)
@@ -2254,6 +2494,9 @@ func (r *Router) Route(ctx context.Context, w dns.ResponseWriter, rMsg *dns.Msg)
 
 func (r *Router) Shutdown()
     Shutdown calls Shutdown on every registered handler exactly once.
+
+func (r *Router) Start()
+    Start calls Start on every registered handler exactly once.
 
 type Server struct {
 	// Has unexported fields.

@@ -1,7 +1,6 @@
 package lease
 
 import (
-	"context"
 	"testing"
 
 	"codeberg.org/miekg/dns"
@@ -27,11 +26,10 @@ func mustSRPRR(t *testing.T, spec string) dns.RR {
 // node keys for the caller to inspect further.
 func srpTree(t *testing.T, store *InMemoryLeaseStore) (hostNodeKey, serviceNodeKey string) {
 	t.Helper()
-	ctx := context.Background()
 	const zone = "srp.example.com."
 
 	hostKey := testKeyRR("myhost.srp.example.com.", "hostpubkey==")
-	if err := store.Register(ctx, hostKey, 7200, 1209600, zone); err != nil {
+	if err := store.Register(hostKey, 7200, 1209600, zone); err != nil {
 		t.Fatalf("register host: %v", err)
 	}
 	hostNodeKey = NodeKey(hostKey)
@@ -46,7 +44,7 @@ func srpTree(t *testing.T, store *InMemoryLeaseStore) (hostNodeKey, serviceNodeK
 	// Service instance: a KEY node parented to the host -- byte-identical key material
 	// (a name-scoped node identity, not a second key) per S3.2.5.1 / S4.4's note.
 	svcKey := testKeyRR("printer._ipps._tcp.srp.example.com.", "hostpubkey==")
-	if err := store.RegisterWithParent(ctx, hostNodeKey, svcKey, 7200, 1209600, zone); err != nil {
+	if err := store.RegisterWithParent(hostNodeKey, svcKey, 7200, 1209600, zone); err != nil {
 		t.Fatalf("register service instance: %v", err)
 	}
 	serviceNodeKey = NodeKey(svcKey)
@@ -205,17 +203,16 @@ func TestSRPShape_DroppedSubtypeSurvivesWipeThenReinsert(t *testing.T) {
 func TestSRPShape_TwoInstancesShareAPTROwnerName(t *testing.T) {
 	store := NewInMemoryManager()
 	defer store.Stop()
-	ctx := context.Background()
 	const zone = "srp.example.com."
 
 	hostKey := testKeyRR("myhost.srp.example.com.", "hostpubkey==")
-	if err := store.Register(ctx, hostKey, 7200, 1209600, zone); err != nil {
+	if err := store.Register(hostKey, 7200, 1209600, zone); err != nil {
 		t.Fatalf("register host: %v", err)
 	}
 	hostNodeKey := NodeKey(hostKey)
 
 	printerKey := testKeyRR("printer._ipps._tcp.srp.example.com.", "hostpubkey==")
-	if err := store.RegisterWithParent(ctx, hostNodeKey, printerKey, 7200, 1209600, zone); err != nil {
+	if err := store.RegisterWithParent(hostNodeKey, printerKey, 7200, 1209600, zone); err != nil {
 		t.Fatalf("register printer instance: %v", err)
 	}
 	printerNodeKey := NodeKey(printerKey)
@@ -226,7 +223,7 @@ func TestSRPShape_TwoInstancesShareAPTROwnerName(t *testing.T) {
 	}
 
 	frontDeskKey := testKeyRR("front desk._ipps._tcp.srp.example.com.", "hostpubkey==")
-	if err := store.RegisterWithParent(ctx, hostNodeKey, frontDeskKey, 7200, 1209600, zone); err != nil {
+	if err := store.RegisterWithParent(hostNodeKey, frontDeskKey, 7200, 1209600, zone); err != nil {
 		t.Fatalf("register front desk instance: %v", err)
 	}
 	frontDeskNodeKey := NodeKey(frontDeskKey)

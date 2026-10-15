@@ -37,10 +37,9 @@ func testKeyRR(name, label string) *dns.KEY {
 
 func TestLeaseExpiresAndRemoved(t *testing.T) {
 	h := newTestHandler()
-	ctx := context.Background()
 	key := testKeyRR("test.dev.zenr.io.", "AAAATESTKEY111=")
 
-	if err := h.leaseManager.Register(ctx, key, 1, 1, "dev.zenr.io."); err != nil {
+	if err := h.leaseManager.Register(key, 1, 1, "dev.zenr.io."); err != nil {
 		t.Fatalf("register lease: %v", err)
 	}
 	h.scheduleLeaseExpiry(lease.NodeKey(key))
@@ -62,10 +61,9 @@ func TestLeaseExpiresAndRemoved(t *testing.T) {
 
 func TestLeaseRenewedAndNotRemovedPrematurely(t *testing.T) {
 	h := newTestHandler()
-	ctx := context.Background()
 	key := testKeyRR("test.dev.zenr.io.", "AAAATESTKEY222=")
 
-	if err := h.leaseManager.Register(ctx, key, 1, 1, "dev.zenr.io."); err != nil {
+	if err := h.leaseManager.Register(key, 1, 1, "dev.zenr.io."); err != nil {
 		t.Fatalf("register lease: %v", err)
 	}
 	h.scheduleLeaseExpiry(lease.NodeKey(key))
@@ -73,7 +71,7 @@ func TestLeaseRenewedAndNotRemovedPrematurely(t *testing.T) {
 
 	time.Sleep(500 * time.Millisecond)
 
-	if err := h.leaseManager.Register(ctx, key, 2, 2, "dev.zenr.io."); err != nil {
+	if err := h.leaseManager.Register(key, 2, 2, "dev.zenr.io."); err != nil {
 		t.Fatalf("refresh lease: %v", err)
 	}
 	h.scheduleLeaseExpiry(lease.NodeKey(key))
@@ -91,11 +89,10 @@ func TestLeaseRenewedAndNotRemovedPrematurely(t *testing.T) {
 
 func TestRefreshRejectedForDifferentKeyAndExpires(t *testing.T) {
 	h := newTestHandler()
-	ctx := context.Background()
 	leaseKey := testKeyRR("test.dev.zenr.io.", "AAAATESTKEY333=")
 	otherKeySameName := testKeyRR("test.dev.zenr.io.", "BBBBOTHERKEY999=")
 
-	if err := h.leaseManager.Register(ctx, leaseKey, 1, 1, "dev.zenr.io."); err != nil {
+	if err := h.leaseManager.Register(leaseKey, 1, 1, "dev.zenr.io."); err != nil {
 		t.Fatalf("register lease: %v", err)
 	}
 	h.scheduleLeaseExpiry(lease.NodeKey(leaseKey))
@@ -117,10 +114,9 @@ func TestRefreshRejectedForDifferentKeyAndExpires(t *testing.T) {
 
 func TestAuthorizeKeyRefresh_SelfSignerCanRefreshOwnKey(t *testing.T) {
 	h := newTestHandler()
-	ctx := context.Background()
 	key := testKeyRR("test.dev.zenr.io.", "AAAASELF111=")
 
-	if err := h.leaseManager.Register(ctx, key, 60, 60, "dev.zenr.io."); err != nil {
+	if err := h.leaseManager.Register(key, 60, 60, "dev.zenr.io."); err != nil {
 		t.Fatalf("register lease: %v", err)
 	}
 
@@ -132,14 +128,13 @@ func TestAuthorizeKeyRefresh_SelfSignerCanRefreshOwnKey(t *testing.T) {
 
 func TestAuthorizeKeyRefresh_RegisteredParentCanRefreshChildKey(t *testing.T) {
 	h := newTestHandler()
-	ctx := context.Background()
 	parentKey := testKeyRR("test.dev.zenr.io.", "AAAAPARENT111=")
 	childKey := testKeyRR("client.test.dev.zenr.io.", "AAAACHILD111=")
 
-	if err := h.leaseManager.Register(ctx, parentKey, 60, 60, "dev.zenr.io."); err != nil {
+	if err := h.leaseManager.Register(parentKey, 60, 60, "dev.zenr.io."); err != nil {
 		t.Fatalf("register parent: %v", err)
 	}
-	if err := h.leaseManager.RegisterWithParent(ctx, lease.NodeKey(parentKey), childKey, 60, 60, "dev.zenr.io."); err != nil {
+	if err := h.leaseManager.RegisterWithParent(lease.NodeKey(parentKey), childKey, 60, 60, "dev.zenr.io."); err != nil {
 		t.Fatalf("register child under parent: %v", err)
 	}
 
@@ -156,11 +151,10 @@ func TestAuthorizeKeyRefresh_RegisteredParentCanRefreshChildKey(t *testing.T) {
 // node's owner.
 func TestAuthorizeKeyRefresh_ForeignSignerCannotHijackEvenWithMatchingRDATA(t *testing.T) {
 	h := newTestHandler()
-	ctx := context.Background()
 	victimKey := testKeyRR("test.dev.zenr.io.", "AAAAVICTIM111=")
 	attackerKey := testKeyRR("attacker.dev.zenr.io.", "AAAAATTACKER111=")
 
-	if err := h.leaseManager.Register(ctx, victimKey, 60, 60, "dev.zenr.io."); err != nil {
+	if err := h.leaseManager.Register(victimKey, 60, 60, "dev.zenr.io."); err != nil {
 		t.Fatalf("register victim: %v", err)
 	}
 
@@ -197,7 +191,7 @@ func TestUpdateHandler_FailsHardWithoutUpstream(t *testing.T) {
 			tc.strip(h)
 			key := testKeyRR("test.dev.zenr.io.", "AAAATESTKEYNOUPSTREAM=")
 			// Already past its lease, so its expiry has an upstream delete to send.
-			if err := h.leaseManager.Register(ctx, key, 0, 0, "dev.zenr.io."); err != nil {
+			if err := h.leaseManager.Register(key, 0, 0, "dev.zenr.io."); err != nil {
 				t.Fatalf("register key lease: %v", err)
 			}
 
@@ -252,7 +246,7 @@ func TestProcessExpiredLease_RetriesWithBackoff(t *testing.T) {
 	h.upstreamCoordinator = stub
 	ctx := context.Background()
 	key := testKeyRR("test.dev.zenr.io.", "AAAATESTKEYRETRY=")
-	if err := h.leaseManager.Register(ctx, key, 1, 1, "dev.zenr.io."); err != nil {
+	if err := h.leaseManager.Register(key, 1, 1, "dev.zenr.io."); err != nil {
 		t.Fatalf("register key lease: %v", err)
 	}
 	time.Sleep(1100 * time.Millisecond)
@@ -291,7 +285,7 @@ func TestProcessExpiredLease_ZoneResolutionFailureIsRetried(t *testing.T) {
 	key := testKeyRR("test.dev.zenr.io.", "AAAATESTKEYRESOLVE=")
 	data := &dns.TXT{Hdr: dns.Header{Name: "test.dev.zenr.io.", Class: dns.ClassINET, TTL: 60}}
 	data.TXT.Txt = []string{"payload"}
-	if err := h.leaseManager.Register(ctx, key, 1, 1, "dev.zenr.io."); err != nil {
+	if err := h.leaseManager.Register(key, 1, 1, "dev.zenr.io."); err != nil {
 		t.Fatalf("register key lease: %v", err)
 	}
 	if err := h.leaseManager.UpsertNonKEYRecords(lease.NodeKey(key), []dns.RR{data}, 1, "dev.zenr.io."); err != nil {
@@ -329,10 +323,10 @@ func keylessOwnerData(t *testing.T, store LeaseManager) string {
 	return owner
 }
 
-// After a restart, the reconciliation pass is what arms a store's timers. Data whose owner has
-// no KEY record is in no KEY node's timer, so the pass must arm its owner's too: otherwise the
-// data is never expired and stays published upstream.
-func TestReconcile_ArmsOwnerWithoutKEYAfterRestart(t *testing.T) {
+// After a restart, Start arms the timers of the store Setup loaded. Data whose owner has no KEY
+// record is in no KEY node's timer, so Start must arm its owner's too: otherwise the data is
+// never expired and stays published upstream.
+func TestStart_ArmsOwnerWithoutKEYAfterRestart(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "lease.json")
 	before := lease.NewInMemoryManager()
 	owner := keylessOwnerData(t, before)
@@ -349,11 +343,11 @@ func TestReconcile_ArmsOwnerWithoutKEYAfterRestart(t *testing.T) {
 	h.leaseManager = store
 	stub := &stubUpstreamCoordinator{resp: &dns.Msg{MsgHeader: dns.MsgHeader{Rcode: dns.RcodeSuccess}}}
 	h.upstreamCoordinator = stub
-	t.Cleanup(func() { h.timers.disarm(owner) })
+	t.Cleanup(h.Shutdown)
 
-	h.timers.reconcile(h.leaseManager, h.logger, h.expireFunc)
+	h.Start()
 	if !h.timers.armed(owner) {
-		t.Fatalf("reconciliation armed no timer for %s", owner)
+		t.Fatalf("Start armed no timer for %s", owner)
 	}
 	waitUntil(t, "the expired data to be deleted", func() bool { return h.leaseManager.GetNonKEYRecordSet(owner) == nil })
 	sent := stub.sentSnapshot()
@@ -438,7 +432,7 @@ func TestLeaseExpiry_RefusedUpdateForgetsNothing(t *testing.T) {
 	nodeKey := lease.NodeKey(key)
 	data := &dns.TXT{Hdr: dns.Header{Name: "test.dev.zenr.io.", Class: dns.ClassINET, TTL: 60}}
 	data.TXT.Txt = []string{"payload"}
-	if err := h.leaseManager.Register(ctx, key, 1, 1, "dev.zenr.io."); err != nil {
+	if err := h.leaseManager.Register(key, 1, 1, "dev.zenr.io."); err != nil {
 		t.Fatal(err)
 	}
 	if err := h.leaseManager.UpsertNonKEYRecords(nodeKey, []dns.RR{data}, 3600, "dev.zenr.io."); err != nil {
@@ -482,10 +476,10 @@ func TestLeaseExpiry_KEYTakesSubtreeInOneUpdate(t *testing.T) {
 	parentKey, childKey := lease.NodeKey(parent), lease.NodeKey(child)
 	data := &dns.TXT{Hdr: dns.Header{Name: "child.dev.zenr.io.", Class: dns.ClassINET, TTL: 60}}
 	data.TXT.Txt = []string{"payload"}
-	if err := h.leaseManager.Register(ctx, parent, 1, 1, "dev.zenr.io."); err != nil {
+	if err := h.leaseManager.Register(parent, 1, 1, "dev.zenr.io."); err != nil {
 		t.Fatal(err)
 	}
-	if err := h.leaseManager.RegisterWithParent(ctx, parentKey, child, 3600, 3600, "dev.zenr.io."); err != nil {
+	if err := h.leaseManager.RegisterWithParent(parentKey, child, 3600, 3600, "dev.zenr.io."); err != nil {
 		t.Fatal(err)
 	}
 	if err := h.leaseManager.UpsertNonKEYRecords(childKey, []dns.RR{data}, 3600, "dev.zenr.io."); err != nil {
@@ -525,7 +519,7 @@ func TestCaseCDelete_TakesSubtreeInOneUpdate(t *testing.T) {
 	childKey := lease.NodeKey(child)
 	data := &dns.TXT{Hdr: dns.Header{Name: "child.test.dev.zenr.io.", Class: dns.ClassINET, TTL: 60}}
 	data.TXT.Txt = []string{"payload"}
-	if err := h.leaseManager.RegisterWithParent(context.Background(), signerKey, child, 3600, 3600, "dev.zenr.io."); err != nil {
+	if err := h.leaseManager.RegisterWithParent(signerKey, child, 3600, 3600, "dev.zenr.io."); err != nil {
 		t.Fatal(err)
 	}
 	if err := h.leaseManager.UpsertNonKEYRecords(childKey, []dns.RR{data}, 3600, "dev.zenr.io."); err != nil {

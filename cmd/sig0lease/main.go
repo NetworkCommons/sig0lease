@@ -200,8 +200,9 @@ func newHandler(moduleName string, cfg *config.Config, logger *logging.Logger) (
 // build from a "storage" section creates the snapshot's directory, writes the snapshot straight
 // back and keeps saving it, so each handler is Setup with its store read once instead
 // (handlers.LeaseStoreFromConfig, read-only), passed as "lease_manager". A dump never changes
-// the snapshot of a proxy running beside it. Setup's other effect is a reconciliation ticker
-// whose first tick, 30s away, a dump never reaches.
+// the snapshot of a proxy running beside it. Setup arms no expiry timer and starts no ticker:
+// lease expiry begins with Start, which only serving calls, so nothing in a dumped store expires
+// or is written upstream.
 func dumpLeases(w io.Writer, cfg *config.Config, level string, logger *logging.Logger) error {
 	printed := false
 	for _, moduleName := range enabledModules(cfg) {

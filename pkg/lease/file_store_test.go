@@ -1,7 +1,6 @@
 package lease
 
 import (
-	"context"
 	"os"
 	"path/filepath"
 	"testing"
@@ -72,12 +71,11 @@ func TestFileLeaseStore_ConstructorMkdirFailureIsHardError(t *testing.T) {
 
 func TestFileLeaseStore_ConstructorLoadsExistingSnapshot(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "snapshot.json")
-	ctx := context.Background()
 
 	seed := NewInMemoryManager()
 	defer seed.Stop()
 	key := testKeyRR("preloaded.dev.zenr.io.", "AAAAPRELOAD=")
-	if err := seed.Register(ctx, key, 300, 300, "dev.zenr.io."); err != nil {
+	if err := seed.Register(key, 300, 300, "dev.zenr.io."); err != nil {
 		t.Fatalf("seed register: %v", err)
 	}
 	if err := seed.SaveSnapshot(path); err != nil {
@@ -108,7 +106,6 @@ func TestFileLeaseStore_ConstructorCorruptFileHardFails(t *testing.T) {
 
 func TestFileLeaseStore_PeriodicSave_PersistsAcrossRestart(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "snapshot.json")
-	ctx := context.Background()
 
 	store, err := NewFileLeaseStore(path, 20*time.Millisecond, nil)
 	if err != nil {
@@ -116,7 +113,7 @@ func TestFileLeaseStore_PeriodicSave_PersistsAcrossRestart(t *testing.T) {
 	}
 
 	key := testKeyRR("restart.dev.zenr.io.", "AAAARESTART=")
-	if err := store.Register(ctx, key, 300, 300, "dev.zenr.io."); err != nil {
+	if err := store.Register(key, 300, 300, "dev.zenr.io."); err != nil {
 		t.Fatalf("register: %v", err)
 	}
 
@@ -153,7 +150,6 @@ func TestFileLeaseStore_PeriodicSave_PersistsAcrossRestart(t *testing.T) {
 
 func TestFileLeaseStore_StopPerformsFinalSave(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "snapshot.json")
-	ctx := context.Background()
 
 	// Interval longer than the test itself, so only Stop()'s final
 	// synchronous save could possibly have written the mutation below.
@@ -163,7 +159,7 @@ func TestFileLeaseStore_StopPerformsFinalSave(t *testing.T) {
 	}
 
 	key := testKeyRR("finalsave.dev.zenr.io.", "AAAAFINALSAVE=")
-	if err := store.Register(ctx, key, 300, 300, "dev.zenr.io."); err != nil {
+	if err := store.Register(key, 300, 300, "dev.zenr.io."); err != nil {
 		t.Fatalf("register: %v", err)
 	}
 	store.Stop()

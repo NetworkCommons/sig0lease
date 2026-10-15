@@ -1,7 +1,6 @@
 package main
 
 import (
-	"context"
 	"errors"
 	"io/fs"
 	"os"
@@ -118,7 +117,7 @@ func TestDumpLeases_WritesNothing(t *testing.T) {
 		t.Fatal(err)
 	}
 	store := lease.NewInMemoryManager()
-	if err := store.Register(context.Background(), key.PublicKey, 3600, 7200, "dev.zenr.io."); err != nil {
+	if err := store.Register(key.PublicKey, 3600, 7200, "dev.zenr.io."); err != nil {
 		t.Fatal(err)
 	}
 	if err := store.SaveSnapshot(updatePath); err != nil {
