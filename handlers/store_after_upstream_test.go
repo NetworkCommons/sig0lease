@@ -62,7 +62,7 @@ func TestHandle_StoreWriteFailingAfterUpstreamPanics(t *testing.T) {
 	t.Run("update_handler", func(t *testing.T) {
 		h, stub, signer := newUpdateHandlerForHandle(t)
 		h.leaseManager = failingUpsertStore{leasepkg.NewInMemoryManager()}
-		req := buildSignedLeaseRegistrationForHandleTest(t, signer, "test.dev.zenr.io.", 120, 120)
+		req := buildSignedLeaseUpdateForHandleTest(t, signer, "test.dev.zenr.io.", leasepkg.Encode8Byte(120, 120), true)
 
 		got := recoverFrom(func() { h.Handle(context.Background(), stubResponseWriter{}, req) })
 		if msg, _ := got.(string); !strings.Contains(msg, want) {
@@ -114,7 +114,7 @@ func TestHandle_RefreshWithRecordOfAnotherKeyRefusedBeforeForwarding(t *testing.
 		t.Fatalf("upsert the other key's record: %v", err)
 	}
 
-	req := buildSignedLeaseRegistrationForHandleTest(t, signer, "test.dev.zenr.io.", 120, 120)
+	req := buildSignedLeaseUpdateForHandleTest(t, signer, "test.dev.zenr.io.", leasepkg.Encode8Byte(120, 120), true)
 	res := h.Handle(context.Background(), stubResponseWriter{}, req)
 	if res == nil || res.Message == nil || res.Message.Rcode != dns.RcodeRefused {
 		t.Fatalf("expected REFUSED, got %+v", res)

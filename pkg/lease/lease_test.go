@@ -30,9 +30,11 @@ func TestEncodeDecode4Byte(t *testing.T) {
 		t.Fatalf("Decode() error = %v", err)
 	}
 
-	// With 8-byte always mode, Encode4Byte encodes 8 bytes with KEY-LEASE=0,
-	// so Decode will produce KeyLease=&0 (not nil).
-	if opt2.Lease != 7200 || opt2.KeyLease == nil || *opt2.KeyLease != 0 {
+	// The 4-byte variant goes on the wire as 4 bytes and comes back without a KEY-LEASE.
+	if erfc := opt.Options[0].(*dns.ERFC3597); len(erfc.Code) != 2*4 {
+		t.Errorf("option data = %s, want 4 bytes", erfc.Code)
+	}
+	if opt2.Lease != 7200 || opt2.KeyLease != nil {
 		t.Errorf("Round-trip failed: got Lease=%d, KeyLease=%v", opt2.Lease, opt2.KeyLease)
 	}
 }

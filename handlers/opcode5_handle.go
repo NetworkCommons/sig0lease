@@ -45,22 +45,12 @@ func (h *UpdateHandler) Handle(ctx context.Context, w dns.ResponseWriter, r *dns
 
 	h.logger.Debugf("UPDATE for zone: %s (class: %d)", zone, class)
 
-	leaseDuration, keyLeaseDuration, err := h.parseLease(r)
+	requestedLease, rcode, err := h.decodeLease(r)
 	if err != nil {
 		h.logger.Debugf("Lease parsing failed: %v", err)
-		msg := makeErrorResponse(r, uint16(16), fmt.Sprintf("invalid lease: %v", err))
+		msg := makeErrorResponse(r, rcode, fmt.Sprintf("invalid lease: %v", err))
 		return NewErrorResult(msg, fmt.Sprintf("lease parsing failed: %v", err), err)
 	}
-
-	originalLeaseDuration := leaseDuration
-	originalKeyLeaseDuration := keyLeaseDuration
-	leaseDuration, keyLeaseDuration = h.LeasePolicy.clamp(leaseDuration, keyLeaseDuration)
-	if leaseDuration != originalLeaseDuration || keyLeaseDuration != originalKeyLeaseDuration {
-		h.logger.Debugf("Lease policy clamped request durations: lease=%d->%d key-lease=%d->%d",
-			originalLeaseDuration, leaseDuration, originalKeyLeaseDuration, keyLeaseDuration)
-	}
-
-	h.logger.Debugf("Parsed lease duration: %d seconds key-lease=%d", leaseDuration, keyLeaseDuration)
 
 	updateKeyRRs, updateOtherRRs, err := extractUpdateRecords(r, h.blacklistedTypes)
 	if err != nil {
@@ -68,6 +58,30 @@ func (h *UpdateHandler) Handle(ctx context.Context, w dns.ResponseWriter, r *dns
 		msg := makeErrorResponse(r, dns.RcodeFormatError, err.Error())
 		return NewErrorResult(msg, err.Error(), err)
 	}
+
+	leaseDuration, keyLeaseDuration := requestedLeases(requestedLease, len(updateKeyRRs) > 0, len(updateOtherRRs) > 0)
+	if err := h.checkLeaseMinimums(leaseDuration, keyLeaseDuration); err != nil {
+		h.logger.Debugf("Lease refused: %v", err)
+		msg := makeErrorResponse(r, dns.RcodeRefused, err.Error())
+		return NewErrorResult(msg, fmt.Sprintf("lease refused: %v", err), err)
+	}
+
+	originalLeaseDuration := leaseDuration
+	originalKeyLeaseDuration := keyLeaseDuration
+	leaseDuration, keyLeaseDuration = h.LeasePolicy.clamp(leaseDuration, keyLeaseDuration)
+	if requestedLease.KeyLease == nil && leaseDuration != 0 && keyLeaseDuration != 0 {
+		// A 4-byte request gets one value back for its KEYs and its other records, which
+		// expire together (RFC 9664 S4); clamp left LEASE <= KEY-LEASE, so the KEYs get the
+		// LEASE. Setup refuses a lease_policy under which that falls below min_key_lease_sec.
+		keyLeaseDuration = leaseDuration
+	}
+	if leaseDuration != originalLeaseDuration || keyLeaseDuration != originalKeyLeaseDuration {
+		h.logger.Debugf("Lease policy clamped request durations: lease=%d->%d key-lease=%d->%d",
+			originalLeaseDuration, leaseDuration, originalKeyLeaseDuration, keyLeaseDuration)
+	}
+	grantedLease := grantedLeaseOption(requestedLease, leaseDuration, keyLeaseDuration)
+
+	h.logger.Debugf("Parsed lease duration: %d seconds key-lease=%d", leaseDuration, keyLeaseDuration)
 
 	h.logger.Infof("UPDATE request for zone %s: LEASE=%d KEY-LEASE=%d RRs=%s",
 		zone, leaseDuration, keyLeaseDuration, summarizeRRTypes(updateKeyRRs, updateOtherRRs))
@@ -449,7 +463,7 @@ func (h *UpdateHandler) Handle(ctx context.Context, w dns.ResponseWriter, r *dns
 		if len(keysToDelete) == 0 && len(recordsToDelete) == 0 {
 			// Nothing locally managed to delete, so there is nothing to
 			// confirm upstream either: just report the notes.
-			return NewProcessedResult(h.buildSuccessResponse(r, allNotes, leaseDuration, keyLeaseDuration))
+			return NewProcessedResult(h.buildSuccessResponse(r, allNotes, grantedLease))
 		}
 
 		// One UPDATE deletes the records named here and, for each named KEY, everything at and
@@ -488,7 +502,7 @@ func (h *UpdateHandler) Handle(ctx context.Context, w dns.ResponseWriter, r *dns
 			h.logger.Debugf("Deleted key for %s (KEY-LEASE=0, LEASE=0)", keyRR.Hdr.Name)
 		}
 
-		return NewProcessedResult(h.buildSuccessResponse(r, allNotes, leaseDuration, keyLeaseDuration))
+		return NewProcessedResult(h.buildSuccessResponse(r, allNotes, grantedLease))
 	} else if keyLeaseDuration != 0 && leaseDuration == 0 {
 		// Case D: KEY-only registration/refresh with optional non-KEY deletes.
 		if len(updateKeyRRs) == 0 {
@@ -637,7 +651,7 @@ func (h *UpdateHandler) Handle(ctx context.Context, w dns.ResponseWriter, r *dns
 	}
 
 	h.logger.Debugf("Sending success response (%d status notes)", len(allNotes))
-	return NewProcessedResult(h.buildSuccessResponse(r, allNotes, leaseDuration, keyLeaseDuration))
+	return NewProcessedResult(h.buildSuccessResponse(r, allNotes, grantedLease))
 }
 
 // requestLockSet returns the lease-store nodes Handle locks for one request
@@ -669,11 +683,12 @@ func (h *UpdateHandler) requestLockSet(leaseDuration, keyLeaseDuration uint32, s
 	}
 }
 
-// buildSuccessResponse builds a successful UPDATE response: leaseResponse (the LEASE and
-// KEY-LEASE actually applied after LeasePolicy clamping, so the client can detect if the
-// proxy granted less than what was requested for either value), plus the status notes.
-func (h *UpdateHandler) buildSuccessResponse(r *dns.Msg, notes []string, leaseDuration, keyLeaseDuration uint32) *dns.Msg {
-	resp := leaseResponse(r, leaseDuration, keyLeaseDuration, h.logger)
+// buildSuccessResponse builds a successful UPDATE response: leaseResponse with granted (the
+// LEASE and KEY-LEASE actually applied after LeasePolicy clamping, so the client can detect if
+// the proxy granted less than what was requested for either value; see grantedLeaseOption),
+// plus the status notes.
+func (h *UpdateHandler) buildSuccessResponse(r *dns.Msg, notes []string, granted *leasepkg.LeaseOption) *dns.Msg {
+	resp := leaseResponse(r, granted)
 	appendStatusNotes(resp, notes)
 	return resp
 }

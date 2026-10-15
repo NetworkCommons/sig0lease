@@ -165,7 +165,7 @@ func TestHandle_WritesRecordTTL(t *testing.T) {
 			}
 			h.upstreamCoordinator = stub
 
-			req := buildSignedLeaseRegistrationForHandleTest(t, loaded, "test.dev.zenr.io.", tc.lease, tc.keyLease)
+			req := buildSignedLeaseUpdateForHandleTest(t, loaded, "test.dev.zenr.io.", leasepkg.Encode8Byte(tc.lease, tc.keyLease), true)
 			res := h.Handle(context.Background(), stubResponseWriter{}, req)
 			if res == nil || res.Message == nil || res.Message.Rcode != dns.RcodeSuccess {
 				t.Fatalf("expected success, got %+v", res)
@@ -214,7 +214,7 @@ func TestHandle_CaseB_ReRegisteredKEYGetsRecordTTL(t *testing.T) {
 	}
 	h.upstreamCoordinator = stub
 
-	req := buildSignedNonKeyOnlyLeaseUpdateForHandleTest(t, loaded, "host.test.dev.zenr.io.", 3600, false)
+	req := buildSignedLeaseUpdateForHandleTest(t, loaded, "host.test.dev.zenr.io.", leasepkg.Encode8Byte(3600, 0), false)
 	res := h.Handle(context.Background(), stubResponseWriter{}, req)
 	if res == nil || res.Message == nil || res.Message.Rcode != dns.RcodeSuccess {
 		t.Fatalf("expected success, got %+v", res)

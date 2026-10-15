@@ -58,7 +58,7 @@ type UpstreamCoordinator interface {
 //   - Future SRP support
 type UpdateHandler struct {
 	leaseHandler[UpstreamCoordinator]
-	prefer4ByteVariant bool // When true, use 4-byte variant (legacy); default false uses 8-byte always.
+	prefer4ByteVariant bool // prefer_4byte_variant: accept 4-byte Update Lease requests (answered in kind); default false refuses them.
 	// AllowOnlineKeyRegistration controls whether a signer resolved only via
 	// authoritative DNS (not in the lease store, not present anywhere in the
 	// request) may authorize registration of new KEY RRs. Such a signer can

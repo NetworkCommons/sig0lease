@@ -127,7 +127,9 @@ Clients include an UPDATE-LEASE option (EDNS option code 2) in their UPDATE pack
 encodings are supported:
 
 - **8-byte variant (default):** 4 bytes encode the LEASE value (lease duration for non-KEY RRs), followed by 4 bytes encoding the KEY-LEASE value (lease duration for KEY RRs). Both are big-endian `uint32` values.
-- **4-byte variant (legacy):** 4 bytes encode a single LEASE value used for both KEY and non-KEY RRs. Off by default; enabled per handler via `prefer_4byte_variant`.
+- **4-byte variant (legacy):** 4 bytes encode a single LEASE value used for both KEY and non-KEY RRs. macOS's mDNSResponder sends it. Accepted only with `prefer_4byte_variant: true` on the handler, and `REFUSED` otherwise. When accepted, the one value is the KEY-LEASE if the Update section has KEY RRs, and the LEASE if it has other records, and 0 for a kind it lacks: Case A with both kinds, B with non-KEY records only, D with KEYs only, C for 0 (`requestedLeases`). After clamping, the KEYs get the granted LEASE, since RFC 9664 S4 has them expire together. The reply carries that one value in the 4-byte variant, the only one mDNSResponder reads (`grantedLeaseOption`). The proxy refuses to start with `prefer_4byte_variant: true` and `min_key_lease_sec` above `max_rr_lease_sec`, since no single lease would then fit both bounds.
+
+A bad option is answered with a header RCODE: `FORMERR` for a length other than 4 or 8 or a LEASE above the KEY-LEASE, `REFUSED` for a 4-byte option without `prefer_4byte_variant` and for a duration below the policy minimum. Extended RCODEs (16 and up, their high bits carried in the OPT RR) are avoided because a requester that reads only the header, as mDNSResponder does, takes them for NOERROR.
 
 LEASE and KEY-LEASE together select one of four behavioral cases, detailed rule-by-rule in
 "Behavior Specification" below:
