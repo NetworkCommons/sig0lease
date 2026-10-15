@@ -72,7 +72,10 @@ func (stubResponseWriter) Close() error              { return nil }
 func (stubResponseWriter) Session() *dns.Session     { return nil }
 func (stubResponseWriter) Hijack()                   {}
 
-func buildSignedLeaseRegistrationForHandleTest(t *testing.T, signerKey *keyrec.LoadedKey, leaseOwner string, leaseDuration uint32, keyLeaseDuration uint32) *dns.Msg {
+// buildSignedLeaseUpdateForHandleTest builds an RFC 9664 update signed by signerKey: the
+// signer's own KEY RR when includeSignerKeyInUpdate, a TXT at leaseOwner, and lo as its Update
+// Lease option, in whichever variant lo is.
+func buildSignedLeaseUpdateForHandleTest(t *testing.T, signerKey *keyrec.LoadedKey, leaseOwner string, lo *leasepkg.LeaseOption, includeSignerKeyInUpdate bool) *dns.Msg {
 	t.Helper()
 
 	msg := dns.NewMsg("test.dev.zenr.io.", dns.TypeSOA)
@@ -81,9 +84,11 @@ func buildSignedLeaseRegistrationForHandleTest(t *testing.T, signerKey *keyrec.L
 	}
 	msg.Opcode = dns.OpcodeUpdate
 
-	keyRR := signerKey.PublicKey.Clone().(*dns.KEY)
-	keyRR.Hdr.Name = signerKey.PublicKey.Hdr.Name
-	msg.Ns = append(msg.Ns, keyRR)
+	if includeSignerKeyInUpdate {
+		keyRR := signerKey.PublicKey.Clone().(*dns.KEY)
+		keyRR.Hdr.Name = signerKey.PublicKey.Hdr.Name
+		msg.Ns = append(msg.Ns, keyRR)
+	}
 
 	txt := &dns.TXT{Hdr: dns.Header{Name: leaseOwner, Class: dns.ClassINET, TTL: 60}}
 	txt.TXT.Txt = []string{"payload"}
@@ -91,8 +96,7 @@ func buildSignedLeaseRegistrationForHandleTest(t *testing.T, signerKey *keyrec.L
 
 	opt := &dns.OPT{Hdr: dns.Header{Name: "."}}
 	opt.SetUDPSize(uint16(dns.DefaultMsgSize))
-	leaseOpt := leasepkg.Encode8Byte(leaseDuration, keyLeaseDuration)
-	if err := leaseOpt.Encode(opt); err != nil {
+	if err := lo.Encode(opt); err != nil {
 		t.Fatalf("encode lease option: %v", err)
 	}
 	msg.Extra = append(msg.Extra, opt)
@@ -162,40 +166,6 @@ func buildSignedUpdateWithSignerKeyInAdditionalForTest(t *testing.T, signerKey *
 
 	keyRR := signerKey.PublicKey.Clone().(*dns.KEY)
 	msg.Extra = append(msg.Extra, keyRR)
-
-	signed, err := sig0.SignMessage(msg, signerKey.PublicKey, signerKey.PrivateKey)
-	if err != nil {
-		t.Fatalf("sign message: %v", err)
-	}
-	return signed
-}
-
-func buildSignedNonKeyOnlyLeaseUpdateForHandleTest(t *testing.T, signerKey *keyrec.LoadedKey, leaseOwner string, leaseDuration uint32, includeSignerKeyInUpdate bool) *dns.Msg {
-	t.Helper()
-
-	msg := dns.NewMsg("test.dev.zenr.io.", dns.TypeSOA)
-	if msg == nil {
-		t.Fatalf("expected message")
-	}
-	msg.Opcode = dns.OpcodeUpdate
-
-	if includeSignerKeyInUpdate {
-		keyRR := signerKey.PublicKey.Clone().(*dns.KEY)
-		keyRR.Hdr.Name = signerKey.PublicKey.Hdr.Name
-		msg.Ns = append(msg.Ns, keyRR)
-	}
-
-	txt := &dns.TXT{Hdr: dns.Header{Name: leaseOwner, Class: dns.ClassINET, TTL: 60}}
-	txt.TXT.Txt = []string{"payload"}
-	msg.Ns = append(msg.Ns, txt)
-
-	opt := &dns.OPT{Hdr: dns.Header{Name: "."}}
-	opt.SetUDPSize(uint16(dns.DefaultMsgSize))
-	leaseOpt := leasepkg.Encode8Byte(leaseDuration, 0)
-	if err := leaseOpt.Encode(opt); err != nil {
-		t.Fatalf("encode lease option: %v", err)
-	}
-	msg.Extra = append(msg.Extra, opt)
 
 	signed, err := sig0.SignMessage(msg, signerKey.PublicKey, signerKey.PrivateKey)
 	if err != nil {
@@ -426,7 +396,7 @@ func TestHandle_DoesNotPersistLeaseWhenUpstreamRejectsUpdate(t *testing.T) {
 	}
 
 	leaseOwner := "test.dev.zenr.io."
-	req := buildSignedLeaseRegistrationForHandleTest(t, loaded, leaseOwner, 120, 120)
+	req := buildSignedLeaseUpdateForHandleTest(t, loaded, leaseOwner, leasepkg.Encode8Byte(120, 120), true)
 	if got := h.leaseManager.FindByName(leaseOwner); len(got) != 0 {
 		t.Fatalf("expected empty lease store before request, got %+v", got)
 	}
@@ -475,7 +445,7 @@ func TestHandle_ReRegistersManagedKeyWhenAuthoritativeFQDNIsMissing(t *testing.T
 	}
 
 	leaseOwner := "test.dev.zenr.io."
-	req := buildSignedLeaseRegistrationForHandleTest(t, loaded, leaseOwner, 120, 120)
+	req := buildSignedLeaseUpdateForHandleTest(t, loaded, leaseOwner, leasepkg.Encode8Byte(120, 120), true)
 
 	res := h.Handle(context.Background(), stubResponseWriter{}, req)
 	if res == nil || res.Message == nil {
@@ -538,7 +508,7 @@ func TestHandle_RefreshPreservesOriginalRegisteredAt(t *testing.T) {
 
 	time.Sleep(5 * time.Millisecond)
 
-	req := buildSignedLeaseRegistrationForHandleTest(t, loaded, "test.dev.zenr.io.", 120, 120)
+	req := buildSignedLeaseUpdateForHandleTest(t, loaded, "test.dev.zenr.io.", leasepkg.Encode8Byte(120, 120), true)
 	res := h.Handle(context.Background(), stubResponseWriter{}, req)
 	if res == nil || res.Message == nil {
 		t.Fatalf("expected response message")
@@ -592,7 +562,7 @@ func TestHandle_NonKeyOnlyLeaseWithoutUpdateKeyRR_RegistersNonKeyRRs(t *testing.
 	h.upstreamCoordinator = &stubUpstreamCoordinator{query: authoritative, resp: &dns.Msg{MsgHeader: dns.MsgHeader{Rcode: dns.RcodeSuccess}}}
 
 	owner := "host.test.dev.zenr.io."
-	req := buildSignedNonKeyOnlyLeaseUpdateForHandleTest(t, loaded, owner, 120, false)
+	req := buildSignedLeaseUpdateForHandleTest(t, loaded, owner, leasepkg.Encode8Byte(120, 0), false)
 	res := h.Handle(context.Background(), stubResponseWriter{}, req)
 	if res == nil || res.Message == nil {
 		t.Fatalf("expected response message")
@@ -639,7 +609,7 @@ func TestHandle_NonKeyOnlyLeaseRejectsUpdateKeyRR(t *testing.T) {
 	h.upstreamCoordinator = &stubUpstreamCoordinator{query: authoritative, resp: &dns.Msg{MsgHeader: dns.MsgHeader{Rcode: dns.RcodeSuccess}}}
 
 	owner := "host.test.dev.zenr.io."
-	req := buildSignedNonKeyOnlyLeaseUpdateForHandleTest(t, loaded, owner, 120, true)
+	req := buildSignedLeaseUpdateForHandleTest(t, loaded, owner, leasepkg.Encode8Byte(120, 0), true)
 	res := h.Handle(context.Background(), stubResponseWriter{}, req)
 	if res == nil || res.Message == nil {
 		t.Fatalf("expected response message")

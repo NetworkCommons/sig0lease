@@ -85,22 +85,26 @@ func updateResponse(req *dns.Msg, rcode uint16) *dns.Msg {
 }
 
 // leaseResponse is the NOERROR reply to a lease update: updateResponse plus the Update Lease
-// option carrying the LEASE and KEY-LEASE actually granted (RFC 9664 S4), so the requester
-// refreshes on those rather than on what it asked for.
+// option granted, carrying the LEASE and KEY-LEASE actually granted (RFC 9664 S4), so the
+// requester refreshes on those rather than on what it asked for. granted is in the variant the
+// request used: RFC 9664 S4 answers a 4-byte request with a 4-byte option, and mDNSResponder,
+// which sends one, reads no other.
 //
 // The option goes in resp.Pseudo, from which the dns library builds the reply's one OPT RR,
 // together with the EDNS fields of the header copied from req. An OPT RR added to resp.Extra
 // instead, as this code once did, became a second OPT RR whenever req used EDNS -- which every
 // lease update does -- and RFC 6891 S6.1.1 allows one. mDNSResponder's srp-client then ignored
 // the granted lease, since it reads it only from a reply whose one record is the OPT RR.
-func leaseResponse(req *dns.Msg, lease, keyLease uint32, logger *logging.Logger) *dns.Msg {
+func leaseResponse(req *dns.Msg, granted *leasepkg.LeaseOption) *dns.Msg {
 	resp := updateResponse(req, dns.RcodeSuccess)
 	resp.Authoritative = true
 	resp.UDPSize = uint16(dns.DefaultMsgSize)
 
 	opt := &dns.OPT{}
-	if err := leasepkg.Encode8Byte(lease, keyLease).Encode(opt); err != nil {
-		logger.Debugf("failed to encode response lease option: %v", err)
+	if err := granted.Encode(opt); err != nil {
+		// Encode only refuses LEASE above KEY-LEASE, which LeasePolicy.clamp rules out for
+		// every lease a handler grants.
+		panic(fmt.Sprintf("leaseResponse: granted lease %+v: %v", granted, err))
 	}
 	for _, option := range opt.Options {
 		resp.Pseudo = append(resp.Pseudo, option)

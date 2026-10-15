@@ -902,8 +902,10 @@ func (h *UpdateHandler) Setup(cfg map[string]any) error
     handlers read (upstream_zone, keystore_dir, upstream, bootstrap_resolvers,
     lease_policy, record_ttl_sec, lease_manager or storage; see
     leaseHandler.setup), and these of its own:
-      - "prefer_4byte_variant": Enable 4-byte variant for backward compatibility
-        [OPTIONAL, defaults to false]
+      - "prefer_4byte_variant": Accept requests whose Update Lease is the 4-byte
+        variant, one lease for every record, as older requesters such as
+        macOS's mDNSResponder send; they are REFUSED otherwise [OPTIONAL,
+        defaults to false]
       - "allow_online_key_registration": Allow a signer resolved only via
         authoritative DNS (not lease-managed, not present in the request) to
         register new KEY RRs [OPTIONAL, defaults to false]
@@ -1643,9 +1645,9 @@ func DecodeOption(erfc *dns.ERFC3597) (*LeaseOption, error)
     FindOption) into a LeaseOption.
 
 func Encode4Byte(lease uint32) *LeaseOption
-    Encode4Byte creates a LeaseOption with only LEASE (4-byte variant).
-    Deprecated: For backward compatibility when 4-byte variant is enabled via
-    config. The 8-byte variant is now the default for all lease requests.
+    Encode4Byte creates a LeaseOption with only LEASE (4-byte variant): one
+    duration for KEY and non-KEY records alike. Requests use the 8-byte variant;
+    a server answers a 4-byte request with this one (RFC 9664 S4).
 
 func Encode8Byte(lease, keyLease uint32) *LeaseOption
     Encode8Byte creates a LeaseOption with both LEASE and KEY-LEASE (8-byte
@@ -1659,9 +1661,9 @@ func (lo *LeaseOption) Decode(opt *dns.OPT) error
     Decode parses a LeaseOption from an OPT RR.
 
 func (lo *LeaseOption) Encode(opt *dns.OPT) error
-    Encode encodes the LeaseOption into an OPT RR per RFC 6891. The 8-byte
-    variant is always used (LEASE + KEY-LEASE). When KeyLease == nil, KEY-LEASE
-    is set to defaultKeyLease (0).
+    Encode encodes the LeaseOption into an OPT RR per RFC 6891, in its own
+    variant: 8 bytes (LEASE + KEY-LEASE) when KeyLease is set, 4 bytes (LEASE)
+    when it is nil.
 
 func (lo *LeaseOption) Validate() error
     Validate checks that the lease values are valid.

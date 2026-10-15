@@ -18,29 +18,6 @@ import (
 	"github.com/NetworkCommons/sig0lease/pkg/sig0"
 )
 
-func TestParseLeaseRegistrationIncludesKeyLease(t *testing.T) {
-	h := newTestHandler()
-	msg := dns.NewMsg("test.dev.zenr.io.", dns.TypeSOA)
-	if msg == nil {
-		t.Fatalf("expected message")
-	}
-	opt := &dns.OPT{Hdr: dns.Header{Name: "."}}
-	opt.SetUDPSize(uint16(dns.DefaultMsgSize))
-	l := lease.Encode8Byte(120, 600)
-	if err := l.Encode(opt); err != nil {
-		t.Fatalf("encode lease: %v", err)
-	}
-	msg.Extra = append(msg.Extra, opt)
-
-	gotLease, gotKeyLease, err := h.parseLease(msg)
-	if err != nil {
-		t.Fatalf("parse lease: %v", err)
-	}
-	if gotLease != 120 || gotKeyLease != 600 {
-		t.Fatalf("unexpected lease values lease=%d key-lease=%d", gotLease, gotKeyLease)
-	}
-}
-
 func TestExtractUpdateRecordsAcceptsMultipleKeys(t *testing.T) {
 	msg := dns.NewMsg("test.dev.zenr.io.", dns.TypeSOA)
 	if msg == nil {

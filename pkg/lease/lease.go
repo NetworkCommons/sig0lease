@@ -26,9 +26,9 @@ type LeaseOption struct {
 	KeyLease *uint32 // Optional KEY-LEASE value (nil for 4-byte variant)
 }
 
-// Encode4Byte creates a LeaseOption with only LEASE (4-byte variant).
-// Deprecated: For backward compatibility when 4-byte variant is enabled via config.
-// The 8-byte variant is now the default for all lease requests.
+// Encode4Byte creates a LeaseOption with only LEASE (4-byte variant): one duration for KEY and
+// non-KEY records alike. Requests use the 8-byte variant; a server answers a 4-byte request
+// with this one (RFC 9664 S4).
 func Encode4Byte(lease uint32) *LeaseOption {
 	return &LeaseOption{Lease: lease, KeyLease: nil}
 }
@@ -46,25 +46,17 @@ func (lo *LeaseOption) Validate() error {
 	return nil
 }
 
-// Encode encodes the LeaseOption into an OPT RR per RFC 6891.
-// The 8-byte variant is always used (LEASE + KEY-LEASE).
-// When KeyLease == nil, KEY-LEASE is set to defaultKeyLease (0).
+// Encode encodes the LeaseOption into an OPT RR per RFC 6891, in its own variant: 8 bytes
+// (LEASE + KEY-LEASE) when KeyLease is set, 4 bytes (LEASE) when it is nil.
 func (lo *LeaseOption) Encode(opt *dns.OPT) error {
 	if err := lo.Validate(); err != nil {
 		return err
 	}
 
-	// Always use 8-byte variant: LEASE + KEY-LEASE
-	// If KeyLease is nil (no KEY-LEASE provided), use defaultKeyLease (0)
-	keyLease := uint32(0)
-
+	buf := binary.BigEndian.AppendUint32(nil, lo.Lease)
 	if lo.KeyLease != nil {
-		keyLease = *lo.KeyLease
+		buf = binary.BigEndian.AppendUint32(buf, *lo.KeyLease)
 	}
-
-	buf := make([]byte, 8)
-	binary.BigEndian.PutUint32(buf[:4], lo.Lease)
-	binary.BigEndian.PutUint32(buf[4:], keyLease)
 	data := hex.EncodeToString(buf)
 
 	opt.Options = append(opt.Options, &dns.ERFC3597{

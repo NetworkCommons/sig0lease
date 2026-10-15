@@ -56,7 +56,7 @@ func testUpdateRequest() *dns.Msg {
 // asked for.
 func TestLeaseResponse_OnlyTheOPTRecord(t *testing.T) {
 	req := testUpdateRequest()
-	resp := leaseResponse(req, 120, 300, logging.NewLogger("error"))
+	resp := leaseResponse(req, leasepkg.Encode8Byte(120, 300))
 
 	if resp.ID != req.ID || resp.Opcode != dns.OpcodeUpdate || !resp.Response || resp.Rcode != dns.RcodeSuccess {
 		t.Fatalf("header = %+v, want the request's ID and Opcode, QR set, NOERROR", resp.MsgHeader)
@@ -92,7 +92,7 @@ func TestUpdateHandlerSuccessResponse_NotesInTheOPTRecord(t *testing.T) {
 	h.SetLogger(logging.NewLogger("error"))
 	notes := []string{"record not found for delete: a", "KEY b. not found for delete"}
 
-	resp := h.buildSuccessResponse(testUpdateRequest(), notes, 120, 300)
+	resp := h.buildSuccessResponse(testUpdateRequest(), notes, leasepkg.Encode8Byte(120, 300))
 
 	zone, prereq, update, additional := wireCounts(t, resp)
 	if zone != 0 || prereq != 0 || update != 0 || additional != 1 {

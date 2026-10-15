@@ -422,7 +422,7 @@ func (h *SRPHandler) Handle(ctx context.Context, w dns.ResponseWriter, r *dns.Ms
 	h.reconcileServiceEnumeration(ctx)
 
 	// Step 10: NOERROR + echo the granted LEASE/KEY-LEASE.
-	resp := leaseResponse(r, lease, keyLease, h.logger)
+	resp := leaseResponse(r, leasepkg.Encode8Byte(lease, keyLease))
 	return NewProcessedResult(resp)
 }
 

@@ -167,10 +167,13 @@ handlers:
     # as handlers.srp_handler's record_ttl_sec. Optional, default 300.
     record_ttl_sec: 300
 
-    # Whether to use 4-byte variant for lease requests (backward compatibility).
-    # Default is false: 8-byte variant is always used for ALL lease requests.
-    # When true, refresh requests use 4-byte variant (no KEY-LEASE).
-    # When false, all requests use 8-byte variant (KEY-LEASE=0 for refresh/no second RR).
+    # Whether to accept requests whose Update Lease option is the 4-byte variant (RFC 9664 S4):
+    # one LEASE for every record in the update, KEYs included. macOS's mDNSResponder sends it.
+    # When true, such a request is handled as its records say -- KEYs and other records: LEASE
+    # and KEY-LEASE alike; other records only: the LEASE; KEYs only: the KEY-LEASE -- and the
+    # reply grants one value, in the 4-byte variant. lease_policy must then leave
+    # min_key_lease_sec at or below max_rr_lease_sec, or the proxy refuses to start.
+    # When false (default), such a request is REFUSED. 8-byte requests are always accepted.
     prefer_4byte_variant: false
 
     # Blacklisted RR types that are not allowed for registration.

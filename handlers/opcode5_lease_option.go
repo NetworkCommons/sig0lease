@@ -19,65 +19,73 @@ func (h *UpdateHandler) hasUpdateLeaseOption(msg *dns.Msg) bool {
 	return false
 }
 
-// parseLease extracts UPDATE-LEASE EDNS(0) data.
-// Returns LEASE and KEY-LEASE values, and error if invalid.
-// The decision between refresh and registration is NOT made here —
-// it is determined by the caller based on lease existence (Lookup).
-func (h *UpdateHandler) parseLease(msg *dns.Msg) (uint32, uint32, error) {
-	// Minimums come from the configured lease_policy (min_rr_lease_sec /
-	// min_key_lease_sec), matching clampLease's convention elsewhere in this
-	// handler: 0 means "no minimum enforced", not "use some hardcoded RFC
-	// 9664 default". A proxy launched with a different policy (e.g. a lower
-	// floor for testing) must actually enforce that policy here, at parse
-	// time, since this check runs before any clamping does.
-	minRRLease := h.LeasePolicy.MinRRLease
-	minKeyLease := h.LeasePolicy.MinKeyLease
-
+// decodeLease reads the request's Update Lease option (RFC 9664 S4) and applies this handler's
+// variant policy: the 4-byte variant only with prefer_4byte_variant. On failure it also returns
+// the RCODE to answer with -- FORMERR for an option RFC 9664 does not allow (a length other
+// than 4 or 8, LEASE above KEY-LEASE), REFUSED for a 4-byte one this handler does not take,
+// SERVFAIL for a request Handle should not have reached without one. Each fits the header's
+// four RCODE bits: an extended RCODE (16 and up, its high bits in the OPT RR) reads as NOERROR
+// to a requester that looks only at the header, as mDNSResponder does (mDNSCore/uDNS.c).
+// REFUSED, not FORMERR, for the 4-byte variant also because mDNSResponder, sending to port 53,
+// answers FORMERR by sending the update again without the option, which this proxy forwards
+// upstream (hndlRecordUpdateReply in mDNSCore/uDNS.c).
+func (h *UpdateHandler) decodeLease(msg *dns.Msg) (*leasepkg.LeaseOption, uint16, error) {
 	erfc, found := leasepkg.FindOption(msg)
 	if !found {
-		return 0, 0, fmt.Errorf("no Update Lease EDNS option found")
+		// Handle takes only requests in which hasUpdateLeaseOption found the option.
+		return nil, dns.RcodeServerFailure, fmt.Errorf("no Update Lease EDNS option found")
 	}
 	lo, err := leasepkg.DecodeOption(erfc)
 	if err != nil {
-		return 0, 0, fmt.Errorf("invalid lease option: %w", err)
+		return nil, dns.RcodeFormatError, fmt.Errorf("invalid lease option: %w", err)
 	}
-
-	if lo.KeyLease == nil {
-		// 4-byte variant: only permitted when prefer_4byte_variant is configured.
-		if minRRLease > 0 && lo.Lease < minRRLease {
-			return 0, 0, fmt.Errorf("lease duration %d below minimum %d", lo.Lease, minRRLease)
-		}
-		if !h.prefer4ByteVariant {
-			return 0, 0, fmt.Errorf("4-byte variant not permitted; prefer 8-byte variant")
-		}
-		return lo.Lease, 0, nil
+	if lo.KeyLease == nil && !h.prefer4ByteVariant {
+		return nil, dns.RcodeRefused, fmt.Errorf("4-byte variant not accepted: prefer_4byte_variant is off")
 	}
+	return lo, dns.RcodeSuccess, nil
+}
 
-	// 8-byte variant: always valid (default mode).
-	lease := lo.Lease
-	keyLease := *lo.KeyLease
-
-	// LEASE==0 is accepted for explicit delete semantics.
-	if lease == 0 {
-		if keyLease != 0 && minKeyLease > 0 && keyLease < minKeyLease {
-			return 0, 0, fmt.Errorf("key-lease duration %d below minimum %d", keyLease, minKeyLease)
-		}
-		return lease, keyLease, nil
+// requestedLeases is the LEASE and KEY-LEASE that lo asks for, as this handler's case matrix
+// reads them. The 8-byte variant carries both. The 4-byte variant carries one value for every
+// record in the Update section (RFC 9664 S4: the KEYs and the other records expire together),
+// so it is the KEY-LEASE when the section has KEY RRs and the LEASE when it has other records,
+// and 0 for the kind it has none of: Case A with both kinds, B with non-KEY records only, D
+// with KEYs only, and C for a value of 0. A section with no records at all keeps it as the
+// LEASE, so it is refused as Case B refuses one.
+func requestedLeases(lo *leasepkg.LeaseOption, hasKeyRRs, hasOtherRRs bool) (lease, keyLease uint32) {
+	if lo.KeyLease != nil {
+		return lo.Lease, *lo.KeyLease
 	}
-
-	if minRRLease > 0 && lease < minRRLease {
-		return 0, 0, fmt.Errorf("lease duration %d below minimum %d", lease, minRRLease)
+	if hasKeyRRs {
+		keyLease = lo.Lease
 	}
-
-	// KEY-LEASE == 0 means no KEY RR lease operation.
-	if keyLease != 0 {
-		if minKeyLease > 0 && keyLease < minKeyLease {
-			return 0, 0, fmt.Errorf("key-lease duration %d below minimum %d", keyLease, minKeyLease)
-		}
-		if lease > keyLease {
-			return 0, 0, fmt.Errorf("lease duration %d cannot exceed key-lease duration %d", lease, keyLease)
-		}
+	if hasOtherRRs || !hasKeyRRs {
+		lease = lo.Lease
 	}
+	return lease, keyLease
+}
 
-	return lease, keyLease, nil
+// checkLeaseMinimums refuses a requested LEASE or KEY-LEASE below the lease_policy minimum
+// (min_rr_lease_sec, min_key_lease_sec; a 0 minimum enforces none). A duration of 0 is never
+// below it: it means delete (Cases B-D), not the shortest duration. This runs before
+// LeasePolicy.clamp, which would otherwise raise such a request to the minimum.
+func (h *UpdateHandler) checkLeaseMinimums(lease, keyLease uint32) error {
+	p := h.LeasePolicy
+	if lease != 0 && p.MinRRLease > 0 && lease < p.MinRRLease {
+		return fmt.Errorf("lease duration %d below minimum %d", lease, p.MinRRLease)
+	}
+	if keyLease != 0 && p.MinKeyLease > 0 && keyLease < p.MinKeyLease {
+		return fmt.Errorf("key-lease duration %d below minimum %d", keyLease, p.MinKeyLease)
+	}
+	return nil
+}
+
+// grantedLeaseOption is the Update Lease option of the success reply: the granted LEASE and
+// KEY-LEASE in the variant the request used (RFC 9664 S4). For a 4-byte request its one value
+// is whichever of the two is set -- Handle makes them equal when both are -- or 0 for a delete.
+func grantedLeaseOption(requested *leasepkg.LeaseOption, lease, keyLease uint32) *leasepkg.LeaseOption {
+	if requested.KeyLease == nil {
+		return leasepkg.Encode4Byte(max(lease, keyLease))
+	}
+	return leasepkg.Encode8Byte(lease, keyLease)
 }

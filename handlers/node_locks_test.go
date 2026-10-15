@@ -134,8 +134,8 @@ func TestNodeLocks_UpdateHandler_SameRecordFromTwoSigners(t *testing.T) {
 	started, release := holdFirstUpdateSend(stub)
 
 	const owner = "client.test.dev.zenr.io."
-	reqA := buildSignedNonKeyOnlyLeaseUpdateForHandleTest(t, a, owner, 120, false)
-	reqB := buildSignedNonKeyOnlyLeaseUpdateForHandleTest(t, b, owner, 120, false)
+	reqA := buildSignedLeaseUpdateForHandleTest(t, a, owner, leasepkg.Encode8Byte(120, 0), false)
+	reqB := buildSignedLeaseUpdateForHandleTest(t, b, owner, leasepkg.Encode8Byte(120, 0), false)
 	resA, resB := raceSecondAgainstFirst(t, h, stubResponseWriter{}, started, release, reqA, reqB)
 
 	if rcodeOf(resA) != dns.RcodeSuccess {
@@ -162,7 +162,7 @@ func TestNodeLocks_UpdateHandler_DeleteWaitsForRegistrationUnderIt(t *testing.T)
 	started, release := holdFirstUpdateSend(stub)
 
 	const owner = "host.test.dev.zenr.io."
-	register := buildSignedNonKeyOnlyLeaseUpdateForHandleTest(t, p, owner, 120, false)
+	register := buildSignedLeaseUpdateForHandleTest(t, p, owner, leasepkg.Encode8Byte(120, 0), false)
 	txt := register.Ns[0]
 	del := buildSignedCaseCDeleteForHandleTest(t, p, p.PublicKey.Clone().(*dns.KEY))
 	resReg, resDel := raceSecondAgainstFirst(t, h, stubResponseWriter{}, started, release, register, del)
@@ -204,7 +204,7 @@ func TestNodeLocks_UpdateHandler_ExpiryBacksOffWhileRequestHoldsNode(t *testing.
 		t.Fatal(err)
 	}
 
-	res := handleAsync(h, stubResponseWriter{}, buildSignedNonKeyOnlyLeaseUpdateForHandleTest(t, p, "host.test.dev.zenr.io.", 120, false))
+	res := handleAsync(h, stubResponseWriter{}, buildSignedLeaseUpdateForHandleTest(t, p, "host.test.dev.zenr.io.", leasepkg.Encode8Byte(120, 0), false))
 	waitUntil(t, "the first operation to reach its upstream send", started)
 
 	ctx, cancel := context.WithTimeout(context.Background(), expiryTimeout)
