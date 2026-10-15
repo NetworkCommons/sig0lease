@@ -83,6 +83,10 @@ func (s *Server) Serve() error {
 		s.handleRequest(ctx, w, r)
 	})
 
+	// The handlers' background work, such as lease expiry, starts now, before any query is
+	// served; shutdown stops it.
+	s.router.Start()
+
 	// Set up OS signal interception that automatically cancels ctx on SIGINT/SIGTERM
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()

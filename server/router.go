@@ -47,6 +47,13 @@ func (r *Router) RegisterHandler(h handlers.Handler) {
 	r.handlers[h.Name()] = h
 }
 
+// Start calls Start on every registered handler exactly once.
+func (r *Router) Start() {
+	for _, h := range r.handlers {
+		h.Start()
+	}
+}
+
 // Shutdown calls Shutdown on every registered handler exactly once.
 func (r *Router) Shutdown() {
 	for _, h := range r.handlers {

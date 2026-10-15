@@ -3,11 +3,9 @@ package handlers
 
 import (
 	"context"
-	"time"
 
 	"codeberg.org/miekg/dns"
 	"github.com/NetworkCommons/sig0lease/pkg/dnsname"
-	"github.com/NetworkCommons/sig0lease/pkg/keyrec"
 	leasepkg "github.com/NetworkCommons/sig0lease/pkg/lease"
 )
 
@@ -56,18 +54,11 @@ type UpstreamCoordinator interface {
 // This implementation supports the following features:
 //   - Basic key registration with 8-byte lease EDNS(0) option (RFC 9664)
 //   - SIG(0) client authentication (RFC 2931)
-//   - In-memory lease tracking with configurable persistence hooks
+//   - Lease tracking in a memory or file lease store
 //   - Future SRP support
 type UpdateHandler struct {
-	BaseHandler
-	upstreamZone        string            // Upstream authoritative zone (e.g., "dev.zenr.io.")
-	upstreamKeyRecord   *keyrec.LoadedKey // Key for signing upstream UPDATE (Upstream key)
-	leaseManager        LeaseManager
-	upstreamCoordinator UpstreamCoordinator
-	keystoreDir         string
-	LeasePolicy         LeasePolicy
-	recordTTL           uint32 // TTL of every record this handler writes upstream (see parseRecordTTL)
-	prefer4ByteVariant  bool   // When true, use 4-byte variant (legacy); default false uses 8-byte always.
+	leaseHandler[UpstreamCoordinator]
+	prefer4ByteVariant bool // When true, use 4-byte variant (legacy); default false uses 8-byte always.
 	// AllowOnlineKeyRegistration controls whether a signer resolved only via
 	// authoritative DNS (not in the lease store, not present anywhere in the
 	// request) may authorize registration of new KEY RRs. Such a signer can
@@ -75,27 +66,21 @@ type UpdateHandler struct {
 	// gates whether it may also be used to create new managed state. Default
 	// false (fail closed).
 	AllowOnlineKeyRegistration bool
-	timers                     *expiryTimers
-	// nodeLocks serializes the requests and lease expiries that touch the same lease-store
-	// nodes (docs/siglease_rfc9664.md, "Node Locks"). Ids are NodeKey/RecordKey values.
-	nodeLocks        *leasepkg.NodeLocks
-	blacklistedTypes map[uint16]struct{} // RR types blocked from registration (type code -> empty)
-	reconcileTicker  *time.Ticker
+	blacklistedTypes           map[uint16]struct{} // RR types blocked from registration (type code -> empty)
 }
 
 // NewUpdateHandler creates a new handler for opcode 5 (UPDATE) queries.
 func NewUpdateHandler() *UpdateHandler {
-	return &UpdateHandler{
-		BaseHandler: BaseHandler{
-			name:    "update_handler",
-			opcodes: []uint8{dns.OpcodeUpdate},
+	h := &UpdateHandler{}
+	// A node's lock ids are its NodeKey and those of its subtree. A lease event is the shared
+	// engine alone: RFC 9664 adds nothing to it, and its reconciliation pass has nothing to
+	// add either.
+	h.leaseHandler = newLeaseHandler[UpstreamCoordinator]("update_handler",
+		func(nodeKey string) []string {
+			return append([]string{nodeKey}, h.leaseManager.ListSubtreeKeys(nodeKey)...)
 		},
-		leaseManager:        NewInMemoryLeaseManager(),
-		upstreamCoordinator: nil, // Must be configured via Setup()
-		recordTTL:           defaultRecordTTL,
-		timers:              newExpiryTimers(),
-		nodeLocks:           leasepkg.NewNodeLocks(),
-	}
+		func(ctx context.Context, nodeKey string) { h.expirer().run(ctx, nodeKey) }, nil)
+	return h
 }
 
 func keyRREqual(a, b *dns.KEY) bool {

@@ -236,7 +236,7 @@ func newSRPTestHandler(t *testing.T) (*SRPHandler, *fakeSRPCoordinator) {
 		keyState: srp.AuthNXDomain,
 		sendResp: &dns.Msg{MsgHeader: dns.MsgHeader{Rcode: dns.RcodeSuccess}},
 	}
-	h.coordinator = coord
+	h.upstreamCoordinator = coord
 	return h, coord
 }
 
@@ -543,7 +543,7 @@ func TestSRPHandle_HijackViaBundledHost_Refused(t *testing.T) {
 
 func TestSRPHandle_ForeignDataRefusedByDefault(t *testing.T) {
 	h, coord := newSRPTestHandler(t)
-	fake := h.coordinator.(*fakeSRPCoordinator)
+	fake := h.upstreamCoordinator.(*fakeSRPCoordinator)
 	fake.keyState = srp.AuthNoKey // simulates an authoritative name with data but no KEY
 	id := newSRPTestIdentity(t)
 	const host = "srptest4.dev.zenr.io."
@@ -561,7 +561,7 @@ func TestSRPHandle_ForeignDataRefusedByDefault(t *testing.T) {
 func TestSRPHandle_ForeignDataAllowedWhenConfigured(t *testing.T) {
 	h, _ := newSRPTestHandler(t)
 	h.refuseOnForeignData = false
-	fake := h.coordinator.(*fakeSRPCoordinator)
+	fake := h.upstreamCoordinator.(*fakeSRPCoordinator)
 	fake.keyState = srp.AuthNoKey
 	id := newSRPTestIdentity(t)
 	const host = "srptest5.dev.zenr.io."
@@ -577,7 +577,7 @@ func TestSRPHandle_ForeignDataAllowedWhenConfigured(t *testing.T) {
 
 func TestSRPHandle_UpstreamRejection_NoLocalMutation(t *testing.T) {
 	h, _ := newSRPTestHandler(t)
-	fake := h.coordinator.(*fakeSRPCoordinator)
+	fake := h.upstreamCoordinator.(*fakeSRPCoordinator)
 	fake.sendResp = &dns.Msg{MsgHeader: dns.MsgHeader{Rcode: dns.RcodeServerFailure}}
 	id := newSRPTestIdentity(t)
 	const host = "srptest6.dev.zenr.io."
@@ -1663,7 +1663,7 @@ func TestSRPHandle_ExpiryUpstreamRejection_NoLocalMutation(t *testing.T) {
 	h.timers.disarm(leasepkg.NodeKey(id.keyAt(oneWidgetInstance()[0].name)))
 	time.Sleep(1100 * time.Millisecond)
 
-	fake := h.coordinator.(*fakeSRPCoordinator)
+	fake := h.upstreamCoordinator.(*fakeSRPCoordinator)
 	fake.sendResp = &dns.Msg{MsgHeader: dns.MsgHeader{Rcode: dns.RcodeRefused}}
 
 	h.processExpiredNode(context.Background(), hostNodeKey)
@@ -1694,9 +1694,9 @@ func TestSRPHandle_ExpiryRefreshedUnderItsLocks_FailsHard(t *testing.T) {
 	h.timers.disarm(hostNodeKey)
 	time.Sleep(1100 * time.Millisecond)
 
-	fake := h.coordinator.(*fakeSRPCoordinator)
+	fake := h.upstreamCoordinator.(*fakeSRPCoordinator)
 	fake.onSendUpdate = func() {
-		if err := h.leaseManager.RenewLease(context.Background(), id.keyAt(host), 3600, 3600); err != nil {
+		if err := h.leaseManager.RenewLease(id.keyAt(host), 3600, 3600); err != nil {
 			t.Errorf("simulated refresh: RenewLease: %v", err)
 		}
 	}
@@ -1730,7 +1730,7 @@ func TestSRPHandle_ExpiryUpstreamFailure_LeavesLocalStateIntact(t *testing.T) {
 	h.timers.disarm(leasepkg.NodeKey(id.keyAt(oneWidgetInstance()[0].name)))
 	time.Sleep(1100 * time.Millisecond)
 
-	fake := h.coordinator.(*fakeSRPCoordinator)
+	fake := h.upstreamCoordinator.(*fakeSRPCoordinator)
 	fake.sendErr = context.DeadlineExceeded // simulate an upstream delete that fails to send
 
 	h.processExpiredNode(context.Background(), hostNodeKey)
@@ -1976,7 +1976,7 @@ func TestSRPHandler_FailsHardWithoutUpstream(t *testing.T) {
 		want  string
 	}{
 		{"no signing key", func(h *SRPHandler) { h.upstreamKeyRecord = nil }, "srp_handler is missing the proxy's signing key"},
-		{"no coordinator", func(h *SRPHandler) { h.coordinator = nil }, "srp_handler is missing an upstream coordinator"},
+		{"no coordinator", func(h *SRPHandler) { h.upstreamCoordinator = nil }, "srp_handler is missing an upstream coordinator"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			h, _ := newSRPTestHandler(t)

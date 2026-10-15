@@ -190,7 +190,6 @@ func (h *UpdateHandler) Handle(ctx context.Context, w dns.ResponseWriter, r *dns
 
 		for _, keyRR := range updateKeyRRs {
 			keyName := keyRR.Hdr.Name
-			scopedOtherRecords := updateOtherRRsByKeyOwner[keyIDFromKEY(keyRR)]
 			existingKey := h.leaseManager.LookupByKEY(keyRR)
 			keyIsRefresh := existingKey != nil
 
@@ -199,72 +198,7 @@ func (h *UpdateHandler) Handle(ctx context.Context, w dns.ResponseWriter, r *dns
 					msg := makeErrorResponse(r, dns.RcodeRefused, err.Error())
 					return NewErrorResult(msg, err.Error(), err)
 				}
-
-				effectiveKeyLease, keyAtFQDN, err := h.effectiveRefreshKeyLease(ctx, zone, keyRR, existingKey, keyLeaseDuration)
-				if err != nil {
-					msg := makeErrorResponse(r, dns.RcodeServerFailure, fmt.Sprintf("authoritative key lookup failed: %v", err))
-					return NewErrorResult(msg, "authoritative key lookup failed", err)
-				}
-				if !keyAtFQDN {
-					// Key is managed locally but missing at the DNS server: re-register
-					// it with the lease time that is still left in the lease store.
-					pendingKeyRR := keyRR
-					pendingKeyName := keyName
-					pendingRecords := scopedOtherRecords
-					pendingKeyLease := effectiveKeyLease
-					pendingMutations = append(pendingMutations, pendingLeaseMutation{
-						keyName: pendingKeyName,
-						apply: func() error {
-							if err := h.leaseManager.RenewLease(ctx, pendingKeyRR, pendingKeyLease, pendingKeyLease); err != nil {
-								return err
-							}
-							if err := h.leaseManager.UpsertNonKEYRecords(leasepkg.NodeKey(pendingKeyRR), pendingRecords, leaseDuration, h.upstreamZone); err != nil {
-								return err
-							}
-							h.scheduleLeaseExpiry(leasepkg.NodeKey(pendingKeyRR))
-							h.logger.Debugf("Lease renewed for %s (KEY-LEASE != 0, key missing at FQDN, remaining key lease=%d)", pendingKeyName, pendingKeyLease)
-							return nil
-						},
-					})
-
-					upstreamKeys = append(upstreamKeys, keyRR)
-					acceptedRecordsForUpstream = append(acceptedRecordsForUpstream, scopedOtherRecords...)
-					continue
-				}
-
-				// Normal refresh: ownership already validated above. Defer the
-				// actual write until upstream confirms success, same as every
-				// other lease-store mutation.
-				pendingKeyRR := keyRR
-				pendingKeyName := keyName
-				pendingRecords := scopedOtherRecords
-				pendingMutations = append(pendingMutations, pendingLeaseMutation{
-					keyName: pendingKeyName,
-					apply: func() error {
-						if err := h.leaseManager.RenewLease(ctx, pendingKeyRR, keyLeaseDuration, keyLeaseDuration); err != nil {
-							return err
-						}
-						if len(pendingRecords) > 0 {
-							// Upsert rather than refresh-only: scopedOtherRecords may
-							// include a non-KEY RR that is new to this key even though
-							// the key itself is being refreshed.
-							if err := h.leaseManager.UpsertNonKEYRecords(leasepkg.NodeKey(pendingKeyRR), pendingRecords, leaseDuration, h.upstreamZone); err != nil {
-								return err
-							}
-						}
-						h.scheduleLeaseExpiry(leasepkg.NodeKey(pendingKeyRR))
-						h.logger.Debugf("Lease refreshed for %s (non-KEY lease=%d seconds)", pendingKeyName, leaseDuration)
-						return nil
-					},
-				})
-
-				acceptedRecordsForUpstream = append(acceptedRecordsForUpstream, scopedOtherRecords...)
-				continue
-			}
-
-			// Normal path (not refresh): KEY-LEASE != 0 and LEASE != 0.
-			partialNotes := make([]string, 0)
-			if h.leaseManager.LookupByKEY(keyRR) == nil {
+			} else {
 				exists, err := h.authoritativeHasRR(ctx, zone, keyRR)
 				if err != nil {
 					msg := makeErrorResponse(r, dns.RcodeServerFailure, fmt.Sprintf("authoritative duplicate check failed: %v", err))
@@ -279,20 +213,79 @@ func (h *UpdateHandler) Handle(ctx context.Context, w dns.ResponseWriter, r *dns
 				// requires non-KEY RRs, so that check already covers this path.
 			}
 
-			acceptedRecords, notes, err := h.filterDuplicateRegistrations(ctx, leasepkg.NodeKey(keyRR), zone, scopedOtherRecords)
+			// Every path below stores this key's records once the upstream server has
+			// applied them, when a store write must no longer fail (see the mutation loop at
+			// the end): refuse now, before anything is sent, a record the store holds under
+			// another key, or the authoritative server holds outside this proxy's management.
+			acceptedRecords, notes, err := h.filterDuplicateRegistrations(ctx, leasepkg.NodeKey(keyRR), zone, updateOtherRRsByKeyOwner[keyIDFromKEY(keyRR)])
 			if err != nil {
 				msg := makeErrorResponse(r, dns.RcodeRefused, fmt.Sprintf("duplicate registration rejected: %v", err))
 				return NewErrorResult(msg, "duplicate registration rejected", err)
 			}
-			partialNotes = append(partialNotes, notes...)
-
+			acceptedRecordsForUpstream = append(acceptedRecordsForUpstream, acceptedRecords...)
+			allNotes = append(allNotes, notes...)
 			pendingKeyRR := keyRR
 			pendingKeyName := keyName
 			pendingRecords := acceptedRecords
+
+			if keyIsRefresh {
+				effectiveKeyLease, keyAtFQDN, err := h.effectiveRefreshKeyLease(ctx, zone, keyRR, existingKey, keyLeaseDuration)
+				if err != nil {
+					msg := makeErrorResponse(r, dns.RcodeServerFailure, fmt.Sprintf("authoritative key lookup failed: %v", err))
+					return NewErrorResult(msg, "authoritative key lookup failed", err)
+				}
+				if !keyAtFQDN {
+					// Key is managed locally but missing at the DNS server: re-register
+					// it with the lease time that is still left in the lease store.
+					pendingKeyLease := effectiveKeyLease
+					pendingMutations = append(pendingMutations, pendingLeaseMutation{
+						keyName: pendingKeyName,
+						apply: func() error {
+							if err := h.leaseManager.RenewLease(pendingKeyRR, pendingKeyLease, pendingKeyLease); err != nil {
+								return err
+							}
+							if err := h.leaseManager.UpsertNonKEYRecords(leasepkg.NodeKey(pendingKeyRR), pendingRecords, leaseDuration, h.upstreamZone); err != nil {
+								return err
+							}
+							h.scheduleLeaseExpiry(leasepkg.NodeKey(pendingKeyRR))
+							h.logger.Debugf("Lease renewed for %s (KEY-LEASE != 0, key missing at FQDN, remaining key lease=%d)", pendingKeyName, pendingKeyLease)
+							return nil
+						},
+					})
+					upstreamKeys = append(upstreamKeys, keyRR)
+					continue
+				}
+
+				// Normal refresh: ownership already validated above. Defer the
+				// actual write until upstream confirms success, same as every
+				// other lease-store mutation.
+				pendingMutations = append(pendingMutations, pendingLeaseMutation{
+					keyName: pendingKeyName,
+					apply: func() error {
+						if err := h.leaseManager.RenewLease(pendingKeyRR, keyLeaseDuration, keyLeaseDuration); err != nil {
+							return err
+						}
+						if len(pendingRecords) > 0 {
+							// Upsert rather than refresh-only: the records may include a
+							// non-KEY RR that is new to this key even though the key
+							// itself is being refreshed.
+							if err := h.leaseManager.UpsertNonKEYRecords(leasepkg.NodeKey(pendingKeyRR), pendingRecords, leaseDuration, h.upstreamZone); err != nil {
+								return err
+							}
+						}
+						h.scheduleLeaseExpiry(leasepkg.NodeKey(pendingKeyRR))
+						h.logger.Debugf("Lease refreshed for %s (non-KEY lease=%d seconds)", pendingKeyName, leaseDuration)
+						return nil
+					},
+				})
+				continue
+			}
+
+			// Normal path (not refresh): KEY-LEASE != 0 and LEASE != 0.
 			pendingMutations = append(pendingMutations, pendingLeaseMutation{
 				keyName: pendingKeyName,
 				apply: func() error {
-					if err := h.registerKeyLease(ctx, keyIDFromSIG(sigRR), pendingKeyRR, keyLeaseDuration, keyLeaseDuration); err != nil {
+					if err := h.registerKeyLease(keyIDFromSIG(sigRR), pendingKeyRR, keyLeaseDuration, keyLeaseDuration); err != nil {
 						return err
 					}
 					if len(pendingRecords) > 0 {
@@ -308,8 +301,6 @@ func (h *UpdateHandler) Handle(ctx context.Context, w dns.ResponseWriter, r *dns
 			h.logger.Debugf("Lease processed for %s (lease=%d seconds, key-lease=%d seconds)", keyName, leaseDuration, keyLeaseDuration)
 
 			upstreamKeys = append(upstreamKeys, keyRR)
-			acceptedRecordsForUpstream = append(acceptedRecordsForUpstream, acceptedRecords...)
-			allNotes = append(allNotes, partialNotes...)
 		}
 
 		// Non-KEY RRs always belong to the signer (docs/siglease_rfc9664.md 5.1.4), grouped
@@ -382,7 +373,7 @@ func (h *UpdateHandler) Handle(ctx context.Context, w dns.ResponseWriter, r *dns
 			pendingMutations = append(pendingMutations, pendingLeaseMutation{
 				keyName: pendingKeyRR.Hdr.Name,
 				apply: func() error {
-					return h.leaseManager.RenewLease(ctx, pendingKeyRR, pendingKeyLease, pendingKeyLease)
+					return h.leaseManager.RenewLease(pendingKeyRR, pendingKeyLease, pendingKeyLease)
 				},
 			})
 			// The stored KEY, not one from this request (KEY-LEASE is 0 here), so it has
@@ -581,9 +572,9 @@ func (h *UpdateHandler) Handle(ctx context.Context, w dns.ResponseWriter, r *dns
 				apply: func() error {
 					var err error
 					if pendingIsRefresh {
-						err = h.leaseManager.RenewLease(ctx, pendingKeyRR, pendingKeyLease, pendingKeyLease)
+						err = h.leaseManager.RenewLease(pendingKeyRR, pendingKeyLease, pendingKeyLease)
 					} else {
-						err = h.registerKeyLease(ctx, keyIDFromSIG(sigRR), pendingKeyRR, pendingKeyLease, pendingKeyLease)
+						err = h.registerKeyLease(keyIDFromSIG(sigRR), pendingKeyRR, pendingKeyLease, pendingKeyLease)
 					}
 					if err != nil {
 						return err
@@ -632,11 +623,16 @@ func (h *UpdateHandler) Handle(ctx context.Context, w dns.ResponseWriter, r *dns
 			len(upstreamResp.Answer), len(upstreamResp.Ns), len(upstreamResp.Extra))
 	}
 
+	// The upstream server has applied the update, so a store write must not fail now: each
+	// one can fail only on a state the checks above rule out while this request holds its
+	// node locks -- a node renewed that is not in the store, or a record already registered
+	// under another key (filterDuplicateRegistrations). A failure is therefore a bug, and the
+	// store can no longer be left as it was, since DNS has changed: the records would stay
+	// published with no lease to end them. It panics, as a lease expiry does on a store write
+	// that fails after its upstream delete.
 	for _, mutation := range pendingMutations {
 		if err := mutation.apply(); err != nil {
-			h.logger.Debugf("post-upstream lease-store update failed for %s: %v", mutation.keyName, err)
-			msg := makeErrorResponse(r, dns.RcodeServerFailure, fmt.Sprintf("lease-store update failed for %s: %v", mutation.keyName, err))
-			return NewErrorResult(msg, fmt.Sprintf("lease-store update failed for %s", mutation.keyName), err)
+			panic(fmt.Sprintf("update_handler: lease-store update of %s after the authoritative server applied it: %v", mutation.keyName, err))
 		}
 	}
 

@@ -3,11 +3,9 @@ package handlers
 import (
 	"context"
 	"math"
-	"strings"
 	"testing"
 
 	"codeberg.org/miekg/dns"
-	"github.com/NetworkCommons/sig0lease/logging"
 	"github.com/NetworkCommons/sig0lease/pkg/dnsname"
 	"github.com/NetworkCommons/sig0lease/pkg/keyrec"
 	leasepkg "github.com/NetworkCommons/sig0lease/pkg/lease"
@@ -47,44 +45,6 @@ func TestParseRecordTTL(t *testing.T) {
 				t.Fatalf("parseRecordTTL(%v) = %d, want an error", tc.raw, got)
 			}
 		})
-	}
-}
-
-// TestSetup_BothHandlersReadRecordTTL: both handlers read record_ttl_sec through
-// parseRecordTTL, and an invalid value stops either one's Setup.
-func TestSetup_BothHandlersReadRecordTTL(t *testing.T) {
-	updateCfg := baseSetupCfg(t)
-	updateCfg["record_ttl_sec"] = 120
-	uh := newTestHandler()
-	if err := uh.Setup(updateCfg); err != nil {
-		t.Fatalf("UpdateHandler.Setup: %v", err)
-	}
-	if uh.recordTTL != 120 {
-		t.Fatalf("UpdateHandler recordTTL = %d, want 120", uh.recordTTL)
-	}
-
-	srpCfg := baseSRPSetupCfg(t)
-	srpCfg["record_ttl_sec"] = 120
-	sh := NewSRPHandler()
-	sh.SetLogger(logging.NewLogger("error"))
-	if err := sh.Setup(srpCfg); err != nil {
-		t.Fatalf("SRPHandler.Setup: %v", err)
-	}
-	if sh.recordTTL != 120 {
-		t.Fatalf("SRPHandler recordTTL = %d, want 120", sh.recordTTL)
-	}
-
-	updateCfg = baseSetupCfg(t)
-	updateCfg["record_ttl_sec"] = 0
-	if err := newTestHandler().Setup(updateCfg); err == nil || !strings.Contains(err.Error(), "record_ttl_sec") {
-		t.Fatalf("UpdateHandler.Setup error = %v, want the record_ttl_sec error", err)
-	}
-	srpCfg = baseSRPSetupCfg(t)
-	srpCfg["record_ttl_sec"] = 0
-	sh = NewSRPHandler()
-	sh.SetLogger(logging.NewLogger("error"))
-	if err := sh.Setup(srpCfg); err == nil || !strings.Contains(err.Error(), "record_ttl_sec") {
-		t.Fatalf("SRPHandler.Setup error = %v, want the record_ttl_sec error", err)
 	}
 }
 
@@ -242,7 +202,7 @@ func TestHandle_CaseB_ReRegisteredKEYGetsRecordTTL(t *testing.T) {
 
 	signerKey := loaded.PublicKey.Clone().(*dns.KEY)
 	signerKey.Hdr.TTL = 3600
-	if err := h.leaseManager.Register(context.Background(), signerKey, 120, 120, "dev.zenr.io."); err != nil {
+	if err := h.leaseManager.Register(signerKey, 120, 120, "dev.zenr.io."); err != nil {
 		t.Fatalf("register signer key in lease store: %v", err)
 	}
 	stub := &stubUpstreamCoordinator{

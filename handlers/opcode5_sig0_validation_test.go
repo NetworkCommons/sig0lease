@@ -282,7 +282,7 @@ func TestExtractAndValidateSig0_DNSFailureFallsBackToLeaseStore(t *testing.T) {
 	}
 
 	h := newTestHandler()
-	if err := h.leaseManager.Register(context.Background(), loaded.PublicKey, 120, 120, "dev.zenr.io."); err != nil {
+	if err := h.leaseManager.Register(loaded.PublicKey, 120, 120, "dev.zenr.io."); err != nil {
 		t.Fatalf("register lease key: %v", err)
 	}
 	h.upstreamCoordinator.(*stubUpstreamCoordinator).query = func(ctx context.Context, zoneHint, fqdn string, rrType uint16) ([]dns.RR, error) {
@@ -313,7 +313,7 @@ func TestExtractAndValidateSig0_DNSNoKeyFallsBackToLeaseStore(t *testing.T) {
 	}
 
 	h := newTestHandler()
-	if err := h.leaseManager.Register(context.Background(), loaded.PublicKey, 120, 120, "dev.zenr.io."); err != nil {
+	if err := h.leaseManager.Register(loaded.PublicKey, 120, 120, "dev.zenr.io."); err != nil {
 		t.Fatalf("register lease key: %v", err)
 	}
 	h.upstreamCoordinator.(*stubUpstreamCoordinator).query = func(ctx context.Context, zoneHint, fqdn string, rrType uint16) ([]dns.RR, error) {
@@ -470,7 +470,7 @@ func TestHandle_ReRegistersManagedKeyWhenAuthoritativeFQDNIsMissing(t *testing.T
 	h.upstreamCoordinator = &stubUpstreamCoordinator{query: authoritative, resp: &dns.Msg{MsgHeader: dns.MsgHeader{Rcode: dns.RcodeSuccess}}}
 
 	keyRR := loaded.PublicKey.Clone().(*dns.KEY)
-	if err := h.leaseManager.Register(context.Background(), keyRR, 10, 10, "dev.zenr.io."); err != nil {
+	if err := h.leaseManager.Register(keyRR, 10, 10, "dev.zenr.io."); err != nil {
 		t.Fatalf("register existing key lease: %v", err)
 	}
 
@@ -527,7 +527,7 @@ func TestHandle_RefreshPreservesOriginalRegisteredAt(t *testing.T) {
 	h.upstreamCoordinator = &stubUpstreamCoordinator{query: authoritative, resp: &dns.Msg{MsgHeader: dns.MsgHeader{Rcode: dns.RcodeSuccess}}}
 
 	keyRR := loaded.PublicKey.Clone().(*dns.KEY)
-	if err := h.leaseManager.Register(context.Background(), keyRR, 60, 60, "dev.zenr.io."); err != nil {
+	if err := h.leaseManager.Register(keyRR, 60, 60, "dev.zenr.io."); err != nil {
 		t.Fatalf("register key: %v", err)
 	}
 	original := h.leaseManager.LookupByKEY(keyRR)
@@ -579,7 +579,7 @@ func TestHandle_NonKeyOnlyLeaseWithoutUpdateKeyRR_RegistersNonKeyRRs(t *testing.
 	}
 
 	signerKey := loaded.PublicKey.Clone().(*dns.KEY)
-	if err := h.leaseManager.Register(context.Background(), signerKey, 120, 120, "dev.zenr.io."); err != nil {
+	if err := h.leaseManager.Register(signerKey, 120, 120, "dev.zenr.io."); err != nil {
 		t.Fatalf("register signer key in lease store: %v", err)
 	}
 
@@ -626,7 +626,7 @@ func TestHandle_NonKeyOnlyLeaseRejectsUpdateKeyRR(t *testing.T) {
 	}
 
 	signerKey := loaded.PublicKey.Clone().(*dns.KEY)
-	if err := h.leaseManager.Register(context.Background(), signerKey, 120, 120, "dev.zenr.io."); err != nil {
+	if err := h.leaseManager.Register(signerKey, 120, 120, "dev.zenr.io."); err != nil {
 		t.Fatalf("register signer key in lease store: %v", err)
 	}
 
@@ -672,7 +672,7 @@ func TestHandle_DottedLabel_Refused(t *testing.T) {
 		t.Fatalf("setup handler: %v", err)
 	}
 	signerKey := loaded.PublicKey.Clone().(*dns.KEY)
-	if err := h.leaseManager.Register(context.Background(), signerKey, 120, 120, "dev.zenr.io."); err != nil {
+	if err := h.leaseManager.Register(signerKey, 120, 120, "dev.zenr.io."); err != nil {
 		t.Fatalf("register signer key in lease store: %v", err)
 	}
 	authoritative := func(ctx context.Context, zoneHint, fqdn string, rrType uint16) ([]dns.RR, error) {
@@ -908,11 +908,11 @@ func setupCaseCDeleteHandler(t *testing.T) (h *UpdateHandler, parent, child, unr
 	}
 
 	parentRR := parent.PublicKey.Clone().(*dns.KEY)
-	if err := h.leaseManager.Register(context.Background(), parentRR, 120, 120, "dev.zenr.io."); err != nil {
+	if err := h.leaseManager.Register(parentRR, 120, 120, "dev.zenr.io."); err != nil {
 		t.Fatalf("register parent key: %v", err)
 	}
 	childRR := child.PublicKey.Clone().(*dns.KEY)
-	if err := h.leaseManager.RegisterWithParent(context.Background(), leasepkg.NodeKey(parentRR), childRR, 120, 120, "dev.zenr.io."); err != nil {
+	if err := h.leaseManager.RegisterWithParent(leasepkg.NodeKey(parentRR), childRR, 120, 120, "dev.zenr.io."); err != nil {
 		t.Fatalf("register child key under parent: %v", err)
 	}
 
@@ -1029,7 +1029,7 @@ func TestHandle_CaseARefresh_ForeignSignerWithOwnRegistrationCannotHijackExistin
 	// Client legitimately registered its KEY plus a companion TXT as its own
 	// self-registered (root) node.
 	clientKeyRR := client.PublicKey.Clone().(*dns.KEY)
-	if err := h.leaseManager.Register(context.Background(), clientKeyRR, 120, 120, "dev.zenr.io."); err != nil {
+	if err := h.leaseManager.Register(clientKeyRR, 120, 120, "dev.zenr.io."); err != nil {
 		t.Fatalf("register client key: %v", err)
 	}
 	clientTXT := &dns.TXT{Hdr: dns.Header{Name: "test.dev.zenr.io.", Class: dns.ClassINET, TTL: 60}}
@@ -1131,7 +1131,7 @@ func TestHandle_CaseARefresh_OnlineAuthorizedSignerCannotHijackExistingKey(t *te
 	}
 
 	clientKeyRR := client.PublicKey.Clone().(*dns.KEY)
-	if err := h.leaseManager.Register(context.Background(), clientKeyRR, 120, 120, "dev.zenr.io."); err != nil {
+	if err := h.leaseManager.Register(clientKeyRR, 120, 120, "dev.zenr.io."); err != nil {
 		t.Fatalf("register client key: %v", err)
 	}
 	clientTXT := &dns.TXT{Hdr: dns.Header{Name: "test.dev.zenr.io.", Class: dns.ClassINET, TTL: 60}}

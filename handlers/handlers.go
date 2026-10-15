@@ -34,6 +34,10 @@ type Handler interface {
 	// Setup initializes the handler with configuration
 	Setup(cfg map[string]any) error
 
+	// Start begins the handler's background work, such as lease expiry. The server calls it
+	// once, after Setup and before it serves; a dump never calls it.
+	Start()
+
 	// Shutdown releases any resources this handler owns (background
 	// goroutines, open files). Called exactly once during server shutdown.
 	Shutdown()
@@ -65,10 +69,6 @@ func (b *BaseHandler) CanHandle(opcode uint8) bool {
 	}
 	return false
 }
-
-// Shutdown is a no-op default; handlers that own no resources needing
-// release on shutdown do not need to override it.
-func (b *BaseHandler) Shutdown() {}
 
 // updateResponse starts the reply to the UPDATE request req: req's header (so its ID and
 // Opcode) with QR and rcode set, and no sections. RFC 2136 S3.8 lets a reply either copy
@@ -200,7 +200,7 @@ type upstreamClient interface {
 
 // upstreamTarget is where one handler's UPDATEs go and what signs them: its coordinator, the
 // proxy's signing key that Setup loaded once (a rotated key on disk needs a restart), and the
-// handler's configured upstream zone. Each handler builds one from its own fields.
+// handler's configured upstream zone. leaseHandler.upstream builds one from the handler's fields.
 type upstreamTarget struct {
 	handler     string
 	coordinator upstreamClient
@@ -243,7 +243,7 @@ func (t upstreamTarget) send(ctx context.Context, prereqs, records []dns.RR) (*d
 // "bootstrap_resolvers", the resolvers discovery asks for a name's SOA, and "upstream", an
 // optional static "host:port" of upstreamZone's authoritative server, used in place of
 // discovery for upstreamZone and every name at or below it (updatecore.StaticUpstream).
-// Shared by UpdateHandler.Setup and SRPHandler.Setup. An "upstream" that is not a
+// leaseHandler.setup reads it for both handlers. An "upstream" that is not a
 // "host:port" string is an error, not ignored: a proxy silently sending to the discovered
 // server instead of the configured one would update a different zone than intended.
 func buildCoordinatorFromConfig(cfg map[string]any, upstreamZone string, logger *logging.Logger) (*updatecore.Coordinator, error) {
@@ -369,7 +369,7 @@ func selectLeaseStore(cfg map[string]any) (given LeaseManager, storage *leaseSto
 // saving it (leasepkg.NewFileLeaseStore); logger receives its save errors. With readOnly, a
 // "file" store is instead its snapshot as it is now, read into an in-memory store that never
 // saves, and nothing is created or written: cmd/sig0lease's dump mode hands that to Setup as
-// "lease_manager". Both handlers' Setup use it with readOnly false.
+// "lease_manager". leaseHandler.setup uses it with readOnly false, for both handlers.
 func LeaseStoreFromConfig(cfg map[string]any, logger *logging.Logger, readOnly bool) (LeaseManager, error) {
 	given, storage, err := selectLeaseStore(cfg)
 	switch {

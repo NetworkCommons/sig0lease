@@ -174,12 +174,11 @@ func TestLeasePolicyClamp_PreservesZeroSemantics(t *testing.T) {
 
 func TestNonKeyLeaseExpiresBeforeKeyLease(t *testing.T) {
 	h := newTestHandler()
-	ctx := context.Background()
 	key := testKeyRR("test.dev.zenr.io.", "AAAATESTKEY444=")
 	data := &dns.TXT{Hdr: dns.Header{Name: "test.dev.zenr.io.", Class: dns.ClassINET, TTL: 60}}
 	data.TXT.Txt = []string{"payload"}
 
-	if err := h.leaseManager.Register(ctx, key, 2, 2, "dev.zenr.io."); err != nil {
+	if err := h.leaseManager.Register(key, 2, 2, "dev.zenr.io."); err != nil {
 		t.Fatalf("register key lease: %v", err)
 	}
 	if err := h.leaseManager.UpsertNonKEYRecords(lease.NodeKey(key), []dns.RR{data}, 1, "dev.zenr.io."); err != nil {
@@ -256,11 +255,10 @@ func TestExtractUpdateRecordsNoKEYRR_NoOtherRecords(t *testing.T) {
 func TestKeyLeaseZeroDeleteKeyNoOtherRecords(t *testing.T) {
 	// Case 2: KEY-LEASE == 0, LEASE != 0, no otherRecords → delete key
 	h := newTestHandler()
-	ctx := context.Background()
 
 	// First, register a key lease.
 	key := testKeyRR("test.dev.zenr.io.", "AAAATESTKEY555=")
-	if err := h.leaseManager.Register(ctx, key, 1, 1, "dev.zenr.io."); err != nil {
+	if err := h.leaseManager.Register(key, 1, 1, "dev.zenr.io."); err != nil {
 		t.Fatalf("register initial lease: %v", err)
 	}
 	h.scheduleLeaseExpiry(lease.NodeKey(key))
@@ -285,11 +283,10 @@ func TestKeyLeaseZeroDeleteKeyNoOtherRecords(t *testing.T) {
 func TestKeyLeaseZeroDeleteKeyAndNonKeyWithOtherRecords(t *testing.T) {
 	// Case 3: KEY-LEASE == 0, LEASE == 0, otherRecords present → delete KEY and non-KEY records
 	h := newTestHandler()
-	ctx := context.Background()
 
 	// Register a key lease with non-KEY records.
 	key := testKeyRR("test.dev.zenr.io.", "AAAATESTKEY666=")
-	if err := h.leaseManager.Register(ctx, key, 1, 1, "dev.zenr.io."); err != nil {
+	if err := h.leaseManager.Register(key, 1, 1, "dev.zenr.io."); err != nil {
 		t.Fatalf("register initial lease: %v", err)
 	}
 	h.scheduleLeaseExpiry(lease.NodeKey(key))
@@ -330,11 +327,10 @@ func TestKeyLeaseZeroDeleteKeyAndNonKeyWithOtherRecords(t *testing.T) {
 func TestKeyLeaseZeroNonKeyOnlyRegistration(t *testing.T) {
 	// Case 1: KEY-LEASE == 0, LEASE != 0, otherRecords present → register non-KEY lease only
 	h := newTestHandler()
-	ctx := context.Background()
 
 	// Register a key lease (existing key).
 	key := testKeyRR("test.dev.zenr.io.", "AAAATESTKEY777=")
-	if err := h.leaseManager.Register(ctx, key, 1, 1, "dev.zenr.io."); err != nil {
+	if err := h.leaseManager.Register(key, 1, 1, "dev.zenr.io."); err != nil {
 		t.Fatalf("register initial lease: %v", err)
 	}
 	h.scheduleLeaseExpiry(lease.NodeKey(key))
@@ -362,10 +358,9 @@ func TestKeyLeaseZeroNonKeyOnlyRegistration(t *testing.T) {
 func TestKeyLeaseZeroDeleteKeyNoOtherRecords_Expires(t *testing.T) {
 	// Full lifecycle test: register, delete key (KEY-LEASE == 0, no otherRecords), verify expiry
 	h := newTestHandler()
-	ctx := context.Background()
 
 	key := testKeyRR("test.dev.zenr.io.", "AAAATESTKEY888=")
-	if err := h.leaseManager.Register(ctx, key, 1, 1, "dev.zenr.io."); err != nil {
+	if err := h.leaseManager.Register(key, 1, 1, "dev.zenr.io."); err != nil {
 		t.Fatalf("register initial lease: %v", err)
 	}
 	h.scheduleLeaseExpiry(lease.NodeKey(key))
@@ -377,7 +372,7 @@ func TestKeyLeaseZeroDeleteKeyNoOtherRecords_Expires(t *testing.T) {
 	}
 
 	// Now register a new lease and immediately delete it (KEY-LEASE == 0, no otherRecords).
-	if err := h.leaseManager.Register(ctx, key, 2, 2, "dev.zenr.io()"); err != nil {
+	if err := h.leaseManager.Register(key, 2, 2, "dev.zenr.io()"); err != nil {
 		t.Fatalf("register new lease: %v", err)
 	}
 	h.scheduleLeaseExpiry(lease.NodeKey(key))
@@ -423,10 +418,9 @@ func TestRecordKey_DistinguishesDifferentPriorities(t *testing.T) {
 
 func TestSetNonKeyLease_StoresMXRecordsWithDifferentPriority(t *testing.T) {
 	h := newTestHandler()
-	ctx := context.Background()
 
 	key := testKeyRR("test.dev.zenr.io.", "AAAAMXPRIORITYKEY=")
-	if err := h.leaseManager.Register(ctx, key, 120, 120, "dev.zenr.io."); err != nil {
+	if err := h.leaseManager.Register(key, 120, 120, "dev.zenr.io."); err != nil {
 		t.Fatalf("register key lease: %v", err)
 	}
 
@@ -514,10 +508,9 @@ func TestSetNonKeyLease_SameRecordDifferentTTL_SingleEntry(t *testing.T) {
 	// Per rfc2136 - 1.1 - Comparison Rules: TTL is excluded from RR comparison.
 	// Same record with different TTLs overwrites the previous entry (single entry).
 	h := newTestHandler()
-	ctx := context.Background()
 
 	key := testKeyRR("test.dev.zenr.io.", "AAAATESTKEY999=")
-	if err := h.leaseManager.Register(ctx, key, 2, 2, "dev.zenr.io."); err != nil {
+	if err := h.leaseManager.Register(key, 2, 2, "dev.zenr.io."); err != nil {
 		t.Fatalf("register key lease: %v", err)
 	}
 
@@ -814,7 +807,7 @@ func TestHandle_CaseD_KeyRefreshWithAccompanyingNonKeyDelete_ForwardsUpstreamAnd
 	}
 
 	ownerRR := owner.PublicKey.Clone().(*dns.KEY)
-	if err := h.leaseManager.Register(context.Background(), ownerRR, 120, 120, "dev.zenr.io."); err != nil {
+	if err := h.leaseManager.Register(ownerRR, 120, 120, "dev.zenr.io."); err != nil {
 		t.Fatalf("register owner key: %v", err)
 	}
 
