@@ -144,8 +144,8 @@ func keyRRFromClientKey(clientKey *keyrec.LoadedKey, ttl uint32) *dns.KEY {
 	return keyRR
 }
 
-func addSignerKeyToAdditional(msg *dns.Msg, clientKey *keyrec.LoadedKey, keyLeaseDuration uint32) {
-	signingKeyRR := keyRRFromClientKey(clientKey, keyLeaseDuration)
+func addSignerKeyToAdditional(msg *dns.Msg, clientKey *keyrec.LoadedKey, ttl uint32) {
+	signingKeyRR := keyRRFromClientKey(clientKey, ttl)
 	msg.Extra = append(msg.Extra, signingKeyRR)
 	fmt.Printf("  ✓ Added signer KEY RR to Additional section: %s\n", signingKeyRR.String())
 }
@@ -193,6 +193,34 @@ func extractKeyAlgFlag(args []string) ([]string, uint8, bool) {
 	return out, alg, provided
 }
 
+// defaultKeyTTL is --ttl's default.
+const defaultKeyTTL = 300
+
+// extractTTLFlag pulls a --ttl=<seconds> token out of args, wherever it appears, returning
+// the remaining positional args and the TTL of the KEY RRs this client builds from the
+// signing key (--same-key, and the signer KEY it adds to the Additional section): the TTL
+// suggested to the proxy, which may override it, and never the key-lease, since a lease is
+// not a TTL. rr-spec records carry their own TTL. Without --ttl it is defaultKeyTTL.
+func extractTTLFlag(args []string) ([]string, uint32) {
+	const prefix = "--ttl="
+	out := make([]string, 0, len(args))
+	ttl := uint32(defaultKeyTTL)
+	for _, a := range args {
+		if strings.HasPrefix(a, prefix) {
+			v := strings.TrimPrefix(a, prefix)
+			n, err := strconv.ParseUint(v, 10, 32)
+			if err != nil || n == 0 {
+				fmt.Fprintf(os.Stderr, "ERROR: invalid --ttl=%s: want a positive number of seconds\n", v)
+				os.Exit(1)
+			}
+			ttl = uint32(n)
+			continue
+		}
+		out = append(out, a)
+	}
+	return out, ttl
+}
+
 // extractProtocolFlag pulls a bare --tcp or --tls token out of args, wherever it appears,
 // returning the remaining positional args and the protocol string client.New expects:
 // "tcp", "tls" (DNS-over-TLS, opportunistic -- see client.New), or, with neither, "udp".
@@ -231,9 +259,10 @@ func cmdRegRefWithMode(proxyAddr string, args []string, operation string, tamper
 	args, sameKey := extractSameKeyFlag(args)
 	args, protocol := extractProtocolFlag(args)
 	args, keyAlg, keyAlgProvided := extractKeyAlgFlag(args)
+	args, keyTTL := extractTTLFlag(args)
 
 	if len(args) < 3 {
-		fmt.Fprintf(os.Stderr, "Usage: sig0lease-client <proxy> register|register-tamper|refresh <keyname> [lease] [key-lease] [rr-spec...] [--signer=update|additional|none] [--same-key] [--tcp|--tls] [--k=<algorithm>]\n")
+		fmt.Fprintf(os.Stderr, "Usage: sig0lease-client <proxy> register|register-tamper|refresh <keyname> [lease] [key-lease] [rr-spec...] [--signer=update|additional|none] [--same-key] [--ttl=<seconds>] [--tcp|--tls] [--k=<algorithm>]\n")
 		os.Exit(1)
 	}
 
@@ -322,7 +351,7 @@ func cmdRegRefWithMode(proxyAddr string, args []string, operation string, tamper
 			fmt.Fprintf(os.Stderr, "ERROR: --same-key conflicts with --signer=none: the signing key must appear in the Update section\n")
 			os.Exit(1)
 		}
-		updateKeyRRs = append(updateKeyRRs, keyRRFromClientKey(clientKey, keyLeaseDuration))
+		updateKeyRRs = append(updateKeyRRs, keyRRFromClientKey(clientKey, keyTTL))
 		fmt.Printf("  ✓ --same-key: reusing signing key %s as the Update-section lease payload\n", clientKey.KeyName())
 	}
 
@@ -396,7 +425,7 @@ func cmdRegRefWithMode(proxyAddr string, args []string, operation string, tamper
 		}
 		fmt.Printf("  ✓ Signer KEY RR present in Update section\n")
 	case signerLocationAdditional:
-		addSignerKeyToAdditional(msg, clientKey, keyLeaseDuration)
+		addSignerKeyToAdditional(msg, clientKey, keyTTL)
 	case signerLocationNone:
 		if signerKeyInUpdate {
 			fmt.Fprintf(os.Stderr, "ERROR: --signer=none conflicts with a KEY rr-spec for %s already among the rr-spec arguments\n", clientKey.KeyName())
@@ -407,7 +436,7 @@ func cmdRegRefWithMode(proxyAddr string, args []string, operation string, tamper
 		if signerKeyInUpdate {
 			fmt.Printf("  ✓ Signer KEY RR already present in Authority section; not duplicated in Additional\n")
 		} else {
-			addSignerKeyToAdditional(msg, clientKey, keyLeaseDuration)
+			addSignerKeyToAdditional(msg, clientKey, keyTTL)
 		}
 	}
 
@@ -594,7 +623,9 @@ func cmdVerify(proxyAddr string, args []string) {
 		for _, rr := range resp.Answer {
 			if key, ok := rr.(*dns.KEY); ok {
 				fmt.Printf("    Name: %s\n", key.Hdr.Name)
-				fmt.Printf("    TTL: %d (expires in %d seconds)\n", key.Hdr.TTL, key.Hdr.TTL)
+				// The TTL the proxy gave the record, not its lease: the proxy keeps the
+				// two apart (record_ttl_sec), and a query has no way to learn the lease.
+				fmt.Printf("    TTL: %d\n", key.Hdr.TTL)
 				fmt.Printf("    Algorithm: %d\n", key.Algorithm)
 				fmt.Printf("    KeyTag: %d\n", key.KeyTag())
 			} else {
@@ -643,7 +674,7 @@ Usage:
   sig0lease-client <proxy> <command> [args...]
 
 Commands:
-	register <keyname> [lease] [key-lease] [rr-spec...] [--signer=update|additional|none] [--same-key] [--tcp|--tls] [--k=<algorithm>]
+	register <keyname> [lease] [key-lease] [rr-spec...] [--signer=update|additional|none] [--same-key] [--ttl=<seconds>] [--tcp|--tls] [--k=<algorithm>]
 		Send a sig0lease UPDATE-LEASE registration request
 
 		keyname: without --k, the exact filename of an existing key in the keystore
@@ -665,6 +696,10 @@ Commands:
 				KEY rr-spec. Builds the KEY RR from the loaded signing key and adds it to
 				the Update section; conflicts with an explicit KEY rr-spec for the same
 				name and with --signer=none.
+			--ttl=<seconds>: TTL of the KEY RRs this client builds from the signing key
+				(--same-key, and the signer KEY in the Additional section), suggested to
+				the proxy, which may override it. Independent of key-lease. rr-spec
+				records carry their own TTL. Default 300.
 			--tcp: send the request over TCP instead of the default UDP.
 			--tls: send the request over DNS-over-TLS (RFC 7858) instead of the default
 				UDP; <proxy> must then be the proxy's DoT address (server.tls.address).
@@ -710,7 +745,7 @@ Commands:
 		// ECDSAP256SHA256 key on first run (reused on every later run for the same name)
 		sig0lease-client 127.0.0.1:8053 register test.dev.zenr.io. 0 3600 --same-key --k=13
 
-	refresh <keyname> [lease] [key-lease] [rr-spec...] [--signer=update|additional|none] [--same-key] [--tcp|--tls] [--k=<algorithm>]
+	refresh <keyname> [lease] [key-lease] [rr-spec...] [--signer=update|additional|none] [--same-key] [--ttl=<seconds>] [--tcp|--tls] [--k=<algorithm>]
 		Send a sig0lease UPDATE-LEASE refresh request (8-byte variant)
 
 		keyname: filename of the key in the keystore (e.g., Ktest.dev.zenr.io.+015+05044)
@@ -718,6 +753,7 @@ Commands:
 		key-lease: key-lease duration in seconds
 		--signer: see register above
 		--same-key: see register above
+		--ttl: see register above
 		--tcp, --tls: see register above
 		--k: see register above
 

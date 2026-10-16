@@ -7,7 +7,6 @@ import (
 
 	"codeberg.org/miekg/dns"
 	leasepkg "github.com/NetworkCommons/sig0lease/pkg/lease"
-	"github.com/NetworkCommons/sig0lease/pkg/updatecore"
 )
 
 func (h *UpdateHandler) Handle(ctx context.Context, w dns.ResponseWriter, r *dns.Msg) *HandlerResult {
@@ -70,17 +69,6 @@ func (h *UpdateHandler) Handle(ctx context.Context, w dns.ResponseWriter, r *dns
 		return NewErrorResult(msg, err.Error(), err)
 	}
 
-	// RFC 2181 S5.2 (erratum-corrected): an RRset with inconsistent TTLs is treated as if
-	// every RR in it carried the lowest TTL present. Normalize here, before anything else
-	// reads these TTLs -- in particular before LeasePolicy clamping (S6) and the
-	// duplicate/authoritative-RR comparisons later in this function, both of which must
-	// see the already-uniform value. This is a base-handler correctness fix independent of
-	// SRP (see docs/siglease_rfc9665.md's TTL consistency section); the SRP path uses the same
-	// helper's CheckConsistentTTLs instead, which rejects rather than rewrites.
-	if changed := updatecore.NormalizeTTLs(updateOtherRRs); changed > 0 {
-		h.logger.Debugf("Normalized TTLs to their RRset minimum for %d RRset(s)", changed)
-	}
-
 	h.logger.Infof("UPDATE request for zone %s: LEASE=%d KEY-LEASE=%d RRs=%s",
 		zone, leaseDuration, keyLeaseDuration, summarizeRRTypes(updateKeyRRs, updateOtherRRs))
 
@@ -96,6 +84,19 @@ func (h *UpdateHandler) Handle(ctx context.Context, w dns.ResponseWriter, r *dns
 		h.logger.Debugf("SIG(0) validation failed: %v", err)
 		msg := makeErrorResponse(r, dns.RcodeRefused, fmt.Sprintf("SIG(0) validation failed: %v", err))
 		return NewErrorResult(msg, fmt.Sprintf("SIG(0) validation failed: %v", err), err)
+	}
+
+	// Replace the requester's TTLs with record_ttl_sec (see parseRecordTTL), cut to the
+	// granted KEY-LEASE on KEYs and to the granted LEASE on everything else -- one TTL per
+	// RRset, so RFC 2181 S5.2 holds whatever the requester sent. Done in place, after the
+	// signature over the original TTLs is checked, so the lease store keeps what the zone
+	// gets. Records under a lease of 0 (Cases C and D) are deletes, which go upstream with
+	// TTL 0 anyway.
+	for _, keyRR := range updateKeyRRs {
+		keyRR.Hdr.TTL = min(h.recordTTL, keyLeaseDuration)
+	}
+	for _, rr := range updateOtherRRs {
+		rr.Header().TTL = min(h.recordTTL, leaseDuration)
 	}
 
 	if err := h.validateSignerHierarchyForUpdateRecords(sigRR.SignerName, updateKeyRRs, updateOtherRRs); err != nil {
@@ -372,7 +373,11 @@ func (h *UpdateHandler) Handle(ctx context.Context, w dns.ResponseWriter, r *dns
 					return h.leaseManager.RenewLease(ctx, pendingKeyRR, pendingKeyLease, pendingKeyLease)
 				},
 			})
-			upstreamKeys = append(upstreamKeys, pendingKeyRR)
+			// The stored KEY, not one from this request (KEY-LEASE is 0 here), so it has
+			// not had its TTL set above: set it on a copy, leaving the store's record alone.
+			upstreamKeyRR := copyRR(pendingKeyRR).(*dns.KEY)
+			upstreamKeyRR.Hdr.TTL = min(h.recordTTL, pendingKeyLease)
+			upstreamKeys = append(upstreamKeys, upstreamKeyRR)
 			allNotes = append(allNotes, fmt.Sprintf("KEY %s was missing at the authoritative DNS and has been re-registered with remaining lease", pendingKeyRR.Hdr.Name))
 		}
 

@@ -35,6 +35,7 @@ func main() {
 	discovery := flag.String("discovery", "closest", `where discovery looks for the registrar's SRV: "closest" (the domain, then each parent up to its zone apex) or "apex" (the zone apex only, as RFC 9665 S3.1.1 specifies)`)
 	lease := flag.Uint("lease", 3600, "requested LEASE seconds")
 	keylease := flag.Uint("keylease", 1209600, "requested KEY-LEASE seconds")
+	ttl := flag.Uint("ttl", 300, "TTL seconds suggested for every registered record, KEYs included; independent of the leases, and the registrar may override it")
 	udp := flag.Bool("udp", false, "use UDP instead of TCP (SRP requires TCP by default, S3.5)")
 	useTLS := flag.Bool("tls", false, "use DNS-over-TLS (RFC 7858, opportunistic: the registrar's certificate is not checked) instead of TCP; discovery then looks for _dnssd-srp-tls._tcp")
 	once := flag.Bool("once", false, "send exactly one registration and exit, instead of running the full refresh lifecycle")
@@ -57,6 +58,11 @@ func main() {
 	if *domain == "" || *host == "" {
 		fmt.Fprintln(os.Stderr, "ERROR: -domain and -host are required")
 		printUsage()
+		os.Exit(1)
+	}
+	if *ttl == 0 {
+		// client/srp reads a zero TTL as "unset" and would send its default instead.
+		fmt.Fprintln(os.Stderr, "ERROR: -ttl must be at least 1")
 		os.Exit(1)
 	}
 
@@ -113,6 +119,7 @@ func main() {
 		Key:               key,
 		RequestedLease:    uint32(*lease),
 		RequestedKeyLease: uint32(*keylease),
+		TTL:               uint32(*ttl),
 		RegistrarAddr:     *server,
 		Discovery:         discoveryMode,
 		Resolvers:         []string(resolvers),
@@ -334,6 +341,9 @@ Options:
                          8.8.4.4:53); ignored with -server
   -lease uint              requested LEASE seconds (default 3600)
   -keylease uint            requested KEY-LEASE seconds (default 1209600)
+  -ttl uint                 TTL seconds suggested for every registered record, KEYs included
+                            (default 300). Independent of the leases; the registrar may
+                            override it (RFC 9665 S4)
   -udp                      use UDP instead of TCP (SRP requires TCP by default, S3.5)
   -tls                      use DNS-over-TLS (RFC 7858) instead of TCP. Opportunistic, as RFC 9665
                             S7 specifies: encrypted, but the registrar's certificate is not

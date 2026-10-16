@@ -1,20 +1,28 @@
 package lease
 
 import (
+	"bytes"
 	"context"
+	"encoding/base64"
+	"encoding/json"
+	"net/netip"
+	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
 	"codeberg.org/miekg/dns"
 )
 
-func testKeyRR(name, pub string) *dns.KEY {
+// testKeyRR returns a KEY RR at name whose public key is the base64 encoding of label, so
+// distinct labels give distinct keys and every key packs (snapshots store KEYs in wire format).
+func testKeyRR(name, label string) *dns.KEY {
 	k := &dns.KEY{DNSKEY: dns.DNSKEY{Hdr: dns.Header{Name: name, Class: dns.ClassINET, TTL: 120}}}
 	k.Flags = 512
 	k.Protocol = 3
 	k.Algorithm = 15
-	k.PublicKey = pub
+	k.PublicKey = base64.StdEncoding.EncodeToString([]byte(label))
 	return k
 }
 
@@ -252,6 +260,150 @@ func TestSnapshot_SaveLoad_RoundTripWithNonKEYRecords(t *testing.T) {
 	}
 }
 
+// TestSnapshot_SaveLoad_RoundTripsDNSSDNames pins the snapshot to every octet of a DNS-SD
+// name: an Instance label with spaces, uppercase and UTF-8 (RFC 6763 S4.1.1), and a subtype
+// label of non-UTF-8 bytes (S7.1), as owner names and inside PTR RDATA. Presentation text
+// can't carry the first -- the dns library neither escapes nor unescapes it, so a reloaded
+// "Freifunk Café._http._tcp..." parsed as owner "Freifunk" and failed -- and JSON strings
+// can't carry the second. It also checks the file still shows the records readably.
+func TestSnapshot_SaveLoad_RoundTripsDNSSDNames(t *testing.T) {
+	store := NewInMemoryManager()
+	defer store.Stop()
+	ctx := context.Background()
+
+	const (
+		instance = "Freifunk Café._http._tcp.dev.zenr.io."
+		subtype  = "\xff\xfe._sub._http._tcp.dev.zenr.io."
+	)
+	owner := testKeyRR(instance, "AAAAOWNER=")
+	if err := store.Register(ctx, owner, 300, 300, "dev.zenr.io."); err != nil {
+		t.Fatalf("register owner: %v", err)
+	}
+	hdr := func(name string) dns.Header {
+		return dns.Header{Name: name, Class: dns.ClassINET, TTL: 60}
+	}
+	srv := &dns.SRV{Hdr: hdr(instance)}
+	srv.Port, srv.Target = 668, "host.dev.zenr.io."
+	txt := &dns.TXT{Hdr: hdr(instance)}
+	txt.Txt = []string{"path=/daemon"}
+	ptr := &dns.PTR{Hdr: hdr("_http._tcp.dev.zenr.io.")}
+	ptr.Ptr = instance
+	subPTR := &dns.PTR{Hdr: hdr(subtype)}
+	subPTR.Ptr = instance
+	records := []dns.RR{srv, txt, ptr, subPTR}
+	if err := store.UpsertNonKEYRecords(NodeKey(owner), records, 120, "dev.zenr.io."); err != nil {
+		t.Fatalf("upsert non-key records: %v", err)
+	}
+
+	path := filepath.Join(t.TempDir(), "lease_snapshot_dnssd_names.json")
+	if err := store.SaveSnapshot(path); err != nil {
+		t.Fatalf("save snapshot: %v", err)
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read snapshot: %v", err)
+	}
+	if !strings.Contains(string(data), "Freifunk Café._http._tcp.dev.zenr.io.\\t60\\tIN\\tSRV\\t0 0 668 host.dev.zenr.io.") {
+		t.Errorf("snapshot does not show the SRV record readably:\n%s", data)
+	}
+
+	loaded := NewInMemoryManager()
+	defer loaded.Stop()
+	if err := loaded.LoadSnapshot(path); err != nil {
+		t.Fatalf("load snapshot: %v", err)
+	}
+	if set := loaded.GetNonKEYRecordSet(NodeKey(owner)); set == nil || len(set.Records) != len(records) {
+		t.Fatalf("expected %d non-key records under the owner, got %+v", len(records), set)
+	}
+	for _, want := range records {
+		got := loaded.LookupNonKEYRecord(want)
+		if got == nil {
+			t.Errorf("record not found after reload: %q", want.String())
+			continue
+		}
+		if got.RR.String() != want.String() {
+			t.Errorf("record changed across reload:\n got  %q\n want %q", got.RR.String(), want.String())
+		}
+	}
+}
+
+// TestSnapshot_SaveLoad_RoundTripsArbitraryNameBytes covers the names node_id and
+// parent_key_name hold, beyond what DNS-SD needs: a KEY owner registered through RFC 9664 can
+// be any bytes (RFC 2181 S11), including ones that aren't UTF-8 or that the escaping itself
+// uses, and a name that begins with a space is a different name from the one without it. Each
+// must reload as its own node, with its children, and a node_id that doesn't match its key
+// must be refused.
+func TestSnapshot_SaveLoad_RoundTripsArbitraryNameBytes(t *testing.T) {
+	store := NewInMemoryManager()
+	defer store.Stop()
+	ctx := context.Background()
+
+	const odd = "\xff\x00\"\\.dev.zenr.io."
+	parent := testKeyRR(odd, "PARENT")
+	child := testKeyRR("child."+odd, "CHILD")
+	lead := testKeyRR(" lead.dev.zenr.io.", "LEAD")
+	plain := testKeyRR("lead.dev.zenr.io.", "PLAIN")
+	for _, k := range []*dns.KEY{parent, lead, plain} {
+		if err := store.Register(ctx, k, 300, 300, "dev.zenr.io."); err != nil {
+			t.Fatalf("register %q: %v", k.Hdr.Name, err)
+		}
+	}
+	if err := store.RegisterWithParent(ctx, NodeKey(parent), child, 300, 300, "dev.zenr.io."); err != nil {
+		t.Fatalf("register child: %v", err)
+	}
+	a := &dns.A{Hdr: dns.Header{Name: odd, Class: dns.ClassINET, TTL: 60}}
+	a.A.Addr = netip.MustParseAddr("192.0.2.1")
+	if err := store.UpsertNonKEYRecords(NodeKey(parent), []dns.RR{a}, 120, "dev.zenr.io."); err != nil {
+		t.Fatalf("upsert non-key record: %v", err)
+	}
+
+	path := filepath.Join(t.TempDir(), "lease_snapshot_arbitrary_names.json")
+	if err := store.SaveSnapshot(path); err != nil {
+		t.Fatalf("save snapshot: %v", err)
+	}
+	loaded := NewInMemoryManager()
+	defer loaded.Stop()
+	if err := loaded.LoadSnapshot(path); err != nil {
+		t.Fatalf("load snapshot: %v", err)
+	}
+
+	for _, k := range []*dns.KEY{parent, child, lead, plain} {
+		rec := loaded.Get(NodeKey(k))
+		if rec == nil {
+			t.Errorf("KEY %q not found after reload", k.Hdr.Name)
+			continue
+		}
+		if rec.KeyRR.Hdr.Name != k.Hdr.Name {
+			t.Errorf("KEY owner changed across reload: got %q, want %q", rec.KeyRR.Hdr.Name, k.Hdr.Name)
+		}
+	}
+	kids := map[string]bool{}
+	for _, id := range loaded.ChildrenOf(NodeKey(parent)) {
+		kids[id] = true
+	}
+	if !kids[NodeKey(child)] || !kids[RecordKey(a)] || len(kids) != 2 {
+		t.Errorf("children of %q after reload = %q, want the child KEY and the A record", odd, loaded.ChildrenOf(NodeKey(parent)))
+	}
+	for _, k := range []*dns.KEY{lead, plain} {
+		if recs := loaded.FindByName(k.Hdr.Name); len(recs) != 1 || recs[0].KeyRR.Hdr.Name != k.Hdr.Name {
+			t.Errorf("FindByName(%q) after reload = %d record(s), want just that name's KEY", k.Hdr.Name, len(recs))
+		}
+	}
+
+	snap, err := store.ExportSnapshot()
+	if err != nil {
+		t.Fatalf("export snapshot: %v", err)
+	}
+	for i := range snap.Nodes {
+		if snap.Nodes[i].NodeKind == NodeKindKEY {
+			snap.Nodes[i].NodeID = quoteNodeKey(NodeKey(plain))
+		}
+	}
+	if err := NewInMemoryManager().ImportSnapshot(snap); err == nil {
+		t.Error("expected a KEY node whose node_id isn't its key's to be refused")
+	}
+}
+
 // TestUpsertNonKEYRecords_RejectsDifferentOwnerForIdenticalRR is the core
 // property the reshape from owner-nested to flat, globally-identity-keyed
 // non-KEY storage exists for: "two different keys cannot register the
@@ -471,7 +623,8 @@ func TestRemoveSingleNonKEYRecord_IdempotentAndOwnershipChecked(t *testing.T) {
 // snapshot from the old (v1, two-slice) format must fail loudly rather than
 // silently unmarshaling into an empty store, and a v2 one (same shape, node
 // IDs from before ASCII-only / RDATA-name case folding) must fail rather than
-// load under IDs no lookup computes anymore.
+// load under IDs no lookup computes anymore. A v3 one stored non-KEY records as
+// rr_text, which v4's rr_wire replaced.
 func TestImportSnapshot_RejectsWrongVersion(t *testing.T) {
 	store := NewInMemoryManager()
 	defer store.Stop()
@@ -482,8 +635,119 @@ func TestImportSnapshot_RejectsWrongVersion(t *testing.T) {
 	if err := store.ImportSnapshot(&LeaseTreeSnapshot{Version: 2}); err == nil {
 		t.Fatalf("expected importing a v2 (pre-case-folding-fix) snapshot to be rejected")
 	}
+	if err := store.ImportSnapshot(&LeaseTreeSnapshot{Version: 3}); err == nil {
+		t.Fatalf("expected importing a v3 (presentation-text rr_text) snapshot to be rejected")
+	}
 
 	if err := store.ImportSnapshot(&LeaseTreeSnapshot{Version: leaseSnapshotVersion}); err != nil {
 		t.Fatalf("expected importing an empty, correctly-versioned snapshot to succeed: %v", err)
+	}
+}
+
+// TestLoadSnapshot_RejectsHandEdits pins the snapshot file as not hand-editable: it holds the
+// SHA-256 of its snapshot, and LoadSnapshot refuses any byte the proxy didn't write -- a
+// record, a field only shown for reading (rr_display), whitespace, an added key -- as well as
+// a file in the pre-checksum layout.
+func TestLoadSnapshot_RejectsHandEdits(t *testing.T) {
+	store := NewInMemoryManager()
+	defer store.Stop()
+	owner := testKeyRR("Freifunk Berlin._http._tcp.dev.zenr.io.", "OWNER")
+	if err := store.Register(context.Background(), owner, 300, 300, "dev.zenr.io."); err != nil {
+		t.Fatalf("register owner: %v", err)
+	}
+	path := filepath.Join(t.TempDir(), "lease_snapshot.json")
+	if err := store.SaveSnapshot(path); err != nil {
+		t.Fatalf("save snapshot: %v", err)
+	}
+	saved, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read snapshot: %v", err)
+	}
+	if err := NewInMemoryManager().LoadSnapshot(path); err != nil {
+		t.Fatalf("an unedited snapshot must load: %v", err)
+	}
+
+	snap, err := store.ExportSnapshot()
+	if err != nil {
+		t.Fatalf("export snapshot: %v", err)
+	}
+	unwrapped, err := json.MarshalIndent(snap, "", "  ")
+	if err != nil {
+		t.Fatalf("marshal snapshot: %v", err)
+	}
+
+	edits := []struct {
+		desc string
+		data []byte
+	}{
+		{"display field changed", bytes.Replace(saved, []byte("IN\\tKEY"), []byte("IN\\tKEY "), 1)},
+		{"whitespace added", bytes.Replace(saved, []byte(`"node_kind": `), []byte(`"node_kind":  `), 1)},
+		{"key added", bytes.Replace(saved, []byte("{\n"), []byte("{\n  \"note\": \"x\",\n"), 1)},
+		{"trailing data", append(append([]byte{}, saved...), "{}"...)},
+		{"no checksum (pre-checksum layout)", unwrapped},
+	}
+	for _, e := range edits {
+		if bytes.Equal(e.data, saved) {
+			t.Fatalf("%s: the edit did not change the file", e.desc)
+		}
+		if err := os.WriteFile(path, e.data, 0o600); err != nil {
+			t.Fatalf("%s: write: %v", e.desc, err)
+		}
+		if err := NewInMemoryManager().LoadSnapshot(path); err == nil {
+			t.Errorf("%s: expected LoadSnapshot to refuse the edited file", e.desc)
+		}
+	}
+}
+
+// TestSaveSnapshot_WritesAtomically checks the parts of SaveSnapshot's temp-file-and-rename
+// write that a test can reach: a save puts a new file at path rather than rewriting the old one
+// in place, leaves no temporary file behind, and a save that fails (here, at the rename: path
+// is a directory) removes its temporary file and reports the error. That a crash mid-save
+// leaves the previous file whole follows from the rename, which a unit test can't interrupt.
+func TestSaveSnapshot_WritesAtomically(t *testing.T) {
+	store := NewInMemoryManager()
+	defer store.Stop()
+	if err := store.Register(context.Background(), testKeyRR("owner.dev.zenr.io.", "OWNER"), 300, 300, "dev.zenr.io."); err != nil {
+		t.Fatalf("register owner: %v", err)
+	}
+	dir := t.TempDir()
+	path := filepath.Join(dir, "lease_snapshot.json")
+	if err := os.WriteFile(path, []byte("previous"), 0o600); err != nil {
+		t.Fatalf("seed previous file: %v", err)
+	}
+	before, err := os.Stat(path)
+	if err != nil {
+		t.Fatalf("stat previous file: %v", err)
+	}
+	if err := store.SaveSnapshot(path); err != nil {
+		t.Fatalf("save snapshot: %v", err)
+	}
+	after, err := os.Stat(path)
+	if err != nil {
+		t.Fatalf("stat saved file: %v", err)
+	}
+	if os.SameFile(before, after) {
+		t.Error("the save rewrote the previous file in place; a crash mid-write would leave it torn")
+	}
+	if err := NewInMemoryManager().LoadSnapshot(path); err != nil {
+		t.Fatalf("the saved snapshot must replace the previous file and load: %v", err)
+	}
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatalf("read dir: %v", err)
+	}
+	if len(entries) != 1 {
+		t.Errorf("expected only the snapshot in %s after a save, got %d entries: %v", dir, len(entries), entries)
+	}
+
+	blocked := filepath.Join(dir, "is_a_directory")
+	if err := os.Mkdir(blocked, 0o700); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	if err := store.SaveSnapshot(blocked); err == nil {
+		t.Fatal("expected saving over a directory to fail")
+	}
+	if matches, _ := filepath.Glob(filepath.Join(dir, "is_a_directory.*.tmp")); len(matches) != 0 {
+		t.Errorf("a failed save left its temporary file behind: %v", matches)
 	}
 }

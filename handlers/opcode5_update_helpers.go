@@ -676,24 +676,12 @@ func (h *UpdateHandler) constructUpstreamUpdate(clientKeyRRs []*dns.KEY, otherRe
 		return nil, err
 	}
 
-	policyOther := make([]dns.RR, 0, len(otherRecords))
-	for _, rr := range otherRecords {
-		cpy := copyRR(rr)
-		if cpy == nil || cpy.Header() == nil {
-			continue
-		}
-		hdr := cpy.Header()
-		hdr.TTL = clampTTL(hdr.TTL, h.LeasePolicy.MinRRLease, h.LeasePolicy.MaxRRLease)
-		policyOther = append(policyOther, cpy)
-	}
+	// Update section: optional KEYs plus supported non-KEY records, carrying the TTLs
+	// Handle already set (record_ttl_sec).
 	for _, keyRR := range clientKeyRRs {
-		policyKey := copyRR(keyRR).(*dns.KEY)
-		policyKey.Hdr.TTL = clampTTL(policyKey.Hdr.TTL, h.LeasePolicy.MinKeyLease, h.LeasePolicy.MaxKeyLease)
-		msg.Ns = append(msg.Ns, policyKey)
+		msg.Ns = append(msg.Ns, keyRR)
 	}
-
-	// Update section: optional KEYs plus supported non-KEY records.
-	msg.Ns = append(msg.Ns, policyOther...)
+	msg.Ns = append(msg.Ns, otherRecords...)
 
 	// RFC 2136 deletes (class NONE, TTL 0) for accompanying non-KEY records
 	// Case D asked to remove.

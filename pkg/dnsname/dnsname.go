@@ -27,11 +27,13 @@ package dnsname
 import "strings"
 
 // Normalize returns the form the lease store, the handlers and pkg/updatecore compare and
-// key names by: surrounding whitespace trimmed (zone names also arrive from configuration),
-// ASCII case folded (see Fold), and the trailing dot removed, so "Demo.Example.",
-// "demo.example" and " demo.example. " all normalize to "demo.example".
+// key names by: ASCII case folded (see Fold) and the trailing dot removed, so "Demo.Example."
+// and "demo.example" both normalize to "demo.example". It does not trim whitespace: a label
+// may begin with a space or U+00A0 (RFC 6763 S4.1.1 allows any non-control character), so
+// " demo.example." is a different name. A name read from configuration is trimmed where it
+// is read (the handlers' Setup), not here.
 func Normalize(name string) string {
-	return strings.TrimSuffix(Fold(strings.TrimSpace(name)), ".")
+	return strings.TrimSuffix(Fold(name), ".")
 }
 
 // Fold returns name with the US-ASCII letters A-Z replaced by a-z and every other byte
