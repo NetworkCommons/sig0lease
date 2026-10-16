@@ -1,10 +1,24 @@
 diff --git a/ServiceRegistration/Makefile b/ServiceRegistration/Makefile
-index 517fe80..221f1b5 100644
+index 517fe80..96007f1 100644
 --- a/ServiceRegistration/Makefile
 +++ b/ServiceRegistration/Makefile
-@@ -36,7 +36,10 @@ TLSOBJS      = $(OBJDIR)/tls-macos.o
+@@ -35,8 +35,24 @@ VERIFYOBJS   = $(OBJDIR)/verify-macos.o
+ TLSOBJS      = $(OBJDIR)/tls-macos.o
  IOOBJS       = $(OBJDIR)/ioloop.o $(OBJDIR)/posix.o $(OBJDIR)/ioloop-common.o
  IOWOTLSOBJS  = $(OBJDIR)/ioloop.o $(OBJDIR)/posix.o
++else ifeq ($(os), x-mbedtls)
++# macOS as for os=x, but with mbedtls 3 (Homebrew's: brew install mbedtls@3) in place of the Security framework, so
++# that srp-client keeps its key in a file in its working directory, as on Linux, rather than in one login-keychain
++# item that every run shares. -DSRP_FEATURE_REPLICATION=0 as for linux below. Local build patch, see
++# main/tests/README.md (mDNSResponder section).
++MBEDTLS_PREFIX ?= $(shell brew --prefix mbedtls@3)
++SRPCFLAGS = -O0 -g -Wall -Werror -I../mDNSCore -I$(MBEDTLS_PREFIX)/include -I. -I../mDNSMacOSX/Private $(INCLUDEDIRS) -I../DSO -MMD -MF .depfile-${notdir $@} -DUSE_KQUEUE -DHAVE_SOCKADDR_DL -DGENKEY_PROGRAM=$(GENKEY) -DCERTWRITE_PROGRAM=$(CERTWRITE) -DEXCLUDE_TLS -DPOSIX_BUILD -D__APPLE_USE_RFC_3542 -DSTANDALONE -DMDNS_NO_STRICT=1 -DSRP_CRYPTO_MBEDTLS -DSRP_FEATURE_REPLICATION=0
++SRPLDOPTS = -L$(MBEDTLS_PREFIX)/lib -lmbedcrypto -lmbedtls -lmbedx509 -framework CoreServices -framework Security -framework CoreFoundation -framework Network
++HMACOBJS     = $(OBJDIR)/hmac-mbedtls.o
++SIGNOBJS     = $(OBJDIR)/sign-mbedtls.o $(OBJDIR)/srp-filedata.o
++VERIFYOBJS   = $(OBJDIR)/verify-mbedtls.o
++IOOBJS       = $(OBJDIR)/ioloop.o $(OBJDIR)/posix.o $(OBJDIR)/ioloop-common.o
++IOWOTLSOBJS  = $(OBJDIR)/ioloop.o $(OBJDIR)/posix.o
  else ifeq ($(os), linux)
 -SRPCFLAGS = -DMDNS_UDS_SERVERPATH=\"/var/run/mdnsd\" -O0 -g -Wall -Werror -DSTANDALONE -I../mDNSCore -I/usr/local/include -I. -I../mDNSMacOSX/Private $(INCLUDEDIRS) -I../DSO -MMD -MF .depfile-${notdir $@} -DNOT_HAVE_SA_LEN -DUSE_SELECT -DUSE_INOTIFY -DGENKEY_PROGRAM=$(GENKEY) -DCERTWRITE_PROGRAM=$(CERTWRITE) -DLINUX -DSRP_CRYPTO_MBEDTLS -DPOSIX_BUILD -DMDNS_NO_STRICT
 +# -DSRP_FEATURE_REPLICATION=0: as of mDNSResponder-2881.120.11, srp-replication.c uses symbols that are not
@@ -14,7 +28,7 @@ index 517fe80..221f1b5 100644
  #SRPLDOPTS = /usr/local/lib/libmbedtls.a /usr/local/lib/libmbedx509.a /usr/local/lib/libmbedcrypto.a -lbsd
  SRPLDOPTS = -lmbedcrypto -lmbedtls -lmbedx509
  HMACOBJS     = $(OBJDIR)/hmac-mbedtls.o
-@@ -97,7 +100,10 @@ clean:
+@@ -97,7 +113,10 @@ clean:
  
  SIMPLEOBJS   = $(OBJDIR)/towire.o $(SIGNOBJS) $(OBJDIR)/srp-log.o
  DSOOBJS      = $(OBJDIR)/dso.o $(OBJDIR)/dso-utils.o
@@ -26,7 +40,7 @@ index 517fe80..221f1b5 100644
  FROMWIREOBJS = $(OBJDIR)/fromwire.o $(VERIFYOBJS) $(OBJDIR)/wireutils.o
  CFOBJS       = $(OBJDIR)/config-parse.o
  $(BUILDDIR)/dnssd-relay:  $(OBJDIR)/dnssd-relay.o $(DSOOBJS) $(IOOBJS) $(CFOBJS)
-@@ -124,6 +130,9 @@ $(OBJDIR)/dso.o:	../DSO/dso.c
+@@ -124,6 +143,9 @@ $(OBJDIR)/dso.o:	../DSO/dso.c
  $(OBJDIR)/dnssd_clientstub.o:  ../mDNSShared/dnssd_clientstub.c
  	$(CC) -o $@ $(SRPCFLAGS) $(CFLAGS) -c -I. $(INCLUDEDIRS) $<
  
@@ -36,6 +50,25 @@ index 517fe80..221f1b5 100644
  $(OBJDIR)/dnssd_clientlib.o:  ../mDNSShared/dnssd_clientlib.c
  	$(CC) -o $@ $(SRPCFLAGS) $(CFLAGS) -c -I. $(INCLUDEDIRS) $<
  
+diff --git a/ServiceRegistration/ioloop.c b/ServiceRegistration/ioloop.c
+index 30ec734..ebe9ae0 100644
+--- a/ServiceRegistration/ioloop.c
++++ b/ServiceRegistration/ioloop.c
+@@ -1223,6 +1223,14 @@ ioloop_listener_create(bool stream, bool tls, bool inetd, uint16_t *UNUSED avoid
+         listener->address = *ip_address;
+     }
+     listener->address.sa.sa_family = real_family;
++#ifndef NOT_HAVE_SA_LEN
++    // Local build patch (mDNSResponder-2881.120.11): with no address given, nothing set sa_len, so on platforms that
++    // have it (macOS) bind() below got length 0 and failed with EINVAL, and srp-mdns-proxy had no SRP listener. See
++    // main/tests/README.md (mDNSResponder section).
++    if (ip_address == NULL) {
++        listener->address.sa.sa_len = real_family == AF_INET ? sizeof(listener->address.sin) : sizeof(listener->address.sin6);
++    }
++#endif
+ 
+     if (multicast != 0) {
+         if (stream) {
 diff --git a/ServiceRegistration/srp-dnssd.h b/ServiceRegistration/srp-dnssd.h
 index 53aed1d..d455dd3 100644
 --- a/ServiceRegistration/srp-dnssd.h
@@ -84,6 +117,22 @@ index 2b870d2..9ea448a 100644
  // Local Variables:
  // mode: C
  // tab-width: 4
+diff --git a/ServiceRegistration/srp.h b/ServiceRegistration/srp.h
+index 93dccad..3b98070 100644
+--- a/ServiceRegistration/srp.h
++++ b/ServiceRegistration/srp.h
+@@ -197,7 +197,10 @@ void srp_log_ref_final(void *x, unsigned ref_count, const char *object_type, con
+ #define SRP_OBJ_REF_COUNT_LIMIT    10000
+ 
+ #ifdef __clang__
+-#define FILE_TRIM(x) (strrchr(x, '/') + 1)
++// Local build patch (mDNSResponder-2881.120.11): a file name without '/' (a Makefile build compiles "ioloop.c",
++// not a path) made this strrchr(...) + 1, an invalid pointer that crashed srp-mdns-proxy at its first ALLOC log
++// line on macOS. See main/tests/README.md (mDNSResponder section).
++#define FILE_TRIM(x) (strrchr(x, '/') != NULL ? strrchr(x, '/') + 1 : (x))
+ #else
+ #define FILE_TRIM(x) (x)
+ #endif
 diff --git a/mDNSShared/uds_daemon.c b/mDNSShared/uds_daemon.c
 index 6486f1e..0250aee 100644
 --- a/mDNSShared/uds_daemon.c

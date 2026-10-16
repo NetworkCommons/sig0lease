@@ -140,9 +140,7 @@ bind9_report_rejections() {
 stop_bind9() {
     if [ -n "${BIND9_PID:-}" ] && kill -0 "$BIND9_PID" 2>/dev/null; then
         log_step "Stopping named (PID: $BIND9_PID)"
-        kill "$BIND9_PID" || true
-        sleep 1
-        kill -0 "$BIND9_PID" 2>/dev/null && kill -9 "$BIND9_PID" 2>/dev/null || true
+        stop_process "$BIND9_PID" || true
         log_success "named stopped"
     fi
     BIND9_PID=""

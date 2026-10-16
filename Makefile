@@ -154,9 +154,10 @@ test-srp:
 	./tests/test_srp.sh run
 
 # Run the SRP interop suite against the real, unmodified mDNSResponder/ServiceRegistration
-# srp-client/srp-mdns-proxy binaries (a sibling checkout -- see tests/README.md for setup).
-# Both directions: real srp-client against our registrar, and our own client/srp against the
-# real srp-mdns-proxy.
+# srp-client/srp-mdns-proxy binaries (a sibling checkout -- see tests/README.md for setup):
+# real srp-client against our registrar, our own client/srp against the real srp-mdns-proxy,
+# and our -mdns bridge reading the mDNS daemon. On Linux it starts mDNSResponder's mdnsd and
+# needs root; on macOS it uses the system's daemon.
 test-mdnsresponder-interop:
 	./tests/test_mdnsresponder_interop.sh run
 

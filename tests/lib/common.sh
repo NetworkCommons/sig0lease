@@ -133,6 +133,58 @@ require_command() {
     fi
 }
 
+# listening_ports <tcp|udp> [<pid>] -- prints, one per line, the ports of every listening TCP
+# socket or bound UDP socket, or only of process <pid>'s. lsof on macOS; on Linux ss or, in
+# containers without it, /proc/net.
+listening_ports() {
+    local proto="$1" pid="${2:-}"
+    if [ "${OS}" = "darwin" ]; then
+        local args=(-nP -Fn -i"$(echo "$proto" | tr '[:lower:]' '[:upper:]')")
+        [ "$proto" = tcp ] && args+=(-sTCP:LISTEN)
+        [ -n "$pid" ] && args+=(-a -p "$pid")
+        # Name lines are n<address>:<port>; a connected socket's also names its peer (->).
+        { lsof "${args[@]}" 2>/dev/null || true; } | sed -n -e '/->/d' -e 's/^n.*:\([0-9][0-9]*\)$/\1/p'
+    elif command -v ss >/dev/null 2>&1; then
+        # The local address is the first field that ends in :<port>; the peer's is *:* or similar.
+        { ss -ln"${proto:0:1}"p 2>/dev/null || true; } \
+            | { if [ -n "$pid" ]; then grep "pid=${pid}," || true; else cat; fi; } \
+            | awk '{ for (i = 1; i <= NF; i++) if ($i ~ /:[0-9]+$/) { sub(/.*:/, "", $i); print $i; next } }'
+    elif [ -d /proc/net ]; then
+        # Columns: sl, local address (hex address:hex port), remote address, state (0A is TCP
+        # LISTEN, 07 an unconnected UDP socket), ..., socket inode (10th), matched against
+        # <pid>'s file descriptors.
+        local files state inodes=""
+        if [ "$proto" = tcp ]; then files="/proc/net/tcp /proc/net/tcp6"; state=0A; else files="/proc/net/udp /proc/net/udp6"; state=07; fi
+        [ -n "$pid" ] && inodes=" $(ls -l "/proc/$pid/fd" 2>/dev/null | sed -n 's/.*socket:\[\([0-9]*\)\].*/\1/p' | tr '\n' ' ')"
+        # shellcheck disable=SC2086 # files is a list
+        cat $files 2>/dev/null \
+            | awk -v st="$state" -v pid="$pid" -v inodes="$inodes" \
+                '$4 == st && (pid == "" || index(inodes, " " $10 " ")) { sub(/.*:/, "", $2); print $2 }' \
+            | while read -r hex; do printf '%d\n' "0x$hex"; done
+    else
+        log_error "Cannot list listening ports: no lsof, ss or /proc/net"
+        return 1
+    fi
+}
+
+# is_listening <port> [<pid>] -- whether anything, or process <pid>, listens on <port> over TCP
+# or UDP.
+is_listening() {
+    local port="$1" pid="${2:-}" ports
+    ports="$(listening_ports tcp "$pid" && listening_ports udp "$pid")" || return 1
+    grep -qx "$port" <<< "$ports"
+}
+
+# stop_process <pid> [<signal>] -- sends <signal> (default TERM) to <pid>, a background job of
+# this shell, waits for it to exit and returns its exit status (128+n when signal n ended it).
+# The wait, with stderr off, is also what keeps bash from printing its own notice for a job a
+# signal ended ("line N: <pid> Killed: 9 ..."), which it otherwise does at whatever line it is
+# on when it notices.
+stop_process() {
+    local pid="$1" signal="${2:-TERM}"
+    { kill -s "$signal" "$pid"; wait "$pid"; } 2>/dev/null
+}
+
 # make_tls_cert <dir> -- writes a fresh self-signed ECDSA P-256 certificate (cert.pem) and its
 # private key (key.pem) into dir, for a test proxy's DNS-over-TLS listener (server.tls). The
 # project's clients use opportunistic DoT and never check the certificate, so a throwaway one

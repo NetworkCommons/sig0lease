@@ -44,23 +44,9 @@ yaml_get_lease_time() {
     fi
 }
 
-# Check if a proxy/service is ALREADY listening on PROXY_PORT. Sets the
-# global PORT_HEX as a side effect (consumed later by start_proxy's
-# post-launch listener check).
+# Check if a proxy/service is ALREADY listening on PROXY_PORT.
 is_port_in_use() {
-    PORT_HEX=$(printf '%04X' "$PROXY_PORT")
-
-    if [ "${OS}" = "darwin" ]; then
-        lsof -nP -iTCP:"${PROXY_PORT}" -sTCP:LISTEN >/dev/null 2>&1 || \
-            lsof -nP -iUDP:"${PROXY_PORT}" >/dev/null 2>&1
-    elif command -v ss >/dev/null 2>&1; then
-        ss -tuln 2>/dev/null | grep -qE ":${PROXY_PORT}\\b"
-    elif [ -f /proc/net/tcp ] || [ -f /proc/net/udp ]; then
-        grep ":${PORT_HEX} " /proc/net/tcp 2>/dev/null | grep -q " 0A " || \
-            grep ":${PORT_HEX} " /proc/net/udp 2>/dev/null | grep -q " 07 "
-    else
-        return 1
-    fi
+    is_listening "$PROXY_PORT"
 }
 
 # prepare_lease_config decides, once, whether this run will start its own
@@ -155,39 +141,10 @@ start_proxy() {
         return 1
     fi
     # Verify our proxy PID owns at least one listener on the target port.
-    is_listening=true
-
-    if [ "${OS}" = "darwin" ]
-    then
-        if ! lsof -nP -a -p "$PROXY_PID" -iTCP:"${PROXY_PORT}" -sTCP:LISTEN >/dev/null 2>&1 && \
-        ! lsof -nP -a -p "$PROXY_PID" -iUDP:"${PROXY_PORT}" >/dev/null 2>&1
-        then
-            is_listening=false
-        fi
-    elif command -v ss >/dev/null 2>&1
-    then
-        if ! ss -tulnp 2>/dev/null | grep -E ":${PROXY_PORT}\\b" | grep -q "pid=${PROXY_PID},"
-        then
-            is_listening=false
-        fi
-    elif [ -f /proc/net/tcp ] || [ -f /proc/net/udp ]
-    then
-        # Fallback for container environments without lsof/ss:
-        # Check /proc/net/tcp (state 0A = LISTEN) and /proc/net/udp for the port.
-        if ! grep ":${PORT_HEX} " /proc/net/tcp 2>/dev/null | grep -q " 0A " && \
-           ! grep ":${PORT_HEX} " /proc/net/udp 2>/dev/null | grep -q " 07 "
-        then
-            is_listening=false
-        fi
-    else
-        log_error "Cannot verify proxy listening: no lsof, ss, or /proc/net available"
-        return 1
-    fi
-
-    if [ "${is_listening}" = false ]
+    if ! is_listening "$PROXY_PORT" "$PROXY_PID"
     then
         log_error "Proxy PID $PROXY_PID is not listening on port ${PROXY_PORT}"
-        kill "$PROXY_PID" 2>/dev/null || true
+        stop_process "$PROXY_PID" || true
         return 1
     fi
 
@@ -199,8 +156,7 @@ start_proxy() {
 stop_proxy() {
     if [ ! -z "${PROXY_PID:-}" ] && kill -0 "$PROXY_PID" 2>/dev/null; then
         log_step "Stopping sig0lease proxy (PID: $PROXY_PID)"
-        kill "$PROXY_PID" || true
-        sleep 1
+        stop_process "$PROXY_PID" || true
         log_success "Proxy stopped"
     fi
     PROXY_PID=""

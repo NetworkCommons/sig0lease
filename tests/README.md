@@ -67,13 +67,24 @@ is stable in both projects) rather than assuming `main`/`master` behaves identic
 ### mDNSResponder (`ServiceRegistration/`) — required for `test_mdnsresponder_interop.sh`
 
 Apple's own SRP client (`srp-client`) and registrar (`srp-mdns-proxy`) reference
-implementation, plus its mDNS daemon (`mdnsd`) and browse tool (`dns-sd`) from `mDNSPosix/` and
-`Clients/`. `tests/test_mdnsresponder_interop.sh` runs the real, unmodified binaries
-against our own registrar and client — see that script's own top-of-file comment for what it
-covers. `tests/lib/mdnsresponder.sh`'s `build_mdnsresponder` builds them automatically the
-first time the interop script runs (subsequent runs reuse the existing build). The script must
-run as root: it starts `mdnsd`, which creates `/var/run/mdnsd` and binds UDP 5353, and it
-refuses to start if another mDNS daemon already listens on that socket.
+implementation, plus an mDNS daemon and its browse tool (`dns-sd`). `tests/test_mdnsresponder_interop.sh`
+runs the real, unmodified binaries against our own registrar and client — see that script's
+own top-of-file comment for what it covers. `tests/lib/mdnsresponder.sh`'s `build_mdnsresponder`
+builds them automatically the first time the interop script runs (subsequent runs reuse the
+existing build), into `ServiceRegistration/build/<os>/` (`linux` or `darwin`), so one checkout
+can serve both a Linux machine and a Mac.
+
+- **Linux:** the daemon is mDNSResponder's own `mdnsd`, with `dns-sd`, built from `mDNSPosix/`
+  and `Clients/`. The script must run as root: it starts `mdnsd`, which creates
+  `/var/run/mdnsd` and binds UDP 5353, and it refuses to start if another mDNS daemon already
+  listens on that socket.
+- **macOS:** the daemon is the system's mDNSResponder (`/var/run/mDNSResponder`), with
+  `/usr/bin/dns-sd`, as in the Mac demo. Nothing to start and no root needed. While Direction 2
+  runs, `srp-mdns-proxy`'s DNS proxy also listens on UDP port 53 of every interface: macOS lets
+  any process bind it, and Linux's build stops the DNS proxy before, for want of a TLS key.
+
+Either way, Directions 2 and 3 advertise their test services (`Gizmo`, `Bridge Demo`) on the
+local network while they run.
 
 ```
 git clone https://github.com/apple-oss-distributions/mDNSResponder.git ../mDNSResponder
@@ -81,9 +92,11 @@ cd ../mDNSResponder && git checkout -b rel/mDNSResponder-2881 --track origin/rel
 git apply ../main/tests/mdnsresponder-build.patch   # tested at mDNSResponder-2881.120.11
 ```
 
-Needs `mbedtls` dev libraries on Linux (`apt-get install libmbedtls-dev`). The open-source
-snapshot does not build on Linux as published; `tests/mdnsresponder-build.patch` holds the
-four local fixes, none of which touches SRP message handling:
+Needs `mbedtls`: on Linux its dev libraries (`apt-get install libmbedtls-dev`), on macOS
+Homebrew's version 3 (`brew install mbedtls@3`; version 4 dropped APIs the code uses). The
+open-source snapshot does not build or run on Linux or macOS as published;
+`tests/mdnsresponder-build.patch` holds the local fixes, none of which touches SRP message
+handling:
 
 - `srp-log.c`: defines `srp_log_ref_check`/`srp_log_ref_final`, which `srp.h` declares and
   `srp-mdns-proxy.c` calls but nothing defines.
@@ -91,14 +104,25 @@ four local fixes, none of which touches SRP message handling:
   the POSIX Makefile) in place of `dnssd_clientstub.o`, and builds the Linux target with
   `-DSRP_FEATURE_REPLICATION=0`: `srp-replication.c` uses symbols that are only in Apple's
   internal tree. The suites never use registrar-to-registrar replication.
+- `ServiceRegistration/Makefile`, again: adds the macOS target `os=x-mbedtls`. It is Apple's
+  `os=x` with mbedtls in place of the Security framework, and the same
+  `-DSRP_FEATURE_REPLICATION=0`. With the Security framework, `srp-client` keeps its key in
+  one login-keychain item that every run shares. With mbedtls it keeps it in a file in its
+  working directory, as on Linux, which the suite relies on to give each test a fresh key.
+- `srp.h` (macOS): with clang, `FILE_TRIM` returned an invalid pointer for a file name without
+  a `/`, which is what a Makefile build compiles, and `srp-mdns-proxy` crashed at its first
+  log line about an allocation. It now returns the name as it is.
+- `ioloop.c` (macOS): a listener created with no address never got its `sa_len`, so `bind()`
+  failed with EINVAL and `srp-mdns-proxy` had no SRP listener. Linux has no `sa_len`.
 - `srp-dnssd.h`: includes `srp-clientstub.h`, which declares the two functions it calls.
 - `mDNSShared/uds_daemon.c`: one AWDL-only expression that refers to stripped code becomes
   `mDNSfalse`, as the file's two other split-AWDL flags already are. Needed for `mdnsd`.
 
-`make` (from `ServiceRegistration/`) builds `build/srp-client`, `build/srp-mdns-proxy`, and a
-couple of supporting tools. `build/srp-dns-proxy` does **not** build in this snapshot
-(unrelated drift, several call sites don't match current signatures elsewhere in the tree) —
-source-level reference only, not exercised by any test here.
+The suite runs `make os=<linux|x-mbedtls> BUILDDIR=build/<os> OBJDIR=objects/<os> setup
+build/<os>/srp-client build/<os>/srp-mdns-proxy` from `ServiceRegistration/`. A plain `make`
+there still builds Apple's default target into `build/`. `srp-dns-proxy` does **not** build
+in this snapshot (unrelated drift, several call sites don't match current signatures
+elsewhere in the tree) — source-level reference only, not exercised by any test here.
 
 ### OpenThread — only needed to *regenerate* a fixture, not for routine test runs
 
