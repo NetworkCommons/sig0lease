@@ -8,6 +8,7 @@ import (
 	"net/netip"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -576,9 +577,8 @@ func TestLookupNonKEYRecord_GlobalRegardlessOfOwner(t *testing.T) {
 
 // TestRemoveSingleNonKEYRecord_IdempotentAndOwnershipChecked covers both
 // halves of the contract: removal by a non-owner fails loudly and leaves
-// the record untouched, while removing an already-absent record (the
-// scenario processExpiredLease's two expiry loops can both hit for the same
-// record in the same tick) is a no-op, not an error.
+// the record untouched, while removing an already-absent record is a no-op,
+// not an error.
 func TestRemoveSingleNonKEYRecord_IdempotentAndOwnershipChecked(t *testing.T) {
 	store := NewInMemoryManager()
 	defer store.Stop()
@@ -749,5 +749,56 @@ func TestSaveSnapshot_WritesAtomically(t *testing.T) {
 	}
 	if matches, _ := filepath.Glob(filepath.Join(dir, "is_a_directory.*.tmp")); len(matches) != 0 {
 		t.Errorf("a failed save left its temporary file behind: %v", matches)
+	}
+}
+
+// ListOwners lists each KEY node and each owner of non-KEY records once, sorted -- including an
+// owner with no KEY record of its own, which the snapshot keeps across a restart -- and drops
+// an owner once its last record is gone.
+func TestListOwners(t *testing.T) {
+	ctx := context.Background()
+	store := NewInMemoryManager()
+	parent := testKeyRR("a.example.", "PARENT")
+	child := testKeyRR("b.a.example.", "CHILD")
+	if err := store.Register(ctx, parent, 60, 60, "example."); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.RegisterWithParent(ctx, NodeKey(parent), child, 60, 60, "example."); err != nil {
+		t.Fatal(err)
+	}
+	txt := func(name, text string) dns.RR {
+		rr := &dns.TXT{Hdr: dns.Header{Name: name, Class: dns.ClassINET, TTL: 60}}
+		rr.TXT.Txt = []string{text}
+		return rr
+	}
+	const keyless = "c.example.+015+00001" // a signer with no KEY record in the store
+	if err := store.UpsertNonKEYRecords(NodeKey(parent), []dns.RR{txt("a.example.", "a")}, 60, "example."); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.UpsertNonKEYRecords(keyless, []dns.RR{txt("c.example.", "1"), txt("c.example.", "2")}, 60, "example."); err != nil {
+		t.Fatal(err)
+	}
+
+	want := []string{NodeKey(parent), NodeKey(child), keyless}
+	slices.Sort(want)
+	if got := store.ListOwners(); !slices.Equal(got, want) {
+		t.Fatalf("ListOwners() = %v, want %v", got, want)
+	}
+
+	path := filepath.Join(t.TempDir(), "snapshot.json")
+	if err := store.SaveSnapshot(path); err != nil {
+		t.Fatal(err)
+	}
+	loaded, found, err := ReadSnapshotFile(path)
+	if err != nil || !found {
+		t.Fatalf("ReadSnapshotFile() = found %v, error %v", found, err)
+	}
+	if got := loaded.ListOwners(); !slices.Equal(got, want) {
+		t.Fatalf("after a snapshot round trip, ListOwners() = %v, want %v", got, want)
+	}
+
+	store.RemoveNonKEYRecords(keyless)
+	if got := store.ListOwners(); slices.Contains(got, keyless) {
+		t.Fatalf("ListOwners() = %v still lists %s after its records were removed", got, keyless)
 	}
 }

@@ -144,6 +144,12 @@ type LeaseStorage interface {
 	// Delete removes the subtree rooted at the composite nodeKey.
 	Delete(nodeKey string) error
 	ListAll() []*Record
+	// ListOwners returns, sorted, the node key of every node that holds a lease: each KEY
+	// node, and each owner of non-KEY records -- also an owner with no KEY record of its own,
+	// such as a signer that registered data without being lease-managed itself. A handler
+	// times each owner's lease events with one expiry timer, so this is what its
+	// reconciliation walks.
+	ListOwners() []string
 	SetPersistenceHook(hook func(ctx context.Context, op string, record *Record) error)
 
 	// -- Tree / hierarchy --
@@ -252,8 +258,8 @@ type NodeSnapshot struct {
 // corresponding upstream DNS delete. A store-driven timer here would race
 // the handler's own precise per-node timer and — whichever fired first —
 // silently erase local state without ever notifying the authoritative
-// server. See UpdateHandler.reconcileLeaseTimers for the single, upstream-
-// aware path that owns expiry.
+// server. See the handlers package's per-node expiry timers (expiryTimers),
+// the single, upstream-aware path that owns expiry.
 type InMemoryLeaseStore struct {
 	mu              sync.RWMutex
 	leases          map[string]*Record             // composite NodeKey → Record (KEY nodes)
@@ -481,6 +487,26 @@ func (m *InMemoryLeaseStore) ListAll() []*Record {
 		all = append(all, cloneRecord(record))
 	}
 	return all
+}
+
+// ListOwners implements LeaseStorage.ListOwners.
+func (m *InMemoryLeaseStore) ListOwners() []string {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	seen := make(map[string]struct{}, len(m.leases))
+	for nodeKey := range m.leases {
+		seen[nodeKey] = struct{}{}
+	}
+	for _, rec := range m.nonKeyRecords {
+		seen[rec.ParentKeyName] = struct{}{}
+	}
+	owners := make([]string, 0, len(seen))
+	for nodeKey := range seen {
+		owners = append(owners, nodeKey)
+	}
+	sort.Strings(owners)
+	return owners
 }
 
 func (m *InMemoryLeaseStore) SetPersistenceHook(hook func(ctx context.Context, op string, record *Record) error) {
@@ -1011,8 +1037,10 @@ func NodeKeyFromSIG(signerName string, algorithm uint8, keyTag uint16) string {
 	return fmt.Sprintf("%s.+%03d+%05d", dnsname.Normalize(signerName), algorithm, keyTag)
 }
 
-// dnsNameFromNodeKey extracts the DNS name portion of a composite node key.
-func dnsNameFromNodeKey(nodeKey string) string {
+// NodeKeyName extracts the DNS name portion of a KEY node's composite key (NodeKey): the
+// name as dnsname.Normalize returns it. Only meaningful for a KEY node's key, not a non-KEY
+// record's RecordKey.
+func NodeKeyName(nodeKey string) string {
 	if i := strings.LastIndex(nodeKey, ".+"); i > 0 {
 		return nodeKey[:i]
 	}
@@ -1197,7 +1225,7 @@ func (m *InMemoryLeaseStore) deleteSubtreeLocked(ctx context.Context, rootKey st
 				_ = m.persistenceHook(ctx, "delete", cloneRecord(rec))
 			}
 			delete(m.leases, key)
-			dnsName := dnsNameFromNodeKey(key)
+			dnsName := NodeKeyName(key)
 			if existing := m.nameIdx[dnsName]; len(existing) > 0 {
 				updated := existing[:0]
 				for _, nk := range existing {

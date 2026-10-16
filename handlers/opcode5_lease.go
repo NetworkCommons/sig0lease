@@ -3,6 +3,7 @@ package handlers
 import (
 	"context"
 	"fmt"
+	"slices"
 	"sort"
 	"strings"
 	"sync"
@@ -11,8 +12,8 @@ import (
 	"codeberg.org/miekg/dns"
 	"github.com/NetworkCommons/sig0lease/logging"
 	"github.com/NetworkCommons/sig0lease/pkg/dnsname"
-	"github.com/NetworkCommons/sig0lease/pkg/keyrec"
 	leasepkg "github.com/NetworkCommons/sig0lease/pkg/lease"
+	"github.com/NetworkCommons/sig0lease/pkg/updatecore"
 )
 
 // authorizeKeyRefresh verifies that signerID may refresh the already
@@ -124,54 +125,151 @@ func nextLeaseEvent(store LeaseManager, nodeKey string) (time.Duration, bool) {
 	return d, true
 }
 
-// expireNonKEYRecords removes nodeKey's due non-KEY records -- each one whose own LEASE has
-// elapsed as of now, or every one regardless when all is set -- upstream first: a record is
-// deleted via deleteUpstream and forgotten locally only once that delete is confirmed. A
-// record whose delete fails stays tracked with its already-past ExpiresAt, so the caller's
-// next expiry pass retries it instead of silently forgetting a record that is still
-// published at authoritative DNS. Returns false if any due record is still pending for
-// that reason. Shared by UpdateHandler and SRPHandler, which differ only in how they build
-// the upstream delete.
-func expireNonKEYRecords(ctx context.Context, store LeaseManager, logger *logging.Logger, nodeKey string, now time.Time, all bool, deleteUpstream func(context.Context, dns.RR) error) bool {
-	set := store.GetNonKEYRecordSet(nodeKey)
-	if set == nil {
-		return true
-	}
-	complete := true
-	for key, entry := range set.Records {
-		if !all && now.Before(entry.ExpiresAt) {
-			continue
-		}
-		if err := deleteUpstream(ctx, entry.RR); err != nil {
-			logger.Warnf("Upstream lease-expiry delete for %s record %s failed: %v (will retry)", nodeKey, key, err)
-			complete = false
-			continue
-		}
-		if err := store.RemoveSingleNonKEYRecord(nodeKey, key); err != nil {
-			logger.Warnf("Failed to remove expired non-KEY record %s for %s locally: %v", key, nodeKey, err)
-		}
-	}
-	return complete
+// leaseExpirer ends the leases of one handler's store; both handlers use it, so a lease ends
+// the same way in each. One lease event of a node is one UPDATE that deletes, record by record,
+// every KEY and non-KEY record the event ends -- "at the same time", as RFC 9665 S5.1 requires
+// of a host and its services -- and those are forgotten locally only once that UPDATE is
+// confirmed. If it is not, nothing is forgotten, and the whole event is retried after the
+// backoff (expiryTimers.finish). Only what the store tracks is deleted, never a Delete All
+// RRsets at a name, which would also take records other writers put there.
+type leaseExpirer struct {
+	store    LeaseManager
+	timers   *expiryTimers
+	upstream upstreamTarget
+	fire     func(nodeKey string) func()
+	locks    *leasepkg.NodeLocks
+	// lockIDs gives the handler's lock ids for a node and its whole subtree.
+	lockIDs func(nodeKey string) []string
+	// dataCascade makes the data expiry of a node take the data of every KEY node below it
+	// along, whatever their own LEASE: RFC 9665 S5.1, "when the lease on a hostname expires,
+	// the hostname and all services that reference it MUST be removed at the same time". An
+	// instance registered by an earlier update and omitted from the host's latest one keeps
+	// that update's LEASE; without the cascade a longer one would stay advertised against a
+	// host with no addresses. RFC 9664 has no such rule.
+	dataCascade bool
 }
 
-// nonKEYExpiryDelete returns processExpiredLease's upstream delete for one expiring non-KEY
-// record in effectiveZone (already resolved to its zone cut), signed with signingKey, for
-// expireNonKEYRecords.
-func (h *UpdateHandler) nonKEYExpiryDelete(effectiveZone string, signingKey *keyrec.LoadedKey) func(context.Context, dns.RR) error {
-	return func(ctx context.Context, rr dns.RR) error {
-		deleteMsg, err := h.constructUpstreamDeleteForRecords([]dns.RR{rr}, signingKey, effectiveZone)
-		if err != nil {
-			return err
+// dueRecord is a non-KEY record a lease event deletes, with the node that owns it.
+type dueRecord struct {
+	owner string
+	rrKey string
+	rr    dns.RR
+}
+
+// subtreeLeases returns every KEY and non-KEY record at and below nodeKey: what a KEY's
+// expiry, or its Case C delete, takes away.
+func subtreeLeases(store LeaseManager, nodeKey string) ([]*dns.KEY, []dueRecord) {
+	var keys []*dns.KEY
+	var records []dueRecord
+	for _, owner := range append([]string{nodeKey}, store.ListSubtreeKeys(nodeKey)...) {
+		if rec := store.Get(owner); rec != nil {
+			keys = append(keys, rec.KeyRR)
 		}
-		resp, err := h.upstreamCoordinator.SendUpdate(ctx, effectiveZone, deleteMsg)
-		if err != nil {
-			return err
-		}
-		if resp == nil || resp.Rcode != dns.RcodeSuccess {
-			return fmt.Errorf("rejected: %s", rcodeDescription(resp))
-		}
+		records = append(records, ownRecords(store, owner, time.Time{})...)
+	}
+	return keys, records
+}
+
+// ownRecords returns owner's non-KEY records whose lease has ended by due, sorted; a zero due
+// means all of them.
+func ownRecords(store LeaseManager, owner string, due time.Time) []dueRecord {
+	set := store.GetNonKEYRecordSet(owner)
+	if set == nil {
 		return nil
 	}
+	var records []dueRecord
+	for rrKey, rec := range set.Records {
+		if due.IsZero() || !due.Before(rec.ExpiresAt) {
+			records = append(records, dueRecord{owner: owner, rrKey: rrKey, rr: rec.RR})
+		}
+	}
+	slices.SortFunc(records, func(a, b dueRecord) int { return strings.Compare(a.rrKey, b.rrKey) })
+	return records
+}
+
+// recordDeletes returns records as the UPDATE instructions that delete them.
+func recordDeletes(records []dueRecord) []dns.RR {
+	deletes := make([]dns.RR, 0, len(records))
+	for _, r := range records {
+		deletes = append(deletes, updatecore.AsDelete(r.rr))
+	}
+	return deletes
+}
+
+// run is a timer's lease event for nodeKey: it takes the node locks of nodeKey and its subtree
+// and runs expire. A timer has nobody waiting on its answer, so it does not wait for a request
+// holding any of them: it backs off and tries again, exactly like a failed attempt
+// (docs/siglease_rfc9664.md, "Node Locks"). Reports whether anything was removed; the locks
+// are released by the time it returns.
+func (e leaseExpirer) run(ctx context.Context, nodeKey string) bool {
+	locks, err := e.locks.TryAcquire(func() []string { return e.lockIDs(nodeKey) })
+	if err != nil {
+		delay := e.timers.finish(e.store, nodeKey, false, e.fire(nodeKey))
+		e.upstream.logger.Infof("%s: lease expiry of %s: %v; retrying in %s", e.upstream.handler, nodeKey, err, delay)
+		return false
+	}
+	defer locks.Release()
+	return e.expire(ctx, nodeKey)
+}
+
+// expire runs nodeKey's lease event, its caller holding the node locks of nodeKey and its
+// subtree, and re-arms nodeKey's timer: for its next lease event, or after the retry backoff
+// if the UPDATE failed. If nodeKey's KEY has expired, the event ends its whole subtree
+// (subtreeLeases), whatever the leases below it; otherwise it ends nodeKey's own records whose
+// LEASE has run out, and with dataCascade, once one has, all the data of the KEY nodes below
+// it. Reports whether anything was removed.
+func (e leaseExpirer) expire(ctx context.Context, nodeKey string) bool {
+	now := time.Now()
+	var keys []*dns.KEY
+	var records []dueRecord
+	keyExpired := false
+	if rec := e.store.Get(nodeKey); rec != nil && !now.Before(rec.ExpiresAt) {
+		keyExpired = true
+		keys, records = subtreeLeases(e.store, nodeKey)
+	} else if records = ownRecords(e.store, nodeKey, now); len(records) > 0 && e.dataCascade {
+		for _, child := range e.store.ListSubtreeKeys(nodeKey) {
+			if e.store.Get(child) != nil {
+				records = append(records, ownRecords(e.store, child, time.Time{})...)
+			}
+		}
+	}
+	if len(keys) == 0 && len(records) == 0 {
+		// Nothing due: a raced refresh, or a node already gone.
+		e.timers.finish(e.store, nodeKey, true, e.fire(nodeKey))
+		return false
+	}
+
+	if _, err := e.upstream.send(ctx, nil, append(asDeletes(keys...), recordDeletes(records)...)); err != nil {
+		delay := e.timers.finish(e.store, nodeKey, false, e.fire(nodeKey))
+		e.upstream.logger.Warnf("%s: lease expiry of %s: %v; nothing forgotten, retrying in %s", e.upstream.handler, nodeKey, err, delay)
+		return false
+	}
+
+	if keyExpired {
+		// Every write to this node or its subtree takes one of the locks held here, so nothing
+		// can have refreshed it during the upstream delete above. If something did, the
+		// locking is broken, and the refresh's add and this delete raced upstream with no way to
+		// tell which one the authoritative server applied last: fail hard instead of deleting
+		// locally anyway.
+		if rec := e.store.Get(nodeKey); rec != nil && !rec.IsExpired() {
+			panic(fmt.Sprintf("%s: %s was refreshed while its expiry held its node locks and was deleting it upstream", e.upstream.handler, nodeKey))
+		}
+		for _, descendant := range e.store.ListSubtreeKeys(nodeKey) {
+			e.timers.disarm(descendant)
+		}
+		if err := e.store.DeleteSubtree(nodeKey); err != nil {
+			panic(fmt.Sprintf("%s: lease expiry of %s: %v", e.upstream.handler, nodeKey, err))
+		}
+	} else {
+		for _, r := range records {
+			if err := e.store.RemoveSingleNonKEYRecord(r.owner, r.rrKey); err != nil {
+				panic(fmt.Sprintf("%s: lease expiry of %s: %v", e.upstream.handler, nodeKey, err))
+			}
+		}
+	}
+	e.upstream.logger.Infof("%s: lease expiry of %s: %d KEY(s) and %d record(s) deleted upstream and locally", e.upstream.handler, nodeKey, len(keys), len(records))
+	e.timers.finish(e.store, nodeKey, true, e.fire(nodeKey))
+	return true
 }
 
 // maxExpiryRetryDelay caps expiryRetryDelay's backoff, well below startLeaseReconciliation's
@@ -271,47 +369,47 @@ func (t *expiryTimers) armed(nodeKey string) bool {
 	return ok
 }
 
+// reconcile arms a timer, for its next lease event, for every lease owner in store that has
+// none: each KEY node, and each owner of non-KEY records, also one without a KEY record of its
+// own (store.ListOwners). fire gives a node's timer callback. Both handlers run it every 30s
+// (startLeaseReconciliation): it is how a store loaded from a snapshot at startup gets its
+// timers, and it catches a node that lost its timer to a bug. It never deletes anything itself:
+// a node already past its lease event gets a timer that fires almost at once, into the same
+// upstream-aware expiry as every other.
+func (t *expiryTimers) reconcile(store LeaseManager, logger *logging.Logger, fire func(nodeKey string) func()) {
+	for _, nodeKey := range store.ListOwners() {
+		if !t.armed(nodeKey) {
+			logger.Debugf("Reconciliation: no active expiry timer for %s, scheduling now", nodeKey)
+			t.schedule(store, nodeKey, fire(nodeKey))
+		}
+	}
+}
+
 func (h *UpdateHandler) scheduleLeaseExpiry(nodeKey string) {
 	h.timers.schedule(h.leaseManager, nodeKey, h.expireFunc(nodeKey))
 }
 
-// expireFunc is nodeKey's timer callback: one processExpiredLease run.
+// expiryTimeout bounds one expiry attempt, both handlers': it holds the node's locks
+// (docs/siglease_rfc9664.md, "Node Locks") while it deletes upstream.
+const expiryTimeout = 10 * time.Second
+
+// expireFunc is nodeKey's timer callback: one lease event (leaseExpirer.run).
 func (h *UpdateHandler) expireFunc(nodeKey string) func() {
 	return func() {
-		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		ctx, cancel := context.WithTimeout(context.Background(), expiryTimeout)
 		defer cancel()
-		h.processExpiredLease(ctx, nodeKey)
+		h.expirer().run(ctx, nodeKey)
 	}
 }
 
-// startLeaseReconciliation periodically ensures every KEY node in the lease
-// store has a live expiry timer. It exists to catch nodes that never got one
-// scheduled (e.g. a future snapshot-restore path that populates the store
-// without calling scheduleLeaseExpiry) or lost theirs to a bug. It never
-// deletes anything itself: for any node found already expired, scheduling
-// its timer fires processExpiredLease almost immediately — the same
-// upstream-aware path used for every other expiry, not a second
-// implementation of it.
+// startLeaseReconciliation runs expiryTimers.reconcile every interval, until Shutdown.
 func (h *UpdateHandler) startLeaseReconciliation(interval time.Duration) {
 	h.reconcileTicker = time.NewTicker(interval)
 	go func() {
 		for range h.reconcileTicker.C {
-			h.reconcileLeaseTimers()
+			h.timers.reconcile(h.leaseManager, h.logger, h.expireFunc)
 		}
 	}()
-}
-
-func (h *UpdateHandler) reconcileLeaseTimers() {
-	for _, rec := range h.leaseManager.ListAll() {
-		if rec == nil || rec.KeyRR == nil {
-			continue
-		}
-		nodeKey := leasepkg.NodeKey(rec.KeyRR)
-		if !h.timers.armed(nodeKey) {
-			h.logger.Debugf("Reconciliation: no active expiry timer for %s, scheduling now", nodeKey)
-			h.scheduleLeaseExpiry(nodeKey)
-		}
-	}
 }
 
 // Shutdown stops the reconciliation ticker and releases the lease storage
@@ -365,6 +463,17 @@ func (h *UpdateHandler) dumpLeaseTreeLevel() string {
 		}
 		if node := addNode(rec.KeyRR.Hdr.Name); node != nil {
 			node.keyRec = rec
+		}
+	}
+
+	// An owner of non-KEY records with no KEY record of its own (ListOwners) is listed by
+	// its node key, under "Orphan data leases" below.
+	for _, owner := range h.leaseManager.ListOwners() {
+		if h.leaseManager.Get(owner) != nil {
+			continue
+		}
+		if node := addNode(owner); node != nil {
+			node.nonKeyRec = h.leaseManager.GetNonKEYRecordSet(owner)
 		}
 	}
 
@@ -529,7 +638,8 @@ func (h *UpdateHandler) dumpLeaseTreeLevel() string {
 //	Key: <keyName>  KEY=<active|expired|absent>  NonKEY=<count>  Status=<active|empty|absent>
 //
 // Keys that appear only in the KEY lease (no non-KEY lease) represent KEY-only registrations.
-// Keys that appear only in the non-KEY lease (no KEY lease) represent non-KEY-only refreshes.
+// Keys that appear only in the non-KEY lease (KEY=absent) own data but have no KEY record in
+// the store, such as a signer that registered data without being lease-managed itself.
 // Keys that appear in both have an active KEY + non-KEY RR lease.
 func (h *UpdateHandler) DumpLeasesLevel(level string) string {
 	// Normalize level.
@@ -546,37 +656,18 @@ func (h *UpdateHandler) DumpLeasesLevel(level string) string {
 
 	var sb strings.Builder
 
-	// Collect all node keys. Get/getNonKeyLease are keyed by the composite
-	// NodeKey (name.+algo+tag), not the plain DNS owner name, so that is
-	// what must be collected here for the lookups below to find anything.
-	keyNames := make(map[string]bool)
-	for _, rec := range h.leaseManager.ListAll() {
-		if rec.KeyRR == nil {
-			continue
-		}
-		keyNames[leasepkg.NodeKey(rec.KeyRR)] = true
-	}
+	// Every lease owner, by its composite NodeKey (name.+algo+tag), sorted: each KEY node, and
+	// each owner of non-KEY records, also one with no KEY record of its own (KEY=absent).
+	owners := h.leaseManager.ListOwners()
 
 	// INFO level: summary output.
 	sb.WriteString("=== Lease Store Summary ===\n")
-	if len(keyNames) == 0 {
+	if len(owners) == 0 {
 		sb.WriteString("(empty)\n")
 		return sb.String()
 	}
 
-	// Sort key names for deterministic output.
-	sortedNames := make([]string, 0, len(keyNames))
-	for name := range keyNames {
-		sortedNames = append(sortedNames, name)
-	}
-	// Simple insertion sort (small N).
-	for i := 1; i < len(sortedNames); i++ {
-		for j := i; j > 0 && sortedNames[j] < sortedNames[j-1]; j-- {
-			sortedNames[j], sortedNames[j-1] = sortedNames[j-1], sortedNames[j]
-		}
-	}
-
-	for _, name := range sortedNames {
+	for _, name := range owners {
 		keyRec := h.leaseManager.Get(name)
 		nonKeyRec := h.leaseManager.GetNonKEYRecordSet(name)
 
@@ -616,165 +707,23 @@ func (h *UpdateHandler) DumpLeases() string {
 	return h.DumpLeasesLevel("debug")
 }
 
-func (h *UpdateHandler) processExpiredLease(ctx context.Context, nodeKey string) {
-	record := h.leaseManager.Get(nodeKey)
-	nonKeyLease := h.leaseManager.GetNonKEYRecordSet(nodeKey)
-	if record == nil && (nonKeyLease == nil || len(nonKeyLease.Records) == 0) {
-		h.timers.disarm(nodeKey)
-		return
-	}
-	requireUpstream(h.Name(), h.upstreamCoordinator != nil, h.upstreamKeyRecord != nil)
-	signingKey := h.upstreamKeyRecord
-
-	// Every exit re-arms the timer: after the retry backoff if anything below was left
-	// pending (an upstream delete that failed or was refused), otherwise for the node's
-	// next lease event.
-	complete := true
-	defer func() {
-		if delay := h.timers.finish(h.leaseManager, nodeKey, complete, h.expireFunc(nodeKey)); delay > 0 {
-			h.logger.Warnf("Lease expiry of %s incomplete, retrying in %s", nodeKey, delay)
-		}
-	}()
-
-	now := time.Now()
-
-	// Per-record expiry: expire each expired non-KEY record individually, upstream
-	// first (see expireNonKEYRecords). A record whose upstream delete fails stays
-	// tracked for the retry.
-	var deleteNonKEYUpstream func(context.Context, dns.RR) error
-	if nonKeyLease != nil {
-		effectiveZone, err := h.upstreamCoordinator.ResolveAuthoritativeZone(ctx, nonKeyLease.UpstreamZone)
-		if err != nil {
-			h.logger.Warnf("Lease expiry of %s: upstream zone resolution for %s failed: %v (will retry)", nodeKey, nonKeyLease.UpstreamZone, err)
-			complete = false
-			return
-		}
-		deleteNonKEYUpstream = h.nonKEYExpiryDelete(effectiveZone, signingKey)
-		if !expireNonKEYRecords(ctx, h.leaseManager, h.logger, nodeKey, now, false, deleteNonKEYUpstream) {
-			complete = false
-		}
-	}
-
-	if record == nil || now.Before(record.ExpiresAt) {
-		return
-	}
-
-	// KEY is expired. Cascade upstream deletes to the entire subtree first.
-	for _, childKey := range h.leaseManager.ListSubtreeKeys(nodeKey) {
-		h.deleteNodeUpstream(ctx, childKey, signingKey)
-		h.timers.disarm(childKey)
-	}
-
-	// The KEY cannot outlive its own lease, so any non-KEY records still owned
-	// by it must be deleted upstream now too, even if their own LEASE has not
-	// individually elapsed yet. Without this, records whose LEASE outlasts the
-	// remaining KEY-LEASE are marked deleted locally but never removed from
-	// the authoritative DNS server. As with the per-record pass above, a
-	// record is only forgotten locally once its upstream delete actually
-	// succeeds -- the retry picks it up otherwise, even though the KEY itself
-	// may already be gone by then.
-	if nonKeyLease != nil && !expireNonKEYRecords(ctx, h.leaseManager, h.logger, nodeKey, now, true, deleteNonKEYUpstream) {
-		complete = false
-	}
-
-	effectiveUpstreamZone, err := h.upstreamCoordinator.ResolveAuthoritativeZone(ctx, record.UpstreamZone)
-	if err != nil {
-		h.logger.Warnf("Lease expiry of %s: upstream zone resolution for %s failed: %v (will retry)", nodeKey, record.UpstreamZone, err)
-		complete = false
-		return
-	}
-
-	// Only forget the KEY locally once its upstream delete actually succeeded:
-	// Get(nodeKey) still finds it with its already-past ExpiresAt, so the retry
-	// tries again. Forgetting it unconditionally would leave it published at
-	// authoritative DNS forever with no way for the proxy to rediscover it.
-	if record.KeyRR != nil {
-		deleteMsg, err := h.constructUpstreamDelete(record.KeyRR, signingKey, effectiveUpstreamZone)
-		if err != nil {
-			h.logger.Warnf("Failed to construct upstream lease-expiry delete for %s: %v (will retry)", nodeKey, err)
-			complete = false
-			return
-		}
-		resp, err := h.upstreamCoordinator.SendUpdate(ctx, effectiveUpstreamZone, deleteMsg)
-		if err != nil {
-			h.logger.Warnf("Upstream lease-expiry delete failed for %s: %v (will retry)", nodeKey, err)
-			complete = false
-			return
-		}
-		if resp == nil || resp.Rcode != dns.RcodeSuccess {
-			h.logger.Warnf("Upstream lease-expiry delete rejected for %s: %s (will retry)", nodeKey, rcodeDescription(resp))
-			complete = false
-			return
-		}
-	}
-
-	if err := h.leaseManager.Delete(nodeKey); err != nil {
-		h.logger.Warnf("Failed to delete expired local lease for %s: %v (upstream KEY delete already succeeded, local state may now diverge)", nodeKey, err)
-	}
-	// Not a blanket h.leaseManager.RemoveNonKEYRecords(nodeKey): the two
-	// passes above already removed each record they confirmed deleted
-	// upstream, one at a time. Wiping the whole set here would also discard
-	// any record that failed its upstream delete and is waiting on the retry.
-	// With the KEY gone, the deferred finish disarms the timer unless such a
-	// record is still left.
+// upstream is where this handler's UPDATEs go (upstreamTarget.send).
+func (h *UpdateHandler) upstream() upstreamTarget {
+	return upstreamTarget{handler: h.Name(), coordinator: h.upstreamCoordinator, signingKey: h.upstreamKeyRecord, zone: h.upstreamZone, logger: h.logger}
 }
 
-// deleteNodeNonKeyUpstream sends upstream DNS deletes for a node's own non-KEY
-// records only (no KEY involved). Split out of deleteNodeUpstream so a
-// caller that has already deleted the node's KEY RR upstream itself (Case C)
-// doesn't also pay for a redundant, no-op re-delete of that same KEY RR --
-// each upstream delete is a real network round trip to the authoritative
-// server, and doubling them raises the odds of a timeout/SERVFAIL for no
-// benefit. Failures are logged instead of silently discarded. signingKey is
-// the caller's already-checked proxy key: both callers (processExpiredLease
-// and Case C) stop before getting here when there is none.
-func (h *UpdateHandler) deleteNodeNonKeyUpstream(ctx context.Context, nodeKey string, signingKey *keyrec.LoadedKey) {
-	nonKeyLease := h.leaseManager.GetNonKEYRecordSet(nodeKey)
-	if nonKeyLease == nil {
-		return
-	}
-
-	effectiveZone, err := h.upstreamCoordinator.ResolveAuthoritativeZone(ctx, nonKeyLease.UpstreamZone)
-	if err != nil {
-		h.logger.Warnf("Upstream zone resolution for %s's non-KEY deletes failed: %v (local state will still be forgotten)", nodeKey, err)
-		return
-	}
-	for key, entry := range nonKeyLease.Records {
-		deleteMsg, err := h.constructUpstreamDeleteForRecords([]dns.RR{entry.RR}, signingKey, effectiveZone)
-		if err != nil {
-			h.logger.Warnf("Failed to construct upstream delete for %s record %s: %v (local state will still be forgotten)", nodeKey, key, err)
-			continue
-		}
-		if _, err := h.upstreamCoordinator.SendUpdate(ctx, effectiveZone, deleteMsg); err != nil {
-			h.logger.Warnf("Upstream delete failed for %s record %s: %v (local state will still be forgotten)", nodeKey, key, err)
-		}
-	}
-}
-
-// deleteNodeUpstream sends upstream DNS deletes for a descendant node's KEY
-// and non-KEY records. Best-effort: unlike processExpiredLease's handling of
-// a node's own records, callers of this function remove the descendant's
-// local state unconditionally afterward (see the ListSubtreeKeys cascades in
-// processExpiredLease and Case C), so a failure here can still leave a
-// descendant's records orphaned upstream with no local record to retry from.
-// Failures are now at least logged instead of silently discarded. signingKey
-// is the caller's already-checked proxy key, as for deleteNodeNonKeyUpstream.
-func (h *UpdateHandler) deleteNodeUpstream(ctx context.Context, nodeKey string, signingKey *keyrec.LoadedKey) {
-	h.deleteNodeNonKeyUpstream(ctx, nodeKey, signingKey)
-
-	record := h.leaseManager.Get(nodeKey)
-	if record != nil && record.KeyRR != nil {
-		effectiveZone, err := h.upstreamCoordinator.ResolveAuthoritativeZone(ctx, record.UpstreamZone)
-		if err != nil {
-			h.logger.Warnf("Upstream zone resolution for descendant %s's KEY delete failed: %v (local state will still be forgotten)", nodeKey, err)
-			return
-		}
-		deleteMsg, err := h.constructUpstreamDelete(record.KeyRR, signingKey, effectiveZone)
-		if err != nil {
-			h.logger.Warnf("Failed to construct upstream KEY delete for descendant %s: %v (local state will still be forgotten)", nodeKey, err)
-		} else if _, err := h.upstreamCoordinator.SendUpdate(ctx, effectiveZone, deleteMsg); err != nil {
-			h.logger.Warnf("Upstream KEY delete failed for descendant %s: %v (local state will still be forgotten)", nodeKey, err)
-		}
+// expirer is how this handler ends leases (leaseExpirer). Its lock ids are NodeKeys and
+// RecordKeys, and RFC 9664 has no data cascade.
+func (h *UpdateHandler) expirer() leaseExpirer {
+	return leaseExpirer{
+		store:    h.leaseManager,
+		timers:   h.timers,
+		upstream: h.upstream(),
+		fire:     h.expireFunc,
+		locks:    h.nodeLocks,
+		lockIDs: func(nodeKey string) []string {
+			return append([]string{nodeKey}, h.leaseManager.ListSubtreeKeys(nodeKey)...)
+		},
 	}
 }
 

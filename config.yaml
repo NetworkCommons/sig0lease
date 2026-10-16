@@ -14,6 +14,10 @@ server:
   # For standard DNS, use :53 but requires root privileges
   address: ":8053"
 
+  # How long the handlers may work on one request, including waiting for a lease-store
+  # node another request is using. Optional, default "15s"; must be positive.
+  # request_timeout: "15s"
+
   # Networks to enable
   networks:
     - udp
@@ -122,7 +126,7 @@ handlers:
     # no warning at startup if this is left unset. Must NOT reuse handlers.update's own path:
     # these are two independent lease-store instances (different zones, different tree
     # shapes), and pointing both at the same file would have each one clobber the other's
-    # snapshot on save.
+    # snapshot on save. The proxy refuses to start (serve or --dump) if they share one.
     storage:
       type: file
       path: "./data/srp_lease_snapshot.json"   # required for type: file

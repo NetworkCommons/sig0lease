@@ -89,7 +89,7 @@ func TestExtractUpdateRecordsAcceptsGenericRRTypes(t *testing.T) {
 	}
 }
 
-func TestConstructUpstreamUpdateIncludesNonKeyOnlyRecordsOnce(t *testing.T) {
+func TestUpstreamUpdateRecordsIncludesNonKeyOnlyRecordsOnce(t *testing.T) {
 	keystoreDir, err := createTestKeystore(t)
 	if err != nil {
 		t.Fatalf("setup test keystore: %v", err)
@@ -99,22 +99,17 @@ func TestConstructUpstreamUpdateIncludesNonKeyOnlyRecordsOnce(t *testing.T) {
 		t.Fatalf("load key: %v", err)
 	}
 
-	h := newTestHandler()
-
 	key1 := loaded.PublicKey.Clone().(*dns.KEY)
 	key2 := loaded.PublicKey.Clone().(*dns.KEY)
 	txt := &dns.TXT{Hdr: dns.Header{Name: "test.dev.zenr.io.", Class: dns.ClassINET, TTL: 120}}
 	txt.TXT.Txt = []string{"payload"}
 
-	msg, err := h.constructUpstreamUpdate([]*dns.KEY{key1, key2}, []dns.RR{txt}, nil, loaded, "dev.zenr.io.")
-	if err != nil {
-		t.Fatalf("construct upstream update: %v", err)
-	}
-	if len(msg.Ns) != 3 {
-		t.Fatalf("expected 3 upstream records (2 KEY + 1 TXT), got %d", len(msg.Ns))
+	records := upstreamUpdateRecords([]*dns.KEY{key1, key2}, []dns.RR{txt}, nil)
+	if len(records) != 3 {
+		t.Fatalf("expected 3 upstream records (2 KEY + 1 TXT), got %d", len(records))
 	}
 	txtCount := 0
-	for _, rr := range msg.Ns {
+	for _, rr := range records {
 		if _, ok := rr.(*dns.TXT); ok {
 			txtCount++
 		}
@@ -123,12 +118,8 @@ func TestConstructUpstreamUpdateIncludesNonKeyOnlyRecordsOnce(t *testing.T) {
 		t.Fatalf("expected TXT record to appear once, got %d", txtCount)
 	}
 
-	nonKeyOnlyMsg, err := h.constructUpstreamUpdate(nil, []dns.RR{txt}, nil, loaded, "dev.zenr.io.")
-	if err != nil {
-		t.Fatalf("construct upstream update for non-KEY-only request: %v", err)
-	}
-	if len(nonKeyOnlyMsg.Ns) != 1 {
-		t.Fatalf("expected 1 upstream record for non-KEY-only request, got %d", len(nonKeyOnlyMsg.Ns))
+	if n := len(upstreamUpdateRecords(nil, []dns.RR{txt}, nil)); n != 1 {
+		t.Fatalf("expected 1 upstream record for non-KEY-only request, got %d", n)
 	}
 }
 

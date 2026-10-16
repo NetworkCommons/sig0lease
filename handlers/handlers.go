@@ -156,6 +156,21 @@ func rcodeDescription(resp *dns.Msg) string {
 	return fmt.Sprintf("rcode=%d (%s)", resp.Rcode, dns.RcodeToString[resp.Rcode])
 }
 
+// updateSender is the UPDATE-sending half of both handlers' upstream coordinators.
+type updateSender interface {
+	SendUpdate(ctx context.Context, upstreamZone string, updateMsg *dns.Msg) (*dns.Msg, error)
+}
+
+// asDeletes returns rrs as RFC 2136 "Delete An RR From An RRset" instructions
+// (updatecore.AsDelete), for updatecore.BuildAndSign.
+func asDeletes[RR dns.RR](rrs ...RR) []dns.RR {
+	deletes := make([]dns.RR, 0, len(rrs))
+	for _, rr := range rrs {
+		deletes = append(deletes, updatecore.AsDelete(rr))
+	}
+	return deletes
+}
+
 // requireUpstream panics unless the named handler has both its upstream coordinator and the
 // proxy's own SIG(0) signing key. Setup refuses to produce a handler without either, and
 // cmd/sig0lease exits when Setup fails, so getting here without them means a handler was
@@ -176,27 +191,52 @@ func requireUpstream(handler string, hasCoordinator, hasSigningKey bool) {
 	panic(fmt.Sprintf("%s is missing %s: Setup did not run or did not succeed", handler, strings.Join(missing, " and ")))
 }
 
-// zoneResolver is the coordinator method resolveUpstreamSigningContext needs; both
-// handlers' coordinator interfaces include it.
-type zoneResolver interface {
+// upstreamClient is what upstreamTarget needs of a handler's coordinator; both handlers'
+// coordinator interfaces include it.
+type upstreamClient interface {
+	updateSender
 	ResolveAuthoritativeZone(ctx context.Context, zone string) (string, error)
 }
 
-// resolveUpstreamSigningContext returns what an UPDATE to the upstream server is signed with
-// and addressed to: the proxy's signing key, and upstreamZone resolved to its zone cut
-// (SOA discovery, or a static upstream). Both handlers call it with their own fields. The
-// key is the one Setup loaded once, rather than re-read from the keystore directory on every
-// request and expiry tick; picking up a rotated key on disk needs a restart. A handler without
-// its coordinator or signing key is a programming error (requireUpstream panics); the error
-// returned is only for the zone lookup, which can fail transiently.
-func resolveUpstreamSigningContext(ctx context.Context, handler string, coordinator zoneResolver, signingKey *keyrec.LoadedKey, upstreamZone string, logger *logging.Logger) (*keyrec.LoadedKey, string, error) {
-	requireUpstream(handler, coordinator != nil, signingKey != nil)
-	effectiveZone, err := coordinator.ResolveAuthoritativeZone(ctx, upstreamZone)
+// upstreamTarget is where one handler's UPDATEs go and what signs them: its coordinator, the
+// proxy's signing key that Setup loaded once (a rotated key on disk needs a restart), and the
+// handler's configured upstream zone. Each handler builds one from its own fields.
+type upstreamTarget struct {
+	handler     string
+	coordinator upstreamClient
+	signingKey  *keyrec.LoadedKey
+	zone        string
+	logger      *logging.Logger
+}
+
+// send sends one UPDATE of prereqs and records to the authoritative server and reads its
+// answer. Every UPDATE either handler sends -- a request's forward, a delete, a lease expiry,
+// the RFC 6763 enumeration -- goes through it, so every one is built, signed and read the
+// same way: the configured zone is resolved to its zone cut (SOA discovery, or a static
+// upstream), the message is built and signed by updatecore.BuildAndSign, and a transport
+// error, no answer, or any RCODE but NOERROR is a failure (the coordinator itself reports
+// transport errors only). The answer is returned whenever there is one, for a caller that
+// tells rejections apart (SRP's FCFS prerequisites). A handler without its coordinator or
+// signing key is a programming error (requireUpstream panics).
+func (t upstreamTarget) send(ctx context.Context, prereqs, records []dns.RR) (*dns.Msg, error) {
+	requireUpstream(t.handler, t.coordinator != nil, t.signingKey != nil)
+	zone, err := t.coordinator.ResolveAuthoritativeZone(ctx, t.zone)
 	if err != nil {
-		return nil, "", fmt.Errorf("upstream zone resolution failed: %w", err)
+		return nil, fmt.Errorf("upstream zone resolution failed: %w", err)
 	}
-	logger.Debugf("Resolved effective upstream zone: configured=%s effective=%s", upstreamZone, effectiveZone)
-	return signingKey, effectiveZone, nil
+	t.logger.Debugf("Resolved effective upstream zone: configured=%s effective=%s", t.zone, zone)
+	msg, err := updatecore.BuildAndSign(zone, prereqs, records, t.signingKey)
+	if err != nil {
+		return nil, fmt.Errorf("building the upstream UPDATE: %w", err)
+	}
+	resp, err := t.coordinator.SendUpdate(ctx, zone, msg)
+	if err != nil {
+		return nil, fmt.Errorf("upstream UPDATE failed: %w", err)
+	}
+	if resp == nil || resp.Rcode != dns.RcodeSuccess {
+		return resp, fmt.Errorf("upstream UPDATE rejected: %s", rcodeDescription(resp))
+	}
+	return resp, nil
 }
 
 // buildCoordinatorFromConfig builds a handler's upstream coordinator from its config:
@@ -229,52 +269,149 @@ func buildCoordinatorFromConfig(cfg map[string]any, upstreamZone string, logger 
 	return updatecore.NewCoordinator(logger, bootstrapResolvers, static), nil
 }
 
-// buildLeaseManagerFromConfig builds a LeaseStorage backend from a handler's "storage"
-// config block. "memory" (or an omitted "type") is the same zero-persistence in-memory
-// store both handlers' NewXxxHandler() constructors already default to; "file"
-// additionally loads/saves a human-readable JSON snapshot at "path". Any unrecognized
-// "type", or a "file" type missing "path", is a hard error -- never a silent fallback to
-// the default. Shared by UpdateHandler.Setup and SRPHandler.Setup, whose two prior
-// method-per-handler copies were identical apart from which handler's logger the "file"
-// backend's save-error callback closed over -- logger takes that place here.
-func buildLeaseManagerFromConfig(storageCfg map[string]any, logger *logging.Logger) (leasepkg.LeaseStorage, error) {
+// leaseStorageConfig is a handler's "storage" config section, as parseLeaseStorageConfig reads
+// it.
+type leaseStorageConfig struct {
+	// path is a "file" store's snapshot file, or "" for a "memory" store.
+	path string
+	// saveInterval is how often a "file" store saves its snapshot.
+	saveInterval time.Duration
+}
+
+// parseLeaseStorageConfig reads a handler's "storage" config section. "memory" (or an omitted
+// "type") is the zero-persistence in-memory store; "file" additionally loads/saves a
+// human-readable JSON snapshot at "path", every "save_interval" (default 30s). Any
+// unrecognized "type", a "file" type missing "path", or a save_interval that is not a positive
+// duration (leasepkg.CheckSaveInterval) is a hard error -- never a silent fallback to the
+// default.
+func parseLeaseStorageConfig(storageCfg map[string]any) (leaseStorageConfig, error) {
 	storageType := "memory"
 	if raw, ok := storageCfg["type"]; ok {
 		s, ok := raw.(string)
 		if !ok || strings.TrimSpace(s) == "" {
-			return nil, fmt.Errorf("\"type\" must be a non-empty string, got %T", raw)
+			return leaseStorageConfig{}, fmt.Errorf("\"type\" must be a non-empty string, got %T", raw)
 		}
 		storageType = strings.ToLower(strings.TrimSpace(s))
 	}
 
 	switch storageType {
 	case "memory":
-		return leasepkg.NewInMemoryManager(), nil
+		return leaseStorageConfig{}, nil
 
 	case "file":
 		path, ok := storageCfg["path"].(string)
 		if !ok || strings.TrimSpace(path) == "" {
-			return nil, fmt.Errorf("\"path\" is required when \"type\" is \"file\"")
+			return leaseStorageConfig{}, fmt.Errorf("\"path\" is required when \"type\" is \"file\"")
 		}
 
 		interval := 30 * time.Second
 		if raw, ok := storageCfg["save_interval"]; ok {
 			s, ok := raw.(string)
 			if !ok {
-				return nil, fmt.Errorf("\"save_interval\" must be a duration string (e.g. \"30s\"), got %T", raw)
+				return leaseStorageConfig{}, fmt.Errorf("\"save_interval\" must be a duration string (e.g. \"30s\"), got %T", raw)
 			}
 			d, err := time.ParseDuration(s)
 			if err != nil {
-				return nil, fmt.Errorf("\"save_interval\" %q is not a valid duration: %w", s, err)
+				return leaseStorageConfig{}, fmt.Errorf("\"save_interval\" %q is not a valid duration: %w", s, err)
+			}
+			if err := leasepkg.CheckSaveInterval(d); err != nil {
+				return leaseStorageConfig{}, err
 			}
 			interval = d
 		}
-
-		return leasepkg.NewFileLeaseStore(path, interval, func(err error) {
-			logger.Errorf("%v", err)
-		})
+		return leaseStorageConfig{path: path, saveInterval: interval}, nil
 
 	default:
-		return nil, fmt.Errorf("unrecognized \"type\" %q (expected \"memory\" or \"file\")", storageType)
+		return leaseStorageConfig{}, fmt.Errorf("unrecognized \"type\" %q (expected \"memory\" or \"file\")", storageType)
 	}
+}
+
+// selectLeaseStore reads which lease store a handler's Setup config selects: "lease_manager", a
+// LeaseManager given directly (Go embedding only), or "storage", a config section
+// (parseLeaseStorageConfig). The two are mutually exclusive; neither (both results nil) means
+// the in-memory, no-persistence default. A value of the wrong type is an error.
+func selectLeaseStore(cfg map[string]any) (given LeaseManager, storage *leaseStorageConfig, err error) {
+	rawLeaseManager, lmPresent := cfg["lease_manager"]
+	lmPresent = lmPresent && rawLeaseManager != nil
+	rawStorage, storagePresent := cfg["storage"]
+	storagePresent = storagePresent && rawStorage != nil
+
+	switch {
+	case lmPresent && storagePresent:
+		return nil, nil, fmt.Errorf(`"lease_manager" and "storage" are mutually exclusive, got both`)
+
+	case lmPresent:
+		lm, ok := rawLeaseManager.(LeaseManager)
+		if !ok || lm == nil {
+			return nil, nil, fmt.Errorf("\"lease_manager\" must implement lease.LeaseStorage, got %T", rawLeaseManager)
+		}
+		return lm, nil, nil
+
+	case storagePresent:
+		storageCfg, ok := rawStorage.(map[string]any)
+		if !ok {
+			return nil, nil, fmt.Errorf("\"storage\" must be a map, got %T", rawStorage)
+		}
+		parsed, err := parseLeaseStorageConfig(storageCfg)
+		if err != nil {
+			return nil, nil, fmt.Errorf("storage: %w", err)
+		}
+		return nil, &parsed, nil
+
+	default:
+		return nil, nil, nil
+	}
+}
+
+// LeaseStoreFromConfig returns the lease store a handler's Setup config selects
+// (selectLeaseStore): the "lease_manager" given, one built from the "storage" section, or the
+// in-memory default. A "file" store loads its snapshot, writes it straight back and keeps
+// saving it (leasepkg.NewFileLeaseStore); logger receives its save errors. With readOnly, a
+// "file" store is instead its snapshot as it is now, read into an in-memory store that never
+// saves, and nothing is created or written: cmd/sig0lease's dump mode hands that to Setup as
+// "lease_manager". Both handlers' Setup use it with readOnly false.
+func LeaseStoreFromConfig(cfg map[string]any, logger *logging.Logger, readOnly bool) (LeaseManager, error) {
+	given, storage, err := selectLeaseStore(cfg)
+	switch {
+	case err != nil:
+		return nil, err
+
+	case given != nil:
+		logger.Debugf("Custom lease manager configured")
+		return given, nil
+
+	case storage == nil || storage.path == "":
+		return NewInMemoryLeaseManager(), nil
+
+	case readOnly:
+		store, found, err := leasepkg.ReadSnapshotFile(storage.path)
+		if err != nil {
+			return nil, fmt.Errorf("storage: %w", err)
+		}
+		if !found {
+			logger.Infof("No lease snapshot at %s yet: the store is empty", storage.path)
+		}
+		return store, nil
+
+	default:
+		store, err := leasepkg.NewFileLeaseStore(storage.path, storage.saveInterval, func(err error) {
+			logger.Errorf("%v", err)
+		})
+		if err != nil {
+			return nil, fmt.Errorf("storage: %w", err)
+		}
+		logger.Debugf("File lease store at %s, saved every %s", storage.path, storage.saveInterval)
+		return store, nil
+	}
+}
+
+// LeaseSnapshotPath returns the snapshot file of the file store a handler's Setup config
+// selects (selectLeaseStore), or "" if it selects none. cmd/sig0lease checks the handlers'
+// snapshot files with it before any Setup runs.
+func LeaseSnapshotPath(cfg map[string]any) (string, error) {
+	_, storage, err := selectLeaseStore(cfg)
+	if err != nil || storage == nil {
+		return "", err
+	}
+	return storage.path, nil
 }

@@ -50,6 +50,17 @@ or directly:
 ./bin/<your OS>/sig0lease ./config.yaml
 ```
 
+To print each enabled handler's lease store and exit, add `--dump` (a summary) or
+`--dump-debug` (every record):
+
+```bash
+./bin/<your OS>/sig0lease --dump ./config.yaml
+```
+
+A dump writes nothing: it reads a file store's snapshot as it is, without saving it back or
+creating its directory, so it is safe beside a running proxy. It still runs each handler's
+`Setup`, so it needs the same keystore as the proxy itself.
+
 Run the client against a proxy:
 
 ```bash
@@ -254,7 +265,40 @@ The proxy never mutates the local lease store before the corresponding upstream 
 3. Only if the upstream server returns `NOERROR` are the staged local mutations applied.
 4. If the upstream server rejects the update (or is unreachable), the proxy returns an error to the client and the local lease store is left exactly as it was before the request — there is nothing to roll back, because nothing was written yet.
 
-This means the local lease store's view of the world and the authoritative DNS server's view can never diverge as a direct result of a single request's outcome. Case C's delete additionally cascades: deleting a KEY also removes its descendant subtree, with best-effort upstream cleanup for the descendants (they are not blocking — a single unreachable descendant does not fail the whole delete).
+This means the local lease store's view of the world and the authoritative DNS server's view can never diverge as a direct result of a single request's outcome. Case C's delete additionally cascades: deleting a KEY takes its whole subtree along, as its expiry does (`subtreeLeases`, see "Storage Backends and Expiry"). The request's one UPDATE deletes the named records and, record by record, every KEY and record at and below each named KEY; nothing is forgotten locally before it is confirmed, and if it is not, the request fails with nothing changed. Every UPDATE either handler sends is built, signed and read the same way (`upstreamTarget.send`): a transport error, no answer, or any RCODE but NOERROR is a failure.
+
+Two operations on the same lease-store nodes never interleave across that upstream round trip: see "Node Locks" below.
+
+### Node Locks
+
+*(Shared mechanism: the SRP handler uses the same lock table, locking names instead — see
+`docs/siglease_rfc9665.md` §5.)*
+
+Every operation that changes the lease store checks local and often remote state, sends one UPDATE upstream, and only then changes the store. The store's own mutex makes each single store call atomic, not that sequence, so without more two operations on the same nodes would interleave across the network round trips:
+
+- two signers registering one RR would both pass the "already registered under another owner" check and both be accepted upstream; the loser would get `SERVFAIL` after its write landed, in Case A with its KEY left registered;
+- a Case C delete would read a KEY's subtree before a registration under that KEY attached its record, and miss it: the record would stay published after the delete that should have taken it, under a KEY that no longer exists, until its own LEASE ran out;
+- a lease expiry's upstream delete and a refresh's upstream add would race, with no way to know which one the authoritative server applied last.
+
+So each handler has a lock table, `pkg/lease.NodeLocks` (`pkg/lease/nodelock.go`). An operation takes the locks of every node it may touch, all of them at once or none, holds them from its first check to its local apply, and releases them. Lock ids are the store's own keys: `NodeKey` for a KEY node, `RecordKey` for a non-KEY record.
+
+| Operation | Locks |
+|---|---|
+| Case A, B, D (may register) | the signer's node, each named KEY, each named non-KEY record |
+| Case C (delete) | each named KEY with its whole current subtree, each named non-KEY record |
+| Expiry of a node | the node and its whole current subtree |
+
+A refresh needs only the node it refreshes, a registration also the node it attaches to (its parent), and a delete the node with its subtree. Whether an RR in Cases A, B and D is a refresh or a registration is only learned from the checks the lock protects, so these cases always lock the registration-shaped set. Its parent is always the signer's node: a new KEY is registered under its signer (`registerKeyLease`), and non-KEY records always belong to the signer ("Non-KEY RR Ownership" above). Holding the signer's node is what keeps a delete or an expiry of the signer, which locks the signer's subtree, from running while something is being attached under it. Case C is known from `LEASE=0, KEY-LEASE=0` before any check, so its set is delete-shaped from the start (`UpdateHandler.requestLockSet`).
+
+- **When a request locks.** In `Handle`, right after SIG(0) verification and before the case dispatch, so an unverified request never holds a lock; the locks are released on every return path, after the local apply. Signer resolution reads the store before that, and the checks that decide anything run under the locks.
+- **One pass reads a whole subtree.** `Acquire` and `TryAcquire` take the lock set as a callback and call it with the table's mutex held, on every attempt; a delete-shaped set reads the subtree there (`ListSubtreeKeys`). Nothing can attach a node under a subtree member meanwhile, because attaching takes the parent's lock, which is either the subtree's root or a member just read, and no lock is taken or released while the table's mutex is held. So the subtree read is exact, with no repeated expansion. A waiting request calls the callback again after every release, so it takes the subtree as it is then, including children attached while it waited. Lock order is always the table's mutex, then the store's; the store never calls the table.
+- **No deadlock.** A set is taken whole under one mutex, so nobody ever holds part of a set, and nobody waits while holding a node lock: a waiting request holds nothing, and expiries never wait. The upstream in-flight limit (`authoritative.max_inflight_updates`) is a wait inside `SendUpdate`, after the node locks: requests holding node locks may wait in it, but nothing holding one of its slots waits for a node lock, so the two cannot form a cycle.
+- **Requests wait, up to their deadline.** A request whose locks are not all free waits, holding nothing, and tries again whenever a lock is released. It does not fail fast because of retransmissions: a client that times out resends its request with the same message ID and takes the first reply with that ID, so an immediate `SERVFAIL` to the resent request would beat the original's `NOERROR`, and the client would report a failure for a registration that happened. Waiting, the resent request runs after the original, as a refresh of what it just did. The wait is bounded by the request's deadline, which the router sets around the handlers: `server.request_timeout`, default 15s, must be positive (`Router.Route`). The deadline bounds the upstream exchanges too, so a request holds its locks at most that long, and a request waiting behind it does not give up before it has answered. 15s is above the worst case of one authoritative UPDATE, a UDP attempt and then TCP at the dns library's default timeouts (about 11s). A request still waiting at its deadline gets `SERVFAIL`, and the proxy logs the contended ids (`lease-store node lock contention on …`). Resent requests are not dropped as duplicates of one in flight: that is only possible over UDP (over TCP, the original's reply goes on a connection the resending client has abandoned), and waiting covers both transports.
+- **Expiries back off instead.** A timer has nobody waiting on its answer. A lease event (`leaseExpirer.run`, the same in both handlers) takes its node and subtree with `TryAcquire`; if any is held, it does nothing and is retried exactly like a failed attempt (`expiryTimers.finish`, after 1s, doubling up to 16s). Each expiry attempt has its own deadline, `expiryTimeout` (10s).
+- **The table.** A lock is an id in a set, not a mutex per id: nothing outlives its holder, so the table doesn't grow with every id ever seen (every A/AAAA address, including rotating IPv6 privacy addresses, and every TXT revision). Ids are deduplicated and sorted, so errors and `IDs()` are deterministic. Releasing a set twice panics: it would free ids another operation may have taken since.
+- **One lease store per handler.** The RFC 9664 and SRP handlers each have their own store and lock table, and must never share a store. Each handler's reconciliation arms expiry timers for every node in its store that its own timer table lacks, so with one store each would expire the other's nodes, by the wrong rules and with the wrong signing key; and SRP allows one KEY per name, while RFC 9664 allows several. `cmd/sig0lease` (`checkSeparateLeaseStores`) refuses to start, before any `Setup`, when the two handlers' `storage.path` name one file, also through a symlink, a hard link or a different letter case once the file exists. A Go program embedding the handlers and passing one `lease_manager` object to both is not checked.
+- **Limits.** The table is in memory, so nothing here makes several proxy processes sharing state safe; SRP's FCFS prerequisites are the only protection across processes. The deadline can cut an upstream UPDATE short: if the authoritative server applied it but its reply did not arrive in time, the request answers `SERVFAIL` and applies nothing locally, as for any upstream timeout.
+- **Tests.** `pkg/lease/nodelock_test.go` covers the table: mutual exclusion, all or none, waiting and the deadline, re-reading a subtree that grew while waiting, releasing twice. `handlers/node_locks_test.go` holds one operation inside its upstream send while a second runs against the same nodes: two signers registering one TXT get one `NOERROR` and one duplicate `REFUSED`, with one UPDATE sent; a Case C delete during a registration under its KEY cascades into the new record; an expiry while a request holds its node sends nothing and re-arms its timer. Each fails with the locks disabled.
 
 ### Lease Clamping, TTLs and Response Echo
 
@@ -285,9 +329,9 @@ Building on the "Storage Model" rules above: the lease store is a tree rooted at
 
 - `BaseRecord` fields (type, expiry, lease duration, registration time, parent) are shared by KEY (`Record`) and non-KEY (`NonKEYRecord`) nodes.
 - **Deletion is always physical, never a soft flag.** A record is either present in the store (active) or absent (gone) — there is no intermediate "marked deleted" state to track or eventually reap.
-- **Expiry is handler-driven, not store-driven.** `UpdateHandler.processExpiredLease` — triggered by a per-node `time.AfterFunc` timer (`scheduleLeaseExpiry`, re-armed after every mutation and after every expiry event) — is the only code path that removes an expired KEY or non-KEY record, and it always attempts the corresponding upstream delete first. The store itself never deletes anything on its own initiative, because it has no way to also notify the authoritative server.
-- **Each node's timer fires at its next lease event**, the earliest of its non-KEY records' LEASE and its own KEY-LEASE (`nextLeaseEvent`). Non-KEY records therefore expire individually on their own LEASE, while the KEY and anything else not yet due stay. Each due record gets its own upstream `Delete An RR From An RRSet` (`expireNonKEYRecords`), and it is forgotten locally only once that delete is confirmed. When the KEY expires, every non-KEY record it still owns goes through the same helper regardless of its own LEASE. A delete that is rejected or fails to send leaves the record in the store, and the attempt is retried after a backoff of 1s, doubling up to 16s (`expiryRetryDelay`); success returns the node to its normal lease-event schedule. The proxy has no function without an upstream it can sign for, so a handler missing its upstream coordinator or signing key (a state `Setup()` refuses to produce, and `cmd/sig0lease` exits when `Setup()` fails) panics rather than expiring, retrying, or forgetting anything (`requireUpstream`). The timer table (`expiryTimers`), `nextLeaseEvent` and `expireNonKEYRecords` are shared with the RFC 9665 `SRPHandler`, so both handlers age the lease store the same way (see `docs/siglease_rfc9665.md`, "Maintenance rules").
-- **Reconciliation backstop:** `UpdateHandler.startLeaseReconciliation` runs every 30 seconds and ensures every KEY node in the store has a live expiry timer (a node waiting on a retry already has one), scheduling one via the same `scheduleLeaseExpiry` for any node that lacks one (for example, a node populated by a future snapshot-restore path that doesn't itself arm a timer). For an already-expired node this routes it through the same `processExpiredLease` almost immediately — there is exactly one deletion implementation, not a second one that might skip the upstream call.
+- **Expiry is handler-driven, not store-driven.** A lease event (`leaseExpirer`, shared by both handlers), triggered by a per-node `time.AfterFunc` timer (`scheduleLeaseExpiry`, re-armed after every mutation and after every expiry event), is the only code path that removes an expired KEY or non-KEY record, and it always sends the corresponding upstream delete first. The store itself never deletes anything on its own initiative, because it has no way to also notify the authoritative server.
+- **Each node's timer fires at its next lease event**, the earliest of its non-KEY records' LEASE and its own KEY-LEASE (`nextLeaseEvent`). One lease event is one UPDATE that deletes, record by record (`Delete An RR From An RRset`), everything the event ends. If only records' LEASE has run out, those records go, while the KEY and anything else not yet due stay. When the KEY expires, it takes its whole subtree along: every KEY and record at and below it, whatever their own leases. Nothing is forgotten locally before that UPDATE is confirmed. If it is rejected or fails to send, nothing is forgotten and the whole event is retried after a backoff of 1s, doubling up to 16s (`expiryRetryDelay`); success returns the node to its normal lease-event schedule. The proxy has no function without an upstream it can sign for, so a handler missing its upstream coordinator or signing key (a state `Setup()` refuses to produce, and `cmd/sig0lease` exits when `Setup()` fails) panics rather than expiring, retrying, or forgetting anything (`requireUpstream`). The engine, the timer table (`expiryTimers`) and `nextLeaseEvent` are shared with the RFC 9665 `SRPHandler`, so both handlers age the lease store the same way (see `docs/siglease_rfc9665.md`, "How expiry runs").
+- **Reconciliation backstop:** every 30 seconds, both handlers run `expiryTimers.reconcile`, which arms a timer for every lease owner in the store that has none (a node waiting on a retry already has one). An owner is each KEY node, and each owner of non-KEY records, also one with no KEY record of its own, such as a signer that registered data without being lease-managed itself (`LeaseStorage.ListOwners`). This is how a store loaded from its snapshot at startup gets its timers, and it catches a node that lost its timer to a bug. For an already-expired node it routes it through the same lease event (`leaseExpirer`) almost immediately — there is exactly one deletion implementation, not a second one that might skip the upstream call. The dumps list owners the same way, an owner without a KEY record as `KEY=absent`.
 
 **Storage backend abstraction.** All of the above is defined against a single interface, `lease.LeaseStorage` (`pkg/lease/state.go`) — KEY lifecycle, tree/hierarchy, non-KEY record sets, and snapshot import/export/persistence all live on this one interface, and every backend must implement all of it. There is no narrower interface for a partial implementation to fall back to, and the handler never type-asserts down to a subset: a backend either supports the full feature set or `Setup()` fails to configure it at all. *(This same interface, and both backends below, are reused as-is by the RFC 9665 SRP handler, confirmed generic across both handlers' differently-shaped KEY trees with zero production-code changes needed.)*
 
@@ -299,12 +343,14 @@ Two backends are selectable via `handlers.update.storage` in `config.yaml` (see 
 ### Reference to Source Files
 
 - `handlers/opcode5_handle.go` — `Handle()`, the full case dispatch, `buildSuccessResponse`.
-- `handlers/opcode5_lease.go` — lease-store read/write helpers, `authorizeKeyRefresh`, `processExpiredLease`, `scheduleLeaseExpiry`, `startLeaseReconciliation`, `UpdateHandler.Shutdown`, and the expiry machinery shared with `SRPHandler`: `expiryTimers`, `expiryRetryDelay`, `nextLeaseEvent`, `expireNonKEYRecords`.
+- `handlers/opcode5_lease.go` — lease-store read/write helpers, `authorizeKeyRefresh`, `scheduleLeaseExpiry`, `startLeaseReconciliation`, `UpdateHandler.Shutdown`, and the expiry machinery shared with `SRPHandler`: `leaseExpirer`, `subtreeLeases`, `expiryTimers`, `expiryRetryDelay`, `nextLeaseEvent`.
+- `handlers/handlers.go` — `upstreamTarget.send`, through which both handlers send every UPDATE; `LeaseStoreFromConfig`.
 - `handlers/opcode5_update_helpers.go` — SIG(0) resolution (`extractAndValidateSig0`), upstream message construction, duplicate-registration checks.
 - `handlers/opcode5_lease_option.go` — UPDATE-LEASE option parsing and request-side policy validation.
-- `handlers/opcode5_setup.go` — `Setup()`, including storage-backend selection (`buildLeaseManagerFromConfig`).
+- `handlers/opcode5_setup.go` — `Setup()`; the storage-backend selection it shares with `SRPHandler.Setup` and `cmd/sig0lease` is `LeaseStoreFromConfig` in `handlers/handlers.go`.
 - `pkg/lease/state.go` — the unified `LeaseStorage` interface and `InMemoryLeaseStore`, the tree-structured in-memory implementation.
 - `pkg/lease/file_store.go` — `FileLeaseStore`, the periodic/shutdown-flush JSON-snapshot-backed implementation.
+- `pkg/lease/nodelock.go` — `NodeLocks`, the lock table both handlers use so that operations on the same lease-store nodes never interleave ("Node Locks").
 - `pkg/lease/lease.go` — `LeaseOption` encode/decode and the shared `FindOption`/`DecodeOption`/`FindAndDecode` helpers.
 - `client/lease_response.go` — client-side decoding of the server's granted LEASE/KEY-LEASE.
 
@@ -313,6 +359,7 @@ Two backends are selectable via `handlers.update.storage` in `config.yaml` (see 
 `config.yaml` controls:
 
 - listening address and enabled transport networks;
+- `server.request_timeout` (default 15s, must be positive): how long the handlers may work on one request, including waiting for a lease-store node another request is using (see "Node Locks");
 - default upstream resolvers;
 - handler-specific settings such as the upstream zone, an optional static `upstream` server for it, keystore directory, lease policy bounds, blacklisted RR types, `allow_online_key_registration`, and the lease storage backend (`storage.type: memory|file`, see "Storage Backends and Expiry" above) for the update handler;
 - opcode-to-module routing (an ordered list per opcode — see `docs/siglease_rfc9665.md` §3 for
