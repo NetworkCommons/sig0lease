@@ -113,8 +113,7 @@ start_srp_proxy() {
 stop_srp_proxy() {
     if [ -n "${SRP_PROXY_PID:-}" ] && kill -0 "$SRP_PROXY_PID" 2>/dev/null; then
         log_step "Stopping SRP proxy (PID: $SRP_PROXY_PID)"
-        kill "$SRP_PROXY_PID" || true
-        sleep 1
+        stop_process "$SRP_PROXY_PID" || true
     fi
     SRP_PROXY_PID=""
     if [ -n "$SRP_TMP_CONFIG" ] && [ -f "$SRP_TMP_CONFIG" ]; then
