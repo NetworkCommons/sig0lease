@@ -1,0 +1,15 @@
+; Template for the local BIND 9's update.test. zone: the zone the RFC 9664 handler serves in
+; tests/test_update.sh's local mode (AUTH_BACKEND=local), whose client registers under
+; test.update.test. start_bind9 copies this into the scratch runtime directory before
+; starting named, same as srp.test.zone.in -- BIND rewrites its own working copy (SOA serial
+; bumps, dynamic-update journal replay) so the source tree's copy must never be the one
+; actually served.
+;
+; The apex KEY is tests/keystore-update-bind9/'s own key, granted zonesub update rights in
+; named.conf.in -- the proxy signs every forwarded UPDATE with this same key
+; (handlers.update's keystore_dir points at that directory in that mode).
+$TTL 3600
+@       IN SOA  ns.update.test. admin.update.test. ( 1 3600 900 604800 3600 )
+        IN NS   ns.update.test.
+ns      IN A    127.0.0.1
+@       IN KEY  512 3 15 RtByNLbvegpkz2HRTmOPc3rNy7fpNCJZbz+hjFYiDec=

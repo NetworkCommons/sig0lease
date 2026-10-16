@@ -2,9 +2,10 @@
 # the proxy) and RR-spec/rdata string helpers. See lib/common.sh for the "no
 # set -e, return not exit" rules this file follows.
 #
-# rr_at_auth_contains, rr_at_authoritative, and wait_for_rr_state read the
-# global $DOWNSTREAM_ZONE, set by the orchestration script (test_update.sh /
-# test_srp.sh), not by this library -- matching how they've always worked.
+# add_rr, delete_rr, rr_at_auth_contains, rr_at_authoritative, and
+# wait_for_rr_state read the global $DOWNSTREAM_ZONE, set by the orchestration
+# script (test_update.sh / test_srp.sh), not by this library -- matching how
+# they've always worked.
 
 if [ -n "${_SIG0LEASE_LIB_DNS_SOURCED:-}" ]; then
     return 0 2>/dev/null || true
@@ -15,6 +16,31 @@ LIB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=./common.sh
 source "$LIB_DIR/common.sh"
 
+# auth_nsupdate <add|delete> <payload> [ttl] -- one RFC 2136 change to the
+# "<TYPE> <rdata...>" payload at DOWNSTREAM_ZONE, sent straight to AUTH_SERVER
+# ("host" or "host:port", the forms dig_query_short takes) in zone AUTH_ZONE,
+# signed with the proxy's own key PROXY_KEY_NAME -- bypassing the proxy
+# entirely. Returns nsupdate's status.
+auth_nsupdate() {
+    local op="$1"
+    local payload="$2"
+    local ttl="${3:-}"
+
+    local host="$AUTH_SERVER"
+    local port="53"
+    if [[ "$AUTH_SERVER" == *:* ]]; then
+        host="${AUTH_SERVER%:*}"
+        port="${AUTH_SERVER##*:}"
+    fi
+
+    nsupdate -k "$PROXY_KEY_NAME" <<EOF
+server $host $port
+zone $AUTH_ZONE
+update $op $DOWNSTREAM_ZONE $ttl $payload
+send
+EOF
+}
+
 delete_rr(){
     local record="$1"
     local payload
@@ -22,25 +48,21 @@ delete_rr(){
     echo "Deleting $record"
     if [ "$record" = "key" ]; then
         require_client_keystore_dir || return 1
-        # Read the secret string straight out of the private file
-        payload="$(cat $CLIENT_KEYSTORE_DIR/$CLIENT_KEY_NAME.key | sed 's/test.dev.zenr.io. IN \(.*\)/\1/g')"
+        # The client KEY's own "<TYPE> <rdata>", from its public .key file
+        payload="$(get_rdata "$(cat "$CLIENT_KEYSTORE_DIR/$CLIENT_KEY_NAME.key")")"
     else
         payload="$record"
     fi
     echo "payload is $payload"
 
-    cat <<EOF | nsupdate -k $PROXY_KEY_NAME
-    server $AUTH_SERVER
-    zone zenr.io
-    update delete test.dev.zenr.io $payload
-    send
-EOF
+    auth_nsupdate delete "$payload"
 }
 
-# add_rr publishes a record directly at the authoritative server, bypassing
-# the proxy entirely. Used to simulate a key or record that exists online but
-# was never registered through the proxy (e.g. an "online-only" signer, or a
-# pre-existing authoritative record for duplicate-registration tests).
+# add_rr publishes a record at DOWNSTREAM_ZONE directly at the authoritative
+# server (auth_nsupdate), bypassing the proxy entirely. Used to simulate a key
+# or record that exists online but was never registered through the proxy
+# (e.g. an "online-only" signer, or a pre-existing authoritative record for
+# duplicate-registration tests).
 #
 # Usage: add_rr <record> [ttl]
 #   record: "key" for the well-known client test KEY, or an explicit
@@ -60,19 +82,14 @@ add_rr(){
     echo "Adding $record (ttl=$ttl)"
     if [ "$record" = "key" ]; then
         require_client_keystore_dir || return 1
-        # Read the secret string straight out of the private file
-        payload="$(cat $CLIENT_KEYSTORE_DIR/$CLIENT_KEY_NAME.key | sed 's/test.dev.zenr.io. IN \(.*\)/\1/g')"
+        # The client KEY's own "<TYPE> <rdata>", from its public .key file
+        payload="$(get_rdata "$(cat "$CLIENT_KEYSTORE_DIR/$CLIENT_KEY_NAME.key")")"
     else
         payload="$record"
     fi
     echo "payload is $payload"
 
-    cat <<EOF | nsupdate -k $PROXY_KEY_NAME
-    server $AUTH_SERVER
-    zone zenr.io
-    update add test.dev.zenr.io $ttl $payload
-    send
-EOF
+    auth_nsupdate add "$payload" "$ttl"
 }
 
 ################################

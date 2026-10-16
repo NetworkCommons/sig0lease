@@ -9,6 +9,7 @@ import (
 	"github.com/NetworkCommons/sig0lease/logging"
 	"github.com/NetworkCommons/sig0lease/pkg/dnsname"
 	leasepkg "github.com/NetworkCommons/sig0lease/pkg/lease"
+	"github.com/NetworkCommons/sig0lease/pkg/updatecore"
 )
 
 // baseSRPSetupCfg mirrors baseSetupCfg (opcode5_setup_test.go), but for SRPHandler.Setup --
@@ -96,6 +97,37 @@ func TestSRPSetup_LeaseManagerAndStorageBothSetErrors(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "mutually exclusive") {
 		t.Fatalf("expected error to mention \"mutually exclusive\", got: %v", err)
+	}
+}
+
+// TestSRPSetup_StaticUpstream: SRPHandler.Setup reads "upstream" through the same
+// buildCoordinatorFromConfig as UpdateHandler.Setup -- a "host:port" is wired in, and
+// anything else is a Setup error rather than silently falling back to SOA/NS discovery.
+func TestSRPSetup_StaticUpstream(t *testing.T) {
+	cfg := baseSRPSetupCfg(t)
+	cfg["upstream"] = "127.0.0.1:5300"
+	h := NewSRPHandler()
+	h.SetLogger(logging.NewLogger("debug"))
+	if err := h.Setup(cfg); err != nil {
+		t.Fatalf("Setup returned error: %v", err)
+	}
+	coordinator, ok := h.coordinator.(*updatecore.Coordinator)
+	if !ok {
+		t.Fatalf("expected *updatecore.Coordinator, got %T", h.coordinator)
+	}
+	server, _, err := coordinator.ResolveSOAMasterServer(context.Background(), srpTestZone)
+	if err != nil || server != "127.0.0.1:5300" {
+		t.Fatalf("ResolveSOAMasterServer(%q) = %q, %v; want the static upstream", srpTestZone, server, err)
+	}
+
+	for _, upstream := range []any{5300, "", "127.0.0.1"} {
+		cfg := baseSRPSetupCfg(t)
+		cfg["upstream"] = upstream
+		h := NewSRPHandler()
+		h.SetLogger(logging.NewLogger("debug"))
+		if err := h.Setup(cfg); err == nil {
+			t.Errorf("expected Setup to reject upstream %#v", upstream)
+		}
 	}
 }
 

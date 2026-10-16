@@ -99,14 +99,14 @@ func TestAsDelete_RewritesClassAndTTL(t *testing.T) {
 }
 
 func TestStaticUpstream_SkipsResolution(t *testing.T) {
-	c := NewCoordinator(testLogger(), nil, map[string]string{"srp.dev.zenr.io.": "127.0.0.1:5300"})
+	c := NewCoordinator(testLogger(), nil, &StaticUpstream{Zone: "srp.dev.zenr.io.", Addr: "127.0.0.1:5300"})
 
 	server, effectiveZone, err := c.ResolveSOAMasterServer(context.Background(), "srp.dev.zenr.io.")
 	if err != nil {
 		t.Fatalf("ResolveSOAMasterServer: %v", err)
 	}
 	if server != "127.0.0.1:5300" {
-		t.Fatalf("expected the static override address, got %q", server)
+		t.Fatalf("expected the static upstream address, got %q", server)
 	}
 	if effectiveZone != "srp.dev.zenr.io." {
 		t.Fatalf("expected the effective zone to be the zone itself, got %q", effectiveZone)
@@ -117,17 +117,44 @@ func TestStaticUpstream_SkipsResolution(t *testing.T) {
 		t.Fatalf("ResolveAuthoritativeZone: %v", err)
 	}
 	if zone != "srp.dev.zenr.io." {
-		t.Fatalf("expected the zone itself with no NS lookup, got %q", zone)
+		t.Fatalf("expected the zone itself with no lookup, got %q", zone)
+	}
+}
+
+// TestStaticUpstream_CoversNamesAtOrBelowZone: the static upstream applies to its zone and to
+// every name below it -- the RFC 9664 handler asks about its requests' own zones, e.g.
+// test.update.test. -- with its zone as the effective zone. "Below" goes by whole labels:
+// evilupdate.test. is not below update.test., so it is left to discovery, which the
+// unreachable bootstrap resolver fails.
+func TestStaticUpstream_CoversNamesAtOrBelowZone(t *testing.T) {
+	c := NewCoordinator(testLogger(), []string{"127.0.0.1:1"}, &StaticUpstream{Zone: "update.test", Addr: "127.0.0.1:5300"})
+	ctx := context.Background()
+
+	for _, name := range []string{"update.test.", "test.update.test.", "a.b.UPDATE.Test."} {
+		server, effectiveZone, err := c.ResolveSOAMasterServer(ctx, name)
+		if err != nil {
+			t.Fatalf("ResolveSOAMasterServer(%q): %v", name, err)
+		}
+		if server != "127.0.0.1:5300" || effectiveZone != "update.test." {
+			t.Errorf("ResolveSOAMasterServer(%q) = %q, %q; want 127.0.0.1:5300, update.test.", name, server, effectiveZone)
+		}
+		zone, err := c.ResolveAuthoritativeZone(ctx, name)
+		if err != nil || zone != "update.test." {
+			t.Errorf("ResolveAuthoritativeZone(%q) = %q, %v; want update.test.", name, zone, err)
+		}
+	}
+
+	if _, _, err := c.ResolveSOAMasterServer(ctx, "evilupdate.test."); err == nil {
+		t.Fatal("expected evilupdate.test. not to be covered by the update.test. static upstream")
 	}
 }
 
 func TestStaticUpstream_UnconfiguredZoneNoOverride(t *testing.T) {
-	// A zone with no override entry must fall through to real resolution, not silently
-	// match some other configured override -- confirmed here by using an unreachable
-	// bootstrap resolver and an unrelated static-upstream zone, expecting a real failure
-	// rather than a bogus "success" from the override map.
-	c := NewCoordinator(testLogger(), []string{"127.0.0.1:1"}, map[string]string{"other.example.": "127.0.0.1:5300"})
+	// A zone the static upstream doesn't cover must go to discovery, not silently use the
+	// static upstream -- confirmed here by using an unreachable bootstrap resolver and an
+	// unrelated static zone, expecting a real failure rather than a bogus "success".
+	c := NewCoordinator(testLogger(), []string{"127.0.0.1:1"}, &StaticUpstream{Zone: "other.example.", Addr: "127.0.0.1:5300"})
 	if _, _, err := c.ResolveSOAMasterServer(context.Background(), "srp.dev.zenr.io."); err == nil {
-		t.Fatal("expected resolution to fail for a zone with no static override and no reachable bootstrap resolver")
+		t.Fatal("expected resolution to fail for a zone with no static upstream and no reachable bootstrap resolver")
 	}
 }

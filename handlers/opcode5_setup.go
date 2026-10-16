@@ -70,11 +70,13 @@ func parseStringSlice(raw any) []string {
 // Configuration options:
 //   - "upstream_zone": Authoritative zone (e.g., "dev.zenr.io.") [REQUIRED]
 //   - "upstream_key": Path to upstream private key file [OPTIONAL, needed for upstream UPDATE signing]
-//   - "upstream_coordinator": Custom UpstreamCoordinator implementation [OPTIONAL]
+//   - "upstream": a static "host:port" for the authoritative server of upstream_zone and
+//     every name below it (the zones of the requests it handles), in place of SOA
+//     discovery; anything but a "host:port" string is a Setup error (see
+//     buildCoordinatorFromConfig). Same option as SRPHandler.Setup's. [OPTIONAL]
 //   - "bootstrap_resolvers": []string of resolver addresses (e.g. "8.8.8.8:53")
-//     used by the default upstream coordinator to look up SOA/NS records when
-//     locating the authoritative server for a zone [OPTIONAL, ignored when
-//     "upstream_coordinator" is set]. cmd/sig0lease/main.go populates this
+//     the upstream coordinator asks for SOA records when locating the
+//     authoritative server for a zone [OPTIONAL]. cmd/sig0lease/main.go populates this
 //     from the top-level "upstreams" config when not set explicitly here, so
 //     zone-authority resolution uses the same operator-configured resolvers
 //     as generic forwarding. Falls back to a small built-in default if unset.
@@ -187,19 +189,11 @@ func (h *UpdateHandler) Setup(cfg map[string]any) error {
 	}
 	h.recordTTL = recordTTL
 
-	// Optional: Custom upstream coordinator
-	if coordinator, ok := cfg["upstream_coordinator"].(UpstreamCoordinator); ok && coordinator != nil {
-		h.upstreamCoordinator = coordinator
-		h.logger.Debugf("Custom upstream coordinator configured")
-	} else {
-		bootstrapResolvers := parseStringSlice(cfg["bootstrap_resolvers"])
-		h.upstreamCoordinator = updatecore.NewCoordinator(h.logger, bootstrapResolvers, nil)
-		if len(bootstrapResolvers) > 0 {
-			h.logger.Debugf("Default upstream coordinator configured with bootstrap resolvers: %v", bootstrapResolvers)
-		} else {
-			h.logger.Debugf("Default upstream coordinator configured with built-in default bootstrap resolvers")
-		}
+	coordinator, err := buildCoordinatorFromConfig(cfg, h.upstreamZone, h.logger)
+	if err != nil {
+		return fmt.Errorf("update handler config: %w", err)
 	}
+	h.upstreamCoordinator = coordinator
 
 	// Check if 4-byte variant is explicitly enabled via config for backward compatibility.
 	// Default: false (always use 8-byte variant for all lease requests).
