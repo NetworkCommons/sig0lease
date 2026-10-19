@@ -4,80 +4,244 @@
 DIR=$(uname | tr '[:upper:]' '[:lower:]')
 ##
 GITDIR="$(git rev-parse --show-toplevel)"
-DIG_OPTIONS="+noall +answer @ns1.free2air.org"
+DIG_OPTIONS=${DIG_OPTIONS:-"+noall +answer @ns1.free2air.org"}
 
-KEYLEASE=250
-LEASE=130
-SERVER_HOSTNAME="vpn"
-DOMAIN="srp.dev.zenr.io"
+# set DNS RFC9664 lease test defaults
+KEYLEASE=${KEYLEASE:-"250"}
+LEASE=${LEASE:-"130"}
 
-SERVER_LISTENPORT=51820
-#
-#
+# set srp registration domain
+DOMAIN=${DOMAIN:-"srp.dev.zenr.io"}
 
- echo "****"
- echo "**** Step -1: DEBUG: Send non-SRP request with ${SERVER_HOSTNAME}.${DOMAIN} KEY first"
- echo "****"
+# set wg Service Host description defaults
+SERVER_HOSTNAME=${SERVER_HOSTNAME:-"vpn"}
+SERVER_HOST_IP=${SERVER_HOST_IP:-"128.140.34.230"}
 
-# when commented this script errors on final sig0lease-client invocation
-# when uncommented, this causes all client invocations to succeed (at least while the lease is active?)
-CLIENT_KEYSTORE_DIR="${GITDIR}/keystore/client" ${GITDIR}/bin/linux/sig0lease-client 127.0.0.1:8053 register ${SERVER_HOSTNAME}.${DOMAIN} ${LEASE} ${KEYLEASE}  "${SERVER_HOSTNAME}.${DOMAIN}. 30 IN TXT \"well well well\""  " ${SERVER_HOSTNAME}.${DOMAIN}. 30 IN TXT \"second well\"" "${SERVER_HOSTNAME}.${DOMAIN}. 30 IN TXT \"third well\"" --k=15 --same-key
-
-
-
+# server wg Service Description defaults
 SERVER_SERVICE_NAME="myserver"
-SD_TYPE="_wg._udp"
-HOST_IP="128.140.34.230"
+SERVER_SD_TYPE="_wg._udp"
 
-SERVER_PUBKEY="dLAovvPP0LQ8ZBgbAw4tkVb3wuqZyS9HFFutsAz+ezA="
+# Set SRP Service Advertisement Details
+SERVER_LISTENPORT=${SERVER_LISTENPORT:-"51820"} # SRV port
+SERVER_NETWORK=${SERVER_NETWORK:-"192.168.179.0/24"}
+SERVER_PUBKEY=${SERVER_PUBKEY:-"dLAovvPP0LQ8ZBgbAw4tkVb3wuqZyS9HFFutsAz+ezA="}
+
 
 echo "****"
-echo "**** Step 0: Register a VPN 'Server' for SD with service type _wg"
+echo "**** Step 1: ADVERTISE: SERVER advertises a VPN Server with instance name ${SERVER_SERVICE_NAME}.${SERVER_SD_TYPE} over SD"
 echo "****"
 
 CLIENT_KEYSTORE_DIR="${GITDIR}/keystore/client" ${GITDIR}/bin/${DIR}/sig0lease-srp-client \
   -domain="${DOMAIN}" \
   -server=127.0.0.1:8053 \
   -host="${SERVER_HOSTNAME}" \
-  -addr="${HOST_IP}" \
-  -instance=${SERVER_SERVICE_NAME}:${SD_TYPE}:${SERVER_LISTENPORT} \
-  -txt=${SERVER_SERVICE_NAME}:"txtver=1 PublicKey=${SERVER_PUBKEY}" \
+  -addr="${SERVER_HOST_IP}" \
+  -instance=${SERVER_SERVICE_NAME}:${SERVER_SD_TYPE}:${SERVER_LISTENPORT} \
+  -txt="${SERVER_SERVICE_NAME}:txtver=1" \
+  -txt="${SERVER_SERVICE_NAME}:pk=${SERVER_PUBKEY}" \
+  -txt="${SERVER_SERVICE_NAME}:net=${SERVER_NETWORK}" \
   -lease=${LEASE} -keylease=${KEYLEASE} \
   -keystore="${GITDIR}/keystore/client" -k=15 \
   -once
 
 
+echo
+echo "*** 1. Advertised (WG Server)"
+echo
+SERVICE_DISCOVERY=`dig ${DIG_OPTIONS} ${SERVER_SD_TYPE}.${DOMAIN} PTR | grep -v RRSIG | grep -v NSEC`
+echo "=== Service Discovery Instruction Results"
+echo ${SERVICE_DISCOVERY}
+echo
+echo "=== Service Description Instruction Results"
+SERVICE_DESCRIPTION=`dig ${DIG_OPTIONS} ${SERVER_SERVICE_NAME}.${SERVER_SD_TYPE}.${DOMAIN} ANY | grep -v RRSIG | grep -v NSEC`
+echo "${SERVICE_DESCRIPTION}"
+echo
+echo "=== Host Description Instruction Results"
+HOST_DESCRIPTION=`dig ${DIG_OPTIONS} ${SERVER_HOSTNAME}.${DOMAIN} ANY | grep -v RRSIG | grep -v NSEC`
+echo "${HOST_DESCRIPTION}"
+echo
 
-KEYLEASE=250
-LEASE=130
+
+
 CLIENT_HOSTNAME="myclient"
-DOMAIN="srp.dev.zenr.io"
-HOST_IP="10.10.10.10"
-SD_TYPE="_wgpeer._udp"
+CLIENT_HOST_IP="10.10.10.10"
+CLIENT_SD_TYPE="_wgpeer._udp"
 CLIENT_SERVICE_NAME="myclient"
-SUBTYPE=${SERVER_SERVICE_NAME}
+CLIENT_SUBTYPE=${SERVER_SERVICE_NAME}
 CLIENT_PUBKEY="mul5zgBo+f14SCYvsj6F1CJgZlO/LFm3dWJrRnCHZzQ="
 #
-# Register VPN 'Client'
-
+# Request to use VPN service instance ${SERVER_SERVICE_NAME}
+#
 echo "****"
-echo "**** Step 1: Register a VPN client: ${HOST_NAME} for SD VPN service: ${SERVER_SERVICE_NAME} with service type: ${SD_TYPE} and subtype: ${SUBTYPE}"
+echo "**** Step 2: REQUEST: CLIENT Browses & Requests to be a VPN client: ${CLIENT_HOSTNAME} for SD VPN service: ${SERVER_SERVICE_NAME} with service type: ${CLIENT_SD_TYPE} and subtype: ${CLIENT_SUBTYPE}"
 echo "****"
 
 CLIENT_KEYSTORE_DIR="${GITDIR}/keystore/client" ${GITDIR}/bin/${DIR}/sig0lease-srp-client \
   -domain="${DOMAIN}" \
   -server=127.0.0.1:8053 \
   -host="${CLIENT_HOSTNAME}" \
-  -addr="${HOST_IP}" \
-  -instance=${CLIENT_SERVICE_NAME}:${SD_TYPE}:0 \
-  -subtype="${CLIENT_SERVICE_NAME}:${SUBTYPE}" \
+  -addr="${CLIENT_HOST_IP}" \
+  -instance=${CLIENT_SERVICE_NAME}:${CLIENT_SD_TYPE}:0 \
+  -subtype="${CLIENT_SERVICE_NAME}:${CLIENT_SUBTYPE}" \
+  -txt=${CLIENT_SERVICE_NAME}:"txtver=1" \
+  -txt=${CLIENT_SERVICE_NAME}:"pk=${CLIENT_PUBKEY}" \
+  -lease=${LEASE} -keylease=${KEYLEASE} \
+  -keystore="${GITDIR}/keystore/client" -k=15 \
+  -once
+
+echo
+echo "*** 2.Requested (WG Client)"
+echo
+echo "== Browse ${SERVER_SD_TYPE} Service Instances Results"
+SERVICE_INSTANCES=`dig ${DIG_OPTIONS} ${SERVER_SD_TYPE}.${DOMAIN} PTR | grep -v RRSIG | grep -v NSEC`
+echo "${SERVICE_INSTANCES}"
+echo
+echo "== Published Request with ${SERVER_SERVICE_NAME}._sub.${CLIENT_SERVICE_NAME}.${CLIENT_SD_TYPE}.${DOMAIN}"
+CLIENT_REQUEST=`dig ${DIG_OPTIONS} ${SERVER_SERVICE_NAME}._sub.${CLIENT_SD_TYPE}.${DOMAIN} PTR | grep -v RRSIG | grep -v NSEC`
+echo "${CLIENT_REQUEST}"
+echo
+
+
+
+
+
+
+CONFIG_HOSTNAME=${SERVER_HOSTNAME}
+CONFIG_SD_TYPE="_wgcfg._udp"
+CONFIG_LISTENPORT="${SERVER_LISTENPORT}"
+CONFIG_SERVICE_NAME="${SERVER_SERVICE_NAME}-${CLIENT_SERVICE_NAME}"
+CONFIG_SUBTYPE="${CLIENT_SERVICE_NAME}"
+CLIENT_VPN_IP="11.11.11.11"
+
+echo "****"
+echo "**** Step 3: ANSWER: SERVER watches ${SERVER_SERVICE_NAME}._sub.${CLIENT_SD_TYPE} For each new request, apply server admit policy, allocates client IP addresses and adds peer to wg configuration. If approved, it registers ${SERVER_SERVICE_NAME}-${CLIENT_SERVICE_NAME}.${CONFIG_SD_TYPE} "
+echo "****    (Initial Default server admit policy is allow all unless VPN network is already fully allocated)"
+echo "****"
+
+CLIENT_KEYSTORE_DIR="${GITDIR}/keystore/client" ${GITDIR}/bin/${DIR}/sig0lease-srp-client \
+  -domain="${DOMAIN}" \
+  -server=127.0.0.1:8053 \
+  -host="${CONFIG_HOSTNAME}" \
+  -addr="${CLIENT_HOST_IP}" \
+  -instance=${CONFIG_SERVICE_NAME}:${CONFIG_SD_TYPE}:${CONFIG_LISTENPORT} \
+  -subtype="${CONFIG_SERVICE_NAME}:${CONFIG_SUBTYPE}" \
+  -txt=${CONFIG_SERVICE_NAME}:"txtver=1" \
+  -txt=${CONFIG_SERVICE_NAME}:"peer=${CLIENT_PUBKEY}" \
+  -txt=${CONFIG_SERVICE_NAME}:"addr=${CLIENT_VPN_IP}" \
+  -txt=${CONFIG_SERVICE_NAME}:"allowed=${CLIENT_VPN_IP}/24" \
+  -lease=${LEASE} -keylease=${KEYLEASE} \
+  -keystore="${GITDIR}/keystore/client" -k=15 \
+  -once
+
+#sleep 2
+echo
+echo "*** 3. Answered (WG Server)"
+echo
+
+CONFIG_CMD="dig ${DIG_OPTIONS} ${CONFIG_SUBTYPE}._sub.${CONFIG_SD_TYPE}.${DOMAIN} PTR"
+CONFIG_REQUEST=`${CONFIG_CMD}`
+echo ${CONFIG_CMD}
+echo ${CONFIG_REQUEST}
+echo 
+
+
+
+
+
+echo "****"
+echo "**** Step 4: CONFIGURE: CLIENT  watches ${CLIENT_SERVICE_NAME}._sub.${CONFIG_SD_TYPE}. It looks for entry where SRV target host is ${SERVER_HOSTNAME} and whose TXT peer= is its own key. It the sets: address addr peer key pk of WG server, endpoint= SRV target and port, AllowedIPs to allowed="
+echo "****"
+
+
+
+
+exit
+
+
+
+
+
+
+
+
+
+
+
+CLIENT_KEYSTORE_DIR="${GITDIR}/keystore/client" ${GITDIR}/bin/${DIR}/sig0lease-srp-client \
+  -domain="${DOMAIN}" \
+  -server=127.0.0.1:8053 \
+  -host="${CLIENT_HOSTNAME}" \
+  -addr="${CLIENT_HOST_IP}" \
+  -instance=${CLIENT_SERVICE_NAME}:${CLIENT_SD_TYPE}:0 \
+  -subtype="${CLIENT_SERVICE_NAME}:${CLIENT_SUBTYPE}" \
   -txt=${CLIENT_SERVICE_NAME}:"txtver=1 PublicKey=${CLIENT_PUBKEY}" \
   -lease=${LEASE} -keylease=${KEYLEASE} \
   -keystore="${GITDIR}/keystore/client" -k=15 \
   -once
 
+
+echo
+echo "*** 3. Answer (WG Server)"
+echo
+
+while true;
+do
+  clear
+  echo "*** Advertise (WG Server) The server registers ${SERVER_INSTANCE}._wg._udp."
+  echo
+  SERVICE_DISCOVERY=`dig ${DIG_OPTIONS} ${SERVER_SD_TYPE}.${DOMAIN} PTR | grep -v RRSIG | grep -v NSEC`
+  echo "=== Service Discovery Instruction Results"
+  echo ${SERVICE_DISCOVERY}
+  echo
+  echo "=== Service Description Instruction Results"
+  SERVICE_DESCRIPTION=`dig ${DIG_OPTIONS} ${SERVER_SERVICE_NAME}.${SERVER_SD_TYPE}.${DOMAIN} ANY | grep -v RRSIG | grep -v NSEC`
+  echo "${SERVICE_DESCRIPTION}"
+  echo
+  echo "=== Host Description Instruction Results"
+  HOST_DESCRIPTION=`dig ${DIG_OPTIONS} ${SERVER_HOSTNAME}.${DOMAIN} ANY | grep -v RRSIG | grep -v NSEC`
+  echo "${HOST_DESCRIPTION}"
+  echo
+  echo "*** Request (WG Client)"
+  echo
+  echo "== Browse ${SERVER_SD_TYPE} Service Instances"
+  SERVICE_INSTANCES=`dig ${DIG_OPTIONS} ${SERVER_SD_TYPE}.${DOMAIN} PTR | grep -v RRSIG | grep -v NSEC`
+  echo "${SERVICE_INSTANCES}"
+  echo
+  echo "== Publish Request with ${SERVER_SERVICE_NAME}._sub.${CLIENT_SERVICE_NAME}.${CLIENT_SD_TYPE}.${DOMAIN}"
+  CLIENT_REQUEST=`dig ${DIG_OPTIONS} ${SERVER_SERVICE_NAME}._sub.${CLIENT_SD_TYPE}.${DOMAIN} PTR | grep -v RRSIG | grep -v NSEC`
+  echo "${CLIENT_REQUEST}"
+  echo
+  echo "*** Answer (WG Server)"
+  echo
+  echo "==  Server watches client requests for ${SERVER_SERVICE_NAME}._sub.${CLIENT_SD_TYPE}.${DOMAIN}"
+
+  CLIENT_INSTANCE=`dig ${DIG_OPTIONS} ${SERVER_SERVICE_NAME}._sub.${CLIENT_SD_TYPE}.${DOMAIN} PTR | grep -v RRSIG | grep -v NSEC`
+  echo "${CLIENT_INSTANCE}"
+
+  echo ${CLIENT_INSTANCE} | wc -l
+
+  sleep 2
+done
+
+exit
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 echo "****"
-echo "**** Step 2: VPN server instance: ${SERVER_SERVICE_NAME} scans for client request PTR records of ${SERVER_SERVICE_NAME}.sub.${SD_TYPE}.${DOMAIN}"
+echo "**** Step 3: VPN server instance: ${SERVER_SERVICE_NAME} scans for client request PTR records of ${SERVER_SERVICE_NAME}.sub.${SD_TYPE}.${DOMAIN}"
 echo "****"
 
 # wait ...
