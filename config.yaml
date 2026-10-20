@@ -18,6 +18,13 @@ server:
   # node another request is using. Optional, default "15s"; must be positive.
   # request_timeout: "15s"
 
+  # Diagnostics, for testing and debugging; keep it off in production. On, every error reply
+  # carries the reason for the refusal as the text of its Extended DNS Error (RFC 8914), and
+  # the proxy answers the lease-store dump query (__dump.sig0lease.internal[.debug]. TXT).
+  # Off, error replies carry only the Extended DNS Error's code, and the dump query is
+  # answered REFUSED. The test suites turn it on in the configs they write.
+  diagnostics: false
+
   # Networks to enable
   networks:
     - udp

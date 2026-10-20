@@ -19,13 +19,6 @@ func ExpiryFromResponse(now time.Time, requestedLease, requestedKeyLease uint32,
     ExpiryFromResponse computes the data-record and KEY expiration times using
     the server-granted LEASE and KEY-LEASE when present in the response.
 
-func StatusNotes(resp *dns.Msg) []string
-    StatusNotes returns the proxy's status notes from an UPDATE response:
-    the EXTRA-TEXT of each Extended DNS Error option (RFC 8914) it carries,
-    in order. The RFC 9664 handler sends one per note, such as "record not found
-    for delete: ...", so a person can see what the proxy did with each record;
-    they are not meant for parsing.
-
 
 TYPES
 
@@ -537,6 +530,12 @@ type ServerConfig struct {
 	// wait for a lease-store node another request holds (docs/siglease_rfc9664.md, "Node
 	// Locks"). Must be positive: without a bound, a waiter could wait forever.
 	RequestTimeout time.Duration `yaml:"request_timeout"`
+	// Diagnostics lets clients see the proxy's internals, for testing and debugging: the
+	// reason text in the Extended DNS Error (RFC 8914) of each error reply, and the lease-store
+	// dump query (__dump.sig0lease.internal[.debug]. TXT). Off by default, as it should be in
+	// production: error replies then carry only the Extended DNS Error's code, and the dump
+	// query is answered REFUSED with code 18 (Prohibited).
+	Diagnostics bool `yaml:"diagnostics"`
 }
     ServerConfig holds server listening configuration.
 
@@ -1035,6 +1034,23 @@ package dnsmsg // import "github.com/NetworkCommons/sig0lease/pkg/dnsmsg"
 
 FUNCTIONS
 
+func AddEDE(resp, req *dns.Msg, infoCode uint16, text string)
+    AddEDE adds an Extended DNS Error (RFC 8914) with infoCode and text to resp,
+    the reply to req, if req carried an OPT RR: RFC 8914 S2 allows the option
+    only in a reply to a request that did. The option goes in resp.Pseudo,
+    from which the dns library builds resp's one OPT RR.
+
+    text is EXTRA-TEXT, for people to read, not for parsing (RFC 8914 S2).
+    Every reply the proxy builds gets its EDE here; the server removes the text
+    of an error reply's EDEs unless server.diagnostics is on (StripEDEText).
+
+func EDEs(m *dns.Msg) []*dns.EDE
+    EDEs returns the Extended DNS Errors in m, in order.
+
+func FormatEDE(e *dns.EDE) string
+    FormatEDE renders e for people: its INFO-CODE, the code's name in the IANA
+    "Extended DNS Error Codes" registry, and its EXTRA-TEXT, if any.
+
 func NewLeaseUpdate(zone string, keyRRs []*dns.KEY, additional []dns.RR, leaseDuration, keyLeaseDuration uint32) (*dns.Msg, error)
     NewLeaseUpdate builds a DNS UPDATE registration message with one optional
     KEY RR, optional additional RRs, and an 8-byte UPDATE-LEASE option.
@@ -1045,6 +1061,10 @@ func ParseAdditionalRRSpec(spec string) (dns.RR, error)
     Required form:
 
         owner ttl class type rdata...
+
+func StripEDEText(m *dns.Msg)
+    StripEDEText empties the EXTRA-TEXT of every Extended DNS Error in m and
+    keeps its INFO-CODE.
 
 ```
 
@@ -2478,7 +2498,7 @@ type Router struct {
     Router routes DNS requests based on opcode to appropriate handlers or
     forwarder.
 
-func NewRouter(opcodeMap map[uint8][]string, logger *logging.Logger, resolver *forward.Resolver, requestTimeout time.Duration) (*Router, error)
+func NewRouter(opcodeMap map[uint8][]string, logger *logging.Logger, resolver *forward.Resolver, requestTimeout time.Duration, diagnostics bool) (*Router, error)
     NewRouter creates a new router instance.
 
 func (r *Router) RegisterHandler(h handlers.Handler)
@@ -2486,7 +2506,8 @@ func (r *Router) RegisterHandler(h handlers.Handler)
 
 func (r *Router) Route(ctx context.Context, w dns.ResponseWriter, rMsg *dns.Msg) *dns.Msg
     Route determines how to handle a DNS message based on its opcode. Flow:
-     1. Check for internal dump query (admin/debug endpoint)
+     1. Check for internal dump query (admin/debug endpoint), refused unless
+        server.diagnostics is on
      2. Check if opcode has any registered handlers
      3. Try each configured handler for the opcode in order: - StatusProcessed:
         Return response to client, stop - StatusNotRelevant: Try the next

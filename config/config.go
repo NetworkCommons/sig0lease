@@ -47,6 +47,12 @@ type ServerConfig struct {
 	// wait for a lease-store node another request holds (docs/siglease_rfc9664.md, "Node
 	// Locks"). Must be positive: without a bound, a waiter could wait forever.
 	RequestTimeout time.Duration `yaml:"request_timeout"`
+	// Diagnostics lets clients see the proxy's internals, for testing and debugging: the
+	// reason text in the Extended DNS Error (RFC 8914) of each error reply, and the lease-store
+	// dump query (__dump.sig0lease.internal[.debug]. TXT). Off by default, as it should be in
+	// production: error replies then carry only the Extended DNS Error's code, and the dump
+	// query is answered REFUSED with code 18 (Prohibited).
+	Diagnostics bool `yaml:"diagnostics"`
 }
 
 // TLSConfig holds the DNS-over-TLS listener's own address and certificate. A separate

@@ -24,8 +24,6 @@ source "$SCRIPT_DIR/lib/leasestore.sh"
 source "$SCRIPT_DIR/lib/bind9.sh"
 
 AUTH_BACKEND="${AUTH_BACKEND:-live}"
-# Holds local mode's lease snapshots and client keys; removed by cleanup.
-LOCAL_SCRATCH_DIR=""
 
 # Zones
 case "$AUTH_BACKEND" in
@@ -44,27 +42,29 @@ case "$AUTH_BACKEND" in
         ;;
 esac
 DOWNSTREAM_ZONE="test.${UPSTREAM_ZONE}"
+# The proxy's config, log and, in local mode, lease files and client keys: named after the
+# Makefile target, test-update or test-update-local.
+if [ "$AUTH_BACKEND" = "local" ]; then
+    PROXY_RUN_DIR="$PROXY_RUN_ROOT/update-local"
+else
+    PROXY_RUN_DIR="$PROXY_RUN_ROOT/update"
+fi
 
 ################################
 # Local backend (AUTH_BACKEND=local)
 ################################
 
-# localize_lease_config -- local mode: turns this run's scratch copy of config.yaml
-# (prepare_lease_config, which already set the listen address, the minimum leases and, with
-# PROXY_PROTOCOL=tls, the DoT listener) into a config for the local BIND 9 deployment, by
-# replacing only what names a server, zone, key or file: the upstream resolvers become the
-# local BIND 9, and each handler gets its own zone on it (srp_handler BIND9_ZONE, the update
-# handler BIND9_UPDATE_ZONE), reached through its static "upstream", with that zone's own key
-# and a lease file in LOCAL_SCRATCH_DIR. Everything else -- processing rules, lease policy,
+# localize_lease_config -- local mode: turns this run's copy of config.yaml
+# (prepare_lease_config, which already set the listen address, diagnostics, the minimum leases
+# and, with PROXY_PROTOCOL=tls, the DoT listener) into a config for the local BIND 9
+# deployment, by replacing only what names a server, zone, key or file: the upstream resolvers
+# become the local BIND 9, and each handler gets its own zone on it (srp_handler BIND9_ZONE,
+# the update handler BIND9_UPDATE_ZONE), reached through its static "upstream", with that
+# zone's own key and a lease file in PROXY_RUN_DIR. Everything else -- processing rules, lease policy,
 # blacklisted types, any setting config.yaml gains later -- stays config.yaml's. Fails if
 # config.yaml has a handler section this doesn't localize, or if any zone, key, file or server
 # config.yaml names is still in the result, so a local run cannot reach a live resource.
 localize_lease_config() {
-    if [ "$REUSED_PROXY" = true ]; then
-        log_error "AUTH_BACKEND=local starts its own proxy, but one already listens on port $PROXY_PORT. Re-run with a free port: PROXY_PORT=18053 AUTH_BACKEND=local tests/test_update.sh run"
-        return 1
-    fi
-
     local handlers
     handlers="$(awk '/^handlers:/ { in_h = 1; next } /^[^ #]/ { in_h = 0 } in_h && /^  [^ #][^ ]*:[ ]*$/ { sub(/^  /, ""); sub(/:.*/, ""); print }' "$CONFIG_FILE")"
     if [ "$(printf '%s\n' "$handlers" | sort | tr '\n' ' ')" != "srp_handler update " ]; then
@@ -72,7 +72,6 @@ localize_lease_config() {
         return 1
     fi
 
-    LOCAL_SCRATCH_DIR="$(mktemp -d /tmp/sig0lease-update-local.XXXXXX)"
     local upstream="${BIND9_ADDR}:${BIND9_PORT}"
     # A handler's block: from "  <name>:" to the next line indented by two spaces or less
     # (the next handler or top-level key), or to the end of the file.
@@ -85,30 +84,30 @@ localize_lease_config() {
         -e "${srp_block} s|^    upstream_zone:.*$|    upstream_zone: \"${BIND9_ZONE}\"|" \
         -e "${srp_block} s|^    # upstream:.*$|    upstream: \"${upstream}\"|" \
         -e "${srp_block} s|^    keystore_dir:.*$|    keystore_dir: \"${BIND9_SRP_KEYSTORE_DIR}\"|" \
-        -e "${srp_block} s|^      path:.*$|      path: \"${LOCAL_SCRATCH_DIR}/srp_lease_snapshot.json\"|" \
+        -e "${srp_block} s|^      path:.*$|      path: \"${PROXY_RUN_DIR}/srp_lease_snapshot.json\"|" \
         -e "${update_block} s|^    upstream_zone:.*$|    upstream_zone: \"${BIND9_UPDATE_ZONE}\"|" \
         -e "${update_block} s|^    # upstream:.*$|    upstream: \"${upstream}\"|" \
         -e "${update_block} s|^    keystore_dir:.*$|    keystore_dir: \"${BIND9_UPDATE_KEYSTORE_DIR}\"|" \
-        -e "${update_block} s|^      path:.*$|      path: \"${LOCAL_SCRATCH_DIR}/lease_snapshot.json\"|" \
-        "$TMP_CONFIG_FILE"
-    rm -f "$TMP_CONFIG_FILE.bak"
+        -e "${update_block} s|^      path:.*$|      path: \"${PROXY_RUN_DIR}/lease_snapshot.json\"|" \
+        "$PROXY_CONFIG_FILE"
+    rm -f "$PROXY_CONFIG_FILE.bak"
 
     local expected
     for expected in \
         "  max_inflight_updates: ${BIND9_SIG0_QUOTA}" \
         "    upstream_zone: \"${BIND9_ZONE}\"" \
         "    keystore_dir: \"${BIND9_SRP_KEYSTORE_DIR}\"" \
-        "      path: \"${LOCAL_SCRATCH_DIR}/srp_lease_snapshot.json\"" \
+        "      path: \"${PROXY_RUN_DIR}/srp_lease_snapshot.json\"" \
         "    upstream_zone: \"${BIND9_UPDATE_ZONE}\"" \
         "    keystore_dir: \"${BIND9_UPDATE_KEYSTORE_DIR}\"" \
-        "      path: \"${LOCAL_SCRATCH_DIR}/lease_snapshot.json\""; do
-        if ! grep -qxF -- "$expected" "$TMP_CONFIG_FILE"; then
-            log_error "Could not localize $TMP_CONFIG_FILE: no line '$expected' after editing -- $CONFIG_FILE no longer has the lines localize_lease_config edits"
+        "      path: \"${PROXY_RUN_DIR}/lease_snapshot.json\""; do
+        if ! grep -qxF -- "$expected" "$PROXY_CONFIG_FILE"; then
+            log_error "Could not localize $PROXY_CONFIG_FILE: no line '$expected' after editing -- $CONFIG_FILE no longer has the lines localize_lease_config edits"
             return 1
         fi
     done
-    if [ "$(grep -cxF -- "    upstream: \"${upstream}\"" "$TMP_CONFIG_FILE")" -ne 2 ]; then
-        log_error "Could not localize $TMP_CONFIG_FILE: each handler section of $CONFIG_FILE needs a commented-out '    # upstream:' line for localize_lease_config to turn on"
+    if [ "$(grep -cxF -- "    upstream: \"${upstream}\"" "$PROXY_CONFIG_FILE")" -ne 2 ]; then
+        log_error "Could not localize $PROXY_CONFIG_FILE: each handler section of $CONFIG_FILE needs a commented-out '    # upstream:' line for localize_lease_config to turn on"
         return 1
     fi
 
@@ -117,20 +116,20 @@ localize_lease_config() {
     local live_value
     for live_value in $(grep -v '^ *#' "$CONFIG_FILE" \
         | sed -n -E 's/^ *(- address|upstream_zone|upstream|keystore_dir|path): *"?([^" #]+).*/\2/p'); do
-        if grep -v '^ *#' "$TMP_CONFIG_FILE" | grep -qF -- "$live_value"; then
-            log_error "Could not localize $TMP_CONFIG_FILE: it still names $live_value from $CONFIG_FILE"
+        if grep -v '^ *#' "$PROXY_CONFIG_FILE" | grep -qF -- "$live_value"; then
+            log_error "Could not localize $PROXY_CONFIG_FILE: it still names $live_value from $CONFIG_FILE"
             return 1
         fi
     done
 }
 
 # make_local_client_keys -- local mode's two client identities: fresh ED25519 KEYs at
-# DOWNSTREAM_ZONE in a scratch keystore, in place of keystore/client's test.dev.zenr.io.
+# DOWNSTREAM_ZONE in PROXY_RUN_DIR/client-keys, in place of keystore/client's test.dev.zenr.io.
 # ones. Different key tags, as the unauthorized-signer tests need. CLIENT_KEYSTORE_DIR is
 # exported because blacklisted_tester (go run) reads it from the environment.
 make_local_client_keys() {
     require_command dnssec-keygen || return 1
-    local dir="${LOCAL_SCRATCH_DIR}/client-keys"
+    local dir="${PROXY_RUN_DIR}/client-keys"
     mkdir "$dir"
     CLIENT_KEY_NAME="$(dnssec-keygen -q -K "$dir" -a ED25519 -n HOST -T KEY "$DOWNSTREAM_ZONE")"
     WRONG_CLIENT_KEY_NAME="$(dnssec-keygen -q -K "$dir" -a ED25519 -n HOST -T KEY "$DOWNSTREAM_ZONE")"
@@ -141,11 +140,9 @@ make_local_client_keys() {
     export CLIENT_KEYSTORE_DIR="$dir"
 }
 
-# Decide up front whether we'll run our own proxy (against a scratch copy of config.yaml with
-# min_*_lease_sec floored to TEST_MIN_LEASE_SECONDS, localized for the local BIND 9 in local
-# mode) or reuse one already listening (whose real policy we read from CONFIG_FILE instead) --
-# must happen before the yaml_get_lease_time calls below, since they read whichever file this
-# settles on.
+# Write the proxy's config (a copy of config.yaml with min_*_lease_sec floored to
+# TEST_MIN_LEASE_SECONDS, localized for the local BIND 9 in local mode) -- before the
+# yaml_get_lease_time calls below, which read it.
 prepare_lease_config
 if [ "$AUTH_BACKEND" = "local" ]; then
     localize_lease_config
@@ -288,13 +285,10 @@ test_blacklisted_type() {
             ;;
     esac
 
-    # Check the response for rejection (should be Rcode=1 FormatError).
-    if echo "$reg_out" | grep -q "Rcode=1\|FormatError\|REGISTRATION FAILED"; then
-        log_success "Proxy correctly rejected blacklisted type $rr_type with format error"
-    else
-        log_error "Proxy should have rejected blacklisted type $rr_type, got: $reg_out"
-        return 1
-    fi
+    # A well-formed request local policy refuses: REFUSED (RFC 2136 S2.2) with
+    # Extended DNS Error 18 (Prohibited).
+    assert_client_reply "$reg_out" REFUSED 18 "is blacklisted for registration"
+    log_success "Proxy refused blacklisted type $rr_type"
 
     # Verify no KEY RR was created (registration should be atomic - all or nothing).
     if rr_at_authoritative KEY $CLIENT_KEY_RR; then
@@ -366,8 +360,8 @@ test_single_rr_register_expire_remove() {
         # longer lease-managed: a non-KEY-only (Case B) refresh attempt must be
         # refused for that reason, not because "the lease does not exist"
         # (that message is Case D's validateRefreshOwnership path, which
-        # this request never reaches). Assert on the client-visible Rcode
-        # plus the actual Case B rejection text, not a guessed string.
+        # this request never reaches). Assert on the reply the client got: its
+        # Rcode plus the reason the proxy gives for the Case B rejection.
         log_step "Attempting refresh after expiry (non-KEY path: expected failure, signer no longer managed)"
         local post_expiry_out
         if post_expiry_out=$(run_client refresh "$CLIENT_KEY_NAME" $LEASE_SECONDS 0 "$rr_spec" 2>&1); then
@@ -375,16 +369,8 @@ test_single_rr_register_expire_remove() {
             echo "$post_expiry_out"
             return 1
         fi
-        if ! echo "$post_expiry_out" | grep -q "Status: REFUSED (Rcode=5)"; then
-            log_error "Expected REFUSED (Rcode=5) for post-expiry non-KEY-only refresh, got:"
-            echo "$post_expiry_out"
-            return 1
-        fi
+        assert_client_reply "$post_expiry_out" REFUSED 18 "requires signing KEY to already be managed"
         wait_for_rr_state $rr_type "$rr_spec" absent
-        # "requires signing KEY to already be managed" is the *response*
-        # message text (never passed to h.logger), not what actually lands
-        # in the proxy's own log -- assert on the real logged reason instead.
-        assert_proxy_log_contains "signing key not found in lease store"
     fi
 
     expected_min=$((lease + BUFFER))
@@ -563,17 +549,10 @@ test_case_unauthorized_refresh_rejected_then_expires() {
         return 1
     fi
 
-    # WRONG_CLIENT_KEY_NAME is a distinct, never-registered key (different
-    # keytag), so the proxy rejects it via the online-signer-authorization 
-    # path ("signer not authorized for new registration").
-    # Assert on the client-visible Rcode.
-    if ! echo "$unauth_out" | grep -q "Status: REFUSED (Rcode=5)"; then
-        log_error "Expected REFUSED (Rcode=5) for unauthorized refresh, got:"
-        echo "$unauth_out"
-        return 1
-    fi
-
-    assert_proxy_log_contains "signing key not found in lease store"
+    # WRONG_CLIENT_KEY_NAME is a distinct, never-registered key at the same
+    # name as CLIENT_KEY_NAME (different keytag), so the proxy rejects this
+    # non-KEY-only (Case B) refresh because the signer is not lease-managed.
+    assert_client_reply "$unauth_out" REFUSED 18 "requires signing KEY to already be managed"
 
     # Now register WRONG_CLIENT_KEY_NAME to test a non-owner rejection
     # for the refresh operation
@@ -592,14 +571,7 @@ test_case_unauthorized_refresh_rejected_then_expires() {
     fi
     # WRONG_CLIENT_KEY_NAME is not the owner of the previously registered RR
     # so the proxy rejects it.
-    # Assert on the client-visible Rcode.
-    if ! echo "$nonowner_out" | grep -q "Status: REFUSED (Rcode=5)"; then
-        log_error "Expected REFUSED (Rcode=5) for unauthorized refresh, got:"
-        echo "$nonowner_out"
-        return 1
-    fi
-
-    assert_proxy_log_contains "duplicate registration rejected:"
+    assert_client_reply "$nonowner_out" REFUSED 18 "is already registered under a different key"
 
     log_step "Waiting until original lease expires"
     wait_until_epoch $((lease_start + KEY_LEASE_SECONDS + BUFFER))
@@ -1040,7 +1012,7 @@ run_all_tests() {
         sub(/^ /, "", types)
         print types
         }
-    ' "$LEASE_CONFIG_FILE")
+    ' "$PROXY_CONFIG_FILE")
 
 
     log_step "Black-listed types: $blacklisted_rrs"
@@ -1102,7 +1074,10 @@ run_all_tests() {
     else
         echo "Proxy process was exercised at $PROXY_URL over $PROXY_PROTOCOL"
     fi
-    echo "Logs: $LOG_FILE"
+    if [ "$PROXY_LAUNCH" = auto ]; then
+        echo "Proxy log: $PROXY_LOG_FILE"
+    fi
+    echo "Proxy config: $PROXY_CONFIG_FILE"
     if [ "$AUTH_BACKEND" = "local" ]; then
         echo "BIND log: ${BIND9_RUNDIR}/named.log"
     fi
@@ -1125,14 +1100,6 @@ cleanup() {
         # anything -- often the reason a later wait_for_rr_state timed out.
         [ -z "${BIND9_REJECTIONS_REPORTED:-}" ] && bind9_report_rejections
         stop_bind9
-        [ -n "$LOCAL_SCRATCH_DIR" ] && rm -rf "$LOCAL_SCRATCH_DIR"
-    fi
-
-    if [ -n "$TMP_TLS_DIR" ] && [ -d "$TMP_TLS_DIR" ]; then
-        rm -rf "$TMP_TLS_DIR"
-    fi
-    if [ -n "$TMP_CONFIG_FILE" ] && [ -f "$TMP_CONFIG_FILE" ]; then
-        rm -f "$TMP_CONFIG_FILE"
     fi
 
     set -e

@@ -95,11 +95,11 @@ add_rr(){
 ################################
 # DNS inquiry functions
 ################################
-dig_query_short() {
+# dig_at <endpoint> <dig arguments...> -- runs dig against <endpoint>, "host[:port]" (port 53
+# if none), logging the command to CLIENT_LOG_FILE.
+dig_at() {
     local endpoint="$1"
-    local name="$2"
-    local rr_type="$3"
-
+    shift
     local host="$endpoint"
     local port="53"
     if [[ "$endpoint" == *:* ]]; then
@@ -107,8 +107,29 @@ dig_query_short() {
         port="${endpoint##*:}"
     fi
 
-    log_file dig_query_short "dig +short +time=5 @\"$host\" -p \"$port\" \"$name\" \"$rr_type\" 2>/dev/null"
-    dig +short +time=5 @"$host" -p "$port" "$name" "$rr_type" 2>/dev/null
+    log_file dig_at "dig @\"$host\" -p \"$port\" $*"
+    dig @"$host" -p "$port" "$@"
+}
+
+dig_query_short() {
+    dig_at "$1" +short +time=5 "$2" "$3" 2>/dev/null
+}
+
+# dig_query_checked <endpoint> <name> <rr_type> -- like dig_query_short, but fails unless the
+# reply is NOERROR, printing to stderr its status and Extended DNS Errors (RFC 8914). Prints
+# each answer RR's RDATA on its own line, as dig +short does.
+dig_query_checked() {
+    local endpoint="$1" name="$2" rr_type="$3" out status
+    out="$(dig_at "$endpoint" +noall +comments +answer +time=5 "$name" "$rr_type" 2>&1)"
+    status="$(sed -n 's/.*status: \([A-Z]*\),.*/\1/p' <<< "$out" | head -n 1)"
+    if [ "$status" != NOERROR ]; then
+        log_error "$name $rr_type at $endpoint: ${status:-no reply}" >&2
+        grep 'EDE' <<< "$out" >&2
+        return 1
+    fi
+    # Answer RRs: <name> <TTL> <class> <type> <RDATA>.
+    grep -v '^;' <<< "$out" | grep -v '^$' \
+        | sed -E 's/^[^[:space:]]+[[:space:]]+[^[:space:]]+[[:space:]]+[^[:space:]]+[[:space:]]+[^[:space:]]+[[:space:]]+//'
 }
 
 # rr_at_auth_contains <name> <rr_type> <needle>

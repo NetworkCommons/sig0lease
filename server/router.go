@@ -11,6 +11,7 @@ import (
 	"github.com/NetworkCommons/sig0lease/forward"
 	"github.com/NetworkCommons/sig0lease/handlers"
 	"github.com/NetworkCommons/sig0lease/logging"
+	"github.com/NetworkCommons/sig0lease/pkg/dnsmsg"
 	"github.com/NetworkCommons/sig0lease/pkg/dnsname"
 )
 
@@ -26,10 +27,13 @@ type Router struct {
 	// requestTimeout is the deadline Route gives the handlers for one request
 	// (server.request_timeout).
 	requestTimeout time.Duration
+	// diagnostics (server.diagnostics) keeps the reason text in the Extended DNS Errors of the
+	// proxy's own error replies, and answers the dump query.
+	diagnostics bool
 }
 
 // NewRouter creates a new router instance.
-func NewRouter(opcodeMap map[uint8][]string, logger *logging.Logger, resolver *forward.Resolver, requestTimeout time.Duration) (*Router, error) {
+func NewRouter(opcodeMap map[uint8][]string, logger *logging.Logger, resolver *forward.Resolver, requestTimeout time.Duration, diagnostics bool) (*Router, error) {
 	if requestTimeout <= 0 {
 		return nil, fmt.Errorf("request timeout must be positive, got %s", requestTimeout)
 	}
@@ -39,6 +43,7 @@ func NewRouter(opcodeMap map[uint8][]string, logger *logging.Logger, resolver *f
 		logger:         logger,
 		resolver:       resolver,
 		requestTimeout: requestTimeout,
+		diagnostics:    diagnostics,
 	}, nil
 }
 
@@ -63,7 +68,8 @@ func (r *Router) Shutdown() {
 
 // Route determines how to handle a DNS message based on its opcode.
 // Flow:
-//  1. Check for internal dump query (admin/debug endpoint)
+//  1. Check for internal dump query (admin/debug endpoint), refused unless
+//     server.diagnostics is on
 //  2. Check if opcode has any registered handlers
 //  3. Try each configured handler for the opcode in order:
 //     - StatusProcessed: Return response to client, stop
@@ -74,6 +80,10 @@ func (r *Router) Shutdown() {
 func (r *Router) Route(ctx context.Context, w dns.ResponseWriter, rMsg *dns.Msg) *dns.Msg {
 	// Check for internal dump query (admin/debug endpoint).
 	if r.isDumpQuery(rMsg) {
+		if !r.diagnostics {
+			r.logger.Debugf("Refusing dump query: server.diagnostics is off")
+			return r.errorReply(rMsg, dns.RcodeRefused, dns.ExtendedErrorProhibited, "")
+		}
 		return r.handleDumpQuery(rMsg)
 	}
 
@@ -121,7 +131,7 @@ func (r *Router) Route(ctx context.Context, w dns.ResponseWriter, rMsg *dns.Msg)
 		case handlers.StatusError:
 			if result.Message != nil {
 				r.logger.Errorf("Handler %s error: %v, returning error response with Rcode=%d", moduleName, result.Error, result.Message.Rcode)
-				return result.Message
+				return r.ownErrorReply(result.Message)
 			}
 			resp := new(dns.Msg)
 			resp.ID = rMsg.ID
@@ -237,13 +247,33 @@ func (r *Router) forwardToUpstream(rMsg *dns.Msg) *dns.Msg {
 	resp, err := r.forwardMessage(rMsg)
 	if err != nil {
 		r.logger.Errorf("Forward error: %v", err)
-		// Create response preserving the original message ID
-		resp = new(dns.Msg)
-		resp.ID = rMsg.ID
-		resp.Rcode = dns.RcodeServerFailure
-		resp.Response = true
+		return r.errorReply(rMsg, dns.RcodeServerFailure, dns.ExtendedErrorNoReachableAuthority,
+			fmt.Sprintf("forwarding to the upstream resolvers failed: %v", err))
 	}
 
+	return resp
+}
+
+// errorReply builds the router's own error reply to m, a query: m's header (so its ID,
+// opcode, RD bit and EDNS) and question, with QR and rcode set, and an Extended DNS Error
+// (RFC 8914) with infoCode and text, passed through ownErrorReply.
+func (r *Router) errorReply(m *dns.Msg, rcode, infoCode uint16, text string) *dns.Msg {
+	resp := &dns.Msg{MsgHeader: m.MsgHeader}
+	resp.Response = true
+	resp.Rcode = rcode
+	resp.Question = m.Question
+	dnsmsg.AddEDE(resp, m, infoCode, text)
+	return r.ownErrorReply(resp)
+}
+
+// ownErrorReply returns resp, an error reply the proxy built itself (a handler's or the
+// router's, never one relayed from upstream), with the reason text removed from its Extended
+// DNS Errors unless server.diagnostics is on. The codes stay: RFC 8914 S3 requires every
+// client to accept them, and they tell nothing about the proxy's state.
+func (r *Router) ownErrorReply(resp *dns.Msg) *dns.Msg {
+	if !r.diagnostics {
+		dnsmsg.StripEDEText(resp)
+	}
 	return resp
 }
 

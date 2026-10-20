@@ -135,6 +135,10 @@ test-cover:
 	CLIENT_KEYSTORE_DIR=$(CLIENT_KEYSTORE_DIR) go test -race ./... -coverprofile=coverage.out
 	go tool cover -func=coverage.out
 
+# Every end-to-end suite below writes its proxy's config to /tmp/sig0lease-debug/<suite>/ and,
+# with PROXY_LAUNCH=manual, waits for you to start the proxy with it, e.g. in a debugger
+# (tests/README.md), instead of starting it itself.
+
 # Run full end-to-end update workflow via test script.
 # Requires CLIENT_KEYSTORE_DIR for the client key, ex. CLIENT_KEYSTORE_DIR=${PWD}/keystore/client make test-update
 test-update: build build-client

@@ -10,6 +10,7 @@ import (
 
 	"codeberg.org/miekg/dns"
 	"github.com/NetworkCommons/sig0lease/logging"
+	"github.com/NetworkCommons/sig0lease/pkg/dnsmsg"
 	"github.com/NetworkCommons/sig0lease/pkg/dnsname"
 	"github.com/NetworkCommons/sig0lease/pkg/keyrec"
 	leasepkg "github.com/NetworkCommons/sig0lease/pkg/lease"
@@ -112,15 +113,26 @@ func leaseResponse(req *dns.Msg, granted *leasepkg.LeaseOption) *dns.Msg {
 	return resp
 }
 
-// makeErrorResponse builds the error reply to req (updateResponse with rcode). msg is
-// currently unused (kept as a parameter for call-site readability -- see the "Note" below);
-// shared by UpdateHandler and SRPHandler.
+// makeErrorResponse builds the error reply to req, shared by UpdateHandler and SRPHandler:
+// updateResponse with rcode, plus an Extended DNS Error (RFC 8914) with infoCode and text,
+// the reason for the requester. infoCode follows the RFC 8914 definitions, one per kind of
+// refusal, whatever the rcode:
+//   - ExtendedErrorProhibited (18): refused for authorization or local policy -- an
+//     unauthorized or unproven signer, records outside its reach, a name or record held by
+//     another key, a lease below the minimum, a blacklisted type, foreign data;
+//   - ExtendedErrorNotSupported (21): a request this proxy or its configuration cannot
+//     serve -- a "." in a label, the 4-byte lease variant while prefer_4byte_variant is
+//     off, UDP while allow_udp is off;
+//   - ExtendedErrorNoReachableAuthority (22): the authoritative server could not be reached
+//     or did not accept what the proxy sent it;
+//   - ExtendedErrorOther (0): anything else -- a malformed request, a busy lease store, an
+//     internal error.
 //
-// Note: we don't include detailed error messages in the response. Errors are logged
-// locally but responses use standard DNS rcodes. In future versions, we can add extended
-// error EDNS options.
-func makeErrorResponse(req *dns.Msg, rcode uint16, _ string) *dns.Msg {
-	return updateResponse(req, rcode)
+// The router removes text unless server.diagnostics is on (dnsmsg.StripEDEText).
+func makeErrorResponse(req *dns.Msg, rcode, infoCode uint16, text string) *dns.Msg {
+	resp := updateResponse(req, rcode)
+	dnsmsg.AddEDE(resp, req, infoCode, text)
+	return resp
 }
 
 // refuseDottedLabels returns an error result -- REFUSED -- if the request r, as it arrived on
@@ -139,14 +151,14 @@ func refuseDottedLabels(r *dns.Msg) *HandlerResult {
 	}
 	label, found, err := dnsname.DottedWireLabel(r.Data)
 	if err != nil {
-		msg := makeErrorResponse(r, dns.RcodeFormatError, err.Error())
+		msg := makeErrorResponse(r, dns.RcodeFormatError, dns.ExtendedErrorOther, err.Error())
 		return NewErrorResult(msg, err.Error(), err)
 	}
 	if !found {
 		return nil
 	}
 	err = fmt.Errorf("label %q contains \".\", which this proxy cannot carry: its DNS library would send it on as several labels", label)
-	msg := makeErrorResponse(r, dns.RcodeRefused, err.Error())
+	msg := makeErrorResponse(r, dns.RcodeRefused, dns.ExtendedErrorNotSupported, err.Error())
 	return NewErrorResult(msg, err.Error(), err)
 }
 

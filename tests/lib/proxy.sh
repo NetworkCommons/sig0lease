@@ -1,7 +1,8 @@
 # tests/lib/proxy.sh -- build, start, stop, and inspect the proxy process
-# itself, plus the scratch-config machinery that lets a test run its own
-# proxy with lease-policy minimums floored for fast tests. See lib/common.sh
-# for the "no set -e, return not exit" rules this file follows.
+# itself: the launch every suite shares (proxy_run_prepare, proxy_launch,
+# proxy_stop), plus the config machinery that lets a test run the proxy on
+# config.yaml with lease-policy minimums floored for fast tests. See
+# lib/common.sh for the "no set -e, return not exit" rules this file follows.
 
 if [ -n "${_SIG0LEASE_LIB_PROXY_SOURCED:-}" ]; then
     return 0 2>/dev/null || true
@@ -30,7 +31,7 @@ yaml_get_lease_time() {
     local value=""
 
     if command -v yq >/dev/null 2>&1; then
-        value="$(yq -r ".handlers.update.lease_policy.${key} // \"\"" "$LEASE_CONFIG_FILE" 2>/dev/null || true)"
+        value="$(yq -r ".handlers.update.lease_policy.${key} // \"\"" "$PROXY_CONFIG_FILE" 2>/dev/null || true)"
     else
         echo "please install yq!"
         return 1
@@ -44,24 +45,150 @@ yaml_get_lease_time() {
     fi
 }
 
-# Check if a proxy/service is ALREADY listening on PROXY_PORT.
-is_port_in_use() {
-    is_listening "$PROXY_PORT"
+################################
+# Proxy lifecycle, shared by every suite
+################################
+
+# proxy_launch_mode_valid -- fails unless PROXY_LAUNCH (lib/common.sh) is auto or manual.
+proxy_launch_mode_valid() {
+    case "$PROXY_LAUNCH" in
+        auto|manual) ;;
+        *)
+            log_error "Unknown PROXY_LAUNCH=$PROXY_LAUNCH (want auto or manual)"
+            return 1
+            ;;
+    esac
 }
 
-# prepare_lease_config decides, once, whether this run will start its own
-# proxy or reuse one already listening on PROXY_PORT, and sets
-# LEASE_CONFIG_FILE accordingly:
-#   - starting our own proxy: writes a scratch TMP_CONFIG_FILE with
-#     min_key_lease_sec/min_rr_lease_sec forced down to
-#     TEST_MIN_LEASE_SECONDS, so lease-cycle tests don't wait out the real
-#     policy minimums. With PROXY_PROTOCOL=tls it also turns on
-#     config.yaml's commented-out DoT listener at PROXY_TLS_URL, with a
-#     throwaway certificate in TMP_TLS_DIR.
-#   - reusing an already-running proxy: we don't control that process's
-#     config, so LEASE_CONFIG_FILE falls back to the real CONFIG_FILE
-#     (whatever policy it's actually enforcing).
-# Idempotent: safe to call from multiple entry points (e.g. a caller that
+# wait_for_port_free <port> -- waits up to PROXY_LAUNCH_TIMEOUT seconds for nothing to listen
+# on <port>.
+wait_for_port_free() {
+    local port="$1" waited=0
+    while is_listening "$port"; do
+        if [ "$waited" -ge "$PROXY_LAUNCH_TIMEOUT" ]; then
+            log_error "Port $port is still in use after ${PROXY_LAUNCH_TIMEOUT}s"
+            return 1
+        fi
+        sleep 1
+        waited=$((waited + 1))
+    done
+}
+
+# proxy_run_prepare <dir> <port> -- readies <dir>, a suite's fixed directory under
+# PROXY_RUN_ROOT, for a proxy that will listen on <port>. Nothing may listen there yet: with
+# PROXY_LAUNCH=auto that fails the run; with manual it waits for you to stop the proxy, which
+# would otherwise save its leases into this run's files as it stops. Then <dir> is emptied for
+# the config and files the suite writes next.
+proxy_run_prepare() {
+    local dir="$1" port="$2"
+    proxy_launch_mode_valid || return 1
+    case "$dir" in
+        "$PROXY_RUN_ROOT"/?*) ;;
+        *)
+            log_error "Proxy run directory $dir is not under $PROXY_RUN_ROOT"
+            return 1
+            ;;
+    esac
+    if is_listening "$port"; then
+        if [ "$PROXY_LAUNCH" = auto ]; then
+            log_error "Port $port is already in use. Stop what listens there, or run with PROXY_LAUNCH=manual to test a proxy you start yourself"
+            return 1
+        fi
+        log_step "PROXY_LAUNCH=manual: something listens on port $port (PID $(listening_pid "$port")). Stop it before this run clears $dir; waiting up to ${PROXY_LAUNCH_TIMEOUT}s"
+        wait_for_port_free "$port" || return 1
+    fi
+    rm -rf "$dir"
+    mkdir -p "$dir"
+}
+
+# proxy_launch <config> <port> <log> -- has the proxy started on <config>, waits for it to
+# listen on <port>, and sets LAUNCHED_PROXY_PID. With PROXY_LAUNCH=auto this script starts
+# PROXY_BIN from the current directory, appending its output to <log>. With manual it asks you
+# to start it -- from main/, e.g. in your debugger -- waits up to PROXY_LAUNCH_TIMEOUT seconds
+# for a process other than the one proxy_stop left running to listen on <port>, and checks
+# that it was started with <config>.
+LAUNCHED_PROXY_PID=""
+PROXY_STALE_PID="" # manual: the proxy proxy_stop left running, which proxy_launch must not take
+proxy_launch() {
+    local config="$1" port="$2" log="$3" pid waited=0
+    LAUNCHED_PROXY_PID=""
+    proxy_launch_mode_valid || return 1
+
+    if [ "$PROXY_LAUNCH" = auto ]; then
+        if ! [ -x "$PROXY_BIN" ]; then
+            log_error "Proxy binary not found or not executable: $PROXY_BIN"
+            return 1
+        fi
+        log_step "Starting proxy on port $port with config $config"
+        "$PROXY_BIN" "$config" >> "$log" 2>&1 &
+        pid=$!
+        until is_listening "$port" "$pid"; do
+            if ! kill -0 "$pid" 2>/dev/null || [ "$waited" -ge 10 ]; then
+                log_error "The proxy (PID $pid) did not listen on port $port. Its log, $log:"
+                cat "$log"
+                stop_process "$pid" || true
+                return 1
+            fi
+            sleep 1
+            waited=$((waited + 1))
+        done
+        LAUNCHED_PROXY_PID="$pid"
+        return 0
+    fi
+
+    if [ -n "$PROXY_STALE_PID" ] && [ "$(listening_pid "$port")" = "$PROXY_STALE_PID" ]; then
+        log_step "PROXY_LAUNCH=manual: restart the proxy (PID $PROXY_STALE_PID) with config $config, so it reads it anew. Waiting up to ${PROXY_LAUNCH_TIMEOUT}s"
+    else
+        log_step "PROXY_LAUNCH=manual: start the proxy from main/ with config $config (VS Code: see tests/README.md). Waiting up to ${PROXY_LAUNCH_TIMEOUT}s for it on port $port"
+    fi
+    while :; do
+        pid="$(listening_pid "$port")" || return 1
+        if [ -n "$pid" ] && [ "$pid" != "$PROXY_STALE_PID" ]; then
+            break
+        fi
+        if [ "$waited" -ge "$PROXY_LAUNCH_TIMEOUT" ]; then
+            log_error "No new proxy listened on port $port within ${PROXY_LAUNCH_TIMEOUT}s"
+            return 1
+        fi
+        sleep 1
+        waited=$((waited + 1))
+    done
+    if ! ps -o args= -p "$pid" | grep -qF -- "$config"; then
+        log_error "The process listening on port $port was not started with $config: PID $pid, $(ps -o args= -p "$pid")"
+        return 1
+    fi
+    LAUNCHED_PROXY_PID="$pid"
+    PROXY_STALE_PID=""
+}
+
+# proxy_stop <pid> -- stops <pid>, a proxy proxy_launch started, with PROXY_LAUNCH=auto. With
+# manual it leaves the proxy you started running, and the next proxy_launch, if any, asks you to
+# restart it.
+proxy_stop() {
+    local pid="$1"
+    [ -n "$pid" ] || return 0
+    if [ "$PROXY_LAUNCH" = manual ]; then
+        log_step "PROXY_LAUNCH=manual: leaving the proxy you started (PID $pid) running"
+        PROXY_STALE_PID="$pid"
+        return 0
+    fi
+    if kill -0 "$pid" 2>/dev/null; then
+        log_step "Stopping proxy (PID: $pid)"
+        stop_process "$pid" || true
+    fi
+}
+
+################################
+# config.yaml-based runs (test_update.sh, test_forward.sh)
+################################
+
+# prepare_lease_config writes, once, PROXY_RUN_DIR/config.yaml (PROXY_CONFIG_FILE): a copy of
+# config.yaml listening on PROXY_ADDR:PROXY_PORT, with server.diagnostics on (the reasons in
+# error replies and the lease-store dump the suites check) and min_key_lease_sec/
+# min_rr_lease_sec forced down to TEST_MIN_LEASE_SECONDS, so lease-cycle tests don't wait out
+# the real policy minimums. With PROXY_PROTOCOL=tls it also turns on config.yaml's
+# commented-out DoT listener at PROXY_TLS_URL, with a throwaway certificate in
+# PROXY_RUN_DIR/tls. Idempotent: safe to call from multiple entry points (e.g. a caller that
 # needs lease values before start_proxy runs, and start_proxy itself).
 prepare_lease_config() {
     if [ "$LEASE_CONFIG_PREPARED" = true ]; then
@@ -69,110 +196,65 @@ prepare_lease_config() {
     fi
     LEASE_CONFIG_PREPARED=true
 
-    if is_port_in_use; then
-        REUSED_PROXY=true
-        LEASE_CONFIG_FILE="$CONFIG_FILE"
-        return 0
+    if [ -z "$PROXY_RUN_DIR" ]; then
+        log_error "PROXY_RUN_DIR is not set: the orchestration script names its run directory under $PROXY_RUN_ROOT"
+        return 1
     fi
+    proxy_run_prepare "$PROXY_RUN_DIR" "$PROXY_PORT" || return 1
+    PROXY_CONFIG_FILE="$PROXY_RUN_DIR/config.yaml"
+    PROXY_LOG_FILE="$PROXY_RUN_DIR/proxy.log"
 
-    log_step "Preparing runtime config for listen address $PROXY_ADDR:$PROXY_PORT"
+    log_step "Preparing runtime config $PROXY_CONFIG_FILE for listen address $PROXY_ADDR:$PROXY_PORT"
 
-    TMP_CONFIG_FILE="$(mktemp /tmp/sig0lease-config.XXXXXX)"
-    cp "$CONFIG_FILE" "$TMP_CONFIG_FILE"
+    cp "$CONFIG_FILE" "$PROXY_CONFIG_FILE"
     sed -i.bak \
         -e "s|^  address:.*$|  address: \"$PROXY_ADDR:$PROXY_PORT\"|" \
+        -e "s|^  diagnostics:.*$|  diagnostics: true|" \
         -e "s|^      min_key_lease_sec:.*$|      min_key_lease_sec: ${TEST_MIN_LEASE_SECONDS}|" \
         -e "s|^      min_rr_lease_sec:.*$|      min_rr_lease_sec: ${TEST_MIN_LEASE_SECONDS}|" \
-        "$TMP_CONFIG_FILE"
-    rm -f "$TMP_CONFIG_FILE.bak"
+        "$PROXY_CONFIG_FILE"
+    rm -f "$PROXY_CONFIG_FILE.bak"
+    if ! grep -qx '  diagnostics: true' "$PROXY_CONFIG_FILE"; then
+        log_error "Could not turn on server.diagnostics in $PROXY_CONFIG_FILE: $CONFIG_FILE no longer has the \"  diagnostics:\" line this edits"
+        return 1
+    fi
 
     if [ "$PROXY_PROTOCOL" = "tls" ]; then
-        TMP_TLS_DIR="$(mktemp -d /tmp/sig0lease-tls.XXXXXX)"
-        make_tls_cert "$TMP_TLS_DIR" || return 1
+        local tls_dir="$PROXY_RUN_DIR/tls"
+        mkdir "$tls_dir"
+        make_tls_cert "$tls_dir" || return 1
         sed -i.bak \
             -e "s|^    # - tls .*$|    - tls|" \
             -e "s|^  # tls:$|  tls:|" \
             -e "s|^  #   address:.*$|    address: \"$PROXY_TLS_URL\"|" \
-            -e "s|^  #   cert:.*$|    cert: \"$TMP_TLS_DIR/cert.pem\"|" \
-            -e "s|^  #   key:.*$|    key: \"$TMP_TLS_DIR/key.pem\"|" \
-            "$TMP_CONFIG_FILE"
-        rm -f "$TMP_CONFIG_FILE.bak"
-        if ! grep -q '^    - tls$' "$TMP_CONFIG_FILE" || ! grep -q '^  tls:$' "$TMP_CONFIG_FILE" \
-            || ! grep -qF "address: \"$PROXY_TLS_URL\"" "$TMP_CONFIG_FILE" \
-            || ! grep -qF "$TMP_TLS_DIR/cert.pem" "$TMP_CONFIG_FILE" \
-            || ! grep -qF "$TMP_TLS_DIR/key.pem" "$TMP_CONFIG_FILE"; then
-            log_error "Could not turn on the DoT listener in $TMP_CONFIG_FILE: $CONFIG_FILE no longer has the commented-out \"- tls\" and \"tls:\" lines this edits"
+            -e "s|^  #   cert:.*$|    cert: \"$tls_dir/cert.pem\"|" \
+            -e "s|^  #   key:.*$|    key: \"$tls_dir/key.pem\"|" \
+            "$PROXY_CONFIG_FILE"
+        rm -f "$PROXY_CONFIG_FILE.bak"
+        if ! grep -q '^    - tls$' "$PROXY_CONFIG_FILE" || ! grep -q '^  tls:$' "$PROXY_CONFIG_FILE" \
+            || ! grep -qF "address: \"$PROXY_TLS_URL\"" "$PROXY_CONFIG_FILE" \
+            || ! grep -qF "$tls_dir/cert.pem" "$PROXY_CONFIG_FILE" \
+            || ! grep -qF "$tls_dir/key.pem" "$PROXY_CONFIG_FILE"; then
+            log_error "Could not turn on the DoT listener in $PROXY_CONFIG_FILE: $CONFIG_FILE no longer has the commented-out \"- tls\" and \"tls:\" lines this edits"
             return 1
         fi
     fi
-
-    LEASE_CONFIG_FILE="$TMP_CONFIG_FILE"
 }
 
 start_proxy() {
     log_section "START: Proxy Process"
 
-    prepare_lease_config
+    prepare_lease_config || return 1
+    proxy_launch "$PROXY_CONFIG_FILE" "$PROXY_PORT" "$PROXY_LOG_FILE" || return 1
+    PROXY_PID="$LAUNCHED_PROXY_PID"
 
-    # If already running, reuse it and skip startup
-    if [ "$REUSED_PROXY" = true ]; then
-        log_success "Reusing proxy already listening on ${PROXY_ADDR}:${PROXY_PORT}"
-        return 0
+    log_success "Proxy listening on ${PROXY_ADDR}:${PROXY_PORT} (PID: $PROXY_PID), config $PROXY_CONFIG_FILE"
+    if [ "$PROXY_LAUNCH" = auto ]; then
+        log_success "Proxy log: tail -f $PROXY_LOG_FILE"
     fi
-
-    if ! [ -x "$PROXY_BIN" ]; then
-        log_error "Proxy binary not found or not executable: $PROXY_BIN"
-        return 1
-    fi
-
-    log_step "Starting proxy on $PROXY_URL with config: $TMP_CONFIG_FILE"
-
-    "$PROXY_BIN" "$TMP_CONFIG_FILE" > "$LOG_FILE" 2>&1 &
-    PROXY_PID=$!
-
-    sleep 2
-
-    if ! kill -0 "$PROXY_PID" 2>/dev/null; then
-        log_error "Proxy failed to start. Check logs:"
-        cat "$LOG_FILE"
-        if grep -q "address already in use" "$LOG_FILE"; then
-            log_error "Port $PROXY_PORT is already in use. Re-run with a free port: PROXY_PORT=18053 tests/test_update.sh run"
-        fi
-        return 1
-    fi
-    # Verify our proxy PID owns at least one listener on the target port.
-    if ! is_listening "$PROXY_PORT" "$PROXY_PID"
-    then
-        log_error "Proxy PID $PROXY_PID is not listening on port ${PROXY_PORT}"
-        stop_process "$PROXY_PID" || true
-        return 1
-    fi
-
-
-    log_success "Proxy started successfully on ${PROXY_ADDR}:${PROXY_PORT} (PID: $PROXY_PID)"
-    log_success "Proxy log: tail -f $LOG_FILE"
 }
 
 stop_proxy() {
-    if [ ! -z "${PROXY_PID:-}" ] && kill -0 "$PROXY_PID" 2>/dev/null; then
-        log_step "Stopping sig0lease proxy (PID: $PROXY_PID)"
-        stop_process "$PROXY_PID" || true
-        log_success "Proxy stopped"
-    fi
+    proxy_stop "${PROXY_PID:-}"
     PROXY_PID=""
-}
-
-restart_proxy() {
-    stop_proxy
-    start_proxy
-}
-
-assert_proxy_log_contains() {
-    local pattern="$1"
-    if grep -q "$pattern" "$LOG_FILE"; then
-        return 0
-    fi
-    log_error "Expected proxy log pattern not found: $pattern"
-    tail -n 120 "$LOG_FILE" || true
-    return 1
 }

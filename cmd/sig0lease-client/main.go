@@ -532,24 +532,25 @@ func cmdRegRefWithMode(proxyAddr string, args []string, operation string, tamper
 		dataExpiry, keyExpiry := client.ExpiryFromResponse(time.Now(), leaseDuration, keyLeaseDuration, resp)
 		fmt.Printf("  Data expiration time: %s\n", dataExpiry.Format(time.RFC3339))
 		fmt.Printf("  Key expiration time: %s\n", keyExpiry.Format(time.RFC3339))
-		printStatusNotes(resp)
+		printExtendedErrors(resp)
 	} else {
 		fmt.Printf("\n✗ %s FAILED\n", strings.ToUpper(operation))
 		fmt.Printf("  Response code: %s\n", dns.RcodeToString[resp.Rcode])
-		printStatusNotes(resp)
+		printExtendedErrors(resp)
 		os.Exit(1)
 	}
 }
 
-// printStatusNotes prints the proxy's status notes from resp, if it sent any.
-func printStatusNotes(resp *dns.Msg) {
-	notes := client.StatusNotes(resp)
-	if len(notes) == 0 {
+// printExtendedErrors prints the Extended DNS Errors (RFC 8914) in resp, if the proxy sent
+// any: the reason for a failure, or a success's status notes.
+func printExtendedErrors(resp *dns.Msg) {
+	edes := dnsmsg.EDEs(resp)
+	if len(edes) == 0 {
 		return
 	}
-	fmt.Printf("\nProxy notes:\n")
-	for _, note := range notes {
-		fmt.Printf("  %s\n", note)
+	fmt.Printf("\nExtended DNS Errors:\n")
+	for _, ede := range edes {
+		fmt.Printf("  EDE %s\n", dnsmsg.FormatEDE(ede))
 	}
 }
 

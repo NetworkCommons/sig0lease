@@ -307,7 +307,7 @@ A refresh needs only the node it refreshes, a registration also the node it atta
 
 Before forwarding, the proxy clamps LEASE and KEY-LEASE to `LeasePolicy` bounds (`min_key_lease_sec`/`max_key_lease_sec`/`min_rr_lease_sec`/`max_rr_lease_sec`). Both handlers parse and clamp with the same code (`handlers/lease_policy.go`), and the proxy refuses to start with a policy whose non-KEY bounds are looser than its KEY bounds (`min_rr_lease_sec` above `min_key_lease_sec`, or `max_rr_lease_sec` unset or above a set `max_key_lease_sec`): clamping the two values separately would then grant a LEASE longer than the KEY-LEASE. The *actual* durations used after clamping — not the client's originally-requested values — are echoed back to the client in the response's UPDATE-LEASE option, so the client can detect when the proxy granted less than what was requested. Both handlers build that response with `handlers.leaseResponse`: it copies none of the request's sections (RFC 2136 §3.8) and carries exactly one OPT RR (RFC 6891 §6.1.1). Copying the request's header used to add a second OPT RR beside the one holding the lease, which strict parsers such as mDNSResponder's `srp-client` reject. `client.EffectiveLeaseDuration(resp, requestedLease, requestedKeyLease)` returns both the effective LEASE and KEY-LEASE from a response.
 
-This handler's status notes (for example `record not found for delete: ...`) travel in that same OPT RR, one Extended DNS Error option (RFC 8914, INFO-CODE 0 "Other") per note, with the note as EXTRA-TEXT; `client.StatusNotes(resp)` returns them and `sig0lease-client` prints them as "Proxy notes". They used to be TXT records in the answer slot, next to an echo of the KEY RRs processed, but in an UPDATE reply that slot is the Prerequisite section, which a reply may only copy from the request. The KEY echo is gone; to see a registered KEY, query it (`sig0lease-client verify`) or `dig` it at the authoritative server.
+This handler's status notes (for example `record not found for delete: ...`) travel in that same OPT RR, one Extended DNS Error option (RFC 8914, INFO-CODE 0 "Other") per note, with the note as EXTRA-TEXT; `dnsmsg.EDEs(resp)` returns them and `sig0lease-client` prints them under "Extended DNS Errors", as it does an error reply's (see "Error Replies" below). They used to be TXT records in the answer slot, next to an echo of the KEY RRs processed, but in an UPDATE reply that slot is the Prerequisite section, which a reply may only copy from the request. The KEY echo is gone; to see a registered KEY, query it (`sig0lease-client verify`) or `dig` it at the authoritative server.
 
 TTLs are not leases, and the proxy does not forward the requester's. A requester may send its
 lease as the TTL, which would let resolvers cache a record for as long as its lease.
@@ -322,9 +322,24 @@ request carries no KEY-LEASE, is cut to the remaining lease it is re-registered 
 says nothing about TTLs; the rule follows RFC 9665 §4 and §5.1, where the SRP handler applies
 the same setting (see `docs/siglease_rfc9665.md` §6).
 
+### Error Replies
+
+Every error reply either handler sends, like a success reply, copies none of the request's sections, and carries one Extended DNS Error (RFC 8914) in its OPT RR when the request had one: an INFO-CODE for the kind of refusal, and the reason as EXTRA-TEXT (`handlers.makeErrorResponse`, `dnsmsg.AddEDE`). The codes follow RFC 8914's definitions, one per kind of refusal whatever the RCODE:
+
+| INFO-CODE | Refusals |
+|---|---|
+| 18 Prohibited | an unauthorized or unproven signer, records outside its subtree, a name or record held by another key (RFC 9664 `REFUSED`, SRP `YXDOMAIN`), a lease below the minimum, a blacklisted type, foreign data at an SRP name |
+| 21 Not Supported | a "." in a label, the 4-byte variant while `prefer_4byte_variant` is off, UDP while SRP's `allow_udp` is off |
+| 22 No Reachable Authority | the authoritative server could not be queried or did not accept the UPDATE (`SERVFAIL`); also a query the proxy could not forward |
+| 0 Other | anything else: a malformed request, a busy lease store, an internal error |
+
+The reason text can tell a requester about the proxy's state, such as whether a key is in its lease store, so it stays only with `server.diagnostics: true`; otherwise the router removes it and keeps the code (`Router.ownErrorReply`), which RFC 8914 §3 requires every client to accept. `sig0lease-client` and `sig0lease-srp-client` print each Extended DNS Error after the status, and the test suites check refusals by them, with diagnostics on.
+
+The RCODE tells the requester whether to retry: `FORMERR` for a request that is not a valid lease request -- a bad option, or records that don't fit the lease case it asks for, in every case alike; `REFUSED` for a valid one this proxy won't do; `SERVFAIL` when it could not finish, including a failed authoritative lookup inside a check that would otherwise refuse (the signer's KEY, a duplicate check: `authoritativeLookupError`), since the request itself may be fine. The SRP handler answers only the RCODEs RFC 9665 §3.3.5 allows, so a malformed SRP update is `REFUSED`.
+
 ### Blacklisted RR Types
 
-The proxy maintains a configurable list of blacklisted RR types (`handlers.update.blacklisted_types` in `config.yaml`). Any UPDATE packet attempting to register one of these RR types is rejected outright.
+The proxy maintains a configurable list of blacklisted RR types (`handlers.update.blacklisted_types` in `config.yaml`). Any UPDATE packet attempting to register one of these RR types is refused: `REFUSED` (RFC 2136 §2.2, "for policy or security reasons") with Extended DNS Error 18 (Prohibited). The request is well-formed, so not `FORMERR`.
 
 ### Storage Backends and Expiry
 
@@ -365,6 +380,7 @@ Two backends are selectable via `handlers.update.storage` in `config.yaml` (see 
 
 - listening address and enabled transport networks;
 - `server.request_timeout` (default 15s, must be positive): how long the handlers may work on one request, including waiting for a lease-store node another request is using (see "Node Locks");
+- `server.diagnostics` (default `false`; keep it off in production): with it on, error replies carry the reason as their Extended DNS Error's text (see "Error Replies"), and the proxy answers the lease-store dump query, `__dump.sig0lease.internal.` TXT for a summary or `__dump.sig0lease.internal.debug.` TXT for every record (`dig @<proxy> -p <port> __dump.sig0lease.internal. TXT`). With it off, error replies carry only the code, and the dump query is answered `REFUSED` with Extended DNS Error 18 (Prohibited). The test suites turn it on in the configs they write;
 - default upstream resolvers;
 - handler-specific settings such as the upstream zone, an optional static `upstream` server for it, keystore directory, lease policy bounds, blacklisted RR types, `allow_online_key_registration`, and the lease storage backend (`storage.type: memory|file`, see "Storage Backends and Expiry" above) for the update handler;
 - opcode-to-module routing (an ordered list per opcode — see `docs/siglease_rfc9665.md` §3 for

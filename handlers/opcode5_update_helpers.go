@@ -2,6 +2,7 @@ package handlers
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sort"
 	"strings"
@@ -45,6 +46,17 @@ func summarizeRRTypes(keyRRs []*dns.KEY, otherRRs []dns.RR) string {
 	return strings.Join(parts, " ")
 }
 
+// blacklistedTypeError is extractUpdateRecords' error for a record of a type the handler's
+// blacklisted_types names: a well-formed request refused by local policy, so REFUSED (RFC 2136
+// S2.2), not FORMERR like the other errors extractUpdateRecords returns.
+type blacklistedTypeError struct {
+	rrType uint16
+}
+
+func (e *blacklistedTypeError) Error() string {
+	return fmt.Sprintf("RR type %s (code %d) is blacklisted for registration", dns.TypeToString[e.rrType], e.rrType)
+}
+
 func extractUpdateRecords(msg *dns.Msg, blacklistedTypes map[uint16]struct{}) ([]*dns.KEY, []dns.RR, error) {
 	var keyRRs []*dns.KEY
 	other := make([]dns.RR, 0, len(msg.Ns))
@@ -63,8 +75,7 @@ func extractUpdateRecords(msg *dns.Msg, blacklistedTypes map[uint16]struct{}) ([
 			// Check blacklist: reject blacklisted RR types.
 			if blacklistedTypes != nil {
 				if _, blacklisted := blacklistedTypes[dns.RRToType(rr)]; blacklisted {
-					return nil, nil, fmt.Errorf("RR type %s (code %d) is blacklisted for registration",
-						dns.TypeToString[dns.RRToType(rr)], dns.RRToType(rr))
+					return nil, nil, &blacklistedTypeError{rrType: dns.RRToType(rr)}
 				}
 			}
 			other = append(other, rr)
@@ -353,6 +364,44 @@ func (h *UpdateHandler) authoritativeHasRR(ctx context.Context, zoneHint string,
 	return false, nil
 }
 
+// authoritativeLookupError is a failed query to the authoritative server, returned by a check
+// that otherwise refuses the request: the request itself may be fine, so refusalResult answers
+// it SERVFAIL, like every other failed authoritative lookup, not REFUSED.
+type authoritativeLookupError struct {
+	err error
+}
+
+func (e *authoritativeLookupError) Error() string { return e.err.Error() }
+func (e *authoritativeLookupError) Unwrap() error { return e.err }
+
+// refusalResult answers err, the error of a check that refuses the request: SERVFAIL with
+// Extended DNS Error 22 (No Reachable Authority) if the check could not query the
+// authoritative server (authoritativeLookupError), else REFUSED with 18 (Prohibited) and
+// reason.
+func refusalResult(r *dns.Msg, reason string, err error) *HandlerResult {
+	var lookup *authoritativeLookupError
+	if errors.As(err, &lookup) {
+		msg := makeErrorResponse(r, dns.RcodeServerFailure, dns.ExtendedErrorNoReachableAuthority, err.Error())
+		return NewErrorResult(msg, "authoritative lookup failed", err)
+	}
+	msg := makeErrorResponse(r, dns.RcodeRefused, dns.ExtendedErrorProhibited, err.Error())
+	return NewErrorResult(msg, reason, err)
+}
+
+// refuseAuthoritativeDuplicate returns an error if the authoritative server already holds rr
+// -- data outside this proxy's management, not the requester's to claim -- or, as an
+// authoritativeLookupError, if the server could not be asked.
+func (h *UpdateHandler) refuseAuthoritativeDuplicate(ctx context.Context, zoneHint string, rr dns.RR) error {
+	exists, err := h.authoritativeHasRR(ctx, zoneHint, rr)
+	if err != nil {
+		return &authoritativeLookupError{err: fmt.Errorf("authoritative duplicate check failed: %w", err)}
+	}
+	if exists {
+		return fmt.Errorf("duplicate registration rejected: authoritative RR already exists for %s", rr.String())
+	}
+	return nil
+}
+
 func (h *UpdateHandler) authoritativeHasKeyAtName(ctx context.Context, zoneHint string, fqdn string) (bool, error) {
 	rrs, err := h.upstreamCoordinator.QueryRRs(ctx, zoneHint, fqdn, dns.TypeKEY)
 	if err != nil {
@@ -389,14 +438,9 @@ func (h *UpdateHandler) filterDuplicateRegistrations(ctx context.Context, keyNam
 		}
 
 		// Not under our control locally: fail the whole request if the
-		// authoritative zone already contains an identical RR anyway (data
-		// outside this proxy's management, not ours to claim).
-		exists, err := h.authoritativeHasRR(ctx, zoneHint, rr)
-		if err != nil {
+		// authoritative zone already contains an identical RR anyway.
+		if err := h.refuseAuthoritativeDuplicate(ctx, zoneHint, rr); err != nil {
 			return nil, nil, err
-		}
-		if exists {
-			return nil, nil, fmt.Errorf("duplicate registration rejected: authoritative RR already exists for %s", rr.String())
 		}
 		accepted = append(accepted, rr)
 	}
@@ -500,7 +544,7 @@ func (h *UpdateHandler) extractAndValidateSig0(ctx context.Context, msg *dns.Msg
 	// Check if the key is present online
 	authRRS, err := h.upstreamCoordinator.QueryRRs(ctx, downstreamZone, sigRR.SignerName, dns.TypeKEY)
 	if err != nil {
-		return nil, nil, signerKeySourceUnknown, fmt.Errorf("failed to resolve signer KEY from authoritative DNS: %w", err)
+		return nil, nil, signerKeySourceUnknown, &authoritativeLookupError{err: fmt.Errorf("failed to resolve signer KEY from authoritative DNS: %w", err)}
 	}
 	authCandidates := make([]*dns.KEY, 0, len(authRRS))
 	for _, rr := range authRRS {

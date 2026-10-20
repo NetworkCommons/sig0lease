@@ -13,21 +13,25 @@ the proxy's DNS-over-TLS listener, which TEST 9 registers through). So is `test_
 with `AUTH_BACKEND=local` (below).
 
 `test_update.sh` (by default) and `test_forward.sh` run against the **real DNS**, not a local
-BIND 9. Both start the proxy from a copy of `main/config.yaml` (only the listen address and the
-minimum leases are rewritten), so they also use its lease-store files under `data/`.
+BIND 9. Both start the proxy from a copy of `main/config.yaml` (only the listen address,
+`server.diagnostics` and the minimum leases are rewritten), so they also use its lease-store
+files under `data/`.
 
 - `test_update.sh` updates the live `test.dev.zenr.io.` records: the proxy finds the
   authoritative server for `dev.zenr.io.` via an SOA lookup and signs with
   `keystore/server/Kdev.zenr.io.+015+35317`. The suite checks results with `dig` against
   `AUTH_SERVER` (default `ns1.free2air.org`) and adds/deletes some records there directly with
   `nsupdate` (needs a current BIND `nsupdate` with ED25519 support). Needs
-  `CLIENT_KEYSTORE_DIR` (see the Makefile's `test-update` target). Overridable via env:
-  `AUTH_SERVER`, `PROXY_ADDR`/`PROXY_PORT` (a proxy already listening there is reused instead
-  of starting one), `PROXY_PROTOCOL`, `CLIENT_KEY_NAME`, `RR_TYPES` and the lease times. The
-  config file, the zones and the proxy key are fixed. `PROXY_PROTOCOL` is `udp` (default),
-  `tcp`, or `tls`: with `tls` the client sends DNS-over-TLS to `PROXY_ADDR:PROXY_TLS_PORT`
-  (default 8853). A proxy the script starts gets that listener turned on in its scratch config,
-  with a throwaway certificate (needs `openssl`); a reused proxy must already serve DoT there.
+  `CLIENT_KEYSTORE_DIR` (see the Makefile's `test-update` target), holding two keys at
+  `test.dev.zenr.io.` with different key tags: `CLIENT_KEY_NAME` and `WRONG_CLIENT_KEY_NAME`,
+  the never-registered signer of TEST 3 (the run fails early if either is elsewhere; make one
+  with `dnssec-keygen -K <dir> -a ED25519 -n HOST -T KEY test.dev.zenr.io.`). Overridable via
+  env: `AUTH_SERVER`, `PROXY_ADDR`/`PROXY_PORT`, `PROXY_PROTOCOL`, `PROXY_LAUNCH` (below),
+  `CLIENT_KEY_NAME`, `WRONG_CLIENT_KEY_NAME`, `RR_TYPES` and the lease times. The config file,
+  the zones and the proxy key are fixed. `PROXY_PROTOCOL` is `udp` (default), `tcp`, or
+  `tls`: with `tls` the client sends DNS-over-TLS to `PROXY_ADDR:PROXY_TLS_PORT` (default
+  8853), and the proxy's config gets that listener turned on, with a throwaway certificate
+  (needs `openssl`).
 
   With `AUTH_BACKEND=local` (`make test-update-local`) the same suite runs against the local
   BIND 9 of `lib/bind9.sh` instead. The scratch copy of `config.yaml` is then localized for
@@ -38,16 +42,60 @@ minimum leases are rewritten), so they also use its lease-store files under `dat
   `test.update.test.`; `srp_handler` runs ahead of it, as in `config.yaml`, on `srp.test.`
   (key in `keystore-srp-bind9/`). Each handler reaches the BIND 9 through its static
   `upstream` (the commented-out `# upstream:` line of its section, turned on) and keeps its
-  leases in a scratch file. The run fails if `config.yaml` has a handler section this doesn't
+  leases in a file in its run directory. The run fails if `config.yaml` has a handler section this doesn't
   localize, or if any zone, key, file or upstream server `config.yaml` names is left, so
   nothing outside the run is touched. (SOA discovery is therefore only exercised by the live
   run.) The two client keys are generated for the run with `dnssec-keygen`, so
-  `CLIENT_KEYSTORE_DIR` is not needed (and is ignored), nor is network access. The proxy must
-  be the script's own, not a reused one. At the end, as in `test_srp.sh`, any request `named`
+  `CLIENT_KEYSTORE_DIR` is not needed (and is ignored), nor is network access. At the end, as
+  in `test_srp.sh`, any request `named`
   rejected other than a SIG(0) quota refusal fails the run, even if a retry later hid it from
   the suite's own checks.
 - `test_forward.sh` needs internet access: it resolves public names (google.com, gmail.com,
   ...) through the proxy's configured upstream resolvers.
+
+## The proxy under test, and debugging it
+
+Every suite writes its proxy's config, and the files the config names (DoT certificate, lease
+files in local runs), into its own directory under `/tmp/sig0lease-debug/`, named after the
+Makefile target: `update`, `update-local`, `srp`, `mdnsresponder-interop`, and `forward` for
+`test_forward.sh`. The directory is emptied at the start of each run and kept after it, so its
+`config.yaml` and `proxy.log` can be read once the run is over. Each config turns on
+`server.diagnostics`, so the suites check refusals by the reason in the reply's Extended DNS
+Error (RFC 8914), which `sig0lease-client` and `sig0lease-srp-client` print after the status
+line (`EDE 18 (Prohibited): ...`), and can query the lease-store dump. Nothing may listen on a
+suite's proxy port when it starts.
+
+`PROXY_LAUNCH` says who starts that proxy. `auto`, the default, has the script start it from
+`bin/<os>/sig0lease`, with its log in `proxy.log`. `manual` has the script write the config
+and wait (up to `PROXY_LAUNCH_TIMEOUT` seconds, default 600) for you to start the proxy with
+it, e.g. in a debugger with breakpoints set; it then checks that the process listening on the
+port was started with that config, and leaves it running at the end. With a proxy still
+listening when a run starts, it waits for you to stop it first, so its last save can't land in
+the new run's files. `test_srp.sh`'s TEST 11 restarts the proxy with a changed config: with
+`manual` it asks you to restart it. The proxy's output then goes wherever you started it.
+
+```sh
+PROXY_LAUNCH=manual make test-update-local
+```
+
+VS Code launch configurations for it, for `.vscode/launch.json` (`cwd` must be `main/`, since
+`config.yaml`'s relative paths start there; with `main/`'s parent open as the workspace, as
+here, prefix `main/` to `program` and `cwd`):
+
+```json
+{
+    "name": "sig0lease: test-update-local",
+    "type": "go",
+    "request": "launch",
+    "mode": "debug",
+    "program": "${workspaceFolder}/cmd/sig0lease",
+    "cwd": "${workspaceFolder}",
+    "args": ["/tmp/sig0lease-debug/update-local/config.yaml"]
+}
+```
+
+and the same with `update`, `srp`, `mdnsresponder-interop` or `forward` in place of
+`update-local` in `name` and `args`.
 
 ## External checkouts
 

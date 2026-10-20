@@ -220,7 +220,7 @@ func (h *SRPHandler) Handle(ctx context.Context, w dns.ResponseWriter, r *dns.Ms
 	// walks the whole Update section, not a cheap length check).
 	if err := srp.ValidateClassified(r, cu); err != nil {
 		h.logger.Debugf("SRP handler: structural validation failed: %v", err)
-		msg := makeErrorResponse(r, dns.RcodeRefused, err.Error())
+		msg := makeErrorResponse(r, dns.RcodeRefused, dns.ExtendedErrorOther, err.Error())
 		return NewErrorResult(msg, err.Error(), err)
 	}
 
@@ -229,7 +229,7 @@ func (h *SRPHandler) Handle(ctx context.Context, w dns.ResponseWriter, r *dns.Ms
 	if !h.allowUDP {
 		if _, isUDP := w.RemoteAddr().(*net.UDPAddr); isUDP {
 			h.logger.Debugf("SRP handler: rejecting UDP request for zone %s (allow_udp not set)", zone)
-			msg := makeErrorResponse(r, dns.RcodeRefused, "TCP required for SRP on this zone")
+			msg := makeErrorResponse(r, dns.RcodeRefused, dns.ExtendedErrorNotSupported, "TCP required for SRP on this zone")
 			return NewErrorResult(msg, "TCP required, got UDP", fmt.Errorf("UDP rejected: allow_udp not set for zone %s", zone))
 		}
 	}
@@ -244,17 +244,17 @@ func (h *SRPHandler) Handle(ctx context.Context, w dns.ResponseWriter, r *dns.Ms
 	// before FCFS reads names that need to already be in their final (rewritten) form.
 	sigRR, err := extractSig0(r)
 	if err != nil {
-		msg := makeErrorResponse(r, dns.RcodeRefused, "missing SIG(0)")
+		msg := makeErrorResponse(r, dns.RcodeRefused, dns.ExtendedErrorProhibited, "missing SIG(0)")
 		return NewErrorResult(msg, err.Error(), err)
 	}
 	if dnsname.Normalize(sigRR.SignerName) != dnsname.Normalize(cu.Host.Name) {
 		err := fmt.Errorf("SIG(0) signer %q does not match Host Description name %q", sigRR.SignerName, cu.Host.Name)
-		msg := makeErrorResponse(r, dns.RcodeRefused, "signer does not match host")
+		msg := makeErrorResponse(r, dns.RcodeRefused, dns.ExtendedErrorProhibited, err.Error())
 		return NewErrorResult(msg, err.Error(), err)
 	}
 	if err := sig0.VerifySignature(r, cu.Host.Key); err != nil {
 		h.logger.Infof("SRP handler: SIG(0) verification failed for %s: %v", cu.Host.Name, err)
-		msg := makeErrorResponse(r, dns.RcodeRefused, "SIG(0) verification failed")
+		msg := makeErrorResponse(r, dns.RcodeRefused, dns.ExtendedErrorProhibited, fmt.Sprintf("SIG(0) verification failed: %v", err))
 		return NewErrorResult(msg, err.Error(), err)
 	}
 
@@ -282,7 +282,7 @@ func (h *SRPHandler) Handle(ctx context.Context, w dns.ResponseWriter, r *dns.Ms
 			// error rather than a client one -- but fail closed rather than proceed
 			// with a stale cu.
 			h.logger.Errorf("SRP handler: re-validation after default.service.arpa. rewrite failed: %v", err)
-			msg := makeErrorResponse(r, dns.RcodeServerFailure, "internal error")
+			msg := makeErrorResponse(r, dns.RcodeServerFailure, dns.ExtendedErrorOther, fmt.Sprintf("internal error: %v", err))
 			return NewErrorResult(msg, err.Error(), err)
 		}
 	}
@@ -301,7 +301,7 @@ func (h *SRPHandler) Handle(ctx context.Context, w dns.ResponseWriter, r *dns.Ms
 	locks, err := h.nodeLocks.Acquire(ctx, func() []string { return h.lockNames(lockRoots...) })
 	if err != nil {
 		h.logger.Warnf("SRP handler: UPDATE for %s: %v", cu.Host.Name, err)
-		msg := makeErrorResponse(r, dns.RcodeServerFailure, "lease store busy, try again")
+		msg := makeErrorResponse(r, dns.RcodeServerFailure, dns.ExtendedErrorOther, "lease store busy, try again")
 		return NewErrorResult(msg, "lease-store node lock contention", err)
 	}
 	unlock := sync.OnceFunc(locks.Release)
@@ -325,17 +325,17 @@ func (h *SRPHandler) Handle(ctx context.Context, w dns.ResponseWriter, r *dns.Ms
 		result, prereq, err := srp.Evaluate(ctx, view, h.upstreamCoordinator.QueryKeyAtName, h.upstreamZone, name, key, h.refuseOnForeignData)
 		if err != nil {
 			h.logger.Errorf("SRP handler: FCFS evaluation failed for %s: %v", name, err)
-			msg := makeErrorResponse(r, dns.RcodeServerFailure, "FCFS evaluation failed")
+			msg := makeErrorResponse(r, dns.RcodeServerFailure, dns.ExtendedErrorNoReachableAuthority, fmt.Sprintf("FCFS evaluation failed: %v", err))
 			return NewErrorResult(msg, err.Error(), err)
 		}
 		switch result {
 		case srp.FCFSConflict:
 			h.logger.Infof("SRP handler: FCFS conflict for %s -- name held by a different key", name)
-			msg := makeErrorResponse(r, dns.RcodeYXDomain, "name held by a different key")
+			msg := makeErrorResponse(r, dns.RcodeYXDomain, dns.ExtendedErrorProhibited, "name held by a different key")
 			return NewErrorResult(msg, fmt.Sprintf("FCFS conflict for %s", name), fmt.Errorf("YXDOMAIN"))
 		case srp.FCFSForeignData:
 			h.logger.Infof("SRP handler: FCFS refused for %s -- foreign data present, no KEY", name)
-			msg := makeErrorResponse(r, dns.RcodeRefused, "name occupied by non-SRP data")
+			msg := makeErrorResponse(r, dns.RcodeRefused, dns.ExtendedErrorProhibited, "name occupied by non-SRP data")
 			return NewErrorResult(msg, fmt.Sprintf("foreign data at %s", name), fmt.Errorf("REFUSED"))
 		}
 		if prereq != nil {
@@ -352,7 +352,7 @@ func (h *SRPHandler) Handle(ctx context.Context, w dns.ResponseWriter, r *dns.Ms
 		// a client one, but fail closed rather than forward TTLs or mutate the store
 		// with zero values.
 		h.logger.Errorf("SRP handler: lease option re-parse failed after validation: %v", err)
-		msg := makeErrorResponse(r, dns.RcodeServerFailure, "internal error")
+		msg := makeErrorResponse(r, dns.RcodeServerFailure, dns.ExtendedErrorOther, fmt.Sprintf("internal error: %v", err))
 		return NewErrorResult(msg, err.Error(), err)
 	}
 	lease, keyLease = h.LeasePolicy.clamp(lease, keyLease)
@@ -393,10 +393,10 @@ func (h *SRPHandler) Handle(ctx context.Context, w dns.ResponseWriter, r *dns.Ms
 			// than by this handler's own pre-forward check -- report it exactly like the
 			// pre-forward conflict case above. Any other rejection is a failure, not a
 			// conflict.
-			msg := makeErrorResponse(r, dns.RcodeYXDomain, "name held by a different key")
+			msg := makeErrorResponse(r, dns.RcodeYXDomain, dns.ExtendedErrorProhibited, "name held by a different key")
 			return NewErrorResult(msg, fmt.Sprintf("FCFS conflict detected atomically by upstream prerequisite: %v", err), fmt.Errorf("YXDOMAIN"))
 		}
-		msg := makeErrorResponse(r, dns.RcodeServerFailure, "upstream UPDATE failed")
+		msg := makeErrorResponse(r, dns.RcodeServerFailure, dns.ExtendedErrorNoReachableAuthority, err.Error())
 		return NewErrorResult(msg, err.Error(), err)
 	}
 

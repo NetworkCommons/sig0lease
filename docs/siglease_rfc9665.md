@@ -161,7 +161,8 @@ Compressed SRV target names (§3.2.5.4) are accepted, matching real client behav
    Description KEY (see §7 below — the registrar synthesizes this when a client omits it).
 6. Response RCODE ∈ `{NOERROR, SERVFAIL, REFUSED, YXDOMAIN}`; a NOERROR response carries the
    granted `LEASE`/`KEY-LEASE` and nothing else: no Zone, Prerequisite or Update section
-   (RFC 2136 §3.8), and one OPT RR. mDNSResponder's `srp-client` reads the granted lease only
+   (RFC 2136 §3.8), and one OPT RR. An error response has the same shape, its OPT RR carrying
+   an Extended DNS Error with the reason (`docs/siglease_rfc9664.md`, "Error Replies"). mDNSResponder's `srp-client` reads the granted lease only
    from that exact shape, and otherwise refreshes on the lease it asked for.
 
 **Closing the check-to-write window.** Between the FCFS check and the forwarded UPDATE,
@@ -462,6 +463,25 @@ off of.
   hashing bug described in §8, unlike ED25519/ECDSAP256SHA256/ECDSAP384SHA384. Extending the fix
   would need a real RSA key and, ideally, an independent implementation's signature to validate
   against, neither of which exists in this codebase today.
+- **Host names the authoritative server refuses.** The proxy forwards a host label as the
+  requester sent it. BIND, by default (`check-names primary fail`), refuses a dynamic update in
+  which an A or AAAA owner, or an SRV target, is not a valid host name: letters, digits and
+  hyphens (RFC 952, RFC 1123). Instance names are free text (RFC 6763 §4.1.1) and are not
+  checked. BIND logs the refusal once, as `general: error: zone <zone>/IN: <name>/A: bad owner
+  name (check-names)`, and the proxy answers SERVFAIL with Extended DNS Error 22. Apple's
+  `srp-client` runs into this after a conflict: on `YXDOMAIN` it renames host and instance by
+  appending " 1", then " 2", then a random number (`conflict_print` in `srp-client.c`), where
+  the example in RFC 9665 §3.2.5.2 appends "-1"; it then keeps retrying the refused name.
+  Checked on 2026-10-20 against the interop zone: refused with BIND's default, registered with
+  `check-names ignore;` on the zone. `ns1.free2air.org` runs BIND too, so on `srp.dev.zenr.io.`
+  expect a renamed `srp-client` to stay unregistered: keep its key file (run it from the same
+  directory every time), or restart it with a `--host-name` and an `--instance-name` no other
+  key holds, since FCFS checks both (§5). The proxy does not check host names itself: the
+  authoritative server's policy decides. Nor does anything here depend on a server's
+  administrator relaxing `check-names`: the proxy has to work with whatever server it forwards
+  to, BIND's defaults included. Our client renames
+  with a hyphen (`demo-2`, `client/srp`), so it meets this only with a `-host` that is not a
+  valid host name, which it does not check.
 - **A prohibited-name dictionary, a pre-registered-keys-only mode, and reverse-PTR
   auto-population** (all optional registrar features RFC 9665 permits but doesn't require) are
   not implemented.

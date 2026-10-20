@@ -21,6 +21,7 @@ import (
 	clientsrp "github.com/NetworkCommons/sig0lease/client/srp"
 	"github.com/NetworkCommons/sig0lease/logging"
 	_ "github.com/NetworkCommons/sig0lease/pkg/dnscompat" // registers EDNS0 code 2 (UPDATE-LEASE); matches cmd/sig0lease/main.go and cmd/sig0lease-client/main.go's own convention (client/srp also self-registers this, so it's redundant here, not load-bearing)
+	"github.com/NetworkCommons/sig0lease/pkg/dnsmsg"
 	"github.com/NetworkCommons/sig0lease/pkg/keyrec"
 	pkgsrp "github.com/NetworkCommons/sig0lease/pkg/srp"
 )
@@ -265,6 +266,9 @@ func main() {
 
 func printResult(resp *dns.Msg, outcome pkgsrp.Outcome) {
 	fmt.Printf("Status: %s (Rcode=%d)\n", dns.RcodeToString[resp.Rcode], resp.Rcode)
+	for _, ede := range dnsmsg.EDEs(resp) {
+		fmt.Printf("EDE %s\n", dnsmsg.FormatEDE(ede))
+	}
 	if outcome == pkgsrp.OutcomeSuccess {
 		if lease, keyLease, ok := pkgsrp.GrantedLease(resp); ok {
 			fmt.Printf("Granted: LEASE=%d KEY-LEASE=%d\n", lease, keyLease)

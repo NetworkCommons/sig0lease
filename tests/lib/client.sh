@@ -50,12 +50,30 @@ run_client() {
     CLIENT_KEYSTORE_DIR="$CLIENT_KEYSTORE_DIR" "$CLIENT_BIN" "$url" "$operation" "$keyname" "$lease_seconds" "$key_lease_seconds" "${extra[@]}"
 }
 
+# assert_client_reply <client output> <rcode> <info-code> <reason> -- checks the reply
+# sig0lease-client (or blacklisted_tester) printed: Status <rcode>, e.g. REFUSED, and an
+# Extended DNS Error (RFC 8914) with <info-code> whose text contains <reason>. The text is the
+# proxy's own reason for the refusal, sent because the suites' configs turn on
+# server.diagnostics.
+assert_client_reply() {
+    local out="$1" rcode="$2" info_code="$3" reason="$4"
+    if ! grep -q "Status: ${rcode} (Rcode=" <<< "$out"; then
+        log_error "Expected a $rcode reply, got:"
+        echo "$out"
+        return 1
+    fi
+    if ! grep "EDE ${info_code} (" <<< "$out" | grep -qF -- "$reason"; then
+        log_error "Expected Extended DNS Error $info_code with \"$reason\", got:"
+        echo "$out"
+        return 1
+    fi
+}
+
 # verify_keystore checks that the two well-known test keys this suite relies
 # on (CLIENT_KEY_NAME, WRONG_CLIENT_KEY_NAME) are present in
-# $CLIENT_KEYSTORE_DIR, and sets CLIENT_KEY_RR / WRONG_CLIENT_KEY_RR (the raw
-# "<name> IN KEY ..." lines) for callers that need the rdata. References
-# $DOWNSTREAM_ZONE only for its log message -- set by the orchestration
-# script, not this library.
+# $CLIENT_KEYSTORE_DIR, both at $DOWNSTREAM_ZONE (set by the orchestration
+# script) with different key tags, and sets CLIENT_KEY_RR / WRONG_CLIENT_KEY_RR
+# (the raw "<name> IN KEY ..." lines) for callers that need the rdata.
 verify_keystore() {
     require_client_keystore_dir || return 1
     log_section "SETUP: Real Keystore"
@@ -77,6 +95,23 @@ verify_keystore() {
         return 1
     fi
     WRONG_CLIENT_KEY_RR=$(cat $CLIENT_KEYSTORE_DIR/${WRONG_CLIENT_KEY_NAME}.key)
+
+    # The unauthorized-signer tests (TEST 3) need a second key at the same name: the proxy
+    # refuses a key at another name earlier, for signing records outside its own subtree,
+    # and never reaches the refusals those tests check.
+    if [ "$CLIENT_KEY_NAME" = "$WRONG_CLIENT_KEY_NAME" ]; then
+        log_error "CLIENT_KEY_NAME and WRONG_CLIENT_KEY_NAME are the same key: $CLIENT_KEY_NAME"
+        return 1
+    fi
+    local name rr owner
+    for name in "$CLIENT_KEY_NAME" "$WRONG_CLIENT_KEY_NAME"; do
+        rr="$(cat "$CLIENT_KEYSTORE_DIR/${name}.key")"
+        owner="$(awk '{ print tolower($1); exit }' <<< "$rr")"
+        if [ "$owner" != "$(tr '[:upper:]' '[:lower:]' <<< "$DOWNSTREAM_ZONE")" ]; then
+            log_error "Key $name is at $owner, not at $DOWNSTREAM_ZONE: both client keys must be at $DOWNSTREAM_ZONE. Make a second one with: dnssec-keygen -K $CLIENT_KEYSTORE_DIR -a ED25519 -n HOST -T KEY $DOWNSTREAM_ZONE"
+            return 1
+        fi
+    done
 
     log_success "Test keystore verified, directory content:"
     ls -1 "$CLIENT_KEYSTORE_DIR" | sed -n '1,50p'

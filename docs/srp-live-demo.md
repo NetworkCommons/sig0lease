@@ -191,7 +191,9 @@ already holds:
 Drop `-once` from that same command to see the other side of a conflict instead: the client
 notices the `YXDOMAIN`, renames itself (`demo-2`, then `demo-3`, ...) and retries
 automatically until a free name is found — the same unattended recovery a real device
-relies on after a collision, rather than a hard failure.
+relies on after a collision, rather than a hard failure. Apple's `srp-client` renames with a
+space instead (`demo 1`), which the zone's BIND is likely to refuse as a host name: see
+`docs/siglease_rfc9665.md` §11.
 
 ## 6. Clean up
 

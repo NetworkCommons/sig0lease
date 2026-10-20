@@ -10,7 +10,7 @@ import (
 	"time"
 
 	"codeberg.org/miekg/dns"
-	"github.com/NetworkCommons/sig0lease/client"
+	"github.com/NetworkCommons/sig0lease/pkg/dnsmsg"
 	"github.com/NetworkCommons/sig0lease/pkg/dnsname"
 	"github.com/NetworkCommons/sig0lease/pkg/keyrec"
 	leasepkg "github.com/NetworkCommons/sig0lease/pkg/lease"
@@ -614,8 +614,13 @@ func TestHandle_NonKeyOnlyLeaseRejectsUpdateKeyRR(t *testing.T) {
 	if res == nil || res.Message == nil {
 		t.Fatalf("expected response message")
 	}
-	if res.Message.Rcode != dns.RcodeRefused {
-		t.Fatalf("expected REFUSED for non-KEY-only update containing KEY RR, got rcode=%d", res.Message.Rcode)
+	// Malformed for its lease case, like a Case A, C or D request missing the records its case
+	// needs: FORMERR with Extended DNS Error 0 (Other).
+	if res.Message.Rcode != dns.RcodeFormatError {
+		t.Fatalf("expected FORMERR for non-KEY-only update containing KEY RR, got rcode=%d", res.Message.Rcode)
+	}
+	if edes := dnsmsg.EDEs(res.Message); len(edes) != 1 || edes[0].InfoCode != dns.ExtendedErrorOther {
+		t.Fatalf("expected one Extended DNS Error 0 (Other), got %v", edes)
 	}
 }
 
@@ -925,7 +930,11 @@ func TestHandle_CaseCDelete_UnrelatedHierarchicalAncestorCannotDeleteChildKey(t 
 	}
 
 	wantNote := fmt.Sprintf("KEY %s not found for delete", childRR.Hdr.Name)
-	if notes := client.StatusNotes(res.Message); !slices.Contains(notes, wantNote) {
+	var notes []string
+	for _, ede := range dnsmsg.EDEs(res.Message) {
+		notes = append(notes, ede.ExtraText)
+	}
+	if !slices.Contains(notes, wantNote) {
 		t.Fatalf("expected note %q when a non-parent ancestor attempts delete, got notes=%q", wantNote, notes)
 	}
 }

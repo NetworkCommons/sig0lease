@@ -12,6 +12,7 @@
 set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "$SCRIPT_DIR/lib/common.sh"
+source "$SCRIPT_DIR/lib/proxy.sh"
 source "$SCRIPT_DIR/lib/dns.sh"
 source "$SCRIPT_DIR/lib/bind9.sh"
 
@@ -33,28 +34,29 @@ SRP_DATA_EXPIRY_LEASE_SECONDS=2
 SRP_DATA_EXPIRY_KEY_LEASE_SECONDS=120 # well past SRP_EXPIRY_TIMEOUT -- see test_lease_expiry_keeps_keys
 SRP_REFUSE_ON_FOREIGN_DATA=true # the default; test_foreign_data_takeover restarts the proxy with false
 
-SRP_PROXY_BIN="${TESTS_DIR}/../bin/${OS}/sig0lease"
 SRP_CLIENT_BIN="${TESTS_DIR}/../bin/${OS}/sig0lease-srp-client"
-SRP_PROXY_LOG="/tmp/sig0lease_srp_proxy.log"
-SRP_TMP_CONFIG=""
+# The proxy's config, DoT certificate and log (lib/proxy.sh's proxy_run_prepare).
+SRP_RUN_DIR="$PROXY_RUN_ROOT/srp"
+SRP_TMP_CONFIG="$SRP_RUN_DIR/config.yaml"
+SRP_PROXY_LOG="$SRP_RUN_DIR/proxy.log"
+SRP_TLS_DIR="$SRP_RUN_DIR/tls" # the DoT listener's throwaway certificate (make_tls_cert)
 SRP_PROXY_PID=""
 SRP_KEY_DIR=""
-SRP_TLS_DIR="" # the DoT listener's throwaway certificate (make_tls_cert)
 
 PERFORMED_TESTS=""
 
 build_srp_binaries() {
     log_section "BUILD"
-    (cd "$TESTS_DIR/.." && go build -o "$SRP_PROXY_BIN" ./cmd/sig0lease)
+    (cd "$TESTS_DIR/.." && go build -o "$PROXY_BIN" ./cmd/sig0lease)
     (cd "$TESTS_DIR/.." && go build -o "$SRP_CLIENT_BIN" ./cmd/sig0lease-srp-client)
     log_success "Binaries built"
 }
 
 prepare_srp_config() {
-    SRP_TMP_CONFIG="$(mktemp /tmp/sig0lease-srp-client-config.XXXXXX.yaml)"
     cat > "$SRP_TMP_CONFIG" <<EOF
 server:
   address: ":${SRP_PROXY_PORT}"
+  diagnostics: true
   networks:
     - udp
     - tcp
@@ -90,35 +92,15 @@ EOF
 start_srp_proxy() {
     log_section "START: SRP proxy"
     prepare_srp_config
-
-    if ! [ -x "$SRP_PROXY_BIN" ]; then
-        log_error "Proxy binary not found: $SRP_PROXY_BIN"
-        return 1
-    fi
-
-    # Appended: test_foreign_data_takeover restarts the proxy, and run_all_tests empties the
-    # log once at the start.
-    "$SRP_PROXY_BIN" "$SRP_TMP_CONFIG" >> "$SRP_PROXY_LOG" 2>&1 &
-    SRP_PROXY_PID=$!
-    sleep 1
-
-    if ! kill -0 "$SRP_PROXY_PID" 2>/dev/null; then
-        log_error "SRP proxy failed to start. Log:"
-        cat "$SRP_PROXY_LOG"
-        return 1
-    fi
-    log_success "SRP proxy started (PID $SRP_PROXY_PID) on $SRP_PROXY_URL, DNS-over-TLS on port $SRP_PROXY_TLS_PORT, log: $SRP_PROXY_LOG"
+    # Appended to its log: test_foreign_data_takeover restarts the proxy.
+    proxy_launch "$SRP_TMP_CONFIG" "$SRP_PROXY_PORT" "$SRP_PROXY_LOG" || return 1
+    SRP_PROXY_PID="$LAUNCHED_PROXY_PID"
+    log_success "SRP proxy listening (PID $SRP_PROXY_PID) on $SRP_PROXY_URL, DNS-over-TLS on port $SRP_PROXY_TLS_PORT, config $SRP_TMP_CONFIG"
 }
 
 stop_srp_proxy() {
-    if [ -n "${SRP_PROXY_PID:-}" ] && kill -0 "$SRP_PROXY_PID" 2>/dev/null; then
-        log_step "Stopping SRP proxy (PID: $SRP_PROXY_PID)"
-        stop_process "$SRP_PROXY_PID" || true
-    fi
+    proxy_stop "$SRP_PROXY_PID"
     SRP_PROXY_PID=""
-    if [ -n "$SRP_TMP_CONFIG" ] && [ -f "$SRP_TMP_CONFIG" ]; then
-        rm -f "$SRP_TMP_CONFIG"
-    fi
 }
 
 # run_srp_client <identity-name> [extra sig0lease-srp-client flags...] -- sends one update
@@ -210,6 +192,8 @@ test_conflict() {
         -lease="$SRP_LEASE_SECONDS" -keylease="$SRP_KEY_LEASE_SECONDS")" || true
     echo "$out"
     echo "$out" | grep -q "Status: YXDOMAIN (Rcode=6)" || { log_error "expected YXDOMAIN for a conflicting registration"; return 1; }
+    # The reason, from the Extended DNS Error: the config turns on server.diagnostics.
+    echo "$out" | grep -q "EDE 18 (Prohibited): name held by a different key" || { log_error "expected Extended DNS Error 18 with the conflict's reason"; return 1; }
 
     # The rejected identity's own instance name must never have landed.
     [ -z "$(dig_srp Gadget._http._tcp.srp.test. SRV)" ] || { log_error "conflicting instance unexpectedly landed at authoritative"; return 1; }
@@ -461,13 +445,13 @@ run_all_tests() {
     require_command named
     require_command go
 
+    proxy_run_prepare "$SRP_RUN_DIR" "$SRP_PROXY_PORT"
     SRP_KEY_DIR="$(mktemp -d /tmp/sig0lease-srp-client-identities.XXXXXX)"
-    SRP_TLS_DIR="$(mktemp -d /tmp/sig0lease-srp-tls.XXXXXX)"
+    mkdir "$SRP_TLS_DIR"
     make_tls_cert "$SRP_TLS_DIR"
 
     build_srp_binaries
     start_bind9
-    : > "$SRP_PROXY_LOG"
     start_srp_proxy
 
     test_register_and_dig
@@ -489,7 +473,10 @@ run_all_tests() {
     echo -e "${GREEN}All SRP integration tests completed successfully!${NC}"
     echo -e "$PERFORMED_TESTS"
     echo ""
-    echo "SRP proxy log: $SRP_PROXY_LOG"
+    if [ "$PROXY_LAUNCH" = auto ]; then
+        echo "SRP proxy log: $SRP_PROXY_LOG"
+    fi
+    echo "SRP proxy config: $SRP_TMP_CONFIG"
     echo "BIND log: ${BIND9_RUNDIR}/named.log"
 }
 
@@ -502,7 +489,6 @@ cleanup() {
     stop_srp_proxy
     stop_bind9
     [ -n "$SRP_KEY_DIR" ] && rm -rf "$SRP_KEY_DIR"
-    [ -n "$SRP_TLS_DIR" ] && rm -rf "$SRP_TLS_DIR"
     set -e
 }
 

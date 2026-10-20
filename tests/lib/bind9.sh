@@ -106,16 +106,19 @@ start_bind9() {
 # bind9_report_rejections lists every request named rejected during this run, with named's
 # own reason, from named.log. Only request-handling categories are matched, so startup noise
 # such as the config category's "rndc.key: permission denied" is not mistaken for a
-# rejection. A SIG(0) quota refusal (named.conf.in's logging comment) is reported but
-# tolerated: the proxy retries it. Any other rejection -- an update-policy denial, an invalid
-# signature, a failed update -- returns 1, even if a later retry hid it from the test's own
-# checks.
+# rejection. The one exception is check-names: named refuses an update with a name that is
+# not a valid host name where one is required (e.g. an A record's owner, BIND's default
+# "check-names primary fail") and logs it once, in the general category, as the zone's
+# "bad owner name (check-names)" or "bad name (check-names)" error. A SIG(0) quota refusal
+# (named.conf.in's logging comment) is reported but tolerated: the proxy retries it. Any other
+# rejection -- an update-policy denial, an invalid signature, a failed update, a check-names
+# failure -- returns 1, even if a later retry hid it from the test's own checks.
 bind9_report_rejections() {
     local log="${BIND9_RUNDIR}/named.log"
     [ -f "$log" ] || return 0
 
     local rejections quota others
-    rejections="$(grep -E ' (client|update|update-security|security): .*(quota reached|denied|invalid signature|update failed|update unsuccessful|refused)' "$log" || true)"
+    rejections="$(grep -E ' (client|update|update-security|security): .*(quota reached|denied|invalid signature|update failed|update unsuccessful|refused)| general: error: zone .*\(check-names\)' "$log" || true)"
     if [ -z "$rejections" ]; then
         log_success "named rejected no requests during this run"
         return 0

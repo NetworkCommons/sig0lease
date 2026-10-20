@@ -36,6 +36,7 @@
 set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "$SCRIPT_DIR/lib/common.sh"
+source "$SCRIPT_DIR/lib/proxy.sh"
 source "$SCRIPT_DIR/lib/dns.sh"
 source "$SCRIPT_DIR/lib/bind9.sh"
 source "$SCRIPT_DIR/lib/mdnsresponder.sh"
@@ -47,10 +48,11 @@ D1_PROXY_URL="${D1_PROXY_ADDR}:${D1_PROXY_PORT}"
 D1_KEYSTORE_DIR="${TESTS_DIR}/keystore-srp-bind9-default-arpa"
 D1_MAX_RR_LEASE_SECONDS=7200 # the D1 proxy's max_rr_lease_sec; D1-TEST 1 asks for more
 
-D1_PROXY_BIN="${TESTS_DIR}/../bin/${OS}/sig0lease"
 D2_CLIENT_BIN="${TESTS_DIR}/../bin/${OS}/sig0lease-srp-client"
-D1_PROXY_LOG="/tmp/sig0lease_d1_proxy.log"
-D1_TMP_CONFIG=""
+# The Direction-1 proxy's config and log (lib/proxy.sh's proxy_run_prepare).
+D1_RUN_DIR="$PROXY_RUN_ROOT/mdnsresponder-interop"
+D1_TMP_CONFIG="$D1_RUN_DIR/config.yaml"
+D1_PROXY_LOG="$D1_RUN_DIR/proxy.log"
 D1_PROXY_PID=""
 
 D2_MDNS_PROXY_LOG="/tmp/srp-mdns-proxy_interop.log"
@@ -72,7 +74,7 @@ PERFORMED_TESTS=""
 
 build_interop_binaries() {
     log_section "BUILD"
-    (cd "$TESTS_DIR/.." && go build -o "$D1_PROXY_BIN" ./cmd/sig0lease)
+    (cd "$TESTS_DIR/.." && go build -o "$PROXY_BIN" ./cmd/sig0lease)
     (cd "$TESTS_DIR/.." && go build -o "$D2_CLIENT_BIN" ./cmd/sig0lease-srp-client)
     build_mdnsresponder
     log_success "Binaries ready"
@@ -83,10 +85,10 @@ build_interop_binaries() {
 ################################
 
 prepare_d1_config() {
-    D1_TMP_CONFIG="$(mktemp /tmp/sig0lease-d1-config.XXXXXX.yaml)"
     cat > "$D1_TMP_CONFIG" <<EOF
 server:
   address: ":${D1_PROXY_PORT}"
+  diagnostics: true
   networks:
     - udp
     - tcp
@@ -116,25 +118,14 @@ EOF
 start_d1_proxy() {
     log_section "START: our registrar for ${D1_ZONE} (Direction 1)"
     prepare_d1_config
-
-    "$D1_PROXY_BIN" "$D1_TMP_CONFIG" > "$D1_PROXY_LOG" 2>&1 &
-    D1_PROXY_PID=$!
-    sleep 1
-
-    if ! kill -0 "$D1_PROXY_PID" 2>/dev/null; then
-        log_error "Direction-1 proxy failed to start. Log:"
-        cat "$D1_PROXY_LOG"
-        return 1
-    fi
-    log_success "Direction-1 proxy started (PID $D1_PROXY_PID) on $D1_PROXY_URL"
+    proxy_launch "$D1_TMP_CONFIG" "$D1_PROXY_PORT" "$D1_PROXY_LOG" || return 1
+    D1_PROXY_PID="$LAUNCHED_PROXY_PID"
+    log_success "Direction-1 proxy listening (PID $D1_PROXY_PID) on $D1_PROXY_URL, config $D1_TMP_CONFIG"
 }
 
 stop_d1_proxy() {
-    if [ -n "${D1_PROXY_PID:-}" ] && kill -0 "$D1_PROXY_PID" 2>/dev/null; then
-        stop_process "$D1_PROXY_PID" || true
-    fi
+    proxy_stop "$D1_PROXY_PID"
     D1_PROXY_PID=""
-    [ -n "$D1_TMP_CONFIG" ] && [ -f "$D1_TMP_CONFIG" ] && rm -f "$D1_TMP_CONFIG"
 }
 
 dig_d1() {
@@ -564,6 +555,7 @@ run_all_tests() {
     require_command named
     require_command go
 
+    proxy_run_prepare "$D1_RUN_DIR" "$D1_PROXY_PORT"
     D2_KEY_DIR="$(mktemp -d /tmp/sig0lease-d2-identities.XXXXXX)"
     D3_KEY_DIR="$(mktemp -d /tmp/sig0lease-d3-identities.XXXXXX)"
 
@@ -594,7 +586,10 @@ run_all_tests() {
     echo -e "${GREEN}All mDNSResponder interop tests completed successfully!${NC}"
     echo -e "$PERFORMED_TESTS"
     echo ""
-    echo "Direction-1 proxy log: $D1_PROXY_LOG"
+    if [ "$PROXY_LAUNCH" = auto ]; then
+        echo "Direction-1 proxy log: $D1_PROXY_LOG"
+    fi
+    echo "Direction-1 proxy config: $D1_TMP_CONFIG"
     echo "srp-mdns-proxy log: $D2_MDNS_PROXY_LOG"
     echo "-mdns bridge log: $D3_BRIDGE_LOG"
     if [ -n "$MDNSD_LOG" ]; then echo "mdnsd log: $MDNSD_LOG"; fi

@@ -481,6 +481,9 @@ func TestSRPHandle_FCFSConflict(t *testing.T) {
 	if res.Status != StatusError || res.Message == nil || res.Message.Rcode != dns.RcodeYXDomain {
 		t.Fatalf("expected YXDOMAIN conflict, got status=%s message=%+v err=%v", res.Status, res.Message, res.Error)
 	}
+	// The name is held by another key: Prohibited, as the RFC 9664 handler answers a record
+	// registered under another key.
+	wantErrorReply(t, res, dns.RcodeYXDomain, dns.ExtendedErrorProhibited, "held by a different key")
 	if len(coord.sent) != sentBefore {
 		t.Fatalf("FCFS conflict must be rejected before any upstream forward (deferred-mutation) -- sent count changed from %d to %d", sentBefore, len(coord.sent))
 	}
@@ -553,6 +556,7 @@ func TestSRPHandle_ForeignDataRefusedByDefault(t *testing.T) {
 	if res.Status != StatusError || res.Message == nil || res.Message.Rcode != dns.RcodeRefused {
 		t.Fatalf("expected REFUSED, got status=%s message=%+v", res.Status, res.Message)
 	}
+	wantErrorReply(t, res, dns.RcodeRefused, dns.ExtendedErrorProhibited, "non-SRP data")
 	if len(coord.sent) != 0 {
 		t.Fatalf("expected no upstream forward for a refused request, got %d", len(coord.sent))
 	}
@@ -587,6 +591,7 @@ func TestSRPHandle_UpstreamRejection_NoLocalMutation(t *testing.T) {
 	if res.Status != StatusError || res.Message == nil || res.Message.Rcode != dns.RcodeServerFailure {
 		t.Fatalf("expected SERVFAIL, got status=%s message=%+v", res.Status, res.Message)
 	}
+	wantErrorReply(t, res, dns.RcodeServerFailure, dns.ExtendedErrorNoReachableAuthority, "upstream UPDATE rejected: rcode=2 (SERVFAIL)")
 
 	if rec := h.leaseManager.Get(leasepkg.NodeKey(id.keyAt(host))); rec != nil {
 		t.Fatalf("deferred-mutation violated: local store was written despite the upstream UPDATE being rejected: %+v", rec)

@@ -18,6 +18,7 @@ import (
 	"codeberg.org/miekg/dns"
 	baseclient "github.com/NetworkCommons/sig0lease/client"
 	_ "github.com/NetworkCommons/sig0lease/pkg/dnscompat" // registers EDNS0 code 2 (UPDATE-LEASE); required to unpack a registrar's response
+	"github.com/NetworkCommons/sig0lease/pkg/dnsmsg"
 	"github.com/NetworkCommons/sig0lease/pkg/dnsname"
 	"github.com/NetworkCommons/sig0lease/pkg/dnssd"
 	"github.com/NetworkCommons/sig0lease/pkg/keyrec"
@@ -382,7 +383,11 @@ func (c *Client) registerWithRenameRetry(ctx context.Context) (*dns.Msg, error) 
 		}
 		if outcome != pkgsrp.OutcomeConflict {
 			if outcome != pkgsrp.OutcomeSuccess {
-				return resp, fmt.Errorf("srp/client: registration failed: %s (rcode=%d)", outcome, resp.Rcode)
+				reason := ""
+				for _, ede := range dnsmsg.EDEs(resp) {
+					reason += ", EDE " + dnsmsg.FormatEDE(ede)
+				}
+				return resp, fmt.Errorf("srp/client: registration failed: %s (rcode=%d%s)", outcome, resp.Rcode, reason)
 			}
 			return resp, nil
 		}

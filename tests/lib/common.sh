@@ -30,8 +30,17 @@ SCRIPT_DIR="$TESTS_DIR"
 OS=$(uname -s | tr '[:upper:]' '[:lower:]')
 PROXY_BIN="${TESTS_DIR}/../bin/${OS}/sig0lease"
 CONFIG_FILE="${TESTS_DIR}/../config.yaml"
-LOG_FILE="/tmp/sig0lease_proxy.log"
 CLIENT_LOG_FILE="/tmp/sig0lease_client.log"
+
+# Who starts the proxy a suite tests (lib/proxy.sh's proxy_launch): auto, the default, starts
+# it from PROXY_BIN; manual waits up to PROXY_LAUNCH_TIMEOUT seconds for one you start
+# yourself, e.g. in a debugger, with the config the suite wrote. Every suite writes its
+# proxy's config, DoT certificate, lease files and log into its own fixed directory under
+# PROXY_RUN_ROOT, emptied at the start of each run and kept after it, so a debugger launch
+# configuration can name the config (tests/README.md lists one per suite).
+PROXY_LAUNCH="${PROXY_LAUNCH:-auto}"
+PROXY_LAUNCH_TIMEOUT="${PROXY_LAUNCH_TIMEOUT:-600}"
+PROXY_RUN_ROOT="/tmp/sig0lease-debug"
 
 PROXY_ADDR="${PROXY_ADDR:-127.0.0.1}"
 PROXY_PORT="${PROXY_PORT:-8053}"
@@ -53,12 +62,12 @@ AUTH_ZONE="zenr.io."
 PROXY_KEYSTORE_DIR="./keystore/server"
 PROXY_KEY_NAME="${PROXY_KEYSTORE_DIR}/Kdev.zenr.io.+015+35317.key"
 
-# Configuration
-TMP_CONFIG_FILE=""
-TMP_TLS_DIR="" # holds the DoT listener's throwaway certificate when PROXY_PROTOCOL=tls
-LEASE_CONFIG_FILE="$CONFIG_FILE"
+# Configuration: prepare_lease_config's copy of config.yaml, and its log, in PROXY_RUN_DIR --
+# PROXY_RUN_ROOT/<suite>, which the orchestration script sets.
+PROXY_RUN_DIR=""
+PROXY_CONFIG_FILE=""
+PROXY_LOG_FILE=""
 LEASE_CONFIG_PREPARED=false
-REUSED_PROXY=false
 # Floor used for min_key_lease_sec/min_rr_lease_sec in the scratch config
 # prepare_lease_config() writes, so lease-cycle tests don't wait out the
 # real (production) policy minimums.
@@ -163,6 +172,35 @@ listening_ports() {
             | while read -r hex; do printf '%d\n' "0x$hex"; done
     else
         log_error "Cannot list listening ports: no lsof, ss or /proc/net"
+        return 1
+    fi
+}
+
+# listening_pid <port> -- the PID of the process listening on <port> over UDP, or else TCP, or
+# nothing: lsof on macOS; on Linux ss or, in containers without it, /proc (the socket's inode
+# in /proc/net, then the process holding it).
+listening_pid() {
+    local port="$1"
+    if [ "${OS}" = "darwin" ]; then
+        { lsof -nP -t -iUDP:"$port" 2>/dev/null; lsof -nP -t -iTCP:"$port" -sTCP:LISTEN 2>/dev/null; } | head -n 1
+    elif command -v ss >/dev/null 2>&1; then
+        # The local address is the field that ends in :<port>; ss -p names the owner pid=<pid>.
+        { ss -lnup 2>/dev/null; ss -lntp 2>/dev/null; } | awk -v want=":${port}\$" '
+            { for (i = 1; i <= NF; i++) if ($i ~ want && match($0, /pid=[0-9]+/)) { print substr($0, RSTART + 4, RLENGTH - 4); exit } }'
+    elif [ -d /proc/net ]; then
+        local inode fd
+        inode="$(cat /proc/net/udp /proc/net/udp6 2>/dev/null \
+            | awk -v hex="$(printf ':%04X' "$port")" '$4 == "07" && substr($2, length($2) - 4) == hex { print $10; exit }')"
+        [ -n "$inode" ] || return 0
+        for fd in /proc/[0-9]*/fd/*; do
+            if [ "$(readlink "$fd" 2>/dev/null)" = "socket:[$inode]" ]; then
+                fd="${fd#/proc/}"
+                echo "${fd%%/*}"
+                return 0
+            fi
+        done
+    else
+        log_error "Cannot find the process listening on port $port: no lsof, ss or /proc/net"
         return 1
     fi
 }

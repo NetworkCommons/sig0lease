@@ -7,8 +7,8 @@ import (
 	"testing"
 
 	"codeberg.org/miekg/dns"
-	"github.com/NetworkCommons/sig0lease/client"
 	"github.com/NetworkCommons/sig0lease/logging"
+	"github.com/NetworkCommons/sig0lease/pkg/dnsmsg"
 	leasepkg "github.com/NetworkCommons/sig0lease/pkg/lease"
 )
 
@@ -71,15 +71,24 @@ func TestLeaseResponse_OnlyTheOPTRecord(t *testing.T) {
 }
 
 // TestMakeErrorResponse_NoSections: an error reply copies none of the request's sections
-// either. Its additional section holds only the OPT RR answering the request's EDNS.
+// either. Its additional section holds only the OPT RR answering the request's EDNS, which
+// carries the Extended DNS Error with the reply's code and reason.
 func TestMakeErrorResponse_NoSections(t *testing.T) {
 	req := testUpdateRequest()
-	resp := makeErrorResponse(req, dns.RcodeRefused, "")
+	resp := makeErrorResponse(req, dns.RcodeRefused, dns.ExtendedErrorProhibited, "signer not authorized")
 	if resp.ID != req.ID || resp.Opcode != dns.OpcodeUpdate || !resp.Response || resp.Rcode != dns.RcodeRefused {
 		t.Fatalf("header = %+v, want the request's ID and Opcode, QR set, REFUSED", resp.MsgHeader)
 	}
 	if zone, prereq, update, additional := wireCounts(t, resp); zone != 0 || prereq != 0 || update != 0 || additional != 1 {
 		t.Fatalf("section counts = %d/%d/%d/%d, want 0/0/0/1 (only the OPT RR)", zone, prereq, update, additional)
+	}
+	received := &dns.Msg{Data: resp.Data}
+	if err := received.Unpack(); err != nil {
+		t.Fatalf("unpack response: %v", err)
+	}
+	edes := dnsmsg.EDEs(received)
+	if len(edes) != 1 || edes[0].InfoCode != dns.ExtendedErrorProhibited || edes[0].ExtraText != "signer not authorized" {
+		t.Fatalf("EDEs = %v, want one 18 (Prohibited) with the reason", edes)
 	}
 }
 
@@ -102,7 +111,11 @@ func TestUpdateHandlerSuccessResponse_NotesInTheOPTRecord(t *testing.T) {
 	if err := received.Unpack(); err != nil {
 		t.Fatalf("unpack response: %v", err)
 	}
-	if got := client.StatusNotes(received); !slices.Equal(got, notes) {
+	var got []string
+	for _, ede := range dnsmsg.EDEs(received) {
+		got = append(got, ede.ExtraText)
+	}
+	if !slices.Equal(got, notes) {
 		t.Fatalf("status notes = %q, want %q", got, notes)
 	}
 	if lease, keyLease := grantedLease(t, received); lease != 120 || keyLease != 300 {

@@ -187,6 +187,9 @@ func main() {
 	// Step 7: Display response
 	fmt.Printf("\nStep 6: Response from proxy\n")
 	fmt.Printf("  Status: %s (Rcode=%d)\n", dns.RcodeToString[resp.Rcode], resp.Rcode)
+	for _, ede := range dnsmsg.EDEs(resp) {
+		fmt.Printf("  EDE %s\n", dnsmsg.FormatEDE(ede))
+	}
 	fmt.Printf("  Flags: AA=%v, RD=%v, RA=%v\n", resp.Authoritative, resp.RecursionDesired, resp.RecursionAvailable)
 
 	if resp.Rcode == dns.RcodeSuccess {

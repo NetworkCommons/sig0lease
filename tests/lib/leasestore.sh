@@ -48,7 +48,7 @@ _default_proxy_url() {
 # defaults to "info"). This keeps every existing call site working
 # unchanged while adding the ability to dump a non-default proxy instance.
 #
-# dig +short hands back the dump in DNS <character-string> presentation form --
+# dig hands back the dump in DNS <character-string> presentation form --
 # embedded control bytes rendered as literal \DDD (decimal, per RFC 1035), and
 # a dump longer than one 240-byte TXT string split across several TXT RRs /
 # output lines. lease_dump strips the per-line quoting, rejoins the chunks, and
@@ -97,18 +97,19 @@ lease_dump() {
             ;;
     esac
 
-    local raw
-    raw=$(dig_query_short "$proxy_addr" "${query_domain}" TXT)
-
     # Test script's own log level, independent from proxy logging; to stderr
     # so a `foo="$(lease_dump ...)"` capture stays clean.
     printf '  [%s] [dig] @%s %s TXT (%s)\n' \
         "$(printf '%s' "$level" | tr '[:lower:]' '[:upper:]')" \
         "$proxy_addr" "$query_domain" "$dump_label" >&2
 
+    # A proxy without server.diagnostics answers REFUSED: fail, rather than read that as an
+    # empty lease store.
+    local raw
+    raw="$(dig_query_checked "$proxy_addr" "${query_domain}" TXT)" || return 1
     if [ -z "$raw" ]; then
-        echo "(no dump response)"
-        return 0
+        log_error "The dump query to $proxy_addr got NOERROR with no dump" >&2
+        return 1
     fi
 
     printf '%s\n' "$raw" | sed 's/^"//; s/"$//' | tr -d '\n' \

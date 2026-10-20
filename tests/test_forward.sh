@@ -17,6 +17,7 @@ source "$SCRIPT_DIR/lib/proxy.sh"
 # not cd'ing at all and relying on being invoked from main/ -- this makes
 # test_forward.sh work the same way regardless of invocation cwd.
 cd "$TESTS_DIR/.." || exit 1
+PROXY_RUN_DIR="$PROXY_RUN_ROOT/forward"
 
 DOWNSTREAM_ZONE="test.dev.zenr.io."
 
