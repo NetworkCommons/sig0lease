@@ -37,7 +37,7 @@ CLIENT_KEYSTORE_DIR="${GITDIR}/keystore/client" ${GITDIR}/bin/${DIR}/sig0lease-s
   -host="${SERVER_HOSTNAME}" \
   -addr="${SERVER_HOST_IP}" \
   -instance=${SERVER_SERVICE_NAME}:${SERVER_SD_TYPE}:${SERVER_LISTENPORT} \
-  -txt="${SERVER_SERVICE_NAME}:txtver=1" \
+  -txt="${SERVER_SERVICE_NAME}:txtvers=1" \
   -txt="${SERVER_SERVICE_NAME}:pk=${SERVER_PUBKEY}" \
   -txt="${SERVER_SERVICE_NAME}:net=${SERVER_NETWORK}" \
   -lease=${LEASE} -keylease=${KEYLEASE} \
@@ -83,7 +83,7 @@ CLIENT_KEYSTORE_DIR="${GITDIR}/keystore/client" ${GITDIR}/bin/${DIR}/sig0lease-s
   -addr="${CLIENT_HOST_IP}" \
   -instance=${CLIENT_SERVICE_NAME}:${CLIENT_SD_TYPE}:0 \
   -subtype="${CLIENT_SERVICE_NAME}:${CLIENT_SUBTYPE}" \
-  -txt=${CLIENT_SERVICE_NAME}:"txtver=1" \
+  -txt=${CLIENT_SERVICE_NAME}:"txtvers=1" \
   -txt=${CLIENT_SERVICE_NAME}:"pk=${CLIENT_PUBKEY}" \
   -lease=${LEASE} -keylease=${KEYLEASE} \
   -keystore="${GITDIR}/keystore/client" -k=15 \
@@ -107,14 +107,16 @@ echo
 
 
 CONFIG_HOSTNAME=${SERVER_HOSTNAME}
+CONFIG_HOST_IP=${SERVER_HOST_IP}
 CONFIG_SD_TYPE="_wgcfg._udp"
 CONFIG_LISTENPORT="${SERVER_LISTENPORT}"
 CONFIG_SERVICE_NAME="${SERVER_SERVICE_NAME}-${CLIENT_SERVICE_NAME}"
 CONFIG_SUBTYPE="${CLIENT_SERVICE_NAME}"
 CLIENT_VPN_IP="11.11.11.11"
+CLIENT_VPN_SUBNET_LEN="24"
 
 echo "****"
-echo "**** Step 3: ANSWER: SERVER watches ${SERVER_SERVICE_NAME}._sub.${CLIENT_SD_TYPE} For each new request, apply server admit policy, allocates client IP addresses and adds peer to wg configuration. If approved, it registers ${SERVER_SERVICE_NAME}-${CLIENT_SERVICE_NAME}.${CONFIG_SD_TYPE} "
+echo "**** Step 3: ANSWER: SERVER watches ${SERVER_SERVICE_NAME}._sub.${CLIENT_SD_TYPE} For each new request, apply server admit policy, allocates client IP addresses and adds peer to wg configuration. If approved, the server registers ${SERVER_SERVICE_NAME}-${CLIENT_SERVICE_NAME}.${CONFIG_SD_TYPE} "
 echo "****    (Initial Default server admit policy is allow all unless VPN network is already fully allocated)"
 echo "****"
 
@@ -122,13 +124,13 @@ CLIENT_KEYSTORE_DIR="${GITDIR}/keystore/client" ${GITDIR}/bin/${DIR}/sig0lease-s
   -domain="${DOMAIN}" \
   -server=127.0.0.1:8053 \
   -host="${CONFIG_HOSTNAME}" \
-  -addr="${CLIENT_HOST_IP}" \
+  -addr="${CONFIG_HOST_IP}" \
   -instance=${CONFIG_SERVICE_NAME}:${CONFIG_SD_TYPE}:${CONFIG_LISTENPORT} \
   -subtype="${CONFIG_SERVICE_NAME}:${CONFIG_SUBTYPE}" \
-  -txt=${CONFIG_SERVICE_NAME}:"txtver=1" \
+  -txt=${CONFIG_SERVICE_NAME}:"txtvers=1" \
   -txt=${CONFIG_SERVICE_NAME}:"peer=${CLIENT_PUBKEY}" \
   -txt=${CONFIG_SERVICE_NAME}:"addr=${CLIENT_VPN_IP}" \
-  -txt=${CONFIG_SERVICE_NAME}:"allowed=${CLIENT_VPN_IP}/24" \
+  -txt=${CONFIG_SERVICE_NAME}:"allowed=${CLIENT_VPN_IP}/${CLIENT_VPN_SUBNET_LEN}" \
   -lease=${LEASE} -keylease=${KEYLEASE} \
   -keystore="${GITDIR}/keystore/client" -k=15 \
   -once
@@ -174,7 +176,7 @@ CLIENT_KEYSTORE_DIR="${GITDIR}/keystore/client" ${GITDIR}/bin/${DIR}/sig0lease-s
   -addr="${CLIENT_HOST_IP}" \
   -instance=${CLIENT_SERVICE_NAME}:${CLIENT_SD_TYPE}:0 \
   -subtype="${CLIENT_SERVICE_NAME}:${CLIENT_SUBTYPE}" \
-  -txt=${CLIENT_SERVICE_NAME}:"txtver=1 PublicKey=${CLIENT_PUBKEY}" \
+  -txt=${CLIENT_SERVICE_NAME}:"txtvers=1 PublicKey=${CLIENT_PUBKEY}" \
   -lease=${LEASE} -keylease=${KEYLEASE} \
   -keystore="${GITDIR}/keystore/client" -k=15 \
   -once
