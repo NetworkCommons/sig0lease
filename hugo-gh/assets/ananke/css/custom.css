@@ -19,10 +19,10 @@
 }
 
 /* general definitions */
-body {
+body, header, article, p, h1, h2, h3, h4, h5 {
   font-family: 'IBM Plex Sans', sans-serif;
 }
-.avenir {
+.avenir, .athelas {
   font-family: 'IBM Plex Sans', sans-serif;
 }
 
@@ -34,7 +34,7 @@ header.cover {
 header div.bg-black-60 {
 	background-color: rgba(0, 0, 0, 0);
 }
-header h1, header h2 {
+header.cover h1, header.cover h2 {
 	display: none;
 }
 
@@ -48,10 +48,60 @@ header h1, header h2 {
 	margin-right: 2%;
 }
 
+/* start page */
+a.ba {
+	font-size: inherit;
+	background-color: inherit;
+	border: inherit;
+	padding: 0;
+	text-decoration: underline;
+}
+a.ba:hover {
+	background-color: inherit;
+}
+a.ba::after {
+	content: '>>'
+}
+h1.athelas {
+	font-size: 2rem;
+}
+
+/* Single Page Layout */
+.is-page header div.bg-black {
+	background-color: #808080;
+}
+article.single header h1 {
+	margin-top: 0.25rem;
+	color: #333;
+}
+article.single header time {
+	padding: 0;
+	margin: 0;
+}
+article ul, article ol {
+	padding-left: 1em;
+}
+article h2, article h3, article h4 {
+	margin: 0.5rem 0;
+	color: #333;
+}
+article p {
+	margin: 0.5rem 0;
+	color: #333;
+}
+article.single aside {
+	margin-top: 0;
+}
+
+
+
 /* footer */
 #funder-footer {
 	color: #ffffff;
 	padding: 1rem;
+}
+footer.bg-black {
+	background-color: #808080;
 }
 
 #funder-footer div.funder-logos {

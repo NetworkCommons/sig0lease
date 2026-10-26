@@ -16,7 +16,7 @@ On Sunday September 13th, Adam Burns and Mathias Jud held a workshop at the 2026
 
 The presentation explained how sig0lease allows time-based leasing and updating of hostnames in the Internet's Domain Name System (DNS) together with publication of service descriptions and service discovery information for services offered by each host joining the local network.
 
-![targets](/images/PXL_20260913_122145604.MP.jpg)
+![targets](PXL_20260913_122145604.MP.jpg)
  
 
 Adam summarized the current status of the sig0lease project:
