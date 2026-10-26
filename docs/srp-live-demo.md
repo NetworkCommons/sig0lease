@@ -213,26 +213,35 @@ proxy.
 
 ## 7. Publish a Mac's own services (optional)
 
-Here macOS supplies the services. With `-mdns`, `sig0lease-srp-client` asks the Mac's running
-mDNSResponder what is advertised on the local link, through the same socket every Bonjour
-application uses, and registers the chosen host and its instances through the proxy, one SRP
-key per host. Turn a sharing service on or off in System Settings and it enters or leaves the
-public zone.
+Here macOS supplies the services. `sig0lease-agent` (`docs/sig0lease-agent.md`), with an `mdns`
+mirror in its template, asks the Mac's running mDNSResponder what is advertised on the local
+link, through the same socket every Bonjour application uses, and registers the chosen host
+and its instances through the proxy, one SRP key per host. Turn a sharing service on or off in
+System Settings and it enters or leaves the public zone.
 
 On the Mac, from `./main`, with the proxy from step 1 running on the same Mac:
 
 ```bash
 make build build-client
+cat > mac-agent.yaml <<EOF
+keystore: mdns-identities
+registrars:
+  - protocol: srp
+    domain: srp.dev.zenr.io.
+    server: 127.0.0.1:8053
+    mirrors:
+      - type: mdns
+        hosts: [$(scutil --get LocalHostName).local.]
+        services: [_ssh._tcp, _smb._tcp, _rfb._tcp]
+EOF
 # What the daemon sees; * marks what would be published. Registers nothing.
-./bin/darwin/sig0lease-srp-client -mdns -mdns-list -mdns-host=$(scutil --get LocalHostName).local.
+./bin/darwin/sig0lease-agent mdns-list mac-agent.yaml
 
-./bin/darwin/sig0lease-srp-client -mdns -mdns-host=$(scutil --get LocalHostName).local. \
-  -mdns-type=_ssh._tcp -mdns-type=_smb._tcp -mdns-type=_rfb._tcp \
-  -domain=srp.dev.zenr.io. -server=127.0.0.1:8053 -keystore=./mdns-identities -k=13
+./bin/darwin/sig0lease-agent run mac-agent.yaml
 ```
 
 Then, in System Settings > General > Sharing, turn on Remote Login (`_ssh._tcp`), File
-Sharing (`_smb._tcp`) or Screen Sharing (`_rfb._tcp`). A few seconds later the client logs
+Sharing (`_smb._tcp`) or Screen Sharing (`_rfb._tcp`). A few seconds later the agent logs
 `registered`, and from any machine:
 
 ```bash
@@ -240,17 +249,20 @@ dig @ns1.free2air.org PTR _ssh._tcp.srp.dev.zenr.io. +short
 dns-sd -B _ssh._tcp srp.dev.zenr.io
 ```
 
-Turn the service off and the client withdraws it; `Ctrl-C` deregisters everything it
-registered. The client does not follow subtypes, nor address or TXT changes after an instance
+Turn the service off and the agent withdraws it; `Ctrl-C` deregisters everything it
+registered. The mirror does not follow subtypes, nor address or TXT changes after an instance
 first appears.
 
 - On first use macOS may ask whether Terminal may find devices on the local network. If that
-  is refused, the daemon answers `PolicyDenied` and the client stops with that error.
+  is refused, the daemon answers `PolicyDenied`; the agent logs it and tries again every 10
+  seconds.
 - The records carry the Mac's LAN addresses and computer name, in a public zone. Keep
-  `-mdns-type` to what you mean to show. `-mdns-all-hosts` publishes every device on the
+  `services:` to what you mean to show. `all_hosts: true` publishes every device on the
   network: not on a shared network.
 - An instance name containing `.` is skipped with a log line: codeberg.org/miekg/dns cannot
   carry such a label (see `pkg/dnsname/labels.go`).
+- The Mac's own services can also be listed under `hosts:` in the same template, with a probe
+  each, instead of mirrored; `agent.yaml` at the top of the repository shows both.
 
 A second Mac can also list these instances among its ordinary Bonjour results, without being
 told the domain. Once the proxy has a live registration it publishes

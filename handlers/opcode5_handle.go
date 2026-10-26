@@ -34,6 +34,10 @@ func (h *UpdateHandler) Handle(ctx context.Context, w dns.ResponseWriter, r *dns
 		h.logger.Debugf("Refusing UPDATE: %v", res.Error)
 		return res
 	}
+	if res := h.refuseNamesNotServed(r); res != nil {
+		h.logger.Debugf("Refusing UPDATE: %v", res.Error)
+		return res
+	}
 
 	if len(r.Question) != 1 {
 		msg := makeErrorResponse(r, dns.RcodeFormatError, dns.ExtendedErrorOther, "exactly one question required")
@@ -72,12 +76,9 @@ func (h *UpdateHandler) Handle(ctx context.Context, w dns.ResponseWriter, r *dns
 	}
 
 	leaseDuration, keyLeaseDuration := requestedLeases(requestedLease, len(updateKeyRRs) > 0, len(updateOtherRRs) > 0)
-	if err := h.checkLeaseMinimums(leaseDuration, keyLeaseDuration); err != nil {
-		h.logger.Debugf("Lease refused: %v", err)
-		msg := makeErrorResponse(r, dns.RcodeRefused, dns.ExtendedErrorProhibited, err.Error())
-		return NewErrorResult(msg, fmt.Sprintf("lease refused: %v", err), err)
-	}
 
+	// A duration outside lease_policy is raised to its minimum or cut to its maximum, as the
+	// SRP handler does; the reply's Update Lease option tells the requester what it got.
 	originalLeaseDuration := leaseDuration
 	originalKeyLeaseDuration := keyLeaseDuration
 	leaseDuration, keyLeaseDuration = h.LeasePolicy.clamp(leaseDuration, keyLeaseDuration)
@@ -175,6 +176,9 @@ func (h *UpdateHandler) Handle(ctx context.Context, w dns.ResponseWriter, r *dns
 	// deletes (see the case-D loop below), forwarded in the same shared
 	// upstream call as the KEY add/refresh at the end of Handle().
 	var recordsToDeleteForUpstream []dns.RR
+	// fcfsPrereqs are the prerequisites fcfs_naming attaches to the upstream UPDATE for the
+	// KEYs registered anew (refuseNewKey).
+	var fcfsPrereqs []dns.RR
 	type pendingLeaseMutation struct {
 		keyName string
 		apply   func() error
@@ -224,9 +228,11 @@ func (h *UpdateHandler) Handle(ctx context.Context, w dns.ResponseWriter, r *dns
 					return NewErrorResult(msg, err.Error(), err)
 				}
 			} else {
-				if err := h.refuseAuthoritativeDuplicate(ctx, zone, keyRR); err != nil {
-					return refusalResult(r, "duplicate registration rejected", err)
+				prereqs, res := h.refuseNewKey(ctx, r, zone, keyRR, signerID, sigRR.SignerName)
+				if res != nil {
+					return res
 				}
+				fcfsPrereqs = append(fcfsPrereqs, prereqs...)
 				// Signer authorization for new registrations was already
 				// checked once for the whole request above; Case A always
 				// requires non-KEY RRs, so that check already covers this path.
@@ -428,8 +434,8 @@ func (h *UpdateHandler) Handle(ctx context.Context, w dns.ResponseWriter, r *dns
 		//
 		// Authorization is ownership-based, not just DNS-name hierarchy: a
 		// record (KEY or non-KEY) may only be deleted by its immediate
-		// parent -- the KEY that registered it -- or by itself in the case
-		// of a self-registered (root) KEY, which has no parent to defer to.
+		// parent -- the KEY that registered it -- or, for a KEY, by itself,
+		// whoever registered it.
 		// A signer merely hierarchically "at or above" a record it did not
 		// itself register cannot delete it directly; it can only reach that
 		// data by deleting the record's actual parent, which cascades.
@@ -544,12 +550,13 @@ func (h *UpdateHandler) Handle(ctx context.Context, w dns.ResponseWriter, r *dns
 			existingKey := h.leaseManager.LookupByKEY(keyRR)
 			keyIsRefresh := existingKey != nil
 			if !keyIsRefresh {
-				// New KEY registration: must not already exist identically at the
-				// authoritative DNS, mirroring Case A's duplicate protection
+				// New KEY registration: the same checks as Case A's
 				// (docs/siglease_rfc9664.md item 6 applies to every case, not just Case A).
-				if err := h.refuseAuthoritativeDuplicate(ctx, zone, keyRR); err != nil {
-					return refusalResult(r, "duplicate registration rejected", err)
+				prereqs, res := h.refuseNewKey(ctx, r, zone, keyRR, signerID, sigRR.SignerName)
+				if res != nil {
+					return res
 				}
+				fcfsPrereqs = append(fcfsPrereqs, prereqs...)
 				if !h.signerAuthorizedForNewRegistration(signerManaged, signerInUpdate, signerSource) {
 					msg := makeErrorResponse(r, dns.RcodeRefused, dns.ExtendedErrorProhibited,
 						"signing key must be managed, present in the Update section, or (if allow_online_key_registration is enabled) an authorized online signer, to register a new KEY RR")
@@ -623,9 +630,13 @@ func (h *UpdateHandler) Handle(ctx context.Context, w dns.ResponseWriter, r *dns
 	// rejected together rather than racing across two separate round trips.
 	if len(upstreamKeys) > 0 || len(acceptedRecordsForUpstream) > 0 || len(recordsToDeleteForUpstream) > 0 {
 		h.logger.Debugf("Sending UPDATE to upstream (configured zone=%s), keys=%d", h.upstreamZone, len(upstreamKeys))
-		upstreamResp, err := h.upstream().send(ctx, nil, upstreamUpdateRecords(upstreamKeys, acceptedRecordsForUpstream, recordsToDeleteForUpstream))
+		upstreamResp, err := h.upstream().send(ctx, fcfsPrereqs, upstreamUpdateRecords(upstreamKeys, acceptedRecordsForUpstream, recordsToDeleteForUpstream))
 		if err != nil {
 			h.logger.Debugf("UPDATE for zone=%s keys=%d: %v", h.upstreamZone, len(upstreamKeys), err)
+			if upstreamResp != nil && prerequisiteFailed(upstreamResp.Rcode, fcfsPrereqs) {
+				// A KEY appeared, through another writer, at a name fcfsNewKey found free.
+				return fcfsConflictResult(r, fmt.Sprintf("FCFS conflict detected atomically by upstream prerequisite: %v", err))
+			}
 			msg := makeErrorResponse(r, dns.RcodeServerFailure, dns.ExtendedErrorNoReachableAuthority, err.Error())
 			return NewErrorResult(msg, err.Error(), err)
 		}

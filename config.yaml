@@ -72,11 +72,13 @@ processing_rules:
   # Route opcode 5 (UPDATE) to the update handler module.
   # UPDATE queries are used for dynamic DNS updates (RFC 2136).
   #
-  # To also enable RFC 9665 SRP on a *different* zone from the same proxy process, add
-  # srp_handler ahead of update_handler and configure handlers.srp_handler below (one
-  # zone, one protocol -- don't point both handlers' upstream_zone at the same
-  # zone):
+  # To also enable RFC 9665 SRP from the same proxy process, add srp_handler ahead of
+  # update_handler and configure handlers.srp_handler below, on a zone of its own:
   #   modules: ["srp_handler", "update_handler"]
+  # Every name belongs to one handler, the one whose zone is the closest above it, as at a
+  # zone cut: here srp.dev.zenr.io. and every name below it are srp_handler's, and
+  # update_handler refuses them although they are below its dev.zenr.io. Each handler also
+  # refuses names outside its own zone. Two handlers on one zone stop the proxy at startup.
   - opcode: 5
     # modules: ["update_handler"]
     modules: ["srp_handler", "update_handler"]
@@ -182,6 +184,16 @@ handlers:
     # min_key_lease_sec at or below max_rr_lease_sec, or the proxy refuses to start.
     # When false (default), such a request is REFUSED. 8-byte requests are always accepted.
     prefer_4byte_variant: false
+
+    # First-Come First-Served naming, as RFC 9665 S3.2.4.1 gives SRP. A KEY holds its name and
+    # every name below it: a new KEY is refused (YXDOMAIN) where a different KEY holds its name
+    # or a name above it, unless the KEY holding that name registers it. A KEY may register
+    # itself only one label below the zone (REFUSED elsewhere, the zone itself included);
+    # deeper names are registered by the KEY holding the name above. Without it (default
+    # false) any new key may register at any name next to another key's, including the
+    # _acme-challenge name that Let's Encrypt's DNS-01 check reads. On here because this zone
+    # is shared.
+    fcfs_naming: true
 
     # Blacklisted RR types that are not allowed for registration.
     # These types will be rejected with a format error if attempted.

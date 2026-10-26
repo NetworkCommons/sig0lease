@@ -9,8 +9,12 @@ those files follow.
 `test_srp.sh` is self-contained: real proxy process, real client (`cmd/sig0lease-srp-client`), a local
 disposable BIND 9 (`lib/bind9.sh`, zone `srp.test.`) — nothing outside this repo required
 beyond `go`, `named`/`named-checkconf`, `dig`, and `openssl` (for the throwaway certificate of
-the proxy's DNS-over-TLS listener, which TEST 9 registers through). So is `test_update.sh`
-with `AUTH_BACKEND=local` (below).
+the proxy's DNS-over-TLS listener, which TEST 9 registers through). So is `test_agent.sh`
+(`make test-agent`), which runs `sig0lease-agent` on templates it writes, against the same proxy
+and BIND 9 (`lib/srp.sh`, shared with `test_srp.sh`), with `python3`'s `http.server` as the
+probed service: run registers, a stopped service is withdrawn and comes back, template edits
+apply and an invalid one is ignored, a held name is renamed and the rename kept across a
+restart, and stopping deregisters. And so is `test_update.sh` with `AUTH_BACKEND=local` (below).
 
 `test_update.sh` (by default) and `test_forward.sh` run against the **real DNS**, not a local
 BIND 9. Both start the proxy from a copy of `main/config.yaml` (only the listen address,
@@ -57,8 +61,8 @@ files under `data/`.
 
 Every suite writes its proxy's config, and the files the config names (DoT certificate, lease
 files in local runs), into its own directory under `/tmp/sig0lease-debug/`, named after the
-Makefile target: `update`, `update-local`, `srp`, `mdnsresponder-interop`, and `forward` for
-`test_forward.sh`. The directory is emptied at the start of each run and kept after it, so its
+Makefile target: `update`, `update-local`, `srp`, `agent`, `mdnsresponder-interop`, and
+`forward` for `test_forward.sh`; `agent`'s also holds the agent's template, keystore and log. The directory is emptied at the start of each run and kept after it, so its
 `config.yaml` and `proxy.log` can be read once the run is over. Each config turns on
 `server.diagnostics`, so the suites check refusals by the reason in the reply's Extended DNS
 Error (RFC 8914), which `sig0lease-client` and `sig0lease-srp-client` print after the status
@@ -94,7 +98,7 @@ here, prefix `main/` to `program` and `cwd`):
 }
 ```
 
-and the same with `update`, `srp`, `mdnsresponder-interop` or `forward` in place of
+and the same with `update`, `srp`, `agent`, `mdnsresponder-interop` or `forward` in place of
 `update-local` in `name` and `args`.
 
 ## External checkouts
@@ -131,8 +135,9 @@ can serve both a Linux machine and a Mac.
   runs, `srp-mdns-proxy`'s DNS proxy also listens on UDP port 53 of every interface: macOS lets
   any process bind it, and Linux's build stops the DNS proxy before, for want of a TLS key.
 
-Either way, Directions 2 and 3 advertise their test services (`Gizmo`, `Bridge Demo`) on the
-local network while they run.
+Either way, Directions 2 and 3 advertise their test services (`Gizmo`, `Mirror Demo`) on the
+local network while they run. Direction 3's is mirrored by `sig0lease-agent`, from a
+template with one `mdns` mirror.
 
 ```
 git clone https://github.com/apple-oss-distributions/mDNSResponder.git ../mDNSResponder

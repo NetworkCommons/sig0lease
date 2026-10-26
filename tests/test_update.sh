@@ -151,6 +151,16 @@ fi
 # Lease times
 POLICY_MIN_RR_LEASE_SECONDS="$(yaml_get_lease_time min_rr_lease_sec)"
 POLICY_MIN_KEY_LEASE_SECONDS="$(yaml_get_lease_time min_key_lease_sec)"
+# Whether the update handler holds names First-Come First-Served; TEST 3 checks the refusal.
+FCFS_NAMING="$(yq -r '.handlers.update.fcfs_naming' "$PROXY_CONFIG_FILE")"
+case "$FCFS_NAMING" in
+    true) ;;
+    false|null) FCFS_NAMING=false ;;
+    *)
+        log_error "Invalid handlers.update.fcfs_naming in $PROXY_CONFIG_FILE: $FCFS_NAMING"
+        exit 1
+        ;;
+esac
 
 LEASE_SECONDS="${LEASE_SECONDS:-$POLICY_MIN_RR_LEASE_SECONDS}"
 KEY_LEASE_SECONDS="${KEY_LEASE_SECONDS:-$POLICY_MIN_KEY_LEASE_SECONDS}"
@@ -555,11 +565,23 @@ test_case_unauthorized_refresh_rejected_then_expires() {
     assert_client_reply "$unauth_out" REFUSED 18 "requires signing KEY to already be managed"
 
     # Now register WRONG_CLIENT_KEY_NAME to test a non-owner rejection
-    # for the refresh operation
-    log_step "Register different key ($WRONG_CLIENT_KEY_NAME)"
+    # for the refresh operation. With fcfs_naming, CLIENT_KEY_NAME holds the
+    # name, so WRONG_CLIENT_KEY_NAME may not register itself there; the holder
+    # registers it instead (Case D), which also works without fcfs_naming.
     local wrong_key_rr
     wrong_key_rr="$(make_rr KEY $LEASE_SECONDS 1)"
-    run_client register "$WRONG_CLIENT_KEY_NAME" 0 $LEASE_SECONDS  "$wrong_key_rr"
+    if [ "$FCFS_NAMING" = "true" ]; then
+        log_step "Different key ($WRONG_CLIENT_KEY_NAME) registering itself at the held name is refused (fcfs_naming)"
+        local fcfs_out
+        if fcfs_out=$(run_client register "$WRONG_CLIENT_KEY_NAME" 0 $LEASE_SECONDS "$wrong_key_rr" 2>&1); then
+            log_error "Self-registration at a name another key holds unexpectedly succeeded"
+            echo "$fcfs_out"
+            return 1
+        fi
+        assert_client_reply "$fcfs_out" YXDOMAIN 18 "name held by a different key"
+    fi
+    log_step "Holder ($CLIENT_KEY_NAME) registers different key ($WRONG_CLIENT_KEY_NAME)"
+    run_client register "$CLIENT_KEY_NAME" 0 $LEASE_SECONDS "$wrong_key_rr"
     wait_for_rr_state KEY "$wrong_key_rr" present
     
     log_step "Refresh RR with different non-owner key ($WRONG_CLIENT_KEY_NAME)"

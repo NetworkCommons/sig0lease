@@ -129,7 +129,7 @@ encodings are supported:
 - **8-byte variant (default):** 4 bytes encode the LEASE value (lease duration for non-KEY RRs), followed by 4 bytes encoding the KEY-LEASE value (lease duration for KEY RRs). Both are big-endian `uint32` values.
 - **4-byte variant (legacy):** 4 bytes encode a single LEASE value used for both KEY and non-KEY RRs. macOS's mDNSResponder sends it. Accepted only with `prefer_4byte_variant: true` on the handler, and `REFUSED` otherwise. When accepted, the one value is the KEY-LEASE if the Update section has KEY RRs, and the LEASE if it has other records, and 0 for a kind it lacks: Case A with both kinds, B with non-KEY records only, D with KEYs only, C for 0 (`requestedLeases`). After clamping, the KEYs get the granted LEASE, since RFC 9664 S4 has them expire together. The reply carries that one value in the 4-byte variant, the only one mDNSResponder reads (`grantedLeaseOption`). The proxy refuses to start with `prefer_4byte_variant: true` and `min_key_lease_sec` above `max_rr_lease_sec`, since no single lease would then fit both bounds.
 
-A bad option is answered with a header RCODE: `FORMERR` for a length other than 4 or 8 or a LEASE above the KEY-LEASE, `REFUSED` for a 4-byte option without `prefer_4byte_variant` and for a duration below the policy minimum. Extended RCODEs (16 and up, their high bits carried in the OPT RR) are avoided because a requester that reads only the header, as mDNSResponder does, takes them for NOERROR.
+A bad option is answered with a header RCODE: `FORMERR` for a length other than 4 or 8 or a LEASE above the KEY-LEASE, `REFUSED` for a 4-byte option without `prefer_4byte_variant`. A duration outside the lease policy is not an error: it is raised to the minimum or cut to the maximum ("Lease Clamping, TTLs and Response Echo" below). Extended RCODEs (16 and up, their high bits carried in the OPT RR) are avoided because a requester that reads only the header, as mDNSResponder does, takes them for NOERROR.
 
 LEASE and KEY-LEASE together select one of four behavioral cases, detailed rule-by-rule in
 "Behavior Specification" below:
@@ -185,13 +185,15 @@ the corresponding entry here), so the numbering is kept stable.
       2. If non-KEY RRs present -> delete non-KEY RRs
       3. Both present -> delete both
       4. Neither present -> error
-      5. Authorization for delete is ownership, not just at-FQDN: a KEY or non-KEY RR may only be deleted by its immediate parent (the KEY that registered it), or, for a KEY RR, by itself if it has no parent (self-registered/root). A signer that is at-FQDN but not the immediate parent cannot delete the record directly, even though it could sign the request; the record is treated the same as if it did not exist, and no error results.
+      5. Authorization for delete is ownership, not just at-FQDN: a KEY or non-KEY RR may only be deleted by its immediate parent (the KEY that registered it), or, for a KEY RR, by itself, whether it registered itself or another KEY registered it; the delete takes along everything it registered. A signer that is at-FQDN but not the immediate parent cannot delete the record directly, even though it could sign the request; the record is treated the same as if it did not exist, and no error results.
    4. KEY-LEASE != 0, LEASE == 0:
       1. KEY RR must be present -> register or refresh KEY
       2. If non-KEY RRs present -> delete non-KEY RRs
 6. If the proxy attemps to register a record that already exists at the DNS server, the request must fail also in the parts that would be successful if performed alone, because the consistency of the LeaseStore cannot be guaranteed, especially in case of already existing KEY RR.
    1. This implies that the proxy needs to verify whether in case of a registration, an identical record is already at the FQDN.
 7. For all attempts of deleting records, if the record does not exist in the lease-store, we assume the record is either outside our control, or it has been removed after expiry. The request does not fail but the user needs to be informed about this. If the record exists in the lease-store but not at the DNS, do not fail the request but signal the situation. Missing local records do not force whole-request failure.
+8. Every name in the Update section must be in the handler's zone, and not in a zone another handler of the same proxy serves below it: the deepest zone wins. Otherwise the request is refused.
+9. With `fcfs_naming` on, a KEY holds its name: a KEY registered anew is refused if a different KEY is at its name or at a name above it, unless the key holding that name registers it. A KEY may register itself only one label below the zone; deeper names are registered by the key holding the name above.
 
 ### Storage Model
 
@@ -248,6 +250,23 @@ Additional rules:
 - A KEY used only for signing should be in the Additional section; a KEY in the Update section is interpreted as intended for lease register/refresh/delete.
 - **Key lease ownership:** when a KEY RR is registered (Case A or D), its public key becomes the "owner" for the non-KEY RRs registered alongside it and for other KEY RRs registered under it. This is tracked via `ParentKeyName` in the lease tree.
 
+### Zones Served: the Deepest Zone Wins
+
+A proxy can run both handlers, each with its own zone (`upstream_zone`). The zones may nest: the live deployment has SRP's `srp.dev.zenr.io.` inside this handler's `dev.zenr.io.`. A name belongs to the handler whose zone is closest above it, as a delegated subzone does in DNS (Behavior Specification item 8). After setting the handlers up, `cmd/sig0lease` tells each one the zones the others serve below its own (`handlers.SeparateZones`), and refuses to start when two handlers serve the same zone.
+
+Each handler refuses an UPDATE that names anything outside its zone, or inside a zone another handler serves, with `REFUSED` and Extended DNS Error 18 (`leaseHandler.refuseNamesNotServed`). This handler checks before the case dispatch and its node locks; SRP checks after its `default.service.arpa` rewrite has made the names final. Before this check only the authoritative server's update-policy kept the handlers apart. This handler could add a second KEY at a name SRP holds First-Come First-Served, or records SRP's lease store knows nothing about, whenever its signing key was allowed to write below its zone.
+
+### First-Come First-Served Naming (`fcfs_naming`)
+
+Without this option, the handler follows RFC 9664 alone: a signer writes at and below its own name (Behavior Specification item 1.2), and a new key may register itself at any name, including at or below another key's name. That suits a zone whose names one operator hands out. A zone that unrelated requesters share, such as the live `dev.zenr.io.`, needs a name to stay with the key that took it first. With `fcfs_naming: true` (default `false`; on in this repo's `config.yaml`) the handler applies RFC 9665's First-Come First-Served Naming (§3.2.4.1) to KEYs (Behavior Specification item 9). The check runs on every KEY a request registers anew in Case A or D (`UpdateHandler.refuseNewKey`, `fcfsNewKey`):
+
+- **One label below the zone.** A KEY may register itself only directly below the zone (`alice.dev.zenr.io.`), not at the apex, which is the zone operator's (the proxy's own KEY is there), nor deeper (`bob.alice.dev.zenr.io.`). Anything else is refused with `REFUSED` and Extended DNS Error 18, before any name is checked. A deeper name is registered by the key holding the name above it, so every held name has its holder above it, and goes with it: deleting or expiring a KEY takes along every KEY it registered. Without this rule, bob could register himself at `bob.alice.dev.zenr.io.` while `alice.dev.zenr.io.` is free. A newcomer could then take `alice.dev.zenr.io.` and, as a signer above bob's name, add records at bob's names (Behavior Specification item 1.2). Checking below the newcomer's name cannot stop that: no DNS query lists the names below a name, so only keys in this proxy's lease store would be found.
+- **Names checked.** For a KEY registering itself: its own name. For a KEY its signer registers: the names from the KEY's name up to but not including the signer's name, which the signer holds. A holder may therefore register further KEYs at its own name and below it, which is how a second key gets a name another key holds. A KEY below a name a different key holds is refused, even when the signer is above that key: only the holder registers below its name.
+- **Each name** is checked as SRP checks one (`srp.Evaluate`, with `refuse_on_foreign_data` off). The lease store comes first and is trusted when it has KEYs at the name; otherwise the handler queries the authoritative server for KEYs there. A name passes when every KEY at it is the new one. A name with any other KEY, alone or next to the new one, is held, as RFC 9665 §3.3.3 says ("If any existing KEY record ... does not match"). The request is then answered `YXDOMAIN` with Extended DNS Error 18 ("name held by a different key"), and nothing is sent upstream. A failed lookup is `SERVFAIL`, as in the other authoritative checks.
+- **Atomic with the write.** Each free name adds an RFC 2136 "RRset does not exist" prerequisite for KEY at that name to the upstream UPDATE. If a KEY lands there between the check and the write, the authoritative server refuses the UPDATE (`YXRRSET`) and the handler answers `YXDOMAIN` with nothing changed. This covers two requests claiming one name at once, through this proxy or another: the node locks don't serialize them, because they lock different keys.
+- **Not checked:** refreshes and records. A KEY already in the lease store keeps what it holds, and non-KEY records are written by a signer at and below its own name.
+- **Keys from before.** The rules hold for what is registered while `fcfs_naming` is on. A KEY registered deeper before it was turned on, or written to the zone without this proxy, can still have a free name above it.
+
 ### Registration and Refresh Details
 
 - **Refresh ownership check:** before treating a KEY RR as a refresh of an existing lease, `UpdateHandler.validateRefreshOwnership` compares the *actual* stored KEY RDATA (flags, protocol, algorithm, public key) against the one in the request. The lease store's node key is a composite of name + algorithm + key tag, which is not collision-free (the key tag is a 16-bit checksum); this check is what makes ownership verification exact rather than relying on the composite key alone.
@@ -300,12 +319,12 @@ A refresh needs only the node it refreshes, a registration also the node it atta
 - **Expiries back off instead.** A timer has nobody waiting on its answer. A lease event (`leaseExpirer.run`, the same in both handlers) takes its node and subtree with `TryAcquire`; if any is held, it does nothing and is retried exactly like a failed attempt (`expiryTimers.finish`, after 1s, doubling up to 16s). Each expiry attempt has its own deadline, `expiryTimeout` (10s).
 - **The table.** A lock is an id in a set, not a mutex per id: nothing outlives its holder, so the table doesn't grow with every id ever seen (every A/AAAA address, including rotating IPv6 privacy addresses, and every TXT revision). Ids are deduplicated and sorted, so errors and `IDs()` are deterministic. Releasing a set twice panics: it would free ids another operation may have taken since.
 - **One lease store per handler.** The RFC 9664 and SRP handlers each have their own store and lock table, and must never share a store. Each handler's `Start` and reconciliation pass arm expiry timers for nodes in its store, so with one store each would expire the other's nodes, by the wrong rules and with the wrong signing key; and SRP allows one KEY per name, while RFC 9664 allows several. `cmd/sig0lease` (`checkSeparateLeaseStores`) refuses to start, before any `Setup`, when the two handlers' `storage.path` name one file, also through a symlink, a hard link or a different letter case once the file exists. A Go program embedding the handlers and passing one `lease_manager` object to both is not checked.
-- **Limits.** The table is in memory, so nothing here makes several proxy processes sharing state safe; SRP's FCFS prerequisites are the only protection across processes. The deadline can cut an upstream UPDATE short: if the authoritative server applied it but its reply did not arrive in time, the request answers `SERVFAIL` and applies nothing locally, as for any upstream timeout.
+- **Limits.** The table is in memory, so nothing here makes several proxy processes sharing state safe; the FCFS prerequisites, SRP's and this handler's with `fcfs_naming`, are the only protection across processes. The deadline can cut an upstream UPDATE short: if the authoritative server applied it but its reply did not arrive in time, the request answers `SERVFAIL` and applies nothing locally, as for any upstream timeout.
 - **Tests.** `pkg/lease/nodelock_test.go` covers the table: mutual exclusion, all or none, waiting and the deadline, re-reading a subtree that grew while waiting, releasing twice. `handlers/node_locks_test.go` holds one operation inside its upstream send while a second runs against the same nodes: two signers registering one TXT get one `NOERROR` and one duplicate `REFUSED`, with one UPDATE sent; a Case C delete during a registration under its KEY cascades into the new record; an expiry while a request holds its node sends nothing and re-arms its timer. Each fails with the locks disabled.
 
 ### Lease Clamping, TTLs and Response Echo
 
-Before forwarding, the proxy clamps LEASE and KEY-LEASE to `LeasePolicy` bounds (`min_key_lease_sec`/`max_key_lease_sec`/`min_rr_lease_sec`/`max_rr_lease_sec`). Both handlers parse and clamp with the same code (`handlers/lease_policy.go`), and the proxy refuses to start with a policy whose non-KEY bounds are looser than its KEY bounds (`min_rr_lease_sec` above `min_key_lease_sec`, or `max_rr_lease_sec` unset or above a set `max_key_lease_sec`): clamping the two values separately would then grant a LEASE longer than the KEY-LEASE. The *actual* durations used after clamping — not the client's originally-requested values — are echoed back to the client in the response's UPDATE-LEASE option, so the client can detect when the proxy granted less than what was requested. Both handlers build that response with `handlers.leaseResponse`: it copies none of the request's sections (RFC 2136 §3.8) and carries exactly one OPT RR (RFC 6891 §6.1.1). Copying the request's header used to add a second OPT RR beside the one holding the lease, which strict parsers such as mDNSResponder's `srp-client` reject. `client.EffectiveLeaseDuration(resp, requestedLease, requestedKeyLease)` returns both the effective LEASE and KEY-LEASE from a response.
+Before forwarding, the proxy clamps LEASE and KEY-LEASE to `LeasePolicy` bounds (`min_key_lease_sec`/`max_key_lease_sec`/`min_rr_lease_sec`/`max_rr_lease_sec`): a duration below its minimum is raised to it and one above its maximum cut to it, and 0, a delete, is left alone. Both handlers parse and clamp with the same code (`handlers/lease_policy.go`), so neither refuses a request for its duration; the proxy refuses to start with a policy whose non-KEY bounds are looser than its KEY bounds (`min_rr_lease_sec` above `min_key_lease_sec`, or `max_rr_lease_sec` unset or above a set `max_key_lease_sec`): clamping the two values separately would then grant a LEASE longer than the KEY-LEASE. The *actual* durations used after clamping — not the client's originally-requested values — are echoed back to the client in the response's UPDATE-LEASE option, so the client can detect when the proxy granted less than what was requested. Both handlers build that response with `handlers.leaseResponse`: it copies none of the request's sections (RFC 2136 §3.8) and carries exactly one OPT RR (RFC 6891 §6.1.1). Copying the request's header used to add a second OPT RR beside the one holding the lease, which strict parsers such as mDNSResponder's `srp-client` reject. `client.EffectiveLeaseDuration(resp, requestedLease, requestedKeyLease)` returns both the effective LEASE and KEY-LEASE from a response.
 
 This handler's status notes (for example `record not found for delete: ...`) travel in that same OPT RR, one Extended DNS Error option (RFC 8914, INFO-CODE 0 "Other") per note, with the note as EXTRA-TEXT; `dnsmsg.EDEs(resp)` returns them and `sig0lease-client` prints them under "Extended DNS Errors", as it does an error reply's (see "Error Replies" below). They used to be TXT records in the answer slot, next to an echo of the KEY RRs processed, but in an UPDATE reply that slot is the Prerequisite section, which a reply may only copy from the request. The KEY echo is gone; to see a registered KEY, query it (`sig0lease-client verify`) or `dig` it at the authoritative server.
 
@@ -328,7 +347,7 @@ Every error reply either handler sends, like a success reply, copies none of the
 
 | INFO-CODE | Refusals |
 |---|---|
-| 18 Prohibited | an unauthorized or unproven signer, records outside its subtree, a name or record held by another key (RFC 9664 `REFUSED`, SRP `YXDOMAIN`), a lease below the minimum, a blacklisted type, foreign data at an SRP name |
+| 18 Prohibited | an unauthorized or unproven signer, records outside its subtree, a record held by another key (`REFUSED`), a name held by another key (`YXDOMAIN`: SRP's FCFS, this handler's `fcfs_naming`), a name outside the handler's zone or in another handler's (`REFUSED`), a KEY registering itself other than one label below the zone with `fcfs_naming` (`REFUSED`), a blacklisted type, foreign data at an SRP name |
 | 21 Not Supported | a "." in a label, the 4-byte variant while `prefer_4byte_variant` is off, UDP while SRP's `allow_udp` is off |
 | 22 No Reachable Authority | the authoritative server could not be queried or did not accept the UPDATE (`SERVFAIL`); also a query the proxy could not forward |
 | 0 Other | anything else: a malformed request, a busy lease store, an internal error |
@@ -361,18 +380,20 @@ Two backends are selectable via `handlers.update.storage` in `config.yaml` (see 
 ### Reference to Source Files
 
 - `handlers/opcode5_handle.go` — `Handle()`, the full case dispatch, `buildSuccessResponse`.
-- `handlers/lease_handler.go` — `leaseHandler`, the part both handlers are made of alike: the handler basics, the `leaseRuntime`, the configuration both read the same way (`setup`: upstream zone, keystore and signing key, coordinator, lease policy, record TTL, lease store), `Start`, which arms the timers of the leases `setup` loaded and starts the reconciliation pass, and `upstream`, where both send their UPDATEs. Each handler's `Setup` reads only its own options and then calls `setup`.
+- `handlers/lease_handler.go` — `leaseHandler`, the part both handlers are made of alike: the handler basics, the `leaseRuntime`, the configuration both read the same way (`setup`: upstream zone, keystore and signing key, coordinator, lease policy, record TTL, lease store), `Start`, which arms the timers of the leases `setup` loaded and starts the reconciliation pass, `upstream`, where both send their UPDATEs, `SeparateZones` and `refuseNamesNotServed` ("Zones Served"), and `fcfsConflictResult`, the `YXDOMAIN` reply both handlers' FCFS checks send. Each handler's `Setup` reads only its own options and then calls `setup`.
 - `handlers/lease_runtime.go` — `leaseRuntime`, which `leaseHandler` embeds: the lease store, expiry timers and node locks, `scheduleLeaseExpiry`, the timer callback, the 30-second reconciliation pass, and `Shutdown`. Each handler supplies only how its lease event runs and what its pass adds (SRP's service enumeration).
 - `handlers/opcode5_lease.go` — lease-store read/write helpers, `authorizeKeyRefresh`, and the expiry machinery shared with `SRPHandler`: `leaseExpirer`, `subtreeLeases`, `expiryTimers`, `expiryRetryDelay`, `nextLeaseEvent`.
 - `handlers/handlers.go` — `upstreamTarget.send`, through which both handlers send every UPDATE; `LeaseStoreFromConfig`.
-- `handlers/opcode5_update_helpers.go` — SIG(0) resolution (`extractAndValidateSig0`), upstream message construction, duplicate-registration checks.
+- `handlers/opcode5_update_helpers.go` — SIG(0) resolution (`extractAndValidateSig0`), upstream message construction, duplicate-registration checks, `fcfs_naming` (`refuseNewKey`, `fcfsNewKey`).
 - `handlers/opcode5_lease_option.go` — UPDATE-LEASE option parsing and request-side policy validation.
-- `handlers/opcode5_setup.go` — `Setup()`: this handler's own options (`prefer_4byte_variant`, `allow_online_key_registration`, `blacklisted_types`), then `leaseHandler.setup`. The storage-backend selection that `setup` shares with `cmd/sig0lease` is `LeaseStoreFromConfig` in `handlers/handlers.go`.
+- `handlers/opcode5_setup.go` — `Setup()`: this handler's own options (`prefer_4byte_variant`, `allow_online_key_registration`, `fcfs_naming`, `blacklisted_types`), then `leaseHandler.setup`. The storage-backend selection that `setup` shares with `cmd/sig0lease` is `LeaseStoreFromConfig` in `handlers/handlers.go`.
 - `pkg/lease/state.go` — the unified `LeaseStorage` interface and `InMemoryLeaseStore`, the tree-structured in-memory implementation.
 - `pkg/lease/file_store.go` — `FileLeaseStore`, the periodic/shutdown-flush JSON-snapshot-backed implementation.
 - `pkg/lease/nodelock.go` — `NodeLocks`, the lock table both handlers use so that operations on the same lease-store nodes never interleave ("Node Locks").
 - `pkg/lease/lease.go` — `LeaseOption` encode/decode and the shared `FindOption`/`DecodeOption`/`FindAndDecode` helpers.
 - `client/lease_response.go` — client-side decoding of the server's granted LEASE/KEY-LEASE.
+- `client/rfc9664/client.go` — the library requester: `Register` (Case A), `Withdraw` (Case D with the records listed), `Deregister` (Case D keeping the name, Case C freeing it) and `Run`, which keeps the name registered on the lease clock (`client/lifecycle.go`). A `YXDOMAIN` (`fcfs_naming`: another key holds the name) is an error `Run` tries again with backoff; it never renames.
+- `client/rfc9664/name.go` — `Name`, one name kept registered as its records change, on `client.Keeper` (`client/keeper.go`, which `client/srp`'s `Host` uses too): it withdraws the records it no longer has, those an earlier run's `NameStore` kept included, before registering the rest. `Release` frees a name that is not running. `sig0lease-agent` registers its `names:` with it (`docs/sig0lease-agent.md`).
 
 ## Configuration
 
@@ -382,9 +403,11 @@ Two backends are selectable via `handlers.update.storage` in `config.yaml` (see 
 - `server.request_timeout` (default 15s, must be positive): how long the handlers may work on one request, including waiting for a lease-store node another request is using (see "Node Locks");
 - `server.diagnostics` (default `false`; keep it off in production): with it on, error replies carry the reason as their Extended DNS Error's text (see "Error Replies"), and the proxy answers the lease-store dump query, `__dump.sig0lease.internal.` TXT for a summary or `__dump.sig0lease.internal.debug.` TXT for every record (`dig @<proxy> -p <port> __dump.sig0lease.internal. TXT`). With it off, error replies carry only the code, and the dump query is answered `REFUSED` with Extended DNS Error 18 (Prohibited). The test suites turn it on in the configs they write;
 - default upstream resolvers;
-- handler-specific settings such as the upstream zone, an optional static `upstream` server for it, keystore directory, lease policy bounds, blacklisted RR types, `allow_online_key_registration`, and the lease storage backend (`storage.type: memory|file`, see "Storage Backends and Expiry" above) for the update handler;
+- handler-specific settings such as the upstream zone, an optional static `upstream` server for it, keystore directory, lease policy bounds, blacklisted RR types, `allow_online_key_registration`, `fcfs_naming` (see "First-Come First-Served Naming"), and the lease storage backend (`storage.type: memory|file`, see "Storage Backends and Expiry" above) for the update handler;
 - opcode-to-module routing (an ordered list per opcode — see `docs/siglease_rfc9665.md` §3 for
-  how SRP's handler fits into the same list);
+  how SRP's handler fits into the same list). Each handler serves its own zone, and the deepest
+  zone wins where they nest; two handlers on one zone stop the proxy at startup (see "Zones
+  Served");
 - `authoritative.max_inflight_updates` (default 1, `0` for no limit): how many UPDATEs the proxy
   has in flight to one authoritative server at a time, across all handlers. Every forwarded
   UPDATE is SIG(0)-signed, and BIND 9.20 refuses SIG(0) requests beyond its `sig0checks-quota`
@@ -444,7 +467,9 @@ through `_dnssd-srp-tls._tcp` and registers over DoT.
 
 - `cmd/sig0lease/` - proxy entrypoint
 - `cmd/sig0lease-client/` - client entrypoint (RFC 9664 lease flow)
-- `client/` - the RFC 9664 client library
+- `client/` - what the RFC 9664 and SRP requesters share (granted leases, transports, refresh
+  clock, `Keeper`); `client/rfc9664` is the RFC 9664 library requester, `client/srp` the SRP
+  one, `client/agent` the template agent on both
 - `config/` - YAML config loading and validation
 - `forward/` - upstream forwarding logic
 - `handlers/` - opcode handlers and result types, including `srp_handler.go` (the RFC 9665
@@ -471,6 +496,7 @@ CLIENT_KEYSTORE_DIR=${PWD}/keystore/client make test-unit
 CLIENT_KEYSTORE_DIR=${PWD}/keystore/client make test-update   # RFC 9664 lease flow, live against a real BIND 9
 make test-update-local                                         # same RFC 9664 suite against a disposable local BIND 9
 make test-srp                                                  # RFC 9665 SRP flow, see docs/siglease_rfc9665.md
+make test-agent                                                # sig0lease-agent, see docs/sig0lease-agent.md
 make test-mdnsresponder-interop                                 # RFC 9665 SRP interop, see docs/siglease_rfc9665.md
 make build
 ```
@@ -575,6 +601,32 @@ Then work through these steps in order. **Do steps 1 and 2 before step 5**: both
    - Update the cases that spell a dotted label the way today's library presents it, unescaped: `TestCheckLabel` in [pkg/dnsname/labels_test.go](../pkg/dnsname/labels_test.go), and the "dot in the instance label" case of `TestServiceTypeFromInstanceName` in [pkg/dnssd/enumeration_test.go](../pkg/dnssd/enumeration_test.go).
    - Add tests for steps 1 and 2 with an escaped dot.
 7. **Docs**: rewrite this section and the one above, drop item 7 from "Applied Compatibility Patches" below, and delete [miekg-dns-escaped-names.patch](miekg-dns-escaped-names.patch).
+
+### The library does not build for WebAssembly
+
+`server.go` calls `srv.listenUDP`, which only `server_recvmmsg.go` (build tag `unix`) and `server_no_recvmmsg.go` (`windows`) define. On any other platform the package does not compile, `GOOS=js GOARCH=wasm` (a browser) and `GOOS=wasip1 GOARCH=wasm` included:
+
+`./server.go:180:7: srv.listenUDP undefined (type *Server has no field or method listenUDP)`
+
+Every package of ours imports the library, so none of them builds for WebAssembly either, although a client never starts a server. This is still the case in v0.6.117.
+
+### Proposed handling
+
+- [miekg-dns-wasm-build.patch](miekg-dns-wasm-build.patch) is a proposed upstream fix, against v0.6.117; it also applies to v0.6.82. It is not applied here. It changes the build tag of `server_no_recvmmsg.go` from `windows` to `!unix`: that file reads one message at a time through `net.PacketConn` and needs nothing from Windows. Builds for unix do not change.
+- With it, `pkg/...`, `client` and `client/srp` build for `js/wasm` and `wasip1/wasm`. A small program that registers through `client/srp` is 10.5 MB, 2.6 MB gzipped.
+- Until a release carries it, build for WebAssembly against a patched copy of the library. From `main/`, leaving `go.mod` and `go.sum` as they are:
+
+```sh
+V=$(go list -m -f '{{.Version}}' codeberg.org/miekg/dns)
+W=$(mktemp -d)
+cp -r "$(go env GOMODCACHE)/codeberg.org/miekg/dns@$V" "$W/dns" && chmod -R u+w "$W/dns"
+git -C "$W/dns" apply "$PWD/docs/miekg-dns-wasm-build.patch"
+cp go.mod go.sum "$W/"
+go mod edit -modfile="$W/go.mod" -replace codeberg.org/miekg/dns="$W/dns"
+GOOS=js GOARCH=wasm go build -modfile="$W/go.mod" ./client/srp ./client ./pkg/...
+```
+
+- Once `go.mod` requires a release with the change, delete this section and the patch.
 
 ## Applied Compatibility Patches
 

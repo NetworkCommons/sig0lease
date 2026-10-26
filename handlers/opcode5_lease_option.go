@@ -65,21 +65,6 @@ func requestedLeases(lo *leasepkg.LeaseOption, hasKeyRRs, hasOtherRRs bool) (lea
 	return lease, keyLease
 }
 
-// checkLeaseMinimums refuses a requested LEASE or KEY-LEASE below the lease_policy minimum
-// (min_rr_lease_sec, min_key_lease_sec; a 0 minimum enforces none). A duration of 0 is never
-// below it: it means delete (Cases B-D), not the shortest duration. This runs before
-// LeasePolicy.clamp, which would otherwise raise such a request to the minimum.
-func (h *UpdateHandler) checkLeaseMinimums(lease, keyLease uint32) error {
-	p := h.LeasePolicy
-	if lease != 0 && p.MinRRLease > 0 && lease < p.MinRRLease {
-		return fmt.Errorf("lease duration %d below minimum %d", lease, p.MinRRLease)
-	}
-	if keyLease != 0 && p.MinKeyLease > 0 && keyLease < p.MinKeyLease {
-		return fmt.Errorf("key-lease duration %d below minimum %d", keyLease, p.MinKeyLease)
-	}
-	return nil
-}
-
 // grantedLeaseOption is the Update Lease option of the success reply: the granted LEASE and
 // KEY-LEASE in the variant the request used (RFC 9664 S4). For a 4-byte request its one value
 // is whichever of the two is set -- Handle makes them equal when both are -- or 0 for a delete.

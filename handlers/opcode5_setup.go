@@ -15,6 +15,11 @@ import (
 //     REFUSED otherwise [OPTIONAL, defaults to false]
 //   - "allow_online_key_registration": Allow a signer resolved only via authoritative DNS
 //     (not lease-managed, not present in the request) to register new KEY RRs [OPTIONAL, defaults to false]
+//   - "fcfs_naming": First-Come First-Served naming, as RFC 9665 S3.2.4.1 gives SRP: a KEY
+//     holds its name and the names below it, so a new KEY is refused (YXDOMAIN) where a
+//     different KEY holds its name or a name above it in the zone, unless that KEY's holder
+//     registers it, and a KEY registers itself only one label below the zone (REFUSED
+//     elsewhere) [OPTIONAL, defaults to false]
 //   - "blacklisted_types": RR type names this handler refuses to register [OPTIONAL]
 func (h *UpdateHandler) Setup(cfg map[string]any) error {
 	var err error
@@ -26,6 +31,11 @@ func (h *UpdateHandler) Setup(cfg map[string]any) error {
 	// Whether a signer resolved only via authoritative DNS may register new KEY RRs.
 	// Default: false (fail closed).
 	if h.AllowOnlineKeyRegistration, err = boolOption(cfg, "allow_online_key_registration", false); err != nil {
+		return err
+	}
+
+	// Whether a KEY holds its name and the names below it against other keys. Default: false.
+	if h.fcfsNaming, err = boolOption(cfg, "fcfs_naming", false); err != nil {
 		return err
 	}
 

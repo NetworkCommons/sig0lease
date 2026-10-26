@@ -10,6 +10,7 @@ import (
 	"codeberg.org/miekg/dns"
 	"github.com/NetworkCommons/sig0lease/pkg/dnsname"
 	"github.com/NetworkCommons/sig0lease/pkg/sig0"
+	"github.com/NetworkCommons/sig0lease/pkg/srp"
 )
 
 // summarizeRRTypes builds a compact, deterministic "TYPE:count" summary of
@@ -400,6 +401,81 @@ func (h *UpdateHandler) refuseAuthoritativeDuplicate(ctx context.Context, zoneHi
 		return fmt.Errorf("duplicate registration rejected: authoritative RR already exists for %s", rr.String())
 	}
 	return nil
+}
+
+// refuseNewKey runs the checks a KEY the request registers anew (Case A or D) must pass: no
+// identical KEY already published (refuseAuthoritativeDuplicate), and, with fcfs_naming, a
+// self-registration one label below the zone and no other key holding its name (fcfsNewKey).
+// It returns the prerequisites the upstream UPDATE must carry, or the reply refusing the
+// request.
+//
+// A KEY registers itself only one label below the zone so that every name deeper down is
+// registered by the key holding the name above it, and goes when that key goes (its subtree's
+// cascade). A KEY registering itself deeper could have a free name above it, and a newcomer
+// taking that name would be a signer above it (validateSignerHierarchyForUpdateRecords), able
+// to write records at its names. Checking below the newcomer cannot stop that: no DNS query
+// lists the names below a name.
+func (h *UpdateHandler) refuseNewKey(ctx context.Context, r *dns.Msg, zoneHint string, keyRR *dns.KEY, signerID keyID, signerName string) ([]dns.RR, *HandlerResult) {
+	if err := h.refuseAuthoritativeDuplicate(ctx, zoneHint, keyRR); err != nil {
+		return nil, refusalResult(r, "duplicate registration rejected", err)
+	}
+	if !h.fcfsNaming {
+		return nil, nil
+	}
+	// The name keyRR's holder already holds: the zone's apex, the operator's, for a KEY
+	// registering itself, else its signer's name.
+	top := signerName
+	if keyIDFromKEY(keyRR) == signerID {
+		if _, parent, _ := dnsname.CutFirstLabel(keyRR.Hdr.Name); dnsname.Normalize(parent) != dnsname.Normalize(h.upstreamZone) {
+			err := fmt.Errorf("KEY %s registers itself, which fcfs_naming allows only one label below zone %s: a deeper name is registered by the key holding the name above it", keyRR.Hdr.Name, h.upstreamZone)
+			return nil, refusalResult(r, "FCFS self-registration below the zone's first level", err)
+		}
+		top = h.upstreamZone
+	}
+	prereqs, heldAt, err := h.fcfsNewKey(ctx, zoneHint, keyRR, top)
+	if err != nil {
+		return nil, refusalResult(r, "FCFS evaluation failed", err)
+	}
+	if heldAt != "" {
+		h.logger.Infof("FCFS conflict for KEY %s: %s is held by a different key", keyRR.Hdr.Name, heldAt)
+		return nil, fcfsConflictResult(r, fmt.Sprintf("FCFS conflict for %s at %s", keyRR.Hdr.Name, heldAt))
+	}
+	return prereqs, nil
+}
+
+// fcfsNewKey is fcfs_naming for keyRR, a KEY registered anew: RFC 9665's FCFS Naming
+// (S3.2.4.1), widened from a name to the names below it, since an RFC 9664 key writes records
+// at and below its own name (validateSignerHierarchyForUpdateRecords). keyRR is refused --
+// heldAt names where -- when a different key holds its name or a name above it, up to but not
+// including top, the name its holder holds. Each name is checked as SRP checks its own
+// (srp.Evaluate), and returns the prerequisite that has the authoritative server check it
+// again when it applies the UPDATE.
+func (h *UpdateHandler) fcfsNewKey(ctx context.Context, zoneHint string, keyRR *dns.KEY, top string) (prereqs []dns.RR, heldAt string, err error) {
+	// refuseNamesNotServed keeps every name inside the zone, refuseNewKey a KEY registering
+	// itself one label below the apex, and validateSignerHierarchyForUpdateRecords every KEY at
+	// or below its signer.
+	if !dnsname.IsAtOrBelow(keyRR.Hdr.Name, top) {
+		panic(fmt.Sprintf("fcfs_naming: KEY %s is not at or below %s", keyRR.Hdr.Name, top))
+	}
+	view := leaseStoreView{store: h.leaseManager}
+	for name := keyRR.Hdr.Name; dnsname.IsAtOrBelow(name, top) && dnsname.Normalize(name) != dnsname.Normalize(top); {
+		result, prereq, err := srp.Evaluate(ctx, view, h.upstreamCoordinator.QueryKeyAtName, zoneHint, name, keyRR, false)
+		if err != nil {
+			return nil, "", &authoritativeLookupError{err: fmt.Errorf("FCFS evaluation failed: %w", err)}
+		}
+		switch result {
+		case srp.FCFSProceed:
+			if prereq != nil {
+				prereqs = append(prereqs, prereq)
+			}
+		case srp.FCFSConflict:
+			return nil, name, nil
+		default:
+			panic(fmt.Sprintf("fcfs_naming: srp.Evaluate returned %s for %s, which it cannot without refuse_on_foreign_data", result, name))
+		}
+		_, name, _ = dnsname.CutFirstLabel(name)
+	}
+	return prereqs, "", nil
 }
 
 func (h *UpdateHandler) authoritativeHasKeyAtName(ctx context.Context, zoneHint string, fqdn string) (bool, error) {

@@ -6,18 +6,34 @@ Package client provides DNS query functionality for testing and client use.
 
 FUNCTIONS
 
+func DescribeAnswer(resp *dns.Msg, outcome Outcome) string
+    DescribeAnswer describes a registrar's answer for an error: its outcome,
+    RCODE and EDEs.
+
 func EffectiveLeaseDuration(resp *dns.Msg, requestedLease, requestedKeyLease uint32) (lease uint32, keyLease uint32)
     EffectiveLeaseDuration returns the LEASE and KEY-LEASE durations the client
-    should use for expiry calculations. If the server response contains an
-    UPDATE-LEASE option, those (possibly clamped) values are authoritative — the
-    proxy applies its own LeasePolicy bounds and may grant less than what was
-    requested for either value independently. Otherwise the originally-requested
-    values are used. For the 4-byte variant (a single shared value), that value
-    is used for both.
+    should use for expiry calculations: what resp grants (GrantedLease), or,
+    if it carries no Update-Lease option, what was requested.
 
 func ExpiryFromResponse(now time.Time, requestedLease, requestedKeyLease uint32, resp *dns.Msg) (dataExpiry, keyExpiry time.Time)
     ExpiryFromResponse computes the data-record and KEY expiration times using
     the server-granted LEASE and KEY-LEASE when present in the response.
+
+func GrantedLease(resp *dns.Msg) (lease, keyLease uint32, ok bool)
+    GrantedLease reads the LEASE/KEY-LEASE the registrar actually granted off
+    a successful response's echoed Update-Lease option -- which may differ from
+    what was requested (the registrar's own LeasePolicy can clamp either value
+    independently). For the 4-byte variant (a single shared value), that value
+    is both. ok is false if resp carries no (decodable) Update-Lease option,
+    in which case the requester should fall back to what it requested.
+
+func Report(logf func(format string, args ...any), action, done string, outcome Outcome, err error) bool
+    Report logs to logf how action went, done if it succeeded, and reports
+    whether it did.
+
+func SleepContext(ctx context.Context, d time.Duration) error
+    SleepContext is context.Context.Done()-aware time.Sleep: it returns
+    ctx.Err() if ctx is canceled before d elapses, nil once d elapses normally.
 
 
 TYPES
@@ -34,6 +50,405 @@ func New(server string, protocol string, timeout time.Duration) *Client
 
 func (c *Client) Query(msg *dns.Msg) (*dns.Msg, error)
     Query sends a DNS query and returns the response.
+
+type Keeper[S any] struct {
+	// Has unexported fields.
+}
+    Keeper keeps one registration current as what it should register changes:
+    it takes the states Set gives it, collects further ones until none comes
+    for Settle, stops keeping the previous registration, and moves to the latest
+    (Moves.To); Stop stops keeping it and leaves (Moves.Leave).
+
+func StartKeeper[S any](cfg KeeperConfig, moves Moves[S]) *Keeper[S]
+    StartKeeper starts a Keeper. cfg must have its defaults
+    (KeeperConfig.Defaults). It does nothing until the first Set.
+
+func (k *Keeper[S]) Set(s S)
+    Set replaces what should be registered with s, replacing any earlier Set the
+    Keeper has not taken yet. It never blocks. Set must not be called from more
+    than one goroutine at a time.
+
+func (k *Keeper[S]) Stop()
+    Stop starts stopping the Keeper: it stops keeping the registration and
+    leaves (Moves.Leave); Wait waits for it to finish. It may be called more
+    than once.
+
+func (k *Keeper[S]) Wait()
+    Wait returns once the Keeper has stopped (Stop).
+
+type KeeperConfig struct {
+	// Settle is how long changes are collected before the registration is sent again; default 1s.
+	Settle time.Duration
+	// StopTimeout bounds each withdrawal or deregistration sent outside the refresh clock;
+	// default 10s.
+	StopTimeout time.Duration
+	// KeepNames makes deregistering, on Stop or when nothing is left to register, keep the
+	// names reserved for the key until the KEY-LEASE ends, so that it gets them back when it
+	// returns. Without it the names are freed.
+	KeepNames bool
+	// Logf receives the log lines, each starting with the name kept. Default: none.
+	Logf func(format string, args ...any)
+	// OnFatal is called, at most once, with an error no later change can cure: a client
+	// configuration the protocol's NewClient refuses. Nothing more is registered until Stop.
+	OnFatal func(error)
+}
+    KeeperConfig configures how one registration is kept as what it should
+    register changes: client/srp's Host and client/rfc9664's Name.
+
+func (cfg *KeeperConfig) Defaults()
+    Defaults applies the defaults of the fields left zero.
+
+type Lifecycle struct {
+	// RequestedLease is the refresh clock's lease when a response grants none (GrantedLease).
+	RequestedLease uint32
+	// Rng jitters the delays; it must not be shared across goroutines (see refreshDelay).
+	Rng *rand.Rand
+	// Sleep waits d, or until ctx ends (SleepContext).
+	Sleep func(ctx context.Context, d time.Duration) error
+	// OnError, if set, is called with every error a registration cycle hits. Run itself never
+	// stops because of one, so this is the caller's only hook for surfacing those failures as
+	// they happen.
+	OnError func(error)
+	// OnRegistered, if set, is called with the registrar's response after every successful
+	// registration cycle, the first and each refresh alike: Run's success-path counterpart to
+	// OnError.
+	OnRegistered func(resp *dns.Msg)
+}
+    Lifecycle is what keeps a requester's registration alive (Run): the lease it
+    asks for, and how it waits and reports.
+
+func (l Lifecycle) Run(ctx context.Context, register func(context.Context) (*dns.Msg, error)) error
+    Run keeps a registration alive: an initial 0-3s random delay, then register,
+    then a sleep for the RFC 9664 S5.2 refresh clock (80% of the granted lease
+    + 0-5% jitter), and register again -- restating the full registration every
+    time, as RFC 9665 S3.2 has SRP do ("no lightweight refresh") and RFC 9664
+    S5.2 has a refresh do. It blocks until ctx is canceled (Sleep returning
+    ctx.Err()), the only thing that stops it.
+
+    A failed registration -- a transient network/DNS error, a registrar
+    rejection, a name another key holds -- does not stop Run: OnError is
+    called with the error, and register is tried again after an exponentially
+    increasing backoff (minRegisterRetryBackoff up to maxRegisterRetryBackoff),
+    reset to the minimum after any success. A single transient blip during a
+    routine refresh -- one UDP timeout, one SERVFAIL -- must not permanently
+    stop a long-running daemon's registration.
+
+type Moves[S any] struct {
+	// To moves to next, from what the previous call registered: it sends whatever withdraws
+	// what next lacks, and returns the registration to keep (run until its ctx ends), nil for
+	// none. An error is one no later state can cure: the Keeper reports it to OnFatal and
+	// waits to be stopped.
+	To func(next S) (keep func(context.Context), err error)
+	// Kept, if set, is called once a registration To returned has stopped, before the next
+	// To or Leave.
+	Kept func()
+	// Leave deregisters what To registered, as the Keeper stops. Its error goes to OnFatal.
+	Leave func() error
+}
+    Moves are what a Keeper does, each called from its goroutine alone.
+
+type Network int
+    Network is how a requester reaches its registrar: an SRP registrar
+    (client/srp) or this proxy's RFC 9664 handler (client/rfc9664).
+
+const (
+	// NetworkTCP, the default, is plain DNS over TCP, which RFC 9665 S3.5 requires on
+	// networks that are not constrained.
+	NetworkTCP Network = iota
+	// NetworkTLS is DNS-over-TLS (RFC 7858). The registrar's certificate is not checked:
+	// RFC 9665 S7 has no way to share the registrar's key, so TLS gives Opportunistic
+	// Privacy only (RFC 7858 S4.1). SRP discovery then looks for the "_dnssd-srp-tls._tcp"
+	// SRV record instead of "_dnssd-srp._tcp" (client/srp.DiscoveryService), and nothing
+	// falls back to plain TCP (S7: a requester able to use TLS SHOULD NOT).
+	NetworkTLS
+	// NetworkUDP is for constrained networks (RFC 9665 S3.1.2): a registrar accepts it only
+	// where it allows UDP.
+	NetworkUDP
+)
+func ParseNetwork(s string) (Network, error)
+    ParseNetwork returns the Network whose String is s: "tcp", "udp" or "tls".
+
+func (n Network) MarshalText() ([]byte, error)
+    MarshalText and UnmarshalText write and read n as its String, as in a JSON
+    document.
+
+func (n Network) String() string
+    String returns the protocol name New takes for n.
+
+func (n *Network) UnmarshalText(b []byte) (err error)
+
+func (n Network) Validate() error
+    Validate reports whether n is one of the Networks above.
+
+type Outcome int
+    Outcome classifies a registrar's response to an UPDATE, from the requester's
+    side: an SRP registrar's (client/srp, RFC 9665) or this proxy's RFC 9664
+    handler's (client/rfc9664).
+
+const (
+	// OutcomeSuccess: NOERROR. The registration was accepted; GrantedLease reads the
+	// granted LEASE/KEY-LEASE off the same response.
+	OutcomeSuccess Outcome = iota
+	// OutcomeConflict: YXDOMAIN, a First-Come First-Served conflict (RFC 9665 S3.3.3, and
+	// the RFC 9664 handler's fcfs_naming): a different key already holds one of the names in
+	// the update. An SRP requester renames and retries (client/srp); an RFC 9664 one, whose
+	// names are typed and linked, waits for the name to be freed (client/rfc9664).
+	OutcomeConflict
+	// OutcomeRefused: REFUSED. Covers every registrar-side rejection that isn't a naming
+	// conflict -- SIG(0) failure, foreign non-SRP data present (refuse_on_foreign_data),
+	// malformed update, TCP-required-but-got-UDP, and so on. The RCODE alone doesn't tell
+	// the requester which; retrying the identical request is unlikely to help.
+	OutcomeRefused
+	// OutcomeServerFailure: SERVFAIL, or no response at all (nil resp).
+	OutcomeServerFailure
+	// OutcomeOther: any other RCODE.
+	OutcomeOther
+)
+func InterpretResponse(resp *dns.Msg) Outcome
+    InterpretResponse classifies resp's RCODE for a requester. A nil resp
+    (e.g. a transport error before any response arrived) is treated as
+    OutcomeServerFailure.
+
+func (o Outcome) String() string
+
+type Transport func(ctx context.Context, addr string, network Network, msg *dns.Msg) (*dns.Msg, error)
+    Transport sends a signed UPDATE to addr over network and returns the
+    response. Requesters default to LiveTransport; tests inject a fake.
+
+func LiveTransport(timeout time.Duration) Transport
+    LiveTransport sends msg to addr over network with this package's Client,
+    the same transport every other client and test tool in this codebase uses.
+
+```
+
+## github.com/NetworkCommons/sig0lease/client/agent
+```
+package agent // import "github.com/NetworkCommons/sig0lease/client/agent"
+
+Package agent is sig0lease-agent: one long-running client per machine that keeps
+what a template (YAML) describes registered: hosts and their services through
+SRP registrars (RFC 9665), and names and their records through this project's
+proxy (RFC 9664).
+
+A template lists its registrars, each with a protocol. An srp one holds hosts --
+each one SRP identity with its own key -- and each host's services. A service
+is an instance of a service type: a built-in preset ("ssh", "http", ...), or a
+type the template defines with the same fields. A service whose probe fails is
+withdrawn and registered again once it passes. Complex types are code, not data:
+a template uses them but cannot define them; "mdns", under an srp registrar's
+mirrors:, mirrors what a running mDNSResponder sees (client/mdnsbridge).
+An rfc9664 one holds names, each with its own key, its addresses and its records
+(client/rfc9664). See docs/sig0lease-agent.md.
+
+CONSTANTS
+
+const StateFile = "sig0lease-agent-state.json"
+    StateFile is the agent's state, in the keystore: every host it registered,
+    mirrored ones included, by requested host name, while its names may be held
+    for its key or it was renamed, and every name, while it may be held or has
+    records registered. With it the agent frees the names of hosts and names
+    the template no longer registers, even after a restart (agent.release),
+    a renamed host keeps its new names, and a name's records the template no
+    longer has are withdrawn.
+
+
+FUNCTIONS
+
+func Describe(w io.Writer, plan *Plan, interfaces func() ([]netip.Addr, error), logger *logging.Logger) error
+    Describe writes what Run would register for plan. It reads, and changes
+    nothing: this machine's addresses for auto (interfaces, InterfaceAddresses
+    if nil), the keys the keystore holds, and in StateFile the names hosts
+    were renamed to, and the hosts and names holding names that Run frees
+    (agent.release).
+
+func InterfaceAddresses() ([]netip.Addr, error)
+    InterfaceAddresses returns the addresses of every interface of this machine.
+
+func Run(ctx context.Context, path string, opts Options) error
+    Run keeps what the template at path describes registered until ctx ends,
+    then deregisters it all and returns ctx's error. It reads the template again
+    every PollInterval: a valid change is applied, an invalid one logged while
+    the agent keeps what it runs. Run returns early only for what it cannot go
+    on without: a first template that is invalid, a keystore it cannot use,
+    a state file edited by hand, a host or name its client refuses.
+
+
+TYPES
+
+type Host struct {
+	Name      string
+	Auto      bool         // this machine's addresses too, as they change
+	Addresses []netip.Addr // literal addresses
+	Services  []Service
+	Lifetime  // the registrar's, with what the host overrides
+}
+    Host is one SRP identity: a name, its addresses and its services.
+
+type Lifetime struct {
+	Lease     uint32 // seconds
+	KeyLease  uint32 // seconds
+	KeepNames bool   // on_stop: keep; release frees them (clientsrp.HostConfig.KeepNames)
+}
+    Lifetime is how long a host's registration lasts: its records, its key,
+    and whether its names outlive the agent stopping.
+
+func (l Lifetime) String() string
+
+type Mirror struct {
+	Type         string // "mdns"
+	Socket       string
+	Hosts        []string // mDNS hosts, as given
+	AllHosts     bool
+	ServiceTypes []string // empty: every type the daemon sees
+}
+    Mirror is a complex type that makes its own hosts.
+
+type Name struct {
+	Name      string       // the label
+	Auto      bool         // this machine's addresses too, as they change
+	Addresses []netip.Addr // literal addresses
+	Records   []dns.RR     // at or below the name, fully qualified; no address of the name
+	Lifetime               // the registrar's, with what the name overrides
+}
+    Name is one RFC 9664 name: a label right below its registrar's zone, held by
+    its own key, with its addresses and records.
+
+type Options struct {
+	// Logf receives the agent's log lines; a host's start with its label, a name's with the
+	// name. Default: none.
+	Logf func(format string, args ...any)
+	// Logger receives keyrec's warnings about the keystore; default logging.NewLogger("info").
+	Logger *logging.Logger
+	// PollInterval is how often the template and this machine's addresses are read again;
+	// default 10s.
+	PollInterval time.Duration
+	// A probed service is probed every ProbeInterval (default 30s), each attempt taking at
+	// most ProbeTimeout (5s) per address, and withdrawn after ProbeFailures (3) failures in a
+	// row. It is registered once a probe passes.
+	ProbeInterval time.Duration
+	ProbeTimeout  time.Duration
+	ProbeFailures int
+	// Settle and StopTimeout are each host's and name's (client.KeeperConfig).
+	Settle      time.Duration
+	StopTimeout time.Duration
+	// Interfaces returns this machine's addresses, for addresses: [auto]; default those of
+	// every interface. Only publishable ones are used (clientsrp.PublishableAddresses).
+	Interfaces func() ([]netip.Addr, error)
+	// Send, Query and Sleep are every SRP client's (clientsrp.Config), Send and Sleep every
+	// RFC 9664 client's too (rfc9664.Config); nil: the clients' own.
+	Send  baseclient.Transport
+	Query clientsrp.DNSQuery
+	Sleep func(context.Context, time.Duration) error
+	// MirrorSource is the daemon an mdns mirror asks, given its socket; default
+	// mdnsbridge.DaemonSource.
+	MirrorSource func(socket string) mdnsbridge.Source
+}
+    Options tune Run; a zero field takes its default.
+
+type Plan struct {
+	Keystore   string      // absolute: one key per host and name, and the agent's state file
+	Registrars []Registrar // in the template's order
+}
+    Plan is a valid template: everything the agent registers.
+
+func Load(path string) (*Plan, error)
+    Load reads and validates the template at path.
+
+func Parse(data []byte, path string) (*Plan, error)
+    Parse validates data, the template read from path; a relative keystore is
+    relative to path's directory, and with none CLIENT_KEYSTORE_DIR is used
+    (keyrec.KeystoreDir).
+
+func (p *Plan) Mirror(t string) (Registrar, Mirror, bool)
+    Mirror returns the template's mirror of type t, and the registrar it
+    registers through.
+
+type Probe struct {
+	Kind ProbeKind
+	Path string // ProbeHTTP's path
+}
+    Probe checks that a service answers, at one of its host's addresses and its
+    port.
+
+func (p Probe) String() string
+
+type ProbeKind int
+    ProbeKind is how a service is checked.
+
+const (
+	ProbeNone ProbeKind = iota // never checked: always registered
+	ProbeTCP                   // a TCP connection to the port succeeds
+	ProbeHTTP                  // an HTTP GET of Path answers 2xx or 3xx
+)
+type Protocol string
+    Protocol is what a registrar is registered with.
+
+const (
+	SRP     Protocol = "srp"     // RFC 9665 (client/srp): hosts with their services, and mirrors
+	RFC9664 Protocol = "rfc9664" // RFC 9664 through this project's proxy (client/rfc9664): names
+)
+type Registrar struct {
+	Protocol  Protocol
+	Domain    string             // SRP: the domain; RFC 9664: the zone. Fully qualified.
+	Server    string             // "host:port"; SRP only: "" to discover the registrar
+	Transport baseclient.Network //
+	Resolvers []string           // SRP: for discovery and KEY lookups; nil: client/srp's default
+	Lifetime                     // every host's or name's, unless it gives its own; the mirrors' hosts'
+	Hosts     []Host             // SRP
+	Mirrors   []Mirror           // SRP
+	Names     []Name             // RFC 9664
+}
+    Registrar is where and how its hosts or names register.
+
+func (r Registrar) Owner(label string) string
+    Owner returns the name a host or name labelled label registers through r,
+    fully qualified.
+
+func (r Registrar) String() string
+
+type Service struct {
+	Type     string // the type's name: a preset or one the template defines
+	Instance clientsrp.InstanceConfig
+	Probe    Probe
+}
+    Service is one instance of a service type on a host.
+
+type TypeInfo struct {
+	Name    string
+	Complex bool
+	// Summary is the type's fields, as a template would write them, or what a complex type does.
+	Summary string
+}
+    TypeInfo describes a service type for listings.
+
+func Types() []TypeInfo
+    Types lists the types a template can use: the presets and the complex types,
+    by name.
+
+type ValidationError struct {
+	Path     string
+	Problems []string
+}
+    ValidationError lists every problem a template has.
+
+func (e *ValidationError) Error() string
+
+```
+
+## github.com/NetworkCommons/sig0lease/client/clienttest
+```
+package clienttest // import "github.com/NetworkCommons/sig0lease/client/clienttest"
+
+Package clienttest has the registrar answers the client packages' tests share.
+
+FUNCTIONS
+
+func Answer(rcode uint16) *dns.Msg
+    Answer is a registrar's answer with rcode and nothing else.
+
+func Granted(lease, keyLease uint32) *dns.Msg
+    Granted is a registrar's NOERROR answer granting lease and keyLease:
+    the 8-byte Update Lease option echoed (RFC 9664 S4).
 
 ```
 
@@ -61,6 +476,11 @@ func Run(ctx context.Context, cfg Config) error
     returns ctx's error. A browse that fails, such as one macOS refuses for lack
     of Local Network permission, stops it the same way, returning that error.
 
+func Selects(hosts []string, allHosts bool, target string) bool
+    Selects reports whether a bridge given Hosts hosts and AllHosts allHosts
+    mirrors the mDNS host named target, as the user gives one ("MyMac",
+    "mymac.local.").
+
 
 TYPES
 
@@ -85,13 +505,21 @@ type Config struct {
 	// Key returns the signing key for a host's name in SRP.Domain, e.g. from a keystore
 	// (keyrec.ResolveOrCreateKey), so that a restarted bridge keeps its names.
 	Key func(owner string) (*keyrec.LoadedKey, error)
+	// Store, if set, keeps each host's labels across restarts, and whether its names are held
+	// (clientsrp.HostConfig.Store).
+	Store clientsrp.HostStore
+	// Exclude lists host labels never to mirror, compared without regard to case: hosts
+	// something else registers under the same name and key, such as sig0lease-agent's own.
+	Exclude []string
 
-	// Settle is how long a host's changes are collected before its registration is sent
-	// again; default 1s.
-	Settle time.Duration
-	// StopTimeout bounds the deregistrations sent when Run stops; default 10s.
+	// Settle and StopTimeout are each host's (client.KeeperConfig, with its defaults):
+	// StopTimeout bounds the deregistrations sent when Run stops.
+	Settle      time.Duration
 	StopTimeout time.Duration
-	Logf        func(format string, args ...any)
+	// KeepNames keeps a host's names reserved for its key when it is deregistered, because
+	// its last instance went or Run stopped (clientsrp.HostConfig.KeepNames).
+	KeepNames bool
+	Logf      func(format string, args ...any)
 }
     Config configures Run.
 
@@ -185,21 +613,192 @@ func Resolve(ctx context.Context, socketPath string, interfaceIndex uint32, name
 
 ```
 
+## github.com/NetworkCommons/sig0lease/client/rfc9664
+```
+package rfc9664 // import "github.com/NetworkCommons/sig0lease/client/rfc9664"
+
+Package rfc9664 implements a requester for this proxy's RFC 9664 handler
+(update_handler): one name, held by its own key, with records at and below it,
+registered as a DNS UPDATE signed with SIG(0) and kept on an Update Lease (RFC
+9664). The name is one label below the zone, the only name a key registers for
+itself under the handler's fcfs_naming (docs/siglease_rfc9664.md, "First-Come
+First-Served Naming"). Every request carries the name's KEY in its Update
+section, so the proxy verifies it with the key it registers, and is one of the
+handler's lease cases (Behavior Specification item 5):
+
+  - Register: Case A, the KEY and the records, both leases non-zero;
+  - Withdraw, and Deregister keeping the name: Case D, the KEY and the records
+    to delete, a LEASE of 0 and the KEY-LEASE, which keeps the name for the key;
+  - Deregister freeing the name: Case C, the KEY alone, both leases 0, which
+    deletes the KEY and everything it registered.
+
+A name another key holds is answered YXDOMAIN. An SRP requester renames
+(client/srp), as its names are found by browsing; an RFC 9664 name is typed or
+linked (a URL, a DNSLink path, a Matrix ID), so a rename would publish records
+nobody reads. Run therefore keeps trying the name, with a backoff: it registers
+once the other key's lease ends, which is when a name an earlier key of the
+requester's own holds comes back to it.
+
+Name keeps one name registered as its records change, as client/srp's Host does
+a host.
+
+FUNCTIONS
+
+func CheckRecords(name string, records []dns.RR) error
+    CheckRecords reports whether records can be registered for name: each at
+    name or below it, of class IN, and neither a KEY (name's own is its key's)
+    nor a SIG.
+
+func Describe(rr dns.RR) string
+    Describe describes rr for people: its owner, type and data, without the TTL
+    a lease overrides and the class, always IN.
+
+func Diff(before, after []dns.RR) []dns.RR
+    Diff returns the records of before that after lacks, compared as the
+    proxy's lease store does (lease.RecordKey: owner, class, type and data,
+    not the TTL).
+
+func Release(cfg NameConfig) error
+    Release frees a name that is not running and may still be held from an
+    earlier run: one deregistration of the KEY alone with both leases 0 (Case
+    C), which deletes every record the key registered with it, bounded by
+    cfg.StopTimeout. cfg.Store records the name as freed once the proxy confirms
+    it, or answers that another key holds it now. Release returns an error only
+    for a client configuration NewClient refuses; a deregistration that fails is
+    logged, and the name stays recorded as held.
+
+
+TYPES
+
+type Client struct {
+	// Has unexported fields.
+}
+    Client is one name's registration: build, sign, send, and (Run) keep it on
+    the refresh clock.
+
+func NewClient(cfg Config) (*Client, error)
+    NewClient validates cfg and applies its defaults.
+
+func (c *Client) Deregister(ctx context.Context, keepName bool) (*dns.Msg, baseclient.Outcome, error)
+    Deregister deletes the name's records. With keepName it deletes
+    Config.Records and keeps the KEY for RequestedKeyLease (Case D), so that no
+    other key takes the name meanwhile; without it, it deletes the KEY (Case C),
+    which takes every record the key registered with it, and the name is free.
+
+func (c *Client) Name() string
+    Name returns the name the client registers, fully qualified.
+
+func (c *Client) Register(ctx context.Context) (*dns.Msg, baseclient.Outcome, error)
+    Register registers the name's KEY and Config.Records, on the requested
+    leases (Case A). The handler needs a record besides the KEY in a
+    registration: with no records, Register fails, and Deregister keeping the
+    name holds it alone.
+
+func (c *Client) Run(ctx context.Context) error
+    Run keeps the name registered (client.Lifecycle.Run): it registers,
+    then again on the RFC 9664 S5.2 refresh clock, until ctx is canceled.
+    A registration that fails, a name another key holds included, is reported to
+    Config.OnError and tried again after a backoff.
+
+func (c *Client) Withdraw(ctx context.Context, records []dns.RR) (*dns.Msg, baseclient.Outcome, error)
+    Withdraw deletes records, registered earlier, from the name, and refreshes
+    its KEY (Case D).
+
+type Config struct {
+	Zone  string // the zone the name is in (the Zone Section); trailing dot optional
+	Label string // the name's single label: the name is Label.Zone
+	// Key is the name's SIG(0) key: required, as the key is what holds the name.
+	Key *keyrec.LoadedKey
+	// Records are what Register registers: records at the name or below it, fully
+	// qualified, of class IN. No KEY, the name's own being Key's, and no SIG. Their TTLs are
+	// replaced with TTL.
+	Records []dns.RR
+
+	RequestedLease    uint32 // default 3600 (1h)
+	RequestedKeyLease uint32 // default 1209600 (14d)
+	// TTL is the TTL suggested for every record registered, the KEY included; the proxy may
+	// override it. Independent of the leases: a lease is not a TTL. Default 300.
+	TTL uint32
+
+	// Server is the proxy, "host:port". Required: RFC 9664 has no registrar discovery.
+	Server  string
+	Network baseclient.Network // default NetworkTCP
+	Timeout time.Duration      // per-request transport timeout; default 20s
+
+	Send  baseclient.Transport                       // default baseclient.LiveTransport(Timeout)
+	Rng   *rand.Rand                                 // default a fresh per-Client source (see client.Lifecycle.Rng)
+	Sleep func(context.Context, time.Duration) error // default baseclient.SleepContext
+
+	// OnError and OnRegistered are Run's (client.Lifecycle).
+	OnError      func(error)
+	OnRegistered func(resp *dns.Msg)
+}
+    Config configures a Client. See NewClient for the defaults.
+
+type Name struct {
+	*baseclient.Keeper[[]dns.RR]
+
+	// Has unexported fields.
+}
+    Name keeps one name registered as its records change: each Set restates
+    the records, and the Name registers them (Client.Run, refreshing on the
+    lease clock), first withdrawing those that are gone, those Store kept from
+    an earlier run included. No records means no registration: the name is
+    deregistered, as it is when the Name stops (the Keeper's Stop and Wait).
+
+func StartName(cfg NameConfig) (*Name, error)
+    StartName starts keeping cfg.Client's name registered. It registers nothing
+    until the first Set, which withdraws the records Store has for the name that
+    the Set lacks.
+
+func (n *Name) Set(records []dns.RR)
+    Set replaces the records the name should have registered (Keeper.Set).
+
+type NameConfig struct {
+	// Client is the template for every Client the Name makes: Zone, Label, Key, the proxy,
+	// transport and leases. The Name sets Records, OnRegistered and OnError.
+	Client Config
+	// Store, if set, keeps the records registered at the name, loaded at start and saved
+	// after every registration and deregistration, and whether the name is held.
+	Store NameStore
+	// KeeperConfig: KeepNames applies to deregistering the name, on Stop or a Set with no
+	// records (Client.Deregister).
+	baseclient.KeeperConfig
+}
+    NameConfig configures StartName.
+
+type NameStore interface {
+	// Load returns the records saved for name, the fully qualified name, or nil.
+	Load(name string) []dns.RR
+	// Save records what name holds: whether the name is held for its key (true after every
+	// registration that succeeded, false once a deregistration freed it), and the records
+	// registered there. A store need not write anything when nothing changes.
+	Save(name string, held bool, records []dns.RR) error
+}
+    NameStore keeps what a name needs across restarts: the records registered at
+    it, so that those a later start no longer has are withdrawn, and whether the
+    name is held for its key, so that a name no longer wanted can be freed after
+    a restart (Release).
+
+```
+
 ## github.com/NetworkCommons/sig0lease/client/srp
 ```
 package srp // import "github.com/NetworkCommons/sig0lease/client/srp"
 
 Package srp implements an RFC 9665 SRP requester: discovery, message building
-(via pkg/srp), the RFC 9664 S5.2 refresh scheduler, and YXDOMAIN rename-retry.
-This library is the deliverable; cmd/sig0lease-srp-client is a thin, non-shipped
-dev/test CLI over it. Deliberately not a full RFC 9665 requester (no mDNS-based
-default.service.arpa. discovery, no CNN transport handling -- both out of scope
-for now) -- this targets the registrar's actual supported shape: an explicitly
-configured zone, reached over TCP by default.
+(via pkg/srp), the RFC 9664 S5.2 refresh scheduler, YXDOMAIN rename-retry, and
+Host, which keeps one host registered as what it offers changes. This library
+is the deliverable; cmd/sig0lease-srp-client is a thin, non-shipped dev/test
+CLI over it, and cmd/sig0lease-agent registers a template's hosts with it.
+Deliberately not a full RFC 9665 requester (no mDNS-based default.service.arpa.
+discovery, no CNN transport handling -- both out of scope for now) -- this
+targets the registrar's actual supported shape: an explicitly configured zone,
+reached over TCP by default.
 
 FUNCTIONS
 
-func Discover(ctx context.Context, query DNSQuery, domain string, mode DiscoveryMode, network Network) (string, error)
+func Discover(ctx context.Context, query DNSQuery, domain string, mode DiscoveryMode, network baseclient.Network) (string, error)
     Discover finds the SRP registrar for domain that is reachable over network.
     As RFC 9665 S3.1.1 specifies, it first finds the apex of the closest DNS
     zone enclosing domain with SOA queries (RFC 8765 S6.1, see zoneApex).
@@ -222,6 +821,32 @@ func Discover(ctx context.Context, query DNSQuery, domain string, mode Discovery
     is the fallback, not the only path, matching cmd/sig0lease-srp-client's own
     "dev/test tool" framing.
 
+func DiscoveryService(n baseclient.Network) string
+    DiscoveryService returns the service whose SRV record names a registrar
+    reachable over n: "_dnssd-srp-tls._tcp" for NetworkTLS (RFC 9665 S10.4.2),
+    "_dnssd-srp._tcp" otherwise (S10.4.1).
+
+func EscapeTXT(raw string) string
+    EscapeTXT turns raw, one TXT string's octets, into the form
+    InstanceConfig.TXT takes. It is presentation text, as codeberg.org/miekg/dns
+    packs it, where a backslash starts an escape, so only backslashes need
+    escaping for every other octet to go out as it is.
+
+func PublishableAddresses(addrs []netip.Addr) []netip.Addr
+    PublishableAddresses returns the addresses in addrs that mean something off
+    the link: not loopback, link-local, unspecified or multicast.
+
+func Release(cfg HostConfig) error
+    Release frees the names a host that is not running may still hold from an
+    earlier run: one deregistration of the host alone asking for a KEY-LEASE of
+    0, under the labels cfg.Store keeps for it, bounded by cfg.StopTimeout. The
+    registrar removes the host's service instances with it (RFC 9665 S3.2.5.5.1:
+    "even if the SRP requester doesn't list them"). cfg.Store records the names
+    as freed once the registrar confirms it, or answers that another key holds
+    the host name now. Release returns an error only for a client configuration
+    NewClient refuses; a deregistration that fails is logged, and the names stay
+    recorded as held.
+
 
 TYPES
 
@@ -236,7 +861,7 @@ func NewClient(cfg Config) (*Client, error)
     NewClient validates cfg, applies defaults, and generates a signing key if
     cfg.Key is nil.
 
-func (c *Client) Deregister(ctx context.Context) (*dns.Msg, pkgsrp.Outcome, error)
+func (c *Client) Deregister(ctx context.Context, keepNames bool) (*dns.Msg, baseclient.Outcome, error)
     Deregister withdraws this identity's entire registration in one message:
     the host's address data (S3.3.1.3's "zero Add operations means delete this
     host's registration") and every configured service instance (each restated
@@ -246,25 +871,26 @@ func (c *Client) Deregister(ctx context.Context) (*dns.Msg, pkgsrp.Outcome, erro
     equivalent since a removal can't conflict (FCFS only ever blocks an
     add-shaped instruction).
 
-    Also requests LEASE=0. RFC 9665 S3.3.1.3's own removal signal is purely
-    structural (zero address Adds), not lease-based -- RFC 9664's LEASE=0 Case
-    C has no direct SRP analog, per this project's own earlier reading of
-    the RFC text. But a real registrar (mDNSResponder/ServiceRegistration's
-    srp-mdns-proxy, srp-parse.c's "does not include a host description" path)
-    additionally requires host_lease==0 before it will recognize a zero-address
-    host update as a removal at all -- confirmed by live interop testing
-    (tests/test_mdnsresponder_interop.sh), not assumed. Sending LEASE=0 is still
-    fully RFC 9665-conformant (a requester may request any lease value including
-    0) and is required in practice for this to interoperate with that real
-    implementation.
+    Also requests LEASE=0: S3.2.5.5.1's removal is both, a LEASE of 0 and no
+    address (S3.3.1.3 allows zero address Adds only "in the case of deleting a
+    registration"). Registrars go by the LEASE: srp-mdns-proxy (srp-parse.c,
+    host_lease == 0, confirmed by tests/test_mdnsresponder_interop.sh),
+    OpenThread's (Host::IsDeleted) and this proxy (pkg/srp.RemoveHost) take
+    any LEASE of 0 as a removal, and refuse, or for srp-mdns-proxy tolerate,
+    no address with a LEASE (pkg/srp's validateHostAddresses).
 
-    Also requests KEY-LEASE=0, unlike Register's use of c.cfg.RequestedKeyLease:
-    RFC 9665 S3.2.5.5.1 is explicit that "if the registration is to be
-    permanently removed, KEY-LEASE SHOULD also be zero" -- and Deregister
-    always means permanent removal, never a lightweight refresh, so there is no
-    configured value to fall back to here.
+    keepNames picks the KEY-LEASE, RFC 9665 S3.2.5.5.1's two kinds of removal:
+    "If the registration is to be permanently removed, KEY-LEASE SHOULD also
+    be zero. Otherwise, it SHOULD be set to the same value it had previously;
+    this holds the name in reserve for when the SRP requester is once again able
+    to provide the service." So with keepNames the KEYs stay, at the host's name
+    and each instance's, for c.cfg.RequestedKeyLease; without it they go with
+    the rest and the names are free.
 
-func (c *Client) Register(ctx context.Context) (*dns.Msg, pkgsrp.Outcome, error)
+func (c *Client) Labels() Labels
+    Labels returns the labels the client registers under now, after any renames.
+
+func (c *Client) Register(ctx context.Context) (*dns.Msg, baseclient.Outcome, error)
     Register performs exactly one build-sign-send-interpret cycle:
     no rename-retry, no scheduling. Callers wanting the full lifecycle (initial
     delay, refresh clock, automatic rename-retry) should use Run instead;
@@ -272,24 +898,11 @@ func (c *Client) Register(ctx context.Context) (*dns.Msg, pkgsrp.Outcome, error)
     for a one-shot CLI invocation.
 
 func (c *Client) Run(ctx context.Context) error
-    Run performs the full RFC 9665 requester lifecycle: an initial 0-3s random
-    delay (plan roadmap), then registers (with rename-retry on conflict),
-    then sleeps for the RFC 9664 S5.2 refresh clock (80% of the granted lease +
-    0-5% jitter) and re-registers -- restating the full registration every time,
-    per S3.2's "no lightweight refresh." Blocks until ctx is canceled (via Sleep
-    returning ctx.Err()); that is the only thing that stops Run.
-
-    A failed registration cycle -- a transient network/DNS error, a registrar
-    rejection, rename attempts exhausted against a persistent conflict --
-    does not stop Run: Config.OnError (if set) is called with the error,
-    and the cycle is retried after an exponentially increasing backoff (see
-    minRegisterRetryBackoff/maxRegisterRetryBackoff), reset back to the minimum
-    after any success. Earlier versions of this method returned immediately on
-    any such error, meaning a single transient blip during a routine refresh --
-    one UDP timeout, one SERVFAIL -- permanently stopped a long-running daemon's
-    registration with no automatic recovery; self-healing from that class of
-    failure is the whole point of a background Run loop rather than a one-shot
-    Register call.
+    Run performs the full RFC 9665 requester lifecycle (client.Lifecycle.Run):
+    it registers, with rename-retry on conflict, then again on the RFC 9664 S5.2
+    refresh clock, restating the full registration every time, per S3.2's "no
+    lightweight refresh", until ctx is canceled. A failed registration does not
+    stop it: Config.OnError is called, and it tries again after a backoff.
 
 type Config struct {
 	Domain    string // registration domain (Zone Section name); trailing dot optional
@@ -319,13 +932,22 @@ type Config struct {
 	Resolvers     []string      // bootstrap resolvers for discovery; LiveDNSQuery's default if empty
 	Query         DNSQuery      // discovery implementation; LiveDNSQuery(Resolvers) if nil
 
-	Network    Network       // default NetworkTCP (S3.5's MUST for non-constrained networks)
-	Timeout    time.Duration // per-request transport timeout; default 20s
-	MaxRenames int           // default 5 -- rename-retry attempts before giving up on YXDOMAIN
+	Network    baseclient.Network // default NetworkTCP (S3.5's MUST for non-constrained networks)
+	Timeout    time.Duration      // per-request transport timeout; default 20s
+	MaxRenames int                // default 5 -- rename-retry attempts before giving up on YXDOMAIN
 
-	Send  Transport                                  // default liveTransport(Timeout)
-	Rng   *rand.Rand                                 // default a fresh per-Client source (see timing.go's doc comments)
-	Sleep func(context.Context, time.Duration) error // default ctxSleep
+	// Labels, if set, are the labels to register under instead of the requested ones: what an
+	// earlier Client renamed them to (Client.Labels, OnRenamed), so that a requester keeps its
+	// names across restarts. Each must be the label it stands for, or a rename of it. Entries
+	// for instances not in Instances are kept, for when those instances return.
+	Labels *Labels
+	// OnRenamed, if set, is called with the labels in use after every rename, from the
+	// goroutine registering (Run's, or Register's caller's).
+	OnRenamed func(Labels)
+
+	Send  baseclient.Transport                       // default baseclient.LiveTransport(Timeout)
+	Rng   *rand.Rand                                 // default a fresh per-Client source (see client.Lifecycle.Rng)
+	Sleep func(context.Context, time.Duration) error // default baseclient.SleepContext
 
 	// OnError, if set, is called from Run with every error a registration cycle hits
 	// (transient network/DNS failure, a registrar rejection, rename attempts exhausted).
@@ -378,12 +1000,63 @@ const (
 	// finds the registrar any S3.1.1 requester would find.
 	DiscoveryApexOnly
 )
+type Host struct {
+	*baseclient.Keeper[hostState]
+
+	// Has unexported fields.
+}
+    Host keeps one host registered as what it offers changes: each Set restates
+    its addresses and instances, and the Host registers them (Client.Run,
+    refreshing on the lease clock), first withdrawing instances that are gone.
+    No addresses means no registration: the host is deregistered (RFC 9665
+    S3.3.1.3), as it is when the Host stops (the Keeper's Stop and Wait).
+    Labels carry over from one registration to the next, so a renamed host keeps
+    its names.
+
+func StartHost(cfg HostConfig) (*Host, error)
+    StartHost starts keeping cfg.Client.HostLabel registered. It registers
+    nothing until the first Set.
+
+func (h *Host) Set(addrs []netip.Addr, instances []InstanceConfig)
+    Set replaces what the host should have registered with addrs and instances
+    (Keeper.Set).
+
+type HostConfig struct {
+	// Client is the template for every Client the Host makes: Domain, HostLabel, Key, the
+	// registrar, transport and leases. Key is required: a host keeps one identity. The Host
+	// sets Addresses, Instances, Labels, OnRenamed, OnRegistered and OnError.
+	Client Config
+	// Store, if set, keeps the host's labels, loaded at start and saved after every rename,
+	// and whether its names are held.
+	Store HostStore
+	// KeeperConfig: KeepNames applies to deregistering the host, on Stop or a Set with no
+	// addresses (Client.Deregister).
+	baseclient.KeeperConfig
+}
+    HostConfig configures StartHost.
+
+type HostStore interface {
+	// Load returns the labels saved for the host whose requested name is host, or nil.
+	Load(host string) *Labels
+	// Save records labels as the host's.
+	Save(host string, labels Labels) error
+	// Hold records whether the host's names are held for its key: true after every
+	// registration that succeeded, false once a deregistration freed them. A store need not
+	// write anything when nothing changes.
+	Hold(host string, held bool) error
+}
+    HostStore keeps what a host needs across restarts: the labels it was renamed
+    to (see Labels), so that a host renamed once does not claim, and lose,
+    its requested names again on every start; and whether its names are held for
+    its key, so that a host no longer wanted can have them freed after a restart
+    (Release).
+
 type InstanceConfig struct {
 	Label       string   // single label, e.g. "My Printer" -- not a full instance name; NewClient rejects one containing "." (dnsname.CheckLabel)
 	ServiceType string   // e.g. "_ipps._tcp" -- not a full service-type name; NewClient rejects any other shape (dnssd.ValidateServiceType)
 	Subtypes    []string // additional bare subtype labels, e.g. "_universal"; checked like Label
 	Port        uint16
-	TXT         []string
+	TXT         []string // presentation text, where a backslash starts an escape: see EscapeTXT
 	// Remove withdraws this instance instead of registering it (RFC 9665 S3.2.5.5.2, first
 	// method): the update carries a bare Delete All RRsets for its name, and Port, TXT and
 	// Subtypes are ignored. The host and every other instance are registered as usual.
@@ -394,42 +1067,36 @@ type InstanceConfig struct {
     fully-qualified names when building the update (pkg/srp.BuildUpdate itself
     takes only already-qualified names).
 
-type Network int
-    Network is how a Client reaches its registrar.
+type InstanceName struct {
+	Label       string
+	ServiceType string
+}
+    InstanceName identifies a requested instance: its label as configured
+    (InstanceConfig.Label) and its service type.
 
-const (
-	// NetworkTCP, the default, is plain DNS over TCP, which RFC 9665 S3.5 requires on
-	// networks that are not constrained.
-	NetworkTCP Network = iota
-	// NetworkTLS is DNS-over-TLS (RFC 7858). The registrar's certificate is not checked:
-	// RFC 9665 S7 has no way to share the registrar's key, so TLS gives Opportunistic
-	// Privacy only (RFC 7858 S4.1). Discovery looks for the "_dnssd-srp-tls._tcp" SRV record
-	// instead of "_dnssd-srp._tcp", and nothing falls back to plain TCP (S7: a requester
-	// able to use TLS SHOULD NOT).
-	NetworkTLS
-	// NetworkUDP is for constrained networks (RFC 9665 S3.1.2): a registrar accepts it only
-	// where it allows UDP.
-	NetworkUDP
-)
-func (n Network) DiscoveryService() string
-    DiscoveryService returns the service whose SRV record names a registrar
-    reachable over n: "_dnssd-srp-tls._tcp" for NetworkTLS (RFC 9665 S10.4.2),
-    "_dnssd-srp._tcp" otherwise (S10.4.1).
-
-func (n Network) String() string
-    String returns the protocol name the base client package (client.New) takes
-    for n.
-
-type Transport func(ctx context.Context, addr string, network Network, msg *dns.Msg) (*dns.Msg, error)
-    Transport sends a signed SRP UPDATE to addr over network and returns
-    the response. Config.Send defaults to a real network implementation (see
-    liveTransport); tests inject a fake.
+type Labels struct {
+	Host      string
+	Instances map[InstanceName]string
+}
+    Labels are the labels a registration uses after renames: the host's, and
+    each instance's by its requested name. A label is renamed when a different
+    key holds the name it makes, to the requested label with "-2" appended,
+    then "-3", and so on (see renameHeld); an instance absent from Instances is
+    registered under its requested label.
 
 ```
 
 ## github.com/NetworkCommons/sig0lease/cmd/sig0lease
 ```
 Package main implements the DNS proxy server.
+```
+
+## github.com/NetworkCommons/sig0lease/cmd/sig0lease-agent
+```
+Package main implements sig0lease-agent: the long-running client that keeps what
+a template describes registered: hosts and services through SRP registrars,
+names and their records through the sig0lease proxy's RFC 9664 handler
+(client/agent). See docs/sig0lease-agent.md.
 ```
 
 ## github.com/NetworkCommons/sig0lease/cmd/sig0lease-client
@@ -440,10 +1107,11 @@ with SIG(0) authentication to the sig0lease proxy.
 
 ## github.com/NetworkCommons/sig0lease/cmd/sig0lease-srp-client
 ```
-Package main implements sig0lease-srp-client, a thin CLI over client/srp -- a
-dev/test tool, not a shipped product. The library is the deliverable; this just
-exercises it. With -mdns it runs client/mdnsbridge instead, registering what the
-local mDNSResponder sees.
+Package main implements sig0lease-srp-client, a thin CLI over client/srp
+-- a dev/test tool, not a shipped product. The library is the deliverable;
+this just exercises it. The long-running client that keeps a machine's
+services registered, mirroring what the local mDNSResponder sees among them,
+is sig0lease-agent.
 ```
 
 ## github.com/NetworkCommons/sig0lease/config
@@ -618,6 +1286,16 @@ func LeaseSnapshotPath(cfg map[string]any) (string, error)
     Setup config selects (selectLeaseStore), or "" if it selects none.
     cmd/sig0lease checks the handlers' snapshot files with it before any Setup
     runs.
+
+func SeparateZones(hs []ZoneHandler) error
+    SeparateZones gives every name at most one of hs: the handler whose zone
+    is the closest one above it, as a zone cut does in DNS. Each handler
+    learns the zones the others serve below its own, and refuses their
+    names (refuseNamesNotServed); with srp.dev.zenr.io. for srp_handler and
+    dev.zenr.io. for update_handler, update_handler refuses every name at or
+    below srp.dev.zenr.io. Two handlers serving one zone leave no closest one,
+    and are an error. The proxy calls it once, after every handler's Setup and
+    before serving.
 
 
 TYPES
@@ -831,6 +1509,9 @@ func (b *SRPHandler) Start()
     A dump runs Setup alone, so nothing in its store expires and nothing is
     written upstream.
 
+func (b *SRPHandler) UpstreamZone() string
+    UpstreamZone is the zone this handler serves.
+
 type UpdateHandler struct {
 	leaseHandler[UpstreamCoordinator]
 
@@ -841,6 +1522,7 @@ type UpdateHandler struct {
 	// gates whether it may also be used to create new managed state. Default
 	// false (fail closed).
 	AllowOnlineKeyRegistration bool
+
 	// Has unexported fields.
 }
     UpdateHandler handles DNS opcode 5 (UPDATE queries).
@@ -902,12 +1584,18 @@ func (h *UpdateHandler) Setup(cfg map[string]any) error
     lease_policy, record_ttl_sec, lease_manager or storage; see
     leaseHandler.setup), and these of its own:
       - "prefer_4byte_variant": Accept requests whose Update Lease is the 4-byte
-        variant, one lease for every record, as older requesters such as
-        macOS's mDNSResponder send; they are REFUSED otherwise [OPTIONAL,
-        defaults to false]
+        variant, one lease for every record, as older requesters such as macOS's
+        mDNSResponder send; they are REFUSED otherwise [OPTIONAL, defaults to
+        false]
       - "allow_online_key_registration": Allow a signer resolved only via
         authoritative DNS (not lease-managed, not present in the request) to
         register new KEY RRs [OPTIONAL, defaults to false]
+      - "fcfs_naming": First-Come First-Served naming, as RFC 9665 S3.2.4.1
+        gives SRP: a KEY holds its name and the names below it, so a new KEY
+        is refused (YXDOMAIN) where a different KEY holds its name or a name
+        above it in the zone, unless that KEY's holder registers it, and a KEY
+        registers itself only one label below the zone (REFUSED elsewhere)
+        [OPTIONAL, defaults to false]
       - "blacklisted_types": RR type names this handler refuses to register
         [OPTIONAL]
 
@@ -929,6 +1617,9 @@ func (b *UpdateHandler) Start()
     A dump runs Setup alone, so nothing in its store expires and nothing is
     written upstream.
 
+func (b *UpdateHandler) UpstreamZone() string
+    UpstreamZone is the zone this handler serves.
+
 type UpstreamCoordinator interface {
 
 	// ResolveAuthoritativeZone returns the apex of the zone holding zone: the zone an UPDATE
@@ -937,6 +1628,9 @@ type UpstreamCoordinator interface {
 	// QueryRRs returns the rrType records at name from zoneHint's authoritative server --
 	// none for NXDOMAIN -- for the handler's checks of what is already published.
 	QueryRRs(ctx context.Context, zoneHint, name string, rrType uint16) ([]dns.RR, error)
+	// QueryKeyAtName reports the KEYs at name, telling NXDOMAIN from a name without one:
+	// fcfs_naming's live check (srp.Evaluate), as for the SRP handler.
+	QueryKeyAtName(ctx context.Context, zoneHint, name string) (srp.AuthoritativeKeyState, []*dns.KEY, error)
 	// Has unexported methods.
 }
     UpstreamCoordinator handles communication with the upstream
@@ -946,6 +1640,15 @@ type UpstreamCoordinator interface {
     handlers/opcode5_sig0_validation_test.go's stubUpstreamCoordinator).
     It covers everything the handler asks of the upstream side, so a stub is
     used the same way as the production implementation, never bypassed.
+
+type ZoneHandler interface {
+	Handler
+	// UpstreamZone is the zone the handler serves (upstream_zone), once Setup has read it.
+	UpstreamZone() string
+	// Has unexported methods.
+}
+    ZoneHandler is an UPDATE handler serving one zone: UpdateHandler and
+    SRPHandler.
 
 ```
 
@@ -1043,6 +1746,10 @@ func AddEDE(resp, req *dns.Msg, infoCode uint16, text string)
     text is EXTRA-TEXT, for people to read, not for parsing (RFC 8914 S2).
     Every reply the proxy builds gets its EDE here; the server removes the text
     of an error reply's EDEs unless server.diagnostics is on (StripEDEText).
+
+func AddressRR(owner string, addr netip.Addr, ttl uint32) dns.RR
+    AddressRR returns owner's address record for addr, class IN: an A for an
+    IPv4 address, an AAAA for an IPv6 one.
 
 func EDEs(m *dns.Msg) []*dns.EDE
     EDEs returns the Extended DNS Errors in m, in order.
@@ -1298,6 +2005,13 @@ func ValidateServiceType(svcType string) error
 package keyrec // import "github.com/NetworkCommons/sig0lease/pkg/keyrec"
 
 
+CONSTANTS
+
+const KeystoreEnv = "CLIENT_KEYSTORE_DIR"
+    KeystoreEnv names the environment variable every client of this project
+    falls back to for its keystore directory.
+
+
 FUNCTIONS
 
 func FindKeysByZone(keystoreDir, zoneName string, logger *logging.Logger) ([]string, error)
@@ -1310,6 +2024,13 @@ func FindKeysByZone(keystoreDir, zoneName string, logger *logging.Logger) ([]str
 func KeyExists(keystoreDir, keyName string, logger *logging.Logger) error
     KeyExists searches for a key by filename without .key in the keystore.
     Returns the key name or error if none found.
+
+func KeystoreDir(given, how string) (string, error)
+    KeystoreDir applies the keystore-location convention shared by
+    sig0lease-client, sig0lease-srp-client and sig0lease-agent: a directory
+    given explicitly (a flag, a template's keystore:) wins, CLIENT_KEYSTORE_DIR
+    is the fallback, and having neither is an error, which says how to give one:
+    how, such as "pass -keystore=<dir>", or CLIENT_KEYSTORE_DIR.
 
 func ListKeysInDirectory(keystoreDir string, logger *logging.Logger) ([]string, error)
     ListKeysInDirectory lists all key names in a keystore directory. logger may
@@ -1629,6 +2350,9 @@ func (m *InMemoryLeaseStore) RenewLease(keyRR *dns.KEY, leaseDuration uint32, ke
     untouched, since renewing a lease is not re-creating it.
 
 func (m *InMemoryLeaseStore) SaveSnapshot(path string) error
+    SaveSnapshot writes the store's snapshot to path, atomically and with its
+    SHA-256, so that LoadSnapshot refuses a file edited by hand or torn by a
+    crash (pkg/sealedfile).
 
 func (m *InMemoryLeaseStore) Stop()
     Stop satisfies LeaseStorage.Stop(). InMemoryLeaseStore owns no background
@@ -1903,6 +2627,32 @@ func (r *Record) TimeRemaining() time.Duration
 
 ```
 
+## github.com/NetworkCommons/sig0lease/pkg/sealedfile
+```
+package sealedfile // import "github.com/NetworkCommons/sig0lease/pkg/sealedfile"
+
+Package sealedfile keeps a JSON document in a file that is written atomically
+and carries the SHA-256 of the document: the proxy's lease store snapshot
+and sig0lease-agent's state. These files are not meant to be edited by hand,
+and Read enforces that: it accepts only a file identical, byte for byte,
+to what Write makes of the document it holds, so any edit -- to a value,
+to the whitespace, or to the layout -- is refused. It is a checksum, not a
+signature: the keys a program could sign with sit on the same host as the file,
+so a signature would make the check no harder to get past on purpose.
+
+FUNCTIONS
+
+func Read(path string, v any) error
+    Read unmarshals the document stored at path into v. A file that is not, byte
+    for byte, what Write wrote is an error. A missing file is an error wrapping
+    fs.ErrNotExist, so a caller can tell "nothing saved yet" from a broken file
+    with errors.Is.
+
+func Write(path string, v any) error
+    Write stores v, marshaled to JSON, at path, atomically (see writeAtomic).
+
+```
+
 ## github.com/NetworkCommons/sig0lease/pkg/sig0
 ```
 package sig0 // import "github.com/NetworkCommons/sig0lease/pkg/sig0"
@@ -1997,14 +2747,6 @@ func BuildUpdate(spec UpdateSpec) (*dns.Msg, error)
     The result is unsigned; sign it with pkg/sig0.SignMessage using the same key
     material as spec.Key before sending.
 
-func GrantedLease(resp *dns.Msg) (lease, keyLease uint32, ok bool)
-    GrantedLease reads the LEASE/KEY-LEASE the registrar actually granted off
-    a successful response's echoed Update-Lease option -- which may differ from
-    what was requested (the registrar's own LeasePolicy can clamp either value
-    independently). ok is false if resp carries no (decodable) Update-Lease
-    option, in which case the requester should fall back to what it originally
-    requested.
-
 func KeyFor(cu *ClassifiedUpdate, name string) *dns.KEY
     KeyFor returns the KEY that governs name: an instance's own explicit KEY if
     it has one, otherwise a copy of the Host Description's KEY with its owner
@@ -2027,6 +2769,12 @@ func KeyFor(cu *ClassifiedUpdate, name string) *dns.KEY
     a caller bug, not a data problem, so KeyFor panics rather than returning a
     zero value a caller could silently misuse.
 
+func KeysAllMatch(keys []*dns.KEY, key *dns.KEY) bool
+    KeysAllMatch reports whether every KEY in keys is key's (same algorithm,
+    protocol and public key): whether a name holding keys is free for key,
+    by the rule Evaluate applies. A requester uses it too, to find which of its
+    names a conflict is about (client/srp).
+
 func Names(cu *ClassifiedUpdate) []string
     Names returns every name Evaluate must be called for to authorize cu
     (S3.3's "the checked names are the Host Description name and each Service
@@ -2036,6 +2784,20 @@ func Names(cu *ClassifiedUpdate) []string
     from the SRV node" reasoning), and per S3.3.1.1 every Service Discovery
     instruction is authorized transitively through its target instance's own
     check.
+
+func RemoveHost(msg *dns.Msg, cu *ClassifiedUpdate) []dns.RR
+    RemoveHost makes msg and cu, an update with a LEASE of 0, the removal of
+    its host and of every service instance it lists. S3.2.5.5.1 defines the
+    removal as "an SRP Update ... with an Update Lease option that has a LEASE
+    value of zero", with "no 'Add to an RRSet' instructions for that hostname".
+    Adds a requester sends anyway are dropped, as both reference registrars
+    do (srp-mdns-proxy's host_lease == 0, OpenThread's Host::IsDeleted);
+    OpenThread's client sends its addresses with every removal. Dropped:
+    the Host Description's addresses, each listed instance's SRV and TXT,
+    which leaves it a removal (Removal), and every Service Discovery add.
+    KEY adds stay, for the KEY-LEASE to keep or free the names, and so do the
+    Delete All RRsets and the Service Discovery deletes. RemoveHost returns the
+    adds it dropped from msg's Update section.
 
 func ValidateClassified(msg *dns.Msg, cu *ClassifiedUpdate) error
     ValidateClassified runs every check Validate performs beyond Classify
@@ -2092,12 +2854,13 @@ func Validate(msg *dns.Msg) (*ClassifiedUpdate, error)
     Validate runs Classify plus every remaining RFC 9665 S3.3.1/S3.3.2
     structural check that needs more than the Update section alone: a single
     Zone Section entry, no prerequisites, a present and internally-consistent
-    Update-Lease option, TTL consistency (S4 -- a MUST, reject rather than
-    normalize), identical KEY RDATA across every KEY add, flags-0 KEY adds
-    (S3.2.5.1), and DNS-SD-shaped service names on every Service Discovery add
-    (RFC 6763 S4.1/S7). It does not verify SIG(0) or FCFS -- those need the
-    lease store and the SIG(0) signer identity, both outside this package's
-    pure-logic scope (S4.3 steps 4-5).
+    Update-Lease option, an address in the Host Description unless the LEASE is
+    0 (S3.3.1.3), TTL consistency (S4 -- a MUST, reject rather than normalize),
+    identical KEY RDATA across every KEY add, flags-0 KEY adds (S3.2.5.1),
+    and DNS-SD-shaped service names on every Service Discovery add (RFC 6763
+    S4.1/S7). It does not verify SIG(0) or FCFS -- those need the lease store
+    and the SIG(0) signer identity, both outside this package's pure-logic scope
+    (S4.3 steps 4-5).
 
     Assumes the caller has already confirmed msg.Opcode == dns.OpcodeUpdate (the
     router dispatch layer's job, not this package's) and that msg has been fully
@@ -2127,12 +2890,25 @@ func Evaluate(ctx context.Context, view StoreView, query AuthoritativeKeyQuery, 
 
     Per RFC 9665 S3.3.3's FCFS table:
 
-        lease store has a KEY at name, matches updateKey        -> FCFSProceed  (refresh)
-        lease store has a KEY at name, does NOT match           -> FCFSConflict (YXDOMAIN)
-        no local record; live query: NXDOMAIN                   -> FCFSProceed  (first come)
-        no local record; live query: NOERROR, no KEY             -> refuseOnForeignData ? FCFSForeignData : FCFSProceed
-        no local record; live query: NOERROR, KEY matches        -> FCFSProceed
-        no local record; live query: NOERROR, KEY doesn't match  -> FCFSConflict (YXDOMAIN)
+        lease store has KEYs at name, all match updateKey         -> FCFSProceed  (refresh)
+        lease store has KEYs at name, any does NOT match          -> FCFSConflict (YXDOMAIN)
+        no local record; live query: NXDOMAIN                     -> FCFSProceed  (first come)
+        no local record; live query: NOERROR, no KEY               -> refuseOnForeignData ? FCFSForeignData : FCFSProceed
+        no local record; live query: NOERROR, every KEY matches    -> FCFSProceed
+        no local record; live query: NOERROR, any KEY doesn't match -> FCFSConflict (YXDOMAIN)
+
+    "Any" is S3.3.3's own wording: "If any existing KEY record corresponding
+    to a KEY record in the SRP Update does not match ... the SRP registrar
+    MUST reject the SRP Update". A name holding the update's key next to
+    someone else's is held by both, so neither may take it over. SRP itself
+    never leaves two KEYs at a name; such a name was written by something else
+    (handlers.SeparateZones keeps this proxy's other handler out of SRP's zone).
+
+    The RFC 9664 handler's fcfs_naming option uses this same rule for its new
+    KEYs, calling Evaluate with refuseOnForeignData false for the new KEY's
+    name and each name above it that the KEY's signer does not already hold
+    (handlers.UpdateHandler.fcfsNewKey). There a holder may put further KEYs at
+    its own name, so a name with several KEYs is normal.
 
     The lease store is checked first and trusted over a live query when both
     are available: it is the source of truth for what this proxy already manages
@@ -2204,36 +2980,6 @@ type InstanceSpec struct {
     a fully-qualified name -- this package stays free of "join a label onto a
     domain" ergonomics, which belongs to the caller (client/srp).
 
-type Outcome int
-    Outcome classifies a registrar's response to an SRP UPDATE, from the
-    requester's side -- the counterpart to the RCODEs handlers/srp_handler.go's
-    Handle() produces.
-
-const (
-	// OutcomeSuccess: NOERROR. The registration was accepted; GrantedLease reads the
-	// granted LEASE/KEY-LEASE off the same response.
-	OutcomeSuccess Outcome = iota
-	// OutcomeConflict: YXDOMAIN (S3.3.3's FCFS conflict). A different key already holds
-	// one of the names in this update. This is "rename and retry,"
-	// not a hard failure -- see client/srp's rename-retry loop.
-	OutcomeConflict
-	// OutcomeRefused: REFUSED. Covers every registrar-side rejection that isn't a naming
-	// conflict -- SIG(0) failure, foreign non-SRP data present (refuse_on_foreign_data),
-	// malformed update, TCP-required-but-got-UDP, and so on. The RCODE alone doesn't tell
-	// the requester which; retrying the identical request is unlikely to help.
-	OutcomeRefused
-	// OutcomeServerFailure: SERVFAIL, or no response at all (nil resp).
-	OutcomeServerFailure
-	// OutcomeOther: any other RCODE.
-	OutcomeOther
-)
-func InterpretResponse(resp *dns.Msg) Outcome
-    InterpretResponse classifies resp's RCODE for a requester. A nil resp
-    (e.g. a transport error before any response arrived) is treated as
-    OutcomeServerFailure.
-
-func (o Outcome) String() string
-
 type ServiceDiscovery struct {
 	Name   string // canonical owner name of the PTR (a service type, or a subtype name)
 	Target string // canonical PTR target -- must name a ServiceInstance in the same update
@@ -2271,12 +3017,18 @@ type ServiceInstance struct {
     Discovery "Delete An RR From An RRSet" targets a Service Description shaped
     exactly this way).
 
+func Removal(name string) *ServiceInstance
+    Removal returns the Service Description Instruction removing the service
+    instance name: a bare Delete All RRsets, as a requester removing that one
+    instance sends (S3.2.5.5.2). A registrar adds one for each instance a host
+    removal does not list (S3.2.5.5.1).
+
 type StoreView interface {
-	// KeyAtName returns the live (non-expired) KEY record the lease store currently
-	// manages at name, and whether one was found. A name the store has never seen, or
-	// whose only record there has expired, reports ok=false -- Evaluate then falls back
-	// to a live authoritative query, exactly as S3.3.3 describes.
-	KeyAtName(name string) (key *dns.KEY, ok bool)
+	// KeysAtName returns every live (non-expired) KEY record the lease store currently
+	// manages at name. None for a name the store has never seen, or whose records there
+	// have all expired -- Evaluate then falls back to a live authoritative query, exactly
+	// as S3.3.3 describes.
+	KeysAtName(name string) []*dns.KEY
 }
     StoreView is the minimal read-only view into the lease store Evaluate needs.
     A thin, intentionally narrow adapter over pkg/lease.LeaseStorage.FindByName

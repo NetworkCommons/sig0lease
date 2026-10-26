@@ -170,9 +170,10 @@ func enabledModules(cfg *config.Config) []string {
 	return slices.Compact(names)
 }
 
-// proxyHandler is a handler module as cmd/sig0lease uses it: served, and dumped by --dump.
+// proxyHandler is a handler module as cmd/sig0lease uses it: served, kept to its own zone
+// (handlers.SeparateZones), and dumped by --dump.
 type proxyHandler interface {
-	handlers.Handler
+	handlers.ZoneHandler
 	DumpLeasesLevel(level string) string
 }
 
@@ -315,6 +316,7 @@ func main() {
 	// Prepare handler configuration with upstream resolver for SIG(0) signing
 	opcodeMap := cfg.GetOpcodeMap()
 	registered := make(map[string]bool)
+	var setUp []handlers.ZoneHandler
 	for opcode, moduleNames := range opcodeMap {
 		for _, moduleName := range moduleNames {
 			if registered[moduleName] {
@@ -337,9 +339,14 @@ func main() {
 
 			srv.RegisterHandler(h)
 			registered[moduleName] = true
+			setUp = append(setUp, h)
 			logger.Infof("Registered %s for opcode %d (%s)",
 				moduleName, opcode, dns.OpcodeToString[opcode])
 		}
+	}
+	if err := handlers.SeparateZones(setUp); err != nil {
+		logger.Errorf("Error in handler zones: %v", err)
+		os.Exit(1)
 	}
 
 	// Start server

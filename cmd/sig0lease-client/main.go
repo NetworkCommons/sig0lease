@@ -35,19 +35,25 @@ func main() {
 	args, keystoreFlag := extractKeystoreFlag(os.Args[3:])
 
 	switch command {
+	case "register", "refresh", "register-tamper", "list-keys":
+		dir, err := keyrec.KeystoreDir(keystoreFlag, "pass --keystore=<dir>")
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "ERROR: %v\n", err)
+			os.Exit(1)
+		}
+		keystoreDir = dir
+	}
+
+	switch command {
 	case "register":
-		keystoreDir = resolveKeystoreDir(keystoreFlag)
 		cmdRegister(proxyAddr, args)
 	case "refresh":
-		keystoreDir = resolveKeystoreDir(keystoreFlag)
 		cmdRefresh(proxyAddr, args)
 	case "register-tamper":
-		keystoreDir = resolveKeystoreDir(keystoreFlag)
 		cmdRegisterTamper(proxyAddr, args)
 	case "verify":
 		cmdVerify(proxyAddr, args)
 	case "list-keys":
-		keystoreDir = resolveKeystoreDir(keystoreFlag)
 		cmdListKeys()
 	case "help":
 		printUsage()
@@ -72,21 +78,6 @@ func extractKeystoreFlag(args []string) ([]string, string) {
 		out = append(out, a)
 	}
 	return out, dir
-}
-
-// resolveKeystoreDir applies this project's unified keystore-location convention (same on
-// both cmd/sig0lease-client and cmd/sig0lease-srp-client): an explicit --keystore= flag wins,
-// CLIENT_KEYSTORE_DIR is the fallback, and having neither is a fatal error.
-func resolveKeystoreDir(flagValue string) string {
-	if flagValue != "" {
-		return flagValue
-	}
-	if env := os.Getenv("CLIENT_KEYSTORE_DIR"); env != "" {
-		return env
-	}
-	fmt.Fprintf(os.Stderr, "ERROR: keystore directory is required: pass --keystore=<dir> or set CLIENT_KEYSTORE_DIR\n")
-	os.Exit(1)
-	return ""
 }
 
 // cmdRegister sends a sig0lease UPDATE-LEASE registration request

@@ -119,7 +119,7 @@ func leaseResponse(req *dns.Msg, granted *leasepkg.LeaseOption) *dns.Msg {
 // refusal, whatever the rcode:
 //   - ExtendedErrorProhibited (18): refused for authorization or local policy -- an
 //     unauthorized or unproven signer, records outside its reach, a name or record held by
-//     another key, a lease below the minimum, a blacklisted type, foreign data;
+//     another key, a blacklisted type, foreign data;
 //   - ExtendedErrorNotSupported (21): a request this proxy or its configuration cannot
 //     serve -- a "." in a label, the 4-byte lease variant while prefer_4byte_variant is
 //     off, UDP while allow_udp is off;

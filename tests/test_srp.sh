@@ -12,18 +12,11 @@
 set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "$SCRIPT_DIR/lib/common.sh"
-source "$SCRIPT_DIR/lib/proxy.sh"
-source "$SCRIPT_DIR/lib/dns.sh"
-source "$SCRIPT_DIR/lib/bind9.sh"
+# The proxy's config, DoT certificate and log; srp.test.'s SRV records point TESTs 8 and 9 at
+# the proxy (lib/srp.sh).
+SRP_RUN_DIR="$PROXY_RUN_ROOT/srp"
+source "$SCRIPT_DIR/lib/srp.sh"
 
-SRP_ZONE="srp.test."
-SRP_PROXY_ADDR="127.0.0.1"
-SRP_PROXY_PORT="${SRP_PROXY_PORT:-8159}"
-SRP_PROXY_URL="${SRP_PROXY_ADDR}:${SRP_PROXY_PORT}"
-BIND9_SRP_REGISTRAR_PORT="$SRP_PROXY_PORT" # the zone's _dnssd-srp._tcp SRV points TEST 8 here
-SRP_PROXY_TLS_PORT="${SRP_PROXY_TLS_PORT:-8160}" # the proxy's DNS-over-TLS listener
-BIND9_SRP_REGISTRAR_TLS_PORT="$SRP_PROXY_TLS_PORT" # the zone's _dnssd-srp-tls._tcp SRV points TEST 9 here
-SRP_KEYSTORE_DIR="$BIND9_SRP_KEYSTORE_DIR"
 SRP_LEASE_SECONDS="${SRP_LEASE_SECONDS:-30}" # outlasts TESTs 1-5, which assert data is still present
 SRP_KEY_LEASE_SECONDS="${SRP_KEY_LEASE_SECONDS:-1209600}"
 SRP_EXPIRY_LEASE_SECONDS=1
@@ -32,15 +25,8 @@ SRP_EXPIRY_TIMEOUT=40 # covers the 30s reconciliation-retry path (see processExp
                        # the next reconciliation pass rather than corrupting local state)
 SRP_DATA_EXPIRY_LEASE_SECONDS=2
 SRP_DATA_EXPIRY_KEY_LEASE_SECONDS=120 # well past SRP_EXPIRY_TIMEOUT -- see test_lease_expiry_keeps_keys
-SRP_REFUSE_ON_FOREIGN_DATA=true # the default; test_foreign_data_takeover restarts the proxy with false
 
 SRP_CLIENT_BIN="${TESTS_DIR}/../bin/${OS}/sig0lease-srp-client"
-# The proxy's config, DoT certificate and log (lib/proxy.sh's proxy_run_prepare).
-SRP_RUN_DIR="$PROXY_RUN_ROOT/srp"
-SRP_TMP_CONFIG="$SRP_RUN_DIR/config.yaml"
-SRP_PROXY_LOG="$SRP_RUN_DIR/proxy.log"
-SRP_TLS_DIR="$SRP_RUN_DIR/tls" # the DoT listener's throwaway certificate (make_tls_cert)
-SRP_PROXY_PID=""
 SRP_KEY_DIR=""
 
 PERFORMED_TESTS=""
@@ -52,57 +38,6 @@ build_srp_binaries() {
     log_success "Binaries built"
 }
 
-prepare_srp_config() {
-    cat > "$SRP_TMP_CONFIG" <<EOF
-server:
-  address: ":${SRP_PROXY_PORT}"
-  diagnostics: true
-  networks:
-    - udp
-    - tcp
-    - tls
-  tls:
-    address: ":${SRP_PROXY_TLS_PORT}"
-    cert: "${SRP_TLS_DIR}/cert.pem"
-    key: "${SRP_TLS_DIR}/key.pem"
-upstreams:
-  - address: "8.8.8.8:53"
-    protocol: "udp"
-    timeout: "5s"
-handlers:
-  srp_handler:
-    upstream_zone: "${SRP_ZONE}"
-    keystore_dir: "${SRP_KEYSTORE_DIR}"
-    upstream: "${BIND9_ADDR}:${BIND9_PORT}"
-    allow_udp: true
-    refuse_on_foreign_data: ${SRP_REFUSE_ON_FOREIGN_DATA}
-    lease_policy:
-      min_key_lease_sec: 1
-      max_key_lease_sec: 1209600
-      min_rr_lease_sec: 1
-      max_rr_lease_sec: 7200
-authoritative:
-  max_inflight_updates: ${BIND9_SIG0_QUOTA}
-processing_rules:
-  - opcode: 5
-    modules: ["srp_handler"]
-EOF
-}
-
-start_srp_proxy() {
-    log_section "START: SRP proxy"
-    prepare_srp_config
-    # Appended to its log: test_foreign_data_takeover restarts the proxy.
-    proxy_launch "$SRP_TMP_CONFIG" "$SRP_PROXY_PORT" "$SRP_PROXY_LOG" || return 1
-    SRP_PROXY_PID="$LAUNCHED_PROXY_PID"
-    log_success "SRP proxy listening (PID $SRP_PROXY_PID) on $SRP_PROXY_URL, DNS-over-TLS on port $SRP_PROXY_TLS_PORT, config $SRP_TMP_CONFIG"
-}
-
-stop_srp_proxy() {
-    proxy_stop "$SRP_PROXY_PID"
-    SRP_PROXY_PID=""
-}
-
 # run_srp_client <identity-name> [extra sig0lease-srp-client flags...] -- sends one update
 # (-once) to the proxy. identity-name selects a keystore directory under a scratch dir: -k=13
 # creates a key there on first use and is a no-op after. Pass a never-before-used name for a
@@ -111,32 +46,6 @@ run_srp_client() {
     local identity="$1"; shift
     "$SRP_CLIENT_BIN" -server="$SRP_PROXY_URL" -domain="$SRP_ZONE" \
         -keystore="${SRP_KEY_DIR}/${identity}" -k=13 -once "$@"
-}
-
-# dig_srp <name> <type> -- query BIND directly (not through the proxy), short form.
-dig_srp() {
-    dig_query_short "${BIND9_ADDR}:${BIND9_PORT}" "$1" "$2"
-}
-
-wait_for_srp_state() {
-    local name="$1" rr_type="$2" state="$3" timeout="${4:-10}"
-    local start
-    start=$(date +%s)
-    while true; do
-        local got
-        got="$(dig_srp "$name" "$rr_type")"
-        if [ "$state" = "present" ] && [ -n "$got" ]; then
-            return 0
-        fi
-        if [ "$state" = "absent" ] && [ -z "$got" ]; then
-            return 0
-        fi
-        if [ $(( $(date +%s) - start )) -ge "$timeout" ]; then
-            log_error "Timed out waiting for $name/$rr_type state=$state (last dig: '$got')"
-            return 1
-        fi
-        sleep 1
-    done
 }
 
 ################################
@@ -216,36 +125,36 @@ test_remove_one_instance() {
 
     wait_for_srp_state Widget._http._tcp.srp.test. SRV absent 10 || return 1
     [ -n "$(dig_srp host1.srp.test. A)" ] || { log_error "host A record disappeared after removing just the instance"; return 1; }
+    # RFC 9665 S3.2.5.5.2: while the host's KEY stays, so does the removed instance's, holding
+    # its name; the registrar adds it back after the instance's Delete All RRsets.
+    [ -n "$(dig_srp Widget._http._tcp.srp.test. KEY)" ] || { log_error "the removed instance's KEY went with it; its name is no longer held"; return 1; }
 
     # RFC 6763 S9: Widget was the only _http._tcp instance registered so far, so removing it
     # must clear the type out of the enumeration record too, not just leave it stale.
     wait_for_srp_state _services._dns-sd._udp.srp.test. PTR absent 10 \
         || { log_error "S9 enumeration record still lists a type with no live instances"; return 1; }
 
-    log_success "Service instance removed; host registration untouched; S9 enumeration record cleared"
+    log_success "Service instance removed, its KEY kept; host registration untouched; S9 enumeration record cleared"
     PERFORMED_TESTS="$PERFORMED_TESTS\n  [OK] $log_msg"
 }
 
 test_remove_all() {
-    # RFC 9665's Host Description Instruction signals "delete this host's registration" by
-    # a Delete All RRsets with ZERO Add operations (S3.3.1.3) -- i.e. no A/AAAA adds, which
-    # is a structural signal, not a LEASE=0 one (that's RFC 9664 Case C; SRP has no direct
-    # analog -- a KEY registration otherwise persists to its own KEY-LEASE, tested
-    # separately by test_expiry). So "remove all" here means the host's address data is
-    # withdrawn while its KEY registration (the reserved name) remains live.
-    local log_msg="TEST 5: Remove all host address data (bare host update, no A/AAAA adds)"
+    # RFC 9665 S3.2.5.5.1: a host is removed by an update with a LEASE of 0, with no address
+    # in its Host Description (S3.3.1.3); with a non-zero KEY-LEASE its KEY stays, holding
+    # the name. No address with a LEASE is not an SRP Update, which the registrar refuses
+    # (handlers' TestSRPHandle_HostWithoutAddressNeedsLeaseZero: this client cannot send one).
+    local log_msg="TEST 5: Remove the host, keeping its name (LEASE 0, KEY-LEASE kept)"
     log_section "$log_msg"
 
     local out
-    out="$(run_srp_client id1 -host=host1 \
-        -lease="$SRP_LEASE_SECONDS" -keylease="$SRP_KEY_LEASE_SECONDS")"
+    out="$(run_srp_client id1 -host=host1 -deregister -keep-names -keylease="$SRP_KEY_LEASE_SECONDS")"
     echo "$out"
-    echo "$out" | grep -q "Status: NOERROR (Rcode=0)" || { log_error "host address removal did not return NOERROR"; return 1; }
+    echo "$out" | grep -q "Status: NOERROR (Rcode=0)" || { log_error "host removal did not return NOERROR"; return 1; }
 
     wait_for_srp_state host1.srp.test. A absent 10 || return 1
-    [ -n "$(dig_srp host1.srp.test. KEY)" ] || { log_error "host KEY unexpectedly disappeared -- only its address data should be withdrawn"; return 1; }
+    [ -n "$(dig_srp host1.srp.test. KEY)" ] || { log_error "host KEY disappeared -- a removal with a KEY-LEASE keeps it"; return 1; }
 
-    log_success "Host address data withdrawn (A gone); KEY registration (reserved name) persists"
+    log_success "Host removed (A gone); its KEY holds the name"
     PERFORMED_TESTS="$PERFORMED_TESTS\n  [OK] $log_msg"
 }
 
@@ -445,10 +354,8 @@ run_all_tests() {
     require_command named
     require_command go
 
-    proxy_run_prepare "$SRP_RUN_DIR" "$SRP_PROXY_PORT"
+    srp_run_prepare
     SRP_KEY_DIR="$(mktemp -d /tmp/sig0lease-srp-client-identities.XXXXXX)"
-    mkdir "$SRP_TLS_DIR"
-    make_tls_cert "$SRP_TLS_DIR"
 
     build_srp_binaries
     start_bind9

@@ -1,6 +1,7 @@
 // Package main implements sig0lease-srp-client, a thin CLI over client/srp -- a dev/test tool,
-// not a shipped product. The library is the deliverable; this just exercises it. With -mdns it
-// runs client/mdnsbridge instead, registering what the local mDNSResponder sees.
+// not a shipped product. The library is the deliverable; this just exercises it. The
+// long-running client that keeps a machine's services registered, mirroring what the local
+// mDNSResponder sees among them, is sig0lease-agent.
 package main
 
 import (
@@ -16,14 +17,12 @@ import (
 	"time"
 
 	"codeberg.org/miekg/dns"
-	"github.com/NetworkCommons/sig0lease/client/mdnsbridge"
-	"github.com/NetworkCommons/sig0lease/client/mdnsresponder"
+	baseclient "github.com/NetworkCommons/sig0lease/client"
 	clientsrp "github.com/NetworkCommons/sig0lease/client/srp"
 	"github.com/NetworkCommons/sig0lease/logging"
 	_ "github.com/NetworkCommons/sig0lease/pkg/dnscompat" // registers EDNS0 code 2 (UPDATE-LEASE); matches cmd/sig0lease/main.go and cmd/sig0lease-client/main.go's own convention (client/srp also self-registers this, so it's redundant here, not load-bearing)
 	"github.com/NetworkCommons/sig0lease/pkg/dnsmsg"
 	"github.com/NetworkCommons/sig0lease/pkg/keyrec"
-	pkgsrp "github.com/NetworkCommons/sig0lease/pkg/srp"
 )
 
 // repeatableFlag collects every occurrence of a flag.Value flag, in order.
@@ -44,63 +43,23 @@ func main() {
 	useTLS := flag.Bool("tls", false, "use DNS-over-TLS (RFC 7858, opportunistic: the registrar's certificate is not checked) instead of TCP; discovery then looks for _dnssd-srp-tls._tcp")
 	once := flag.Bool("once", false, "send exactly one registration and exit, instead of running the full refresh lifecycle")
 	deregister := flag.Bool("deregister", false, "send exactly one Deregister (withdraw host + every -instance) and exit, instead of registering; implies -once")
+	keepNames := flag.Bool("keep-names", false, "with -deregister: keep the names for this identity's key, asking for -keylease instead of a KEY-LEASE of 0")
 	keystoreDir := flag.String("keystore", "", "directory to load this identity's signing key from; falls back to CLIENT_KEYSTORE_DIR if unset")
 	keyAlg := flag.Uint("k", 0, "DNSSEC algorithm (13=ECDSAP256SHA256, 15=ED25519) to generate a NEW signing key with if none exists yet; omit to require an existing key")
 	maxRenames := flag.Int("max-renames", 5, "rename-retry attempts on YXDOMAIN before giving up")
 
-	mdns := flag.Bool("mdns", false, "mirror the services the local mDNSResponder sees, one SRP host per mDNS host, instead of registering -host")
-	mdnsSocket := flag.String("mdns-socket", mdnsresponder.DefaultSocketPath(), "the mDNSResponder daemon's client socket (with -mdns)")
-	mdnsAllHosts := flag.Bool("mdns-all-hosts", false, "with -mdns, mirror every host on the link instead of the -mdns-host ones")
-	mdnsList := flag.Bool("mdns-list", false, "with -mdns, only print what the daemon sees, marking with * what would be mirrored; registers nothing")
-
-	var addrs, instances, removes, txts, subtypes, resolvers, mdnsHosts, mdnsTypes repeatableFlag
+	var addrs, instances, removes, txts, subtypes, resolvers repeatableFlag
 	flag.Var(&addrs, "addr", "host A/AAAA address to publish (repeatable)")
 	flag.Var(&resolvers, "resolver", "resolver \"host:port\" for every discovery lookup -- zone apex SOA, registrar SRV, registrar address (repeatable); default 8.8.8.8:53, 8.8.4.4:53")
 	flag.Var(&instances, "instance", `service instance "Label:_svctype._proto:port" (repeatable)`)
 	flag.Var(&removes, "remove", `service instance "Label:_svctype._proto" to withdraw in this update (repeatable)`)
 	flag.Var(&txts, "txt", `TXT string for a declared instance, "Label:content" (repeatable)`)
 	flag.Var(&subtypes, "subtype", `DNS-SD subtype for a declared instance, "Label:subtypelabel" (repeatable)`)
-	flag.Var(&mdnsHosts, "mdns-host", `with -mdns, an mDNS host to mirror, e.g. "mymac.local." (repeatable)`)
-	flag.Var(&mdnsTypes, "mdns-type", `with -mdns, a service type to mirror, e.g. "_ssh._tcp" (repeatable; default every type the daemon enumerates)`)
 
 	flag.Usage = printUsage
 	flag.Parse()
 
-	if *mdns {
-		var conflicting []string
-		flag.Visit(func(f *flag.Flag) {
-			switch f.Name {
-			case "host", "addr", "instance", "remove", "txt", "subtype", "once", "deregister":
-				conflicting = append(conflicting, "-"+f.Name)
-			}
-		})
-		if len(conflicting) > 0 {
-			fmt.Fprintf(os.Stderr, "ERROR: -mdns takes hosts and instances from mDNSResponder; drop %s\n", strings.Join(conflicting, " "))
-			os.Exit(1)
-		}
-	} else if *mdnsList || *mdnsAllHosts || len(mdnsHosts) > 0 || len(mdnsTypes) > 0 {
-		fmt.Fprintln(os.Stderr, "ERROR: -mdns-host, -mdns-type, -mdns-all-hosts and -mdns-list need -mdns")
-		os.Exit(1)
-	}
-
-	if *mdns && *mdnsList {
-		// Nothing is registered, so no registrar, domain or keystore is needed.
-		runBridge(mdnsbridge.Config{
-			Source:       mdnsbridge.DaemonSource(*mdnsSocket),
-			ServiceTypes: []string(mdnsTypes),
-			Hosts:        []string(mdnsHosts),
-			AllHosts:     *mdnsAllHosts,
-			List:         true,
-		}, *mdnsSocket)
-		return
-	}
-
-	if *mdns && *domain == "" {
-		fmt.Fprintln(os.Stderr, "ERROR: -domain is required")
-		printUsage()
-		os.Exit(1)
-	}
-	if !*mdns && (*domain == "" || *host == "") {
+	if *domain == "" || *host == "" {
 		fmt.Fprintln(os.Stderr, "ERROR: -domain and -host are required")
 		printUsage()
 		os.Exit(1)
@@ -111,15 +70,15 @@ func main() {
 		os.Exit(1)
 	}
 
-	network := clientsrp.NetworkTCP
+	network := baseclient.NetworkTCP
 	switch {
 	case *udp && *useTLS:
 		fmt.Fprintln(os.Stderr, "ERROR: -udp and -tls are mutually exclusive")
 		os.Exit(1)
 	case *udp:
-		network = clientsrp.NetworkUDP
+		network = baseclient.NetworkUDP
 	case *useTLS:
-		network = clientsrp.NetworkTLS
+		network = baseclient.NetworkTLS
 	}
 
 	var discoveryMode clientsrp.DiscoveryMode
@@ -133,35 +92,6 @@ func main() {
 		os.Exit(1)
 	}
 
-	if *mdns {
-		if !*mdnsAllHosts && len(mdnsHosts) == 0 {
-			fmt.Fprintln(os.Stderr, "ERROR: -mdns needs -mdns-host (repeatable) or -mdns-all-hosts; -mdns-list shows the hosts on the link")
-			os.Exit(1)
-		}
-		dir := resolveKeystoreDir(*keystoreDir)
-		runBridge(mdnsbridge.Config{
-			Source:       mdnsbridge.DaemonSource(*mdnsSocket),
-			ServiceTypes: []string(mdnsTypes),
-			Hosts:        []string(mdnsHosts),
-			AllHosts:     *mdnsAllHosts,
-			SRP: clientsrp.Config{
-				Domain:            *domain,
-				RequestedLease:    uint32(*lease),
-				RequestedKeyLease: uint32(*keylease),
-				TTL:               uint32(*ttl),
-				RegistrarAddr:     *server,
-				Discovery:         discoveryMode,
-				Resolvers:         []string(resolvers),
-				Network:           network,
-				MaxRenames:        *maxRenames,
-			},
-			Key: func(owner string) (*keyrec.LoadedKey, error) {
-				return resolveKeyFor(dir, owner, uint8(*keyAlg))
-			},
-		}, *mdnsSocket)
-		return
-	}
-
 	var parsedAddrs []netip.Addr
 	for _, a := range addrs {
 		addr, err := netip.ParseAddr(a)
@@ -171,6 +101,15 @@ func main() {
 		}
 		parsedAddrs = append(parsedAddrs, addr)
 	}
+	// RFC 9665 S3.3.1.3: a Host Description without an address is a removal.
+	if len(parsedAddrs) == 0 && !*deregister {
+		fmt.Fprintln(os.Stderr, "ERROR: -addr is required to register: a host without an address is a removal (RFC 9665 S3.3.1.3); use -deregister")
+		os.Exit(1)
+	}
+	if *keepNames && !*deregister {
+		fmt.Fprintln(os.Stderr, "ERROR: -keep-names is for -deregister")
+		os.Exit(1)
+	}
 
 	instCfgs, err := parseInstances(instances, removes, txts, subtypes)
 	if err != nil {
@@ -178,7 +117,12 @@ func main() {
 		os.Exit(1)
 	}
 
-	dir := resolveKeystoreDir(*keystoreDir)
+	// Every identity is kept in a keystore (keyrec.KeystoreDir), none is an unsaved one-off.
+	dir, err := keyrec.KeystoreDir(*keystoreDir, "pass -keystore=<dir>")
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "ERROR: %v\n", err)
+		os.Exit(1)
+	}
 	key, err := resolveKey(dir, *host, *domain, uint8(*keyAlg))
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "ERROR: %v\n", err)
@@ -201,7 +145,7 @@ func main() {
 		MaxRenames:        *maxRenames,
 		OnRegistered: func(resp *dns.Msg) {
 			fmt.Printf("[%s] ", time.Now().Format(time.RFC3339))
-			printResult(resp, pkgsrp.OutcomeSuccess)
+			printResult(resp, baseclient.OutcomeSuccess)
 		},
 		OnError: func(err error) {
 			fmt.Fprintf(os.Stderr, "[%s] ERROR: %v\n", time.Now().Format(time.RFC3339), err)
@@ -221,21 +165,21 @@ func main() {
 	if *server != "" {
 		fmt.Printf("Registrar: %s (explicit)\n", *server)
 	} else if discoveryMode == clientsrp.DiscoveryApexOnly {
-		fmt.Printf("Registrar: discovered via %s.<zone apex enclosing %s>\n", network.DiscoveryService(), strings.TrimSuffix(*domain, "."))
+		fmt.Printf("Registrar: discovered via %s.<zone apex enclosing %s>\n", clientsrp.DiscoveryService(network), strings.TrimSuffix(*domain, "."))
 	} else {
-		fmt.Printf("Registrar: discovered via the closest %s SRV from %s up to its zone apex\n", network.DiscoveryService(), strings.TrimSuffix(*domain, "."))
+		fmt.Printf("Registrar: discovered via the closest %s SRV from %s up to its zone apex\n", clientsrp.DiscoveryService(network), strings.TrimSuffix(*domain, "."))
 	}
 	fmt.Printf("Transport: %s\n", network)
 	fmt.Printf("Instances: %d\n\n", len(instCfgs))
 
 	if *deregister {
-		resp, outcome, err := c.Deregister(context.Background())
+		resp, outcome, err := c.Deregister(context.Background(), *keepNames)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "ERROR: %v\n", err)
 			os.Exit(1)
 		}
 		printResult(resp, outcome)
-		if outcome != pkgsrp.OutcomeSuccess {
+		if outcome != baseclient.OutcomeSuccess {
 			os.Exit(1)
 		}
 		return
@@ -248,7 +192,7 @@ func main() {
 			os.Exit(1)
 		}
 		printResult(resp, outcome)
-		if outcome != pkgsrp.OutcomeSuccess {
+		if outcome != baseclient.OutcomeSuccess {
 			os.Exit(1)
 		}
 		return
@@ -264,33 +208,16 @@ func main() {
 	fmt.Println("Stopped.")
 }
 
-func printResult(resp *dns.Msg, outcome pkgsrp.Outcome) {
+func printResult(resp *dns.Msg, outcome baseclient.Outcome) {
 	fmt.Printf("Status: %s (Rcode=%d)\n", dns.RcodeToString[resp.Rcode], resp.Rcode)
 	for _, ede := range dnsmsg.EDEs(resp) {
 		fmt.Printf("EDE %s\n", dnsmsg.FormatEDE(ede))
 	}
-	if outcome == pkgsrp.OutcomeSuccess {
-		if lease, keyLease, ok := pkgsrp.GrantedLease(resp); ok {
+	if outcome == baseclient.OutcomeSuccess {
+		if lease, keyLease, ok := baseclient.GrantedLease(resp); ok {
 			fmt.Printf("Granted: LEASE=%d KEY-LEASE=%d\n", lease, keyLease)
 		}
 	}
-}
-
-// resolveKeystoreDir applies this project's unified keystore-location convention (same on
-// both cmd/sig0lease-client and cmd/sig0lease-srp-client): an explicit flag wins, CLIENT_KEYSTORE_DIR
-// is the fallback, and having neither is a fatal error -- there is no more "empty means an
-// ephemeral unsaved key" special case (that was sig0lease-srp-client-only and predates this
-// consistency requirement; every identity is now persisted like the base client's already is).
-func resolveKeystoreDir(flagValue string) string {
-	if flagValue != "" {
-		return flagValue
-	}
-	if env := os.Getenv("CLIENT_KEYSTORE_DIR"); env != "" {
-		return env
-	}
-	fmt.Fprintln(os.Stderr, "ERROR: keystore directory is required: pass -keystore=<dir> or set CLIENT_KEYSTORE_DIR")
-	os.Exit(1)
-	return ""
 }
 
 // resolveKey finds an existing signing key for host+domain in dir, or -- only when
@@ -299,11 +226,7 @@ func resolveKeystoreDir(flagValue string) string {
 // strict default (see the keyrec.ResolveOrCreateKey doc comment for the shared logic).
 // The logger carries ResolveOrCreateKey's warning when more than one key in dir matches.
 func resolveKey(dir, host, domain string, algorithm uint8) (*keyrec.LoadedKey, error) {
-	return resolveKeyFor(dir, ensureFQDN(host+"."+strings.TrimSuffix(domain, ".")), algorithm)
-}
-
-// resolveKeyFor is resolveKey for an already-joined owner name, which -mdns gets per host.
-func resolveKeyFor(dir, owner string, algorithm uint8) (*keyrec.LoadedKey, error) {
+	owner := ensureFQDN(host + "." + strings.TrimSuffix(domain, "."))
 	k, created, err := keyrec.ResolveOrCreateKey(dir, owner, algorithm, logging.NewLogger("info"))
 	if err != nil {
 		return nil, err
@@ -312,35 +235,6 @@ func resolveKeyFor(dir, owner string, algorithm uint8) (*keyrec.LoadedKey, error
 		fmt.Printf("Generated new signing key: %s (algorithm %d)\n", k.Name, k.PublicKey.Algorithm)
 	}
 	return k, nil
-}
-
-// runBridge runs -mdns until Ctrl-C or SIGTERM, then exits; a failure exits 1.
-func runBridge(cfg mdnsbridge.Config, socket string) {
-	cfg.Logf = func(format string, args ...any) {
-		fmt.Printf("[%s] %s\n", time.Now().Format("15:04:05"), fmt.Sprintf(format, args...))
-	}
-	fmt.Printf("=== sig0lease-srp-client -mdns ===\n")
-	fmt.Printf("mDNSResponder: %s\n", socket)
-	if cfg.List {
-		fmt.Println("Listing only; * marks what would be mirrored. Ctrl-C to stop.")
-	} else {
-		fmt.Printf("Domain: %s\n", cfg.SRP.Domain)
-		if cfg.SRP.RegistrarAddr != "" {
-			fmt.Printf("Registrar: %s (explicit)\n", cfg.SRP.RegistrarAddr)
-		} else {
-			fmt.Printf("Registrar: discovered via %s\n", cfg.SRP.Network.DiscoveryService())
-		}
-		fmt.Println("Mirroring. Ctrl-C or SIGTERM deregisters every host and stops.")
-	}
-	fmt.Println()
-
-	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
-	defer cancel()
-	if err := mdnsbridge.Run(ctx, cfg); err != nil && ctx.Err() == nil {
-		fmt.Fprintf(os.Stderr, "ERROR: %v\n", err)
-		os.Exit(1)
-	}
-	fmt.Println("Stopped.")
 }
 
 // ensureFQDN appends a trailing dot if name doesn't already have one.
@@ -427,15 +321,17 @@ func printUsage() {
 
 Usage:
   sig0lease-srp-client -domain=<domain> -host=<label> [options]
-  sig0lease-srp-client -mdns -domain=<domain> (-mdns-host=<name> ... | -mdns-all-hosts) [options]
-  sig0lease-srp-client -mdns -mdns-list
+
+A machine's services are kept registered, and what its mDNSResponder sees mirrored, by
+sig0lease-agent (docs/sig0lease-agent.md); this tool sends what its flags say.
 
 Required:
   -domain string       registration domain, e.g. srp.dev.zenr.io.
   -host string          base host label, e.g. myhost (not the full FQDN)
 
 Options:
-  -addr value            host A/AAAA address to publish (repeatable)
+  -addr value            host A/AAAA address to publish (repeatable); at least one, unless
+                         -deregister
   -instance value        service instance "Label:_svctype._proto:port" (repeatable); _proto is
                          _tcp or _udp -- to narrow a type further, add a -subtype instead of a label
   -remove value           service instance "Label:_svctype._proto" to withdraw in this update,
@@ -463,7 +359,10 @@ Options:
                             _dnssd-srp._tcp and never falls back to plain TCP; with -server, give
                             the registrar's DoT port. Not with -udp
   -once                    send exactly one registration and exit, instead of running the full lifecycle
-  -deregister               send exactly one Deregister (withdraw host + every -instance) and exit; implies -once
+  -deregister               send exactly one Deregister (withdraw host + every -instance) and exit; implies -once.
+                            The names are freed (KEY-LEASE 0), unless -keep-names
+  -keep-names               with -deregister: keep the names for this identity's key, asking for
+                            -keylease (RFC 9665 S3.2.5.5.1)
   -keystore string          directory holding this identity's signing key; falls back to the
                             CLIENT_KEYSTORE_DIR environment variable if unset (an explicit flag
                             always wins); one of the two is required
@@ -472,26 +371,6 @@ Options:
                             in the keystore yet; omit to require an existing key (error if
                             missing) -- same convention as sig0lease-client's -k
   -max-renames int           rename-retry attempts on YXDOMAIN before giving up (default 5)
-
-Mirroring what mDNSResponder sees (-mdns):
-  -mdns                     ask the running mDNSResponder daemon, over its client socket, for
-                            the services on the link, and register each selected mDNS host
-                            ("mymac.local." becomes mymac.<domain>) with its addresses and
-                            instances. An instance the daemon reports gone is withdrawn; a host
-                            with none left, and every host when this stops, is deregistered.
-                            Each host gets its own key in the keystore (-k to create them).
-                            Not with -host, -addr, -instance, -remove, -txt, -subtype, -once,
-                            -deregister. Subtypes, and later address or TXT changes, are not
-                            followed
-  -mdns-host value          mDNS host to mirror, e.g. mymac.local. (repeatable); on a Mac,
-                            scutil --get LocalHostName prints this machine's
-  -mdns-all-hosts           mirror every host on the link instead
-  -mdns-type value          service type to mirror, e.g. _ssh._tcp (repeatable); default every
-                            type the daemon enumerates
-  -mdns-list                print the instances the daemon sees, * marking those that would be
-                            mirrored, and register nothing; needs no -domain or keystore
-  -mdns-socket string       the daemon's socket (default /var/run/mDNSResponder on macOS,
-                            /var/run/mdnsd, mDNSPosix's mdnsd, elsewhere)
 
 Examples:
   // One-shot registration of a host with one service instance, against an explicit registrar;
@@ -503,11 +382,5 @@ Examples:
   // -host.myhost's key to already exist in ./srp-identity, since -k is not given here
   sig0lease-srp-client -domain=srp.dev.zenr.io. -host=myhost -addr=192.0.2.1 \
     -instance=Widget:_http._tcp:8080 -keystore=./srp-identity
-
-  // On a Mac: publish its Remote Login, File Sharing and Screen Sharing services, as macOS
-  // advertises them, under srp.dev.zenr.io. through a registrar at 192.0.2.10:8053
-  sig0lease-srp-client -mdns -mdns-host=$(scutil --get LocalHostName).local. \
-    -mdns-type=_ssh._tcp -mdns-type=_smb._tcp -mdns-type=_rfb._tcp \
-    -domain=srp.dev.zenr.io. -server=192.0.2.10:8053 -keystore=./mdns-identities -k=13
 `)
 }

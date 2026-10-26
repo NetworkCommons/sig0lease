@@ -1,15 +1,7 @@
 package lease
 
 import (
-	"bytes"
-	"crypto/sha256"
-	"encoding/json"
-	"errors"
 	"fmt"
-	"io/fs"
-	"os"
-	"path/filepath"
-	"runtime"
 	"sort"
 	"strconv"
 	"strings"
@@ -18,6 +10,7 @@ import (
 
 	"codeberg.org/miekg/dns"
 	"github.com/NetworkCommons/sig0lease/pkg/dnsname"
+	"github.com/NetworkCommons/sig0lease/pkg/sealedfile"
 )
 
 type NodeKind string
@@ -863,108 +856,23 @@ func (m *InMemoryLeaseStore) ImportSnapshot(snapshot *LeaseTreeSnapshot) error {
 	return nil
 }
 
-// snapshotFile is the on-disk layout SaveSnapshot writes: the snapshot's JSON, and the
-// SHA-256 of exactly those bytes. The lease store is not meant to be edited by hand, and
-// LoadSnapshot enforces that: it accepts only a file identical, byte for byte, to what
-// snapshotFileBytes makes of the snapshot it holds, so any edit -- to a record, to a field
-// only shown for reading such as rr_display, to the whitespace, or to the layout -- is
-// refused. It is a checksum, not a signature: the proxy's keys sit on the same host as the
-// file, so a key would make the check no harder to get past on purpose.
-type snapshotFile struct {
-	SHA256   string          `json:"sha256"`
-	Snapshot json.RawMessage `json:"snapshot"`
-}
-
-// snapshotFileBytes is the file SaveSnapshot writes for body, the snapshot's JSON. It is
-// assembled here rather than by marshaling a snapshotFile, because encoding/json re-indents a
-// RawMessage: this way the snapshot's bytes in the file are exactly the bytes hashed.
-func snapshotFileBytes(body []byte) []byte {
-	return fmt.Appendf(nil, "{\n  \"sha256\": \"%x\",\n  \"snapshot\": %s\n}\n", sha256.Sum256(body), body)
-}
-
+// SaveSnapshot writes the store's snapshot to path, atomically and with its SHA-256, so that
+// LoadSnapshot refuses a file edited by hand or torn by a crash (pkg/sealedfile).
 func (m *InMemoryLeaseStore) SaveSnapshot(path string) error {
 	snapshot, err := m.ExportSnapshot()
 	if err != nil {
 		return err
 	}
-	// Indented one level deeper, as the value of snapshotFile's "snapshot" key.
-	body, err := json.MarshalIndent(snapshot, "  ", "  ")
-	if err != nil {
-		return fmt.Errorf("marshal snapshot: %w", err)
-	}
-	if err := writeFileAtomic(path, snapshotFileBytes(body)); err != nil {
+	if err := sealedfile.Write(path, snapshot); err != nil {
 		return fmt.Errorf("write snapshot: %w", err)
 	}
 	return nil
 }
 
-// writeFileAtomic writes data to path so that path always holds either its previous content or
-// all of data, never part of it: a crash mid-save would otherwise leave a file that fails
-// LoadSnapshot's checksum and keeps the proxy from starting. data goes to a new temporary file
-// (mode 0600) in path's directory -- the same filesystem, so the rename is atomic -- which is
-// synced and then renamed over path; the directory is synced last so the rename itself survives
-// a power loss. A unique temporary name means two saves to the same path can't interleave into
-// one torn file. On failure the temporary file is removed.
-func writeFileAtomic(path string, data []byte) (err error) {
-	dir := filepath.Dir(path)
-	tmp, err := os.CreateTemp(dir, filepath.Base(path)+".*.tmp")
-	if err != nil {
-		return err
-	}
-	defer func() {
-		if err == nil {
-			return
-		}
-		if rmErr := os.Remove(tmp.Name()); rmErr != nil && !errors.Is(rmErr, fs.ErrNotExist) {
-			err = errors.Join(err, rmErr)
-		}
-	}()
-	if _, err = tmp.Write(data); err != nil {
-		return errors.Join(err, tmp.Close())
-	}
-	if err = tmp.Sync(); err != nil {
-		return errors.Join(err, tmp.Close())
-	}
-	if err = tmp.Close(); err != nil {
-		return err
-	}
-	if err = os.Rename(tmp.Name(), path); err != nil {
-		return err
-	}
-	return syncDir(dir)
-}
-
-// syncDir makes a rename in dir durable. Windows has no directory sync -- it can't open a
-// directory for it -- so there the rename is atomic but may not survive a power loss.
-func syncDir(dir string) error {
-	if runtime.GOOS == "windows" {
-		return nil
-	}
-	d, err := os.Open(dir)
-	if err != nil {
-		return err
-	}
-	return errors.Join(d.Sync(), d.Close())
-}
-
 func (m *InMemoryLeaseStore) LoadSnapshot(path string) error {
-	data, err := os.ReadFile(path)
-	if err != nil {
-		return fmt.Errorf("read snapshot: %w", err)
-	}
-	var file snapshotFile
-	if err := json.Unmarshal(data, &file); err != nil {
-		return fmt.Errorf("unmarshal snapshot file: %w", err)
-	}
-	if len(file.Snapshot) == 0 || file.SHA256 == "" {
-		return fmt.Errorf("snapshot file %s has no sha256/snapshot pair -- it was not written by this version", path)
-	}
-	if !bytes.Equal(data, snapshotFileBytes(file.Snapshot)) {
-		return fmt.Errorf("snapshot file %s is not as the proxy wrote it (its SHA-256 or layout doesn't match): the lease store must not be edited by hand", path)
-	}
 	var snapshot LeaseTreeSnapshot
-	if err := json.Unmarshal(file.Snapshot, &snapshot); err != nil {
-		return fmt.Errorf("unmarshal snapshot: %w", err)
+	if err := sealedfile.Read(path, &snapshot); err != nil {
+		return fmt.Errorf("read snapshot: %w (the lease store must not be edited by hand)", err)
 	}
 	return m.ImportSnapshot(&snapshot)
 }

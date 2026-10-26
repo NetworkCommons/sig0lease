@@ -1,0 +1,34 @@
+# sig0lease-agent's built-in service types. A template uses one by name ("type: ssh") and may
+# override any of its fields in that service's entry. Each is defined exactly as a template's
+# own types: are (see docs/sig0lease-agent.md).
+ssh:
+  service: _ssh._tcp
+  port: 22
+  probe: {tcp: true}
+sftp-ssh:
+  service: _sftp-ssh._tcp
+  port: 22
+  probe: {tcp: true}
+http:
+  service: _http._tcp
+  port: 80
+  probe: {tcp: true}
+https:
+  service: _https._tcp
+  port: 443
+  probe: {tcp: true}
+ipfs-gateway:
+  service: _http._tcp
+  port: 8080
+  txt: {path: /ipfs/}
+  subtypes: [_ipfs]
+  probe: {tcp: true}
+activitypub:
+  service: _activitypub._tcp
+  port: 443
+  probe: {tcp: true}
+ipp:
+  service: _ipp._tcp
+  port: 631
+  txt: {txtvers: "1", rp: ipp/print}
+  probe: {tcp: true}

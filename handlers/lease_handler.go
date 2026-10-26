@@ -6,6 +6,7 @@ import (
 	"strings"
 
 	"codeberg.org/miekg/dns"
+	"github.com/NetworkCommons/sig0lease/pkg/dnsname"
 	"github.com/NetworkCommons/sig0lease/pkg/keyrec"
 	"github.com/NetworkCommons/sig0lease/pkg/updatecore"
 )
@@ -21,7 +22,10 @@ type leaseHandler[C upstreamClient] struct {
 	*leaseRuntime
 
 	upstreamZone string // the one zone this handler serves (e.g. "dev.zenr.io.")
-	keystoreDir  string
+	// deeperZones are the zones other handlers of this proxy serve below upstreamZone, whose
+	// names are theirs, not this handler's (SeparateZones, refuseNamesNotServed).
+	deeperZones []servedZone
+	keystoreDir string
 	// upstreamKeyRecord is the proxy's own SIG(0) key for upstreamZone, which signs every
 	// UPDATE the handler sends (upstreamTarget.send). setup loads it once: a rotated key on
 	// disk needs a restart.
@@ -47,6 +51,73 @@ func newLeaseHandler[C upstreamClient](name string, lockIDs func(nodeKey string)
 		leaseRuntime: newLeaseRuntime(lockIDs, leaseEvent, passExtra),
 		recordTTL:    defaultRecordTTL,
 	}
+}
+
+// servedZone is a zone and the name of the handler serving it.
+type servedZone struct {
+	zone, handler string
+}
+
+// ZoneHandler is an UPDATE handler serving one zone: UpdateHandler and SRPHandler.
+type ZoneHandler interface {
+	Handler
+	// UpstreamZone is the zone the handler serves (upstream_zone), once Setup has read it.
+	UpstreamZone() string
+	setDeeperZones(zones []servedZone)
+}
+
+// UpstreamZone is the zone this handler serves.
+func (b *leaseHandler[C]) UpstreamZone() string { return b.upstreamZone }
+
+func (b *leaseHandler[C]) setDeeperZones(zones []servedZone) { b.deeperZones = zones }
+
+// SeparateZones gives every name at most one of hs: the handler whose zone is the closest one
+// above it, as a zone cut does in DNS. Each handler learns the zones the others serve below its
+// own, and refuses their names (refuseNamesNotServed); with srp.dev.zenr.io. for srp_handler and
+// dev.zenr.io. for update_handler, update_handler refuses every name at or below
+// srp.dev.zenr.io. Two handlers serving one zone leave no closest one, and are an error. The
+// proxy calls it once, after every handler's Setup and before serving.
+func SeparateZones(hs []ZoneHandler) error {
+	for _, h := range hs {
+		var deeper []servedZone
+		for _, other := range hs {
+			if other == h {
+				continue
+			}
+			if dnsname.Normalize(other.UpstreamZone()) == dnsname.Normalize(h.UpstreamZone()) {
+				return fmt.Errorf("%s and %s both serve zone %s: a zone must have one handler", h.Name(), other.Name(), h.UpstreamZone())
+			}
+			if dnsname.IsAtOrBelow(other.UpstreamZone(), h.UpstreamZone()) {
+				deeper = append(deeper, servedZone{zone: other.UpstreamZone(), handler: other.Name()})
+			}
+		}
+		h.setDeeperZones(deeper)
+	}
+	return nil
+}
+
+// refuseNamesNotServed refuses r when its Update section names a record this handler does not
+// serve: one outside upstreamZone, or one in a zone another handler serves below it
+// (SeparateZones). Every owner name the requester sent counts, deletes included. Each handler
+// calls it once the names are final, before anything is looked up or locked.
+func (b *leaseHandler[C]) refuseNamesNotServed(r *dns.Msg) *HandlerResult {
+	for _, rr := range r.Ns {
+		name := rr.Header().Name
+		var err error
+		if !dnsname.IsAtOrBelow(name, b.upstreamZone) {
+			err = fmt.Errorf("%s is outside zone %s, which %s serves", name, b.upstreamZone, b.Name())
+		}
+		for _, z := range b.deeperZones {
+			if err == nil && dnsname.IsAtOrBelow(name, z.zone) {
+				err = fmt.Errorf("%s is in zone %s, which %s serves", name, z.zone, z.handler)
+			}
+		}
+		if err != nil {
+			msg := makeErrorResponse(r, dns.RcodeRefused, dns.ExtendedErrorProhibited, err.Error())
+			return NewErrorResult(msg, "name not served by this handler", err)
+		}
+	}
+	return nil
 }
 
 // upstream is where this handler's UPDATEs go and what signs them.
@@ -154,6 +225,54 @@ func (b *leaseHandler[C]) Start() {
 	}
 	b.logger.Infof("%s: expiry timers armed for the %d lease owner(s) in the store", b.Name(), len(owners))
 	b.startLeaseReconciliation(leaseReconcileInterval, b.logger)
+}
+
+// leaseStoreView adapts LeaseManager to srp.StoreView, the narrow read-only interface
+// srp.Evaluate needs: SRP's FCFS check (SRPHandler.Handle) and the RFC 9664 handler's
+// fcfs_naming (UpdateHandler.fcfsNewKey) alike.
+type leaseStoreView struct{ store LeaseManager }
+
+func (v leaseStoreView) KeysAtName(name string) []*dns.KEY {
+	records := v.store.FindByName(name)
+	keys := make([]*dns.KEY, 0, len(records))
+	for _, rec := range records {
+		if rec.KeyRR == nil {
+			panic(fmt.Sprintf("lease store: KEY node %s at %s has no KEY RR", rec.KeyName, name))
+		}
+		keys = append(keys, rec.KeyRR)
+	}
+	return keys
+}
+
+// fcfsConflictResult is either handler's answer to an update a different key's name stops
+// (srp.FCFSConflict), found by its own check or by the authoritative server's prerequisite
+// (prerequisiteFailed): YXDOMAIN, which RFC 9665 S3.3.3 has the SRP registrar answer.
+func fcfsConflictResult(r *dns.Msg, reason string) *HandlerResult {
+	msg := makeErrorResponse(r, dns.RcodeYXDomain, dns.ExtendedErrorProhibited, "name held by a different key")
+	return NewErrorResult(msg, reason, fmt.Errorf("YXDOMAIN"))
+}
+
+// prerequisiteFailed reports whether rcode is the authoritative server's answer to one of
+// prereqs no longer holding (RFC 2136 S3.2.2): YXDOMAIN to "Name is not in use" (TYPE ANY),
+// YXRRSET to "KEY RRset does not exist" (TYPE KEY). Only prerequisites produce these, so
+// either one without its prerequisite in prereqs is an impossible answer, not an FCFS
+// conflict.
+func prerequisiteFailed(rcode uint16, prereqs []dns.RR) bool {
+	var prereqType uint16
+	switch rcode {
+	case dns.RcodeYXDomain:
+		prereqType = dns.TypeANY
+	case dns.RcodeYXRrset:
+		prereqType = dns.TypeKEY
+	default:
+		return false
+	}
+	for _, rr := range prereqs {
+		if dns.RRToType(rr) == prereqType {
+			return true
+		}
+	}
+	return false
 }
 
 // boolOption reads the optional boolean option key from a handler's config: def when absent,

@@ -7,6 +7,7 @@ import (
 	"codeberg.org/miekg/dns"
 	"github.com/NetworkCommons/sig0lease/pkg/dnsname"
 	leasepkg "github.com/NetworkCommons/sig0lease/pkg/lease"
+	"github.com/NetworkCommons/sig0lease/pkg/srp"
 )
 
 // LeaseRecord is the shared lease state record used by handlers.
@@ -47,6 +48,9 @@ type UpstreamCoordinator interface {
 	// QueryRRs returns the rrType records at name from zoneHint's authoritative server --
 	// none for NXDOMAIN -- for the handler's checks of what is already published.
 	QueryRRs(ctx context.Context, zoneHint, name string, rrType uint16) ([]dns.RR, error)
+	// QueryKeyAtName reports the KEYs at name, telling NXDOMAIN from a name without one:
+	// fcfs_naming's live check (srp.Evaluate), as for the SRP handler.
+	QueryKeyAtName(ctx context.Context, zoneHint, name string) (srp.AuthoritativeKeyState, []*dns.KEY, error)
 }
 
 // UpdateHandler handles DNS opcode 5 (UPDATE queries).
@@ -66,7 +70,10 @@ type UpdateHandler struct {
 	// gates whether it may also be used to create new managed state. Default
 	// false (fail closed).
 	AllowOnlineKeyRegistration bool
-	blacklistedTypes           map[uint16]struct{} // RR types blocked from registration (type code -> empty)
+	// fcfsNaming (fcfs_naming) refuses a new KEY at a name another key holds: its own name or
+	// one above it (fcfsNewKey). Default false: any new key may register next to another.
+	fcfsNaming       bool
+	blacklistedTypes map[uint16]struct{} // RR types blocked from registration (type code -> empty)
 }
 
 // NewUpdateHandler creates a new handler for opcode 5 (UPDATE) queries.

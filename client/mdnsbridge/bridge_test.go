@@ -1,7 +1,6 @@
 package mdnsbridge
 
 import (
-	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -14,8 +13,8 @@ import (
 	"time"
 
 	"codeberg.org/miekg/dns"
+	baseclient "github.com/NetworkCommons/sig0lease/client"
 	"github.com/NetworkCommons/sig0lease/client/mdnsresponder"
-	clientsrp "github.com/NetworkCommons/sig0lease/client/srp"
 	"github.com/NetworkCommons/sig0lease/pkg/keyrec"
 )
 
@@ -115,7 +114,7 @@ func (f *fakeSource) instance(name, target string, port uint16, txt ...string) {
 // registrar records every update the bridge's clients send, and accepts them all.
 type registrar struct{ sent chan *dns.Msg }
 
-func (r *registrar) Send(ctx context.Context, addr string, network clientsrp.Network, msg *dns.Msg) (*dns.Msg, error) {
+func (r *registrar) Send(ctx context.Context, addr string, network baseclient.Network, msg *dns.Msg) (*dns.Msg, error) {
 	r.sent <- msg
 	return &dns.Msg{MsgHeader: dns.MsgHeader{Rcode: dns.RcodeSuccess}}, nil
 }
@@ -447,20 +446,6 @@ func TestRun_NeedsHostsUnlessListing(t *testing.T) {
 	}
 }
 
-func TestEscapeTXT_PacksToTheRawBytes(t *testing.T) {
-	raw := []byte("a\\b\x00\xff\"q")
-	m := &dns.Msg{}
-	txt := &dns.TXT{Hdr: dns.Header{Name: "x.", Class: dns.ClassINET}}
-	txt.TXT.Txt = []string{escapeTXT(raw)}
-	m.Answer = []dns.RR{txt}
-	if err := m.Pack(); err != nil {
-		t.Fatal(err)
-	}
-	if want := append([]byte{byte(len(raw))}, raw...); !bytes.HasSuffix(m.Data, want) {
-		t.Errorf("packed TXT ends % x, want % x", m.Data[len(m.Data)-len(want):], want)
-	}
-}
-
 func TestNormalizeHost(t *testing.T) {
 	for _, in := range []string{"Box", "box.local", "BOX.local.", "box.LOCAL."} {
 		if got := normalizeHost(in); got != "box.local." {
@@ -469,5 +454,25 @@ func TestNormalizeHost(t *testing.T) {
 	}
 	if got := normalizeHost("Box.Example.com"); got != "box.example.com." {
 		t.Errorf("normalizeHost(Box.Example.com) = %q, want box.example.com.", got)
+	}
+}
+
+// Selects compares host names in the forms a user gives them, and selects every host with
+// AllHosts.
+func TestSelects(t *testing.T) {
+	hosts := []string{"MyMac", "box.local."}
+	for _, tt := range []struct {
+		target   string
+		allHosts bool
+		want     bool
+	}{
+		{"mymac.local.", false, true},
+		{"BOX", false, true},
+		{"other.local.", false, false},
+		{"other.local.", true, true},
+	} {
+		if got := Selects(hosts, tt.allHosts, tt.target); got != tt.want {
+			t.Errorf("Selects(%q, %v, %q) = %v, want %v", hosts, tt.allHosts, tt.target, got, tt.want)
+		}
 	}
 }

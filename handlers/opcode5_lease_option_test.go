@@ -94,27 +94,23 @@ func TestRequestedLeases_FourByteFollowsRecordKinds(t *testing.T) {
 	}
 }
 
-// TestCheckLeaseMinimums: a duration below its lease_policy minimum is refused; 0, a delete,
-// never is.
-func TestCheckLeaseMinimums(t *testing.T) {
-	h := newTestHandler()
-	h.LeasePolicy = LeasePolicy{MinRRLease: 30, MinKeyLease: 60}
-	tests := []struct {
-		lease, keyLease uint32
-		wantErr         bool
-	}{
-		{30, 60, false},
-		{0, 0, false},
-		{30, 0, false},
-		{0, 60, false},
-		{20, 60, true},
-		{30, 50, true},
-		{0, 50, true},
+// TestHandle_LeaseBelowMinimumIsRaisedToIt: a LEASE or KEY-LEASE below the lease_policy
+// minimum is granted the minimum, as the SRP handler grants it (LeasePolicy.clamp), and the
+// reply says so; it is not refused.
+func TestHandle_LeaseBelowMinimumIsRaisedToIt(t *testing.T) {
+	h, signer := setupFourByteHandler(t, false, false)
+	req := buildSignedLeaseUpdateForHandleTest(t, signer, "test.dev.zenr.io.", leasepkg.Encode8Byte(10, 20), true)
+
+	res := h.Handle(context.Background(), stubResponseWriter{}, req)
+	if res == nil || res.Message == nil || res.Message.Rcode != dns.RcodeSuccess {
+		t.Fatalf("result = %+v, want NOERROR", res)
 	}
-	for _, tt := range tests {
-		if err := h.checkLeaseMinimums(tt.lease, tt.keyLease); (err != nil) != tt.wantErr {
-			t.Errorf("checkLeaseMinimums(%d, %d) = %v, want error %v", tt.lease, tt.keyLease, err, tt.wantErr)
-		}
+	granted, err := leasepkg.FindAndDecode(res.Message)
+	if err != nil || granted.KeyLease == nil || granted.Lease != 30 || *granted.KeyLease != 30 {
+		t.Fatalf("granted %+v (%v), want 30/30, the policy's minimums", granted, err)
+	}
+	if keyLease := h.leaseManager.LookupByKEY(signer.PublicKey.Clone().(*dns.KEY)); keyLease == nil || keyLease.KeyLeaseDuration != 30 {
+		t.Fatalf("stored KEY lease = %+v, want 30 s", keyLease)
 	}
 }
 

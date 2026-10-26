@@ -172,7 +172,11 @@ func buildSRPUpdateUnsigned(t *testing.T, zone string, identity *srpTestIdentity
 
 	msg.Ns = append(msg.Ns, srpDeleteAll(host))
 	for _, addr := range addrs {
-		msg.Ns = append(msg.Ns, srpMustRR(t, host+" 3600 IN A "+addr))
+		rrType := "A"
+		if strings.Contains(addr, ":") {
+			rrType = "AAAA"
+		}
+		msg.Ns = append(msg.Ns, srpMustRR(t, host+" 3600 IN "+rrType+" "+addr))
 	}
 	msg.Ns = append(msg.Ns, identity.keyAt(host))
 
@@ -329,6 +333,136 @@ func TestSRPHandle_ForwardsSynthesizedKEYForInstanceThatOmittedIt(t *testing.T) 
 	}
 	if !found {
 		t.Fatalf("expected a synthesized KEY add at the instance's own name (%s) matching the host's key material, got Ns: %+v", inst, coord.sent[0].Ns)
+	}
+}
+
+// TestSRPHandle_RemovalKeepsInstanceKEYUnlessKeyLeaseIsZero pins RFC 9665 S3.2.5.5.1: a
+// removal whose KEY-LEASE is not zero holds the names for the requester ("the SRP registrar
+// MUST NOT delete the KEY records for these service instances"), so the instance's KEY is
+// added back after its Delete All RRsets; with a KEY-LEASE of 0, a permanent removal, it
+// goes with the rest.
+func TestSRPHandle_RemovalKeepsInstanceKEYUnlessKeyLeaseIsZero(t *testing.T) {
+	for _, tt := range []struct {
+		keyLease uint32
+		wantKey  bool
+	}{{1209600, true}, {0, false}} {
+		h, coord := newSRPTestHandler(t)
+		id := newSRPTestIdentity(t)
+		const host = "srptest1r.dev.zenr.io."
+		live := oneWidgetInstance()
+		inst := live[0].name
+
+		register := buildSRPUpdate(t, srpTestZone, id, host, []string{"192.0.2.1"}, live, 30, 1209600, host)
+		if res := h.Handle(context.Background(), stubTCPResponseWriter{}, register); res.Status != StatusProcessed {
+			t.Fatalf("register: expected Processed, got %s: %v", res.Status, res.Error)
+		}
+		removal := buildSRPUpdate(t, srpTestZone, id, host, nil, []srpInstanceSpec{{name: inst, removalShaped: true}}, 0, tt.keyLease, host)
+		sentBefore := len(coord.sent)
+		if res := h.Handle(context.Background(), stubTCPResponseWriter{}, removal); res.Status != StatusProcessed {
+			t.Fatalf("removal with KEY-LEASE %d: expected Processed, got %s: %v", tt.keyLease, res.Status, res.Error)
+		}
+
+		// Every UPDATE the removal sent: the service-type enumeration follows in one of its own.
+		found := false
+		for _, sent := range coord.sent[sentBefore:] {
+			for _, rr := range sent.Ns {
+				if key, ok := rr.(*dns.KEY); ok && key.Hdr.Class != dns.ClassNONE && key.Hdr.Name == inst {
+					found = true
+				}
+			}
+		}
+		if found != tt.wantKey {
+			t.Errorf("removal with KEY-LEASE %d: KEY add at %s forwarded = %v, want %v", tt.keyLease, inst, found, tt.wantKey)
+		}
+	}
+}
+
+// A LEASE of 0 removes the host with its live service instances, listed or not, and their
+// PTRs, keeping their KEYs while KEY-LEASE is not 0 (RFC 9665 S3.2.5.5.1). Adds it carries are
+// dropped, not forwarded or stored: OpenThread's client sends its addresses with every
+// removal. An update with a LEASE leaves the instances it omits alone.
+func TestSRPHandle_HostRemovalRemovesEveryInstance(t *testing.T) {
+	widget := oneWidgetInstance()[0]
+	gadget := srpInstanceSpec{name: "Gadget._ipp._tcp.dev.zenr.io.", port: 631, txt: "rp=x", svctype: "_ipp._tcp.dev.zenr.io."}
+	for _, tt := range []struct {
+		name            string
+		addrs           []string
+		listed          []srpInstanceSpec
+		lease, keyLease uint32
+		removed, keys   bool
+	}{
+		{"removal keeping the names", nil, nil, 0, 1209600, true, true},
+		{"removal freeing the names", nil, nil, 0, 0, true, false},
+		{"removal with an address, as OpenThread's client sends it", []string{"2001:db8::1"}, nil, 0, 1209600, true, true},
+		{"removal listing an instance with its records", []string{"192.0.2.1"}, []srpInstanceSpec{widget}, 0, 1209600, true, true},
+		{"an address, no instance listed", []string{"192.0.2.1"}, nil, 30, 1209600, false, false},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			h, coord := newSRPTestHandler(t)
+			id := newSRPTestIdentity(t)
+			const host = "srptest1u.dev.zenr.io."
+			register := buildSRPUpdate(t, srpTestZone, id, host, []string{"192.0.2.1"}, []srpInstanceSpec{widget, gadget}, 30, 1209600, host)
+			if res := h.Handle(context.Background(), stubTCPResponseWriter{}, register); res.Status != StatusProcessed {
+				t.Fatalf("register: expected Processed, got %s: %v", res.Status, res.Error)
+			}
+			update := buildSRPUpdate(t, srpTestZone, id, host, tt.addrs, tt.listed, tt.lease, tt.keyLease, host)
+			sentBefore := len(coord.sent)
+			if res := h.Handle(context.Background(), stubTCPResponseWriter{}, update); res.Status != StatusProcessed {
+				t.Fatalf("update: expected Processed, got %s: %v", res.Status, res.Error)
+			}
+
+			if tt.lease == 0 {
+				for _, sent := range coord.sent[sentBefore:] {
+					for _, rr := range sent.Ns {
+						switch rr.(type) {
+						case *dns.A, *dns.AAAA, *dns.SRV, *dns.TXT, *dns.PTR:
+							if rr.Header().Class == dns.ClassINET {
+								t.Errorf("a removal forwarded the add %s", rr)
+							}
+						}
+					}
+				}
+				if set := h.leaseManager.GetNonKEYRecordSet(leasepkg.NodeKey(id.keyAt(host))); set != nil && len(set.Records) > 0 {
+					t.Errorf("the removed host's addresses are in the lease store: %v", set.Records)
+				}
+			}
+
+			for _, inst := range []srpInstanceSpec{widget, gadget} {
+				var deleted, keyAdded, ptrDeleted bool
+				for _, sent := range coord.sent[sentBefore:] {
+					for _, rr := range sent.Ns {
+						switch r := rr.(type) {
+						case *dns.ANY:
+							deleted = deleted || (r.Hdr.Class == dns.ClassANY && dnsname.EqualFold(r.Hdr.Name, inst.name))
+						case *dns.KEY:
+							keyAdded = keyAdded || (r.Hdr.Class != dns.ClassNONE && dnsname.EqualFold(r.Hdr.Name, inst.name))
+						case *dns.PTR:
+							ptrDeleted = ptrDeleted || (r.Hdr.Class == dns.ClassNONE && dnsname.EqualFold(r.Ptr, inst.name))
+						}
+					}
+				}
+				if deleted != tt.removed || ptrDeleted != tt.removed || keyAdded != tt.keys {
+					t.Errorf("%s: deleted %v, PTR deleted %v, KEY added %v; want %v, %v, %v", inst.name, deleted, ptrDeleted, keyAdded, tt.removed, tt.removed, tt.keys)
+				}
+				set := h.leaseManager.GetNonKEYRecordSet(leasepkg.NodeKey(id.keyAt(inst.name)))
+				if stored := set != nil && len(set.Records) > 0; stored == tt.removed {
+					t.Errorf("%s: SRV/TXT/PTR in the lease store %v, want %v", inst.name, stored, !tt.removed)
+				}
+			}
+		})
+	}
+}
+
+// RFC 9665 S3.3.1.3 allows a Host Description without an address only in a removal (LEASE
+// 0): with a LEASE, the update is not an SRP Update, refused (S3.3.2), and nothing is sent.
+func TestSRPHandle_HostWithoutAddressNeedsLeaseZero(t *testing.T) {
+	h, coord := newSRPTestHandler(t)
+	id := newSRPTestIdentity(t)
+	const host = "srptest1u.dev.zenr.io."
+	res := h.Handle(context.Background(), stubTCPResponseWriter{}, buildSRPUpdate(t, srpTestZone, id, host, nil, nil, 30, 1209600, host))
+	wantErrorReply(t, res, dns.RcodeRefused, dns.ExtendedErrorOther, "no address")
+	if len(coord.sent) != 0 {
+		t.Errorf("sent %d upstream UPDATEs, want none", len(coord.sent))
 	}
 }
 
@@ -1690,7 +1824,7 @@ func TestSRPHandle_ExpiryRefreshedUnderItsLocks_FailsHard(t *testing.T) {
 	id := newSRPTestIdentity(t)
 	const host = "srptest14f.dev.zenr.io."
 
-	msg := buildSRPUpdate(t, srpTestZone, id, host, nil, nil, 1, 1, host)
+	msg := buildSRPUpdate(t, srpTestZone, id, host, []string{"192.0.2.1"}, nil, 1, 1, host)
 	if res := h.Handle(context.Background(), stubTCPResponseWriter{}, msg); res.Status != StatusProcessed {
 		t.Fatalf("fresh registration: expected Processed, got %s: %v", res.Status, res.Error)
 	}

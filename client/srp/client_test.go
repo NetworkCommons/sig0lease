@@ -1,6 +1,7 @@
 package srp
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"math/rand"
@@ -10,6 +11,8 @@ import (
 	"time"
 
 	"codeberg.org/miekg/dns"
+	baseclient "github.com/NetworkCommons/sig0lease/client"
+	"github.com/NetworkCommons/sig0lease/client/clienttest"
 	leasepkg "github.com/NetworkCommons/sig0lease/pkg/lease"
 	"github.com/NetworkCommons/sig0lease/pkg/sig0"
 	pkgsrp "github.com/NetworkCommons/sig0lease/pkg/srp"
@@ -21,12 +24,12 @@ import (
 type fakeTransport struct {
 	sent      []*dns.Msg
 	addrs     []string
-	networks  []Network
+	networks  []baseclient.Network
 	responses []*dns.Msg
 	err       error
 }
 
-func (f *fakeTransport) Send(ctx context.Context, addr string, network Network, msg *dns.Msg) (*dns.Msg, error) {
+func (f *fakeTransport) Send(ctx context.Context, addr string, network baseclient.Network, msg *dns.Msg) (*dns.Msg, error) {
 	f.sent = append(f.sent, msg)
 	f.addrs = append(f.addrs, addr)
 	f.networks = append(f.networks, network)
@@ -41,20 +44,6 @@ func (f *fakeTransport) Send(ctx context.Context, addr string, network Network, 
 		return &dns.Msg{MsgHeader: dns.MsgHeader{Rcode: dns.RcodeSuccess}}, nil
 	}
 	return f.responses[idx], nil
-}
-
-func successResp(lease, keyLease uint32) *dns.Msg {
-	resp := &dns.Msg{MsgHeader: dns.MsgHeader{Rcode: dns.RcodeSuccess}}
-	opt := &dns.OPT{Hdr: dns.Header{Name: "."}}
-	opt.SetUDPSize(dns.DefaultMsgSize)
-	lo := leasepkg.Encode8Byte(lease, keyLease)
-	_ = lo.Encode(opt)
-	resp.Extra = append(resp.Extra, opt)
-	return resp
-}
-
-func rcodeResp(rcode uint16) *dns.Msg {
-	return &dns.Msg{MsgHeader: dns.MsgHeader{Rcode: rcode}}
 }
 
 func testConfig(t *testing.T, transport *fakeTransport) Config {
@@ -139,7 +128,7 @@ func TestNewClient_RejectsLabelThatIsNotOneDNSLabel(t *testing.T) {
 }
 
 func TestClient_Register_BuildsSignsAndSends(t *testing.T) {
-	transport := &fakeTransport{responses: []*dns.Msg{successResp(30, 1209600)}}
+	transport := &fakeTransport{responses: []*dns.Msg{clienttest.Granted(30, 1209600)}}
 	c, err := NewClient(testConfig(t, transport))
 	if err != nil {
 		t.Fatalf("NewClient: %v", err)
@@ -149,7 +138,7 @@ func TestClient_Register_BuildsSignsAndSends(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Register: %v", err)
 	}
-	if outcome != pkgsrp.OutcomeSuccess {
+	if outcome != baseclient.OutcomeSuccess {
 		t.Fatalf("outcome = %v, want success", outcome)
 	}
 	if resp.Rcode != dns.RcodeSuccess {
@@ -177,7 +166,7 @@ func TestClient_Register_BuildsSignsAndSends(t *testing.T) {
 }
 
 func TestClient_Deregister_SendsRemovalShapedUpdate(t *testing.T) {
-	transport := &fakeTransport{responses: []*dns.Msg{successResp(0, 1209600)}}
+	transport := &fakeTransport{responses: []*dns.Msg{clienttest.Granted(0, 0)}}
 	cfg := testConfig(t, transport)
 	cfg.Instances = []InstanceConfig{{Label: "Widget", ServiceType: "_http._tcp", Port: 80}}
 	c, err := NewClient(cfg)
@@ -185,11 +174,11 @@ func TestClient_Deregister_SendsRemovalShapedUpdate(t *testing.T) {
 		t.Fatalf("NewClient: %v", err)
 	}
 
-	resp, outcome, err := c.Deregister(context.Background())
+	resp, outcome, err := c.Deregister(context.Background(), false)
 	if err != nil {
 		t.Fatalf("Deregister: %v", err)
 	}
-	if outcome != pkgsrp.OutcomeSuccess {
+	if outcome != baseclient.OutcomeSuccess {
 		t.Fatalf("outcome = %v, want success", outcome)
 	}
 	if resp.Rcode != dns.RcodeSuccess {
@@ -214,13 +203,35 @@ func TestClient_Deregister_SendsRemovalShapedUpdate(t *testing.T) {
 	if len(cu.Instances) != 1 || cu.Instances[0].SRV != nil {
 		t.Fatalf("expected exactly 1 removal-shaped instance (SRV nil), got %+v", cu.Instances)
 	}
+	if lo, err := leasepkg.FindAndDecode(sent); err != nil || lo.Lease != 0 || lo.KeyLease == nil || *lo.KeyLease != 0 {
+		t.Fatalf("lease option %+v (%v), want LEASE 0 and KEY-LEASE 0, a permanent removal", lo, err)
+	}
+}
+
+// TestClient_Deregister_KeepingNames: keeping the names, the removal asks for the KEY-LEASE the
+// client registers with (RFC 9665 S3.2.5.5.1), so the registrar holds the names for its key.
+func TestClient_Deregister_KeepingNames(t *testing.T) {
+	transport := &fakeTransport{responses: []*dns.Msg{clienttest.Granted(0, 600)}}
+	cfg := testConfig(t, transport)
+	cfg.RequestedKeyLease = 600
+	cfg.RequestedLease = 60
+	c, err := NewClient(cfg)
+	if err != nil {
+		t.Fatalf("NewClient: %v", err)
+	}
+	if _, outcome, err := c.Deregister(context.Background(), true); err != nil || outcome != baseclient.OutcomeSuccess {
+		t.Fatalf("Deregister: %v, %v", outcome, err)
+	}
+	if lo, err := leasepkg.FindAndDecode(transport.sent[0]); err != nil || lo.Lease != 0 || lo.KeyLease == nil || *lo.KeyLease != 600 {
+		t.Fatalf("lease option %+v (%v), want LEASE 0 and KEY-LEASE 600", lo, err)
+	}
 }
 
 // TestClient_Register_WithdrawsOneInstance: an instance with Remove set goes out as a bare
 // Delete All RRsets (RFC 9665 S3.2.5.5.2), while the host keeps its addresses and the other
 // instance is registered as usual.
 func TestClient_Register_WithdrawsOneInstance(t *testing.T) {
-	transport := &fakeTransport{responses: []*dns.Msg{successResp(30, 1209600)}}
+	transport := &fakeTransport{responses: []*dns.Msg{clienttest.Granted(30, 1209600)}}
 	cfg := testConfig(t, transport)
 	cfg.Instances = []InstanceConfig{
 		{Label: "Screen", ServiceType: "_rfb._tcp", Remove: true},
@@ -259,7 +270,7 @@ func TestClient_Register_WithdrawsOneInstance(t *testing.T) {
 }
 
 func TestClient_Register_DiscoversWhenNoExplicitAddr(t *testing.T) {
-	transport := &fakeTransport{responses: []*dns.Msg{successResp(30, 1209600)}}
+	transport := &fakeTransport{responses: []*dns.Msg{clienttest.Granted(30, 1209600)}}
 	cfg := testConfig(t, transport)
 	cfg.RegistrarAddr = ""
 	cfg.Query = (&fakeDNS{
@@ -282,7 +293,7 @@ func TestClient_Register_DiscoversWhenNoExplicitAddr(t *testing.T) {
 // TestClient_Register_DiscoveryApexOnly: Config.Discovery reaches Discover. With a record at
 // both the domain and its zone apex, DiscoveryApexOnly sends to the apex's registrar.
 func TestClient_Register_DiscoveryApexOnly(t *testing.T) {
-	transport := &fakeTransport{responses: []*dns.Msg{successResp(30, 1209600)}}
+	transport := &fakeTransport{responses: []*dns.Msg{clienttest.Granted(30, 1209600)}}
 	cfg := testConfig(t, transport)
 	cfg.Domain = "srp.example.com."
 	cfg.RegistrarAddr = ""
@@ -308,7 +319,7 @@ func TestClient_Register_DiscoveryApexOnly(t *testing.T) {
 }
 
 func TestClient_Register_InterpretsConflict(t *testing.T) {
-	transport := &fakeTransport{responses: []*dns.Msg{rcodeResp(dns.RcodeYXDomain)}}
+	transport := &fakeTransport{responses: []*dns.Msg{clienttest.Answer(dns.RcodeYXDomain)}}
 	c, err := NewClient(testConfig(t, transport))
 	if err != nil {
 		t.Fatalf("NewClient: %v", err)
@@ -317,43 +328,90 @@ func TestClient_Register_InterpretsConflict(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Register: %v", err)
 	}
-	if outcome != pkgsrp.OutcomeConflict {
+	if outcome != baseclient.OutcomeConflict {
 		t.Fatalf("outcome = %v, want conflict", outcome)
 	}
 }
 
-func TestClient_Rename_AppendsSuffixToHostAndInstances(t *testing.T) {
-	transport := &fakeTransport{}
-	cfg := testConfig(t, transport)
-	cfg.Instances = []InstanceConfig{{Label: "Widget", ServiceType: "_http._tcp", Port: 8080}}
+// heldBy is a DNSQuery answering a KEY query with another key's KEY at every name in held,
+// and NXDOMAIN everywhere else.
+func heldBy(held ...string) DNSQuery {
+	return func(ctx context.Context, name string, qtype uint16) (*dns.Msg, error) {
+		resp := &dns.Msg{MsgHeader: dns.MsgHeader{Rcode: dns.RcodeNameError}}
+		for _, h := range held {
+			if strings.EqualFold(h, name) && qtype == dns.TypeKEY {
+				k := &dns.KEY{}
+				k.Hdr = dns.Header{Name: name, Class: dns.ClassINET, TTL: 300}
+				k.Protocol, k.Algorithm, k.PublicKey = 3, dns.ECDSAP256SHA256, "c29tZW9uZSBlbHNl"
+				resp.Rcode = dns.RcodeSuccess
+				resp.Answer = []dns.RR{k}
+			}
+		}
+		return resp, nil
+	}
+}
+
+// Only the names another key holds are renamed, each from its own requested label.
+func TestClient_RenameHeld_RenamesOnlyHeldNames(t *testing.T) {
+	cfg := testConfig(t, &fakeTransport{})
+	cfg.Instances = []InstanceConfig{
+		{Label: "Widget", ServiceType: "_http._tcp", Port: 8080},
+		{Label: "Shell", ServiceType: "_ssh._tcp", Port: 22},
+	}
+	cfg.Query = heldBy("myhost.example.com.", "Widget._http._tcp.example.com.", "Widget-2._http._tcp.example.com.")
+	var saved []Labels
+	cfg.OnRenamed = func(l Labels) { saved = append(saved, l) }
 	c, err := NewClient(cfg)
 	if err != nil {
 		t.Fatalf("NewClient: %v", err)
 	}
 
-	if c.hostFQDN() != "myhost.example.com." {
-		t.Fatalf("initial host = %q", c.hostFQDN())
+	if err := c.renameHeld(context.Background()); err != nil {
+		t.Fatalf("renameHeld: %v", err)
 	}
-	c.rename()
-	if c.hostFQDN() != "myhost-2.example.com." {
-		t.Fatalf("after 1 rename, host = %q, want %q", c.hostFQDN(), "myhost-2.example.com.")
+	specs := c.specs(false)
+	if c.hostFQDN() != "myhost-2.example.com." || specs[0].Name != "Widget-2._http._tcp.example.com." || specs[1].Name != "Shell._ssh._tcp.example.com." {
+		t.Fatalf("after one rename: host %q, instances %q %q; want myhost-2, Widget-2, Shell", c.hostFQDN(), specs[0].Name, specs[1].Name)
 	}
-	if got := c.specs(false)[0].Name; got != "Widget-2._http._tcp.example.com." {
-		t.Fatalf("after 1 rename, instance name = %q, want %q", got, "Widget-2._http._tcp.example.com.")
+	if err := c.renameHeld(context.Background()); err != nil {
+		t.Fatalf("second renameHeld: %v", err)
 	}
-	c.rename()
-	if c.hostFQDN() != "myhost-3.example.com." {
-		t.Fatalf("after 2 renames, host = %q, want %q", c.hostFQDN(), "myhost-3.example.com.")
+	specs = c.specs(false)
+	if c.hostFQDN() != "myhost-2.example.com." || specs[0].Name != "Widget-3._http._tcp.example.com." {
+		t.Fatalf("after a second rename: host %q, Widget %q; want myhost-2 kept (free), Widget-3", c.hostFQDN(), specs[0].Name)
+	}
+	if len(saved) != 2 || saved[1].Host != "myhost-2" || saved[1].Instances[InstanceName{Label: "Widget", ServiceType: "_http._tcp"}] != "Widget-3" {
+		t.Fatalf("OnRenamed got %+v, want two calls, the last with myhost-2 and Widget-3", saved)
+	}
+}
+
+// When the resolvers show no name held, the client does not guess: nothing is renamed, and
+// the cycle fails for Run to retry.
+func TestClient_RenameHeld_NothingHeldIsAnError(t *testing.T) {
+	transport := &fakeTransport{responses: []*dns.Msg{clienttest.Answer(dns.RcodeYXDomain)}}
+	cfg := testConfig(t, transport)
+	cfg.Query = heldBy()
+	c, err := NewClient(cfg)
+	if err != nil {
+		t.Fatalf("NewClient: %v", err)
+	}
+	if _, err := c.registerWithRenameRetry(context.Background()); err == nil || !strings.Contains(err.Error(), "no name of this update holds another key") {
+		t.Fatalf("expected the unexplained-conflict error, got: %v", err)
+	}
+	if len(transport.sent) != 1 || c.hostFQDN() != "myhost.example.com." {
+		t.Fatalf("expected one attempt and no rename, got %d attempts, host %q", len(transport.sent), c.hostFQDN())
 	}
 }
 
 func TestClient_RegisterWithRenameRetry_SucceedsAfterConflicts(t *testing.T) {
 	transport := &fakeTransport{responses: []*dns.Msg{
-		rcodeResp(dns.RcodeYXDomain),
-		rcodeResp(dns.RcodeYXDomain),
-		successResp(30, 1209600),
+		clienttest.Answer(dns.RcodeYXDomain),
+		clienttest.Answer(dns.RcodeYXDomain),
+		clienttest.Granted(30, 1209600),
 	}}
-	c, err := NewClient(testConfig(t, transport))
+	cfg := testConfig(t, transport)
+	cfg.Query = heldBy("myhost.example.com.", "myhost-2.example.com.")
+	c, err := NewClient(cfg)
 	if err != nil {
 		t.Fatalf("NewClient: %v", err)
 	}
@@ -373,9 +431,10 @@ func TestClient_RegisterWithRenameRetry_SucceedsAfterConflicts(t *testing.T) {
 }
 
 func TestClient_RegisterWithRenameRetry_ExhaustsRetries(t *testing.T) {
-	transport := &fakeTransport{responses: []*dns.Msg{rcodeResp(dns.RcodeYXDomain)}} // repeats forever
+	transport := &fakeTransport{responses: []*dns.Msg{clienttest.Answer(dns.RcodeYXDomain)}} // repeats forever
 	cfg := testConfig(t, transport)
 	cfg.MaxRenames = 2
+	cfg.Query = heldBy("myhost.example.com.", "myhost-2.example.com.", "myhost-3.example.com.")
 	c, err := NewClient(cfg)
 	if err != nil {
 		t.Fatalf("NewClient: %v", err)
@@ -389,8 +448,39 @@ func TestClient_RegisterWithRenameRetry_ExhaustsRetries(t *testing.T) {
 	}
 }
 
+// A client starts from the labels an earlier one renamed to, and refuses labels that are not
+// renames of the requested ones.
+func TestNewClient_Labels(t *testing.T) {
+	cfg := testConfig(t, &fakeTransport{})
+	cfg.Instances = []InstanceConfig{{Label: "Widget", ServiceType: "_http._tcp", Port: 8080}}
+	widget := InstanceName{Label: "Widget", ServiceType: "_http._tcp"}
+	cfg.Labels = &Labels{Host: "myhost-3", Instances: map[InstanceName]string{widget: "Widget-2", {Label: "Gone", ServiceType: "_ipp._tcp"}: "Gone-4"}}
+	c, err := NewClient(cfg)
+	if err != nil {
+		t.Fatalf("NewClient: %v", err)
+	}
+	if c.hostFQDN() != "myhost-3.example.com." || c.specs(false)[0].Name != "Widget-2._http._tcp.example.com." {
+		t.Fatalf("host %q, instance %q; want myhost-3 and Widget-2", c.hostFQDN(), c.specs(false)[0].Name)
+	}
+	if got := c.Labels().Instances[InstanceName{Label: "Gone", ServiceType: "_ipp._tcp"}]; got != "Gone-4" {
+		t.Fatalf("an absent instance's label must be kept, got %q", got)
+	}
+
+	for _, bad := range []Labels{
+		{Host: "otherhost"},
+		{Host: "myhost-1"},
+		{Host: "myhost-02"},
+		{Host: "myhost", Instances: map[InstanceName]string{widget: "Gadget-2"}},
+	} {
+		cfg.Labels = &bad
+		if _, err := NewClient(cfg); err == nil || !strings.Contains(err.Error(), "rename of it") {
+			t.Errorf("Labels %+v: expected a not-a-rename error, got %v", bad, err)
+		}
+	}
+}
+
 func TestClient_RegisterWithRenameRetry_NonConflictFailureStopsImmediately(t *testing.T) {
-	transport := &fakeTransport{responses: []*dns.Msg{rcodeResp(dns.RcodeRefused)}}
+	transport := &fakeTransport{responses: []*dns.Msg{clienttest.Answer(dns.RcodeRefused)}}
 	c, err := NewClient(testConfig(t, transport))
 	if err != nil {
 		t.Fatalf("NewClient: %v", err)
@@ -405,7 +495,7 @@ func TestClient_RegisterWithRenameRetry_NonConflictFailureStopsImmediately(t *te
 }
 
 func TestClient_Run_SleepsInitialDelayThenRefreshesOnGrantedLease(t *testing.T) {
-	transport := &fakeTransport{responses: []*dns.Msg{successResp(30, 1209600), successResp(30, 1209600)}}
+	transport := &fakeTransport{responses: []*dns.Msg{clienttest.Granted(30, 1209600), clienttest.Granted(30, 1209600)}}
 	cfg := testConfig(t, transport)
 
 	var sleeps []time.Duration
@@ -439,57 +529,6 @@ func TestClient_Run_SleepsInitialDelayThenRefreshesOnGrantedLease(t *testing.T) 
 	}
 	if len(transport.sent) < 1 {
 		t.Fatal("expected at least one registration to have been sent")
-	}
-}
-
-// TestClient_Run_BackoffDoublesOnConsecutiveFailuresThenResets pins the shape of Run's
-// retry backoff: it starts at minRegisterRetryBackoff, doubles on each consecutive
-// failure, and resets back to the minimum the moment a cycle succeeds -- so the steady
-// -state refresh clock after a recovery is the normal S5.2 clock, not a leftover
-// multi-minute backoff from the outage that just ended.
-func TestClient_Run_BackoffDoublesOnConsecutiveFailuresThenResets(t *testing.T) {
-	transport := &fakeTransport{responses: []*dns.Msg{
-		rcodeResp(dns.RcodeServerFailure),
-		rcodeResp(dns.RcodeServerFailure),
-		successResp(30, 1209600),
-	}}
-	cfg := testConfig(t, transport)
-
-	var sleeps []time.Duration
-	callCount := 0
-	cfg.Sleep = func(ctx context.Context, d time.Duration) error {
-		sleeps = append(sleeps, d)
-		callCount++
-		if callCount >= 4 { // initial delay + 2 backoffs + 1 post-success refresh sleep
-			return context.Canceled
-		}
-		return nil
-	}
-	var gotErrs []error
-	cfg.OnError = func(err error) { gotErrs = append(gotErrs, err) }
-
-	c, err := NewClient(cfg)
-	if err != nil {
-		t.Fatalf("NewClient: %v", err)
-	}
-	if err := c.Run(context.Background()); !errors.Is(err, context.Canceled) {
-		t.Fatalf("expected Run to stop via Sleep/ctx cancellation, got: %v", err)
-	}
-	if len(gotErrs) != 2 {
-		t.Fatalf("expected exactly 2 OnError calls (for the 2 failed cycles), got %d: %v", len(gotErrs), gotErrs)
-	}
-	if len(sleeps) < 4 {
-		t.Fatalf("expected at least 4 sleeps (initial, 2 backoffs, 1 refresh), got %d: %v", len(sleeps), sleeps)
-	}
-	if sleeps[1] != minRegisterRetryBackoff {
-		t.Fatalf("first retry backoff = %v, want %v (the floor)", sleeps[1], minRegisterRetryBackoff)
-	}
-	if sleeps[2] != minRegisterRetryBackoff*2 {
-		t.Fatalf("second retry backoff = %v, want %v (doubled)", sleeps[2], minRegisterRetryBackoff*2)
-	}
-	wantRefreshMin := 30 * time.Second * 80 / 100
-	if sleeps[3] < wantRefreshMin {
-		t.Fatalf("post-success sleep = %v, want >= %v (the reset refresh clock, not another backoff)", sleeps[3], wantRefreshMin)
 	}
 }
 
@@ -529,10 +568,10 @@ func TestClient_Run_RetriesOnDiscoveryFailure(t *testing.T) {
 	}
 }
 
-// TestClient_Register_DefaultNetworkIsTCP: a Config that leaves Network unset sends over TCP,
+// TestClient_Register_DefaultNetworkIsTCP: a Config that leaves baseclient.Network unset sends over TCP,
 // RFC 9665 S3.5's requirement on networks that are not constrained.
 func TestClient_Register_DefaultNetworkIsTCP(t *testing.T) {
-	transport := &fakeTransport{responses: []*dns.Msg{successResp(30, 1209600)}}
+	transport := &fakeTransport{responses: []*dns.Msg{clienttest.Granted(30, 1209600)}}
 	c, err := NewClient(testConfig(t, transport))
 	if err != nil {
 		t.Fatalf("NewClient: %v", err)
@@ -540,19 +579,19 @@ func TestClient_Register_DefaultNetworkIsTCP(t *testing.T) {
 	if _, _, err := c.Register(context.Background()); err != nil {
 		t.Fatalf("Register: %v", err)
 	}
-	if transport.networks[0] != NetworkTCP {
+	if transport.networks[0] != baseclient.NetworkTCP {
 		t.Fatalf("sent over %s, want tcp", transport.networks[0])
 	}
 }
 
-// TestClient_Register_TLSDiscoversTLSRegistrar: with Network set to NetworkTLS and no
+// TestClient_Register_TLSDiscoversTLSRegistrar: with baseclient.Network set to baseclient.NetworkTLS and no
 // explicit address, the update goes over TLS to the registrar named by
 // "_dnssd-srp-tls._tcp", not the "_dnssd-srp._tcp" one.
 func TestClient_Register_TLSDiscoversTLSRegistrar(t *testing.T) {
-	transport := &fakeTransport{responses: []*dns.Msg{successResp(30, 1209600)}}
+	transport := &fakeTransport{responses: []*dns.Msg{clienttest.Granted(30, 1209600)}}
 	cfg := testConfig(t, transport)
 	cfg.RegistrarAddr = ""
-	cfg.Network = NetworkTLS
+	cfg.Network = baseclient.NetworkTLS
 	cfg.Query = tlsAndPlainDNS().query
 	c, err := NewClient(cfg)
 	if err != nil {
@@ -561,25 +600,39 @@ func TestClient_Register_TLSDiscoversTLSRegistrar(t *testing.T) {
 	if _, _, err := c.Register(context.Background()); err != nil {
 		t.Fatalf("Register: %v", err)
 	}
-	if transport.addrs[0] != "192.0.2.2:853" || transport.networks[0] != NetworkTLS {
+	if transport.addrs[0] != "192.0.2.2:853" || transport.networks[0] != baseclient.NetworkTLS {
 		t.Fatalf("sent to %q over %s, want 192.0.2.2:853 over tls", transport.addrs[0], transport.networks[0])
 	}
 }
 
 func TestNewClient_RejectsUnknownNetwork(t *testing.T) {
 	cfg := testConfig(t, &fakeTransport{})
-	cfg.Network = Network(7)
+	cfg.Network = baseclient.Network(7)
 	if _, err := NewClient(cfg); err == nil {
-		t.Fatal("NewClient accepted an unknown Network")
+		t.Fatal("NewClient accepted an unknown baseclient.Network")
 	}
 }
 
-// TestNetwork_String pins the protocol names liveTransport hands to the base client
+// TestNetwork_String pins the protocol names baseclient.LiveTransport hands to the base client
 // package's client.New, which accepts exactly these.
 func TestNetwork_String(t *testing.T) {
-	for n, want := range map[Network]string{NetworkTCP: "tcp", NetworkTLS: "tls", NetworkUDP: "udp"} {
+	for n, want := range map[baseclient.Network]string{baseclient.NetworkTCP: "tcp", baseclient.NetworkTLS: "tls", baseclient.NetworkUDP: "udp"} {
 		if got := n.String(); got != want {
 			t.Errorf("%d.String() = %q, want %q", int(n), got, want)
 		}
+	}
+}
+
+func TestEscapeTXT_PacksToTheRawBytes(t *testing.T) {
+	raw := "a\\b\x00\xff\"q"
+	m := &dns.Msg{}
+	txt := &dns.TXT{Hdr: dns.Header{Name: "x.", Class: dns.ClassINET}}
+	txt.TXT.Txt = []string{EscapeTXT(raw)}
+	m.Answer = []dns.RR{txt}
+	if err := m.Pack(); err != nil {
+		t.Fatal(err)
+	}
+	if want := append([]byte{byte(len(raw))}, raw...); !bytes.HasSuffix(m.Data, want) {
+		t.Errorf("packed TXT ends % x, want % x", m.Data[len(m.Data)-len(want):], want)
 	}
 }

@@ -90,23 +90,6 @@ func NewSRPHandler() *SRPHandler {
 	return h
 }
 
-// leaseStoreView adapts LeaseManager to srp.StoreView -- the narrow read-only interface
-// Evaluate (S3.3.3 FCFS) needs. Defined here, not in pkg/srp or pkg/updatecore: it's glue
-// specific to how this handler's store is shaped, not shared plumbing.
-type leaseStoreView struct{ store LeaseManager }
-
-func (v leaseStoreView) KeyAtName(name string) (*dns.KEY, bool) {
-	records := v.store.FindByName(name)
-	if len(records) == 0 || records[0].KeyRR == nil {
-		return nil, false
-	}
-	// Multiple distinct KEY nodes at one DNS name (different algorithm/keytag) is
-	// possible in principle but not a shape SRP itself ever produces (S3.2.5.1: one key
-	// governs the whole update) -- taking the first is a deliberate simplification, not
-	// an attempt to disambiguate a case that shouldn't arise from SRP traffic itself.
-	return records[0].KeyRR, true
-}
-
 // defaultServiceARPA is the zone name real SRP clients hardcode when they have no other
 // way to discover their registration domain (RFC 9665 S3.3.1). Dot-terminated and
 // lower-case -- every comparison/rewrite against it below matches on that same shape.
@@ -287,6 +270,13 @@ func (h *SRPHandler) Handle(ctx context.Context, w dns.ResponseWriter, r *dns.Ms
 		}
 	}
 
+	// Every name is now final: refuse one outside this zone, or in a zone another handler
+	// serves below it (SeparateZones).
+	if res := h.refuseNamesNotServed(r); res != nil {
+		h.logger.Debugf("SRP handler: %v", res.Error)
+		return res
+	}
+
 	// Steps 6-9 read the host's and instances' lease-store nodes, write upstream, then change
 	// those nodes: hold their locks throughout, waiting while another request or a lease
 	// expiry holds any of them (docs/siglease_rfc9665.md §5). Taken only now,
@@ -306,6 +296,26 @@ func (h *SRPHandler) Handle(ctx context.Context, w dns.ResponseWriter, r *dns.Ms
 	}
 	unlock := sync.OnceFunc(locks.Release)
 	defer unlock()
+
+	// The granted LEASE/KEY-LEASE, needed from here on: a host removal is one with a LEASE
+	// of 0, applyRecordTTL cuts TTLs to them, step 8 stores them, step 10 echoes them.
+	lease, keyLease, err := h.parseLease(r)
+	if err != nil {
+		// Validate() already confirmed the option is present and internally
+		// consistent (LEASE<=KEY-LEASE); a failure here would be a coding error, not
+		// a client one, but fail closed rather than forward TTLs or mutate the store
+		// with zero values.
+		h.logger.Errorf("SRP handler: lease option re-parse failed after validation: %v", err)
+		msg := makeErrorResponse(r, dns.RcodeServerFailure, dns.ExtendedErrorOther, fmt.Sprintf("internal error: %v", err))
+		return NewErrorResult(msg, err.Error(), err)
+	}
+	lease, keyLease = h.LeasePolicy.clamp(lease, keyLease)
+
+	// S3.2.5.5.1: a LEASE of 0 removes the host, with its service instances, listed or not.
+	var unlistedDeletes []dns.RR
+	if lease == 0 {
+		unlistedDeletes = h.removeHost(r, cu)
+	}
 
 	// Step 6: FCFS (S3.3.3). Checked names are the host and each service instance name
 	// only (srp.Names) -- SRV/TXT/PTR owner names are never independently checked
@@ -331,8 +341,7 @@ func (h *SRPHandler) Handle(ctx context.Context, w dns.ResponseWriter, r *dns.Ms
 		switch result {
 		case srp.FCFSConflict:
 			h.logger.Infof("SRP handler: FCFS conflict for %s -- name held by a different key", name)
-			msg := makeErrorResponse(r, dns.RcodeYXDomain, dns.ExtendedErrorProhibited, "name held by a different key")
-			return NewErrorResult(msg, fmt.Sprintf("FCFS conflict for %s", name), fmt.Errorf("YXDOMAIN"))
+			return fcfsConflictResult(r, fmt.Sprintf("FCFS conflict for %s", name))
 		case srp.FCFSForeignData:
 			h.logger.Infof("SRP handler: FCFS refused for %s -- foreign data present, no KEY", name)
 			msg := makeErrorResponse(r, dns.RcodeRefused, dns.ExtendedErrorProhibited, "name occupied by non-SRP data")
@@ -342,20 +351,6 @@ func (h *SRPHandler) Handle(ctx context.Context, w dns.ResponseWriter, r *dns.Ms
 			prereqs = append(prereqs, prereq)
 		}
 	}
-
-	// The granted LEASE/KEY-LEASE, needed from here on: applyRecordTTL cuts TTLs to them,
-	// step 8 stores them, step 10 echoes them.
-	lease, keyLease, err := h.parseLease(r)
-	if err != nil {
-		// Validate() already confirmed the option is present and internally
-		// consistent (LEASE<=KEY-LEASE); a failure here would be a coding error, not
-		// a client one, but fail closed rather than forward TTLs or mutate the store
-		// with zero values.
-		h.logger.Errorf("SRP handler: lease option re-parse failed after validation: %v", err)
-		msg := makeErrorResponse(r, dns.RcodeServerFailure, dns.ExtendedErrorOther, fmt.Sprintf("internal error: %v", err))
-		return NewErrorResult(msg, err.Error(), err)
-	}
-	lease, keyLease = h.LeasePolicy.clamp(lease, keyLease)
 
 	// After step 4, like step 5's rewrite: both change r.Ns in place, and the signature
 	// covers the requester's original TTLs.
@@ -375,12 +370,13 @@ func (h *SRPHandler) Handle(ctx context.Context, w dns.ResponseWriter, r *dns.Ms
 	// Service Description that's updated must end up with a KEY RR published, regardless
 	// of whether the requester's message included one -- see
 	// synthesizeOmittedInstanceKeys's own doc comment).
-	forwardRecords := make([]dns.RR, 0, len(r.Ns))
+	forwardRecords := make([]dns.RR, 0, len(r.Ns)+len(unlistedDeletes))
 	for _, rr := range r.Ns {
 		forwardRecords = append(forwardRecords, rr)
 	}
+	forwardRecords = append(forwardRecords, unlistedDeletes...)
 	forwardRecords = append(forwardRecords, h.ptrDeleteDiff(cu)...)
-	forwardRecords = append(forwardRecords, synthesizeOmittedInstanceKeys(cu)...)
+	forwardRecords = append(forwardRecords, synthesizeOmittedInstanceKeys(cu, keyLease)...)
 
 	if upstreamResp, err := h.upstream().send(ctx, prereqs, forwardRecords); err != nil {
 		h.logger.Errorf("SRP handler: UPDATE for zone %s: %v", h.upstreamZone, err)
@@ -393,8 +389,7 @@ func (h *SRPHandler) Handle(ctx context.Context, w dns.ResponseWriter, r *dns.Ms
 			// than by this handler's own pre-forward check -- report it exactly like the
 			// pre-forward conflict case above. Any other rejection is a failure, not a
 			// conflict.
-			msg := makeErrorResponse(r, dns.RcodeYXDomain, dns.ExtendedErrorProhibited, "name held by a different key")
-			return NewErrorResult(msg, fmt.Sprintf("FCFS conflict detected atomically by upstream prerequisite: %v", err), fmt.Errorf("YXDOMAIN"))
+			return fcfsConflictResult(r, fmt.Sprintf("FCFS conflict detected atomically by upstream prerequisite: %v", err))
 		}
 		msg := makeErrorResponse(r, dns.RcodeServerFailure, dns.ExtendedErrorNoReachableAuthority, err.Error())
 		return NewErrorResult(msg, err.Error(), err)
@@ -424,29 +419,6 @@ func (h *SRPHandler) Handle(ctx context.Context, w dns.ResponseWriter, r *dns.Ms
 	// Step 10: NOERROR + echo the granted LEASE/KEY-LEASE.
 	resp := leaseResponse(r, leasepkg.Encode8Byte(lease, keyLease))
 	return NewProcessedResult(resp)
-}
-
-// prerequisiteFailed reports whether rcode is the authoritative server's answer to one of
-// prereqs no longer holding (RFC 2136 S3.2.2): YXDOMAIN to "Name is not in use" (TYPE ANY),
-// YXRRSET to "KEY RRset does not exist" (TYPE KEY). Only prerequisites produce these, so
-// either one without its prerequisite in prereqs is an impossible answer, not an FCFS
-// conflict.
-func prerequisiteFailed(rcode uint16, prereqs []dns.RR) bool {
-	var prereqType uint16
-	switch rcode {
-	case dns.RcodeYXDomain:
-		prereqType = dns.TypeANY
-	case dns.RcodeYXRrset:
-		prereqType = dns.TypeKEY
-	default:
-		return false
-	}
-	for _, rr := range prereqs {
-		if dns.RRToType(rr) == prereqType {
-			return true
-		}
-	}
-	return false
 }
 
 // collectLiveServiceTypes scans the lease store for every currently-registered, unexpired
@@ -672,7 +644,7 @@ func applyRecordTTL(cu *srp.ClassifiedUpdate, ttl, lease, keyLease uint32) {
 }
 
 // synthesizeOmittedInstanceKeys returns an explicit "Add To An RRSet" KEY instruction (RFC
-// 2136 S2.5.1) for every live (SRV-present) service instance in cu whose own Service
+// 2136 S2.5.1) for every service instance in cu whose own Service
 // Description Instruction omitted its KEY. RFC 9665 S3.2.5.1 lets a requester omit it "for
 // brevity" -- client/srp, this project's own requester, always takes that option -- but
 // S3.3.3 is unconditional on the other side of that trade: "After the SRP Update has been
@@ -689,20 +661,61 @@ func applyRecordTTL(cu *srp.ClassifiedUpdate, ttl, lease, keyLease uint32) {
 // srp.KeyFor already computes exactly the right value for this (same algorithm/protocol/
 // public-key/TTL as the Host Description's own KEY, owner name rewritten to the instance) --
 // it's reused here as-is for the local lease store's own bookkeeping; this function is the
-// one place that also forwards it upstream. A removal-shaped instance (SRV == nil) is
-// excluded: its Delete All RRsets already removes whatever KEY might exist there, and there
-// is no live Service Description left afterward for the MUST to apply to. An instance whose
-// Service Description DID include an explicit KEY is also excluded -- it's already part of
-// r.Ns, forwarded verbatim, and synthesizing a second copy would be redundant.
-func synthesizeOmittedInstanceKeys(cu *srp.ClassifiedUpdate) []dns.RR {
+// one place that also forwards it upstream. A removal-shaped instance (SRV == nil) gets one
+// only while the granted keyLease is not zero: its Delete All RRsets removes the KEY at its
+// name too, and S3.2.5.5.1 holds the name for the requester ("If the KEY lease time is
+// nonzero, the SRP registrar MUST NOT delete the KEY records for these service instances"),
+// as the lease store does (applyLocalMutations). With a KEY-LEASE of 0, a permanent removal,
+// the KEY goes with the rest. An instance whose Service Description DID include an explicit
+// KEY is excluded -- it's already part of r.Ns, forwarded verbatim, and synthesizing a
+// second copy would be redundant.
+func synthesizeOmittedInstanceKeys(cu *srp.ClassifiedUpdate, keyLease uint32) []dns.RR {
 	var records []dns.RR
 	for _, inst := range cu.Instances {
-		if inst.SRV == nil || inst.Key != nil {
+		if (inst.SRV == nil && keyLease == 0) || inst.Key != nil {
 			continue
 		}
 		records = append(records, srp.KeyFor(cu, inst.Name))
 	}
 	return records
+}
+
+// removeHost makes r and cu, an update with a LEASE of 0, the removal of its host
+// (S3.2.5.5.1): srp.RemoveHost drops any adds it carries, and every live service instance of
+// the host's that cu does not list gets a removal (srp.Removal), whose Delete All RRsets
+// removeHost returns for the upstream UPDATE: "an SRP registrar MUST remove all service
+// instances pointing to that hostname and all Service Discovery PTR records pointing to those
+// service instances, even if the SRP requester doesn't list them explicitly". From here on
+// every instance takes the path a listed removal does: FCFS, the PTR deletes (ptrDeleteDiff),
+// the KEY kept while KEY-LEASE is not 0 (synthesizeOmittedInstanceKeys), the lease store.
+// Called holding the host's node locks, which cover its instances (lockNames).
+func (h *SRPHandler) removeHost(r *dns.Msg, cu *srp.ClassifiedUpdate) []dns.RR {
+	if dropped := srp.RemoveHost(r, cu); len(dropped) > 0 {
+		h.logger.Infof("SRP handler: removal of %s (LEASE 0) carries %d adds; dropped, as a removal adds nothing (RFC 9665 S3.2.5.5.1)", cu.Host.Name, len(dropped))
+	}
+	listed := map[string]bool{}
+	for _, inst := range cu.Instances {
+		listed[dnsname.Normalize(inst.Name)] = true
+	}
+	var deletes []dns.RR
+	for _, child := range h.leaseManager.ListSubtreeKeys(leasepkg.NodeKey(cu.Host.Key)) {
+		if h.leaseManager.Get(child) == nil || listed[leasepkg.NodeKeyName(child)] {
+			continue // a non-KEY record, or an instance cu lists
+		}
+		set := h.leaseManager.GetNonKEYRecordSet(child)
+		if set == nil {
+			continue
+		}
+		for _, rec := range set.Records {
+			if srv, ok := rec.RR.(*dns.SRV); ok {
+				inst := srp.Removal(srv.Hdr.Name)
+				cu.Instances = append(cu.Instances, inst)
+				deletes = append(deletes, inst.Delete)
+				break
+			}
+		}
+	}
+	return deletes
 }
 
 // ptrDeleteDiff implements the one piece of genuinely new logic the lease-store mapping

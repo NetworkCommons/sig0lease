@@ -15,6 +15,7 @@ import (
 	"github.com/NetworkCommons/sig0lease/pkg/keyrec"
 	leasepkg "github.com/NetworkCommons/sig0lease/pkg/lease"
 	"github.com/NetworkCommons/sig0lease/pkg/sig0"
+	"github.com/NetworkCommons/sig0lease/pkg/srp"
 )
 
 type stubUpstreamCoordinator struct {
@@ -58,6 +59,25 @@ func (s *stubUpstreamCoordinator) QueryRRs(ctx context.Context, zoneHint, name s
 		return nil, fmt.Errorf("stubUpstreamCoordinator: no authoritative data for %s", name)
 	}
 	return s.query(ctx, zoneHint, name, rrType)
+}
+
+// QueryKeyAtName answers from query's KEY records: a name without any reports no KEY, which
+// fcfs_naming treats as it treats NXDOMAIN.
+func (s *stubUpstreamCoordinator) QueryKeyAtName(ctx context.Context, zoneHint, name string) (srp.AuthoritativeKeyState, []*dns.KEY, error) {
+	rrs, err := s.QueryRRs(ctx, zoneHint, name, dns.TypeKEY)
+	if err != nil {
+		return 0, nil, err
+	}
+	var keys []*dns.KEY
+	for _, rr := range rrs {
+		if k, ok := rr.(*dns.KEY); ok {
+			keys = append(keys, k)
+		}
+	}
+	if len(keys) == 0 {
+		return srp.AuthNoKey, nil, nil
+	}
+	return srp.AuthKeyPresent, keys, nil
 }
 
 type stubResponseWriter struct{}
@@ -815,7 +835,8 @@ func TestGroupOtherRecordsByTargetKey_HierarchyRejectsUnmappedOwner(t *testing.T
 func buildSignedCaseCDeleteForHandleTest(t *testing.T, signerKey *keyrec.LoadedKey, keyRRToDelete *dns.KEY) *dns.Msg {
 	t.Helper()
 
-	msg := dns.NewMsg("test.dev.zenr.io.", dns.TypeSOA)
+	// The signer's name in the Zone section, as cmd/sig0lease-client sends it.
+	msg := dns.NewMsg(signerKey.PublicKey.Hdr.Name, dns.TypeSOA)
 	if msg == nil {
 		t.Fatalf("expected message")
 	}
@@ -954,6 +975,27 @@ func TestHandle_CaseCDelete_SelfRegisteredKeyCanDeleteItself(t *testing.T) {
 	}
 	if got := h.leaseManager.LookupByKEY(parentRR); got != nil {
 		t.Fatalf("expected self-registered root key to be able to delete itself")
+	}
+}
+
+func TestHandle_CaseCDelete_ChildKeyCanDeleteItself(t *testing.T) {
+	h, parent, child, _ := setupCaseCDeleteHandler(t)
+
+	childRR := child.PublicKey.Clone().(*dns.KEY)
+	req := buildSignedCaseCDeleteForHandleTest(t, child, childRR)
+
+	res := h.Handle(context.Background(), stubResponseWriter{}, req)
+	if res == nil || res.Message == nil {
+		t.Fatalf("expected response message")
+	}
+	if res.Message.Rcode != dns.RcodeSuccess {
+		t.Fatalf("expected success, got rcode=%d", res.Message.Rcode)
+	}
+	if got := h.leaseManager.LookupByKEY(childRR); got != nil {
+		t.Fatalf("expected a key its parent registered to be able to delete itself")
+	}
+	if got := h.leaseManager.LookupByKEY(parent.PublicKey); got == nil {
+		t.Fatalf("expected the parent key to remain when its child deletes itself")
 	}
 }
 

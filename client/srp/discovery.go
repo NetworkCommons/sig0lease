@@ -9,6 +9,8 @@ import (
 	"strings"
 
 	"codeberg.org/miekg/dns"
+	"codeberg.org/miekg/dns/dnsutil"
+	baseclient "github.com/NetworkCommons/sig0lease/client"
 	"github.com/NetworkCommons/sig0lease/pkg/dnsname"
 )
 
@@ -99,17 +101,17 @@ func (m DiscoveryMode) validate() error {
 // Returns "address:port". A caller with an explicit registrar address configured should skip
 // this entirely (see Config.RegistrarAddr) -- discovery is the fallback, not the only path,
 // matching cmd/sig0lease-srp-client's own "dev/test tool" framing.
-func Discover(ctx context.Context, query DNSQuery, domain string, mode DiscoveryMode, network Network) (string, error) {
+func Discover(ctx context.Context, query DNSQuery, domain string, mode DiscoveryMode, network baseclient.Network) (string, error) {
 	if query == nil {
 		return "", fmt.Errorf("srp/client: Discover called with a nil DNSQuery")
 	}
 	if err := mode.validate(); err != nil {
 		return "", fmt.Errorf("srp/client: %w", err)
 	}
-	if err := network.validate(); err != nil {
+	if err := network.Validate(); err != nil {
 		return "", fmt.Errorf("srp/client: %w", err)
 	}
-	domain = ensureFQDN(domain)
+	domain = dnsutil.Fqdn(domain)
 	zone, err := zoneApex(ctx, query, domain)
 	if err != nil {
 		return "", fmt.Errorf("srp/client: discovery failed for %s: %w", domain, err)
@@ -122,7 +124,7 @@ func Discover(ctx context.Context, query DNSQuery, domain string, mode Discovery
 	var srvs []*dns.SRV
 	var asked []string
 	for _, n := range names {
-		name := network.DiscoveryService() + "." + n
+		name := DiscoveryService(network) + "." + n
 		resp, err := query(ctx, name, dns.TypeSRV)
 		if err != nil {
 			return "", fmt.Errorf("srp/client: discovery failed for %s: %w", domain, err)
@@ -190,7 +192,7 @@ func targetAddress(ctx context.Context, query DNSQuery, target string) (netip.Ad
 // is a subdomain of the registration domain, and an SRP Update covers exactly one zone
 // (S3.3), so starting from domain itself finds the same zone.
 func zoneApex(ctx context.Context, query DNSQuery, name string) (string, error) {
-	candidate := ensureFQDN(name)
+	candidate := dnsutil.Fqdn(name)
 	// Labels counts the empty root label too: "example.com." has 3, "com." has 2.
 	for len(dnsname.Labels(candidate)) > 2 {
 		resp, err := query(ctx, candidate, dns.TypeSOA)
@@ -202,15 +204,15 @@ func zoneApex(ctx context.Context, query DNSQuery, name string) (string, error) 
 			soa = firstSOA(resp.Ns)
 		}
 		if soa != nil {
-			apex := ensureFQDN(soa.Hdr.Name)
+			apex := dnsutil.Fqdn(soa.Hdr.Name)
 			if apex == "." {
-				return "", fmt.Errorf("no zone below the root encloses %s: the resolver answered with the root zone's SOA, so the top-level domain does not exist there", ensureFQDN(name))
+				return "", fmt.Errorf("no zone below the root encloses %s: the resolver answered with the root zone's SOA, so the top-level domain does not exist there", dnsutil.Fqdn(name))
 			}
 			return apex, nil
 		}
 		_, candidate, _ = dnsname.CutFirstLabel(candidate)
 	}
-	return "", fmt.Errorf("no SOA record found for %s or any parent name above the top-level domain (RFC 8765 S6.1 step 4)", ensureFQDN(name))
+	return "", fmt.Errorf("no SOA record found for %s or any parent name above the top-level domain (RFC 8765 S6.1 step 4)", dnsutil.Fqdn(name))
 }
 
 // registrarSearchNames returns the names Discover looks under for the registrar's SRV
@@ -242,11 +244,4 @@ func firstSOA(rrs []dns.RR) *dns.SOA {
 		}
 	}
 	return nil
-}
-
-func ensureFQDN(name string) string {
-	if strings.HasSuffix(name, ".") {
-		return name
-	}
-	return name + "."
 }

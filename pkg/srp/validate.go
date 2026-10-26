@@ -12,7 +12,8 @@ import (
 
 // Validate runs Classify plus every remaining RFC 9665 S3.3.1/S3.3.2 structural check
 // that needs more than the Update section alone: a single Zone Section entry, no
-// prerequisites, a present and internally-consistent Update-Lease option, TTL consistency
+// prerequisites, a present and internally-consistent Update-Lease option, an address in the
+// Host Description unless the LEASE is 0 (S3.3.1.3), TTL consistency
 // (S4 -- a MUST, reject rather than normalize), identical KEY RDATA across every KEY add,
 // flags-0 KEY adds (S3.2.5.1), and DNS-SD-shaped service names on every Service Discovery
 // add (RFC 6763 S4.1/S7). It does not verify SIG(0) or FCFS -- those need the lease store and the
@@ -72,7 +73,11 @@ func ValidateClassified(msg *dns.Msg, cu *ClassifiedUpdate) error {
 // Classify() itself -- shared by Validate (which just computed cu) and ValidateClassified
 // (whose caller already had one).
 func validatePostClassify(msg *dns.Msg, cu *ClassifiedUpdate) error {
-	if err := validateLeaseOption(msg); err != nil {
+	lease, err := validateLeaseOption(msg)
+	if err != nil {
+		return err
+	}
+	if err := validateHostAddresses(cu, lease); err != nil {
 		return err
 	}
 	if err := validateTTLConsistency(cu); err != nil {
@@ -132,17 +137,32 @@ func validateServiceNames(cu *ClassifiedUpdate) error {
 // pkg/lease.FindOption/LeaseOption.Decode/Validate rather than re-parsing the option --
 // those already handle both wire shapes this fork's EDNS0 unpacking can produce (see
 // pkg/lease.FindOption's doc comment) and already implement the LEASE<=KEY-LEASE check.
-func validateLeaseOption(msg *dns.Msg) error {
+// It returns the requested LEASE.
+func validateLeaseOption(msg *dns.Msg) (uint32, error) {
 	erfc, ok := leasepkg.FindOption(msg)
 	if !ok {
-		return fmt.Errorf("srp: no Update-Lease EDNS(0) option present -- not an SRP update")
+		return 0, fmt.Errorf("srp: no Update-Lease EDNS(0) option present -- not an SRP update")
 	}
 	var lo leasepkg.LeaseOption
 	opt := &dns.OPT{Options: []dns.EDNS0{erfc}}
 	if err := lo.Decode(opt); err != nil {
-		return fmt.Errorf("srp: invalid Update-Lease option: %w", err)
+		return 0, fmt.Errorf("srp: invalid Update-Lease option: %w", err)
 	}
-	return nil // lo.Decode already calls lo.Validate() internally (see pkg/lease.LeaseOption.decodeERFC)
+	return lo.Lease, nil // lo.Decode already calls lo.Validate() internally (see pkg/lease.LeaseOption.decodeERFC)
+}
+
+// validateHostAddresses implements S3.3.1.3: a Host Description has "zero 'Add To An RRset'
+// operations (in the case of deleting a registration) or one or more 'Add to an RRset'
+// operations (in the case of creating or updating a registration)" of A/AAAA, and deleting
+// is a LEASE of 0 (S3.2.5.5.1). An update with a LEASE and no address is neither, so not an
+// SRP Update, which S3.3.2 has the registrar refuse, as OpenThread's does ("There MUST be at
+// least one valid address if we have nonzero lease"). The other mismatch, a LEASE of 0 with
+// addresses, is a removal whose adds the registrar drops (RemoveHost).
+func validateHostAddresses(cu *ClassifiedUpdate, lease uint32) error {
+	if lease != 0 && len(cu.Host.Addresses) == 0 {
+		return fmt.Errorf("srp: Host Description %s has no address, which S3.3.1.3 allows only in a removal (LEASE 0)", cu.Host.Name)
+	}
+	return nil
 }
 
 // validateTTLConsistency implements S4's TTL-consistency MUST for the SRP path: reject

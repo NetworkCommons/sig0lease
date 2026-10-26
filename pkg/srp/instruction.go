@@ -13,6 +13,7 @@ package srp
 
 import (
 	"fmt"
+	"slices"
 
 	"codeberg.org/miekg/dns"
 	"github.com/NetworkCommons/sig0lease/pkg/dnsname"
@@ -81,6 +82,47 @@ type ClassifiedUpdate struct {
 	Host      *HostDescription
 	Instances []*ServiceInstance // in first-sighting order
 	Discovery []ServiceDiscovery // every Service Discovery instruction, in encounter order
+}
+
+// RemoveHost makes msg and cu, an update with a LEASE of 0, the removal of its host and of
+// every service instance it lists. S3.2.5.5.1 defines the removal as "an SRP Update ... with an
+// Update Lease option that has a LEASE value of zero", with "no 'Add to an RRSet'
+// instructions for that hostname". Adds a requester sends anyway are dropped, as both
+// reference registrars do (srp-mdns-proxy's host_lease == 0, OpenThread's Host::IsDeleted);
+// OpenThread's client sends its addresses with every removal. Dropped: the Host
+// Description's addresses, each listed instance's SRV and TXT, which leaves it a removal
+// (Removal), and every Service Discovery add. KEY adds stay, for the KEY-LEASE to keep or
+// free the names, and so do the Delete All RRsets and the Service Discovery deletes.
+// RemoveHost returns the adds it dropped from msg's Update section.
+func RemoveHost(msg *dns.Msg, cu *ClassifiedUpdate) []dns.RR {
+	var kept, dropped []dns.RR
+	for _, rr := range msg.Ns {
+		switch rr.(type) {
+		case *dns.A, *dns.AAAA, *dns.SRV, *dns.TXT:
+			dropped = append(dropped, rr) // Classify admits only adds of these
+			continue
+		case *dns.PTR:
+			if rr.Header().Class == dns.ClassINET {
+				dropped = append(dropped, rr)
+				continue
+			}
+		}
+		kept = append(kept, rr)
+	}
+	msg.Ns = kept
+	cu.Host.Addresses = nil
+	for _, inst := range cu.Instances {
+		inst.SRV, inst.TXT, inst.removalShaped = nil, nil, true
+	}
+	cu.Discovery = slices.DeleteFunc(cu.Discovery, func(d ServiceDiscovery) bool { return d.IsAdd })
+	return dropped
+}
+
+// Removal returns the Service Description Instruction removing the service instance name: a
+// bare Delete All RRsets, as a requester removing that one instance sends (S3.2.5.5.2). A
+// registrar adds one for each instance a host removal does not list (S3.2.5.5.1).
+func Removal(name string) *ServiceInstance {
+	return &ServiceInstance{Name: dnsname.Fold(name), Delete: deleteAllRR(name), removalShaped: true}
 }
 
 // classifyState accumulates the single-pass scan before the reconciliation pass runs.
@@ -297,8 +339,8 @@ func (st *classifyState) reconcile() error {
 	// LEASE-independent, unlike srp-parse.c's host_lease==0 gate -- Classify() never sees
 	// the lease option (Validate(), a layer up, owns that -- see the package doc
 	// comment), and the structural shape ("a bare delete-all whose name carries the
-	// update's key") is sufficient to identify the host regardless of what lease value
-	// Validate() later finds attached.
+	// update's key") is sufficient to identify the host; Validate() then refuses it
+	// unless the LEASE is 0 (validateHostAddresses).
 	if st.host == nil {
 		for _, k := range st.keyAdds {
 			name := dnsname.Fold(k.Hdr.Name)
