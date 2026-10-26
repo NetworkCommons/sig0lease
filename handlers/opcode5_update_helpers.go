@@ -349,11 +349,11 @@ func rrEqual(a, b dns.RR) bool {
 	}
 }
 
-func (h *UpdateHandler) authoritativeHasRR(ctx context.Context, zoneHint string, rr dns.RR) (bool, error) {
+func (h *UpdateHandler) authoritativeHasRR(ctx context.Context, rr dns.RR) (bool, error) {
 	if rr == nil || rr.Header() == nil {
 		return false, fmt.Errorf("rr is nil")
 	}
-	rrs, err := h.upstreamCoordinator.QueryRRs(ctx, zoneHint, rr.Header().Name, dns.RRToType(rr))
+	rrs, err := h.upstreamCoordinator.QueryRRs(ctx, h.upstreamZone, rr.Header().Name, dns.RRToType(rr))
 	if err != nil {
 		return false, err
 	}
@@ -392,8 +392,8 @@ func refusalResult(r *dns.Msg, reason string, err error) *HandlerResult {
 // refuseAuthoritativeDuplicate returns an error if the authoritative server already holds rr
 // -- data outside this proxy's management, not the requester's to claim -- or, as an
 // authoritativeLookupError, if the server could not be asked.
-func (h *UpdateHandler) refuseAuthoritativeDuplicate(ctx context.Context, zoneHint string, rr dns.RR) error {
-	exists, err := h.authoritativeHasRR(ctx, zoneHint, rr)
+func (h *UpdateHandler) refuseAuthoritativeDuplicate(ctx context.Context, rr dns.RR) error {
+	exists, err := h.authoritativeHasRR(ctx, rr)
 	if err != nil {
 		return &authoritativeLookupError{err: fmt.Errorf("authoritative duplicate check failed: %w", err)}
 	}
@@ -415,8 +415,8 @@ func (h *UpdateHandler) refuseAuthoritativeDuplicate(ctx context.Context, zoneHi
 // taking that name would be a signer above it (validateSignerHierarchyForUpdateRecords), able
 // to write records at its names. Checking below the newcomer cannot stop that: no DNS query
 // lists the names below a name.
-func (h *UpdateHandler) refuseNewKey(ctx context.Context, r *dns.Msg, zoneHint string, keyRR *dns.KEY, signerID keyID, signerName string) ([]dns.RR, *HandlerResult) {
-	if err := h.refuseAuthoritativeDuplicate(ctx, zoneHint, keyRR); err != nil {
+func (h *UpdateHandler) refuseNewKey(ctx context.Context, r *dns.Msg, keyRR *dns.KEY, signerID keyID, signerName string) ([]dns.RR, *HandlerResult) {
+	if err := h.refuseAuthoritativeDuplicate(ctx, keyRR); err != nil {
 		return nil, refusalResult(r, "duplicate registration rejected", err)
 	}
 	if !h.fcfsNaming {
@@ -432,7 +432,7 @@ func (h *UpdateHandler) refuseNewKey(ctx context.Context, r *dns.Msg, zoneHint s
 		}
 		top = h.upstreamZone
 	}
-	prereqs, heldAt, err := h.fcfsNewKey(ctx, zoneHint, keyRR, top)
+	prereqs, heldAt, err := h.fcfsNewKey(ctx, keyRR, top)
 	if err != nil {
 		return nil, refusalResult(r, "FCFS evaluation failed", err)
 	}
@@ -450,7 +450,7 @@ func (h *UpdateHandler) refuseNewKey(ctx context.Context, r *dns.Msg, zoneHint s
 // including top, the name its holder holds. Each name is checked as SRP checks its own
 // (srp.Evaluate), and returns the prerequisite that has the authoritative server check it
 // again when it applies the UPDATE.
-func (h *UpdateHandler) fcfsNewKey(ctx context.Context, zoneHint string, keyRR *dns.KEY, top string) (prereqs []dns.RR, heldAt string, err error) {
+func (h *UpdateHandler) fcfsNewKey(ctx context.Context, keyRR *dns.KEY, top string) (prereqs []dns.RR, heldAt string, err error) {
 	// refuseNamesNotServed keeps every name inside the zone, refuseNewKey a KEY registering
 	// itself one label below the apex, and validateSignerHierarchyForUpdateRecords every KEY at
 	// or below its signer.
@@ -459,7 +459,7 @@ func (h *UpdateHandler) fcfsNewKey(ctx context.Context, zoneHint string, keyRR *
 	}
 	view := leaseStoreView{store: h.leaseManager}
 	for name := keyRR.Hdr.Name; dnsname.IsAtOrBelow(name, top) && dnsname.Normalize(name) != dnsname.Normalize(top); {
-		result, prereq, err := srp.Evaluate(ctx, view, h.upstreamCoordinator.QueryKeyAtName, zoneHint, name, keyRR, false)
+		result, prereq, err := srp.Evaluate(ctx, view, h.upstreamCoordinator.QueryKeyAtName, h.upstreamZone, name, keyRR, false)
 		if err != nil {
 			return nil, "", &authoritativeLookupError{err: fmt.Errorf("FCFS evaluation failed: %w", err)}
 		}
@@ -478,8 +478,8 @@ func (h *UpdateHandler) fcfsNewKey(ctx context.Context, zoneHint string, keyRR *
 	return prereqs, "", nil
 }
 
-func (h *UpdateHandler) authoritativeHasKeyAtName(ctx context.Context, zoneHint string, fqdn string) (bool, error) {
-	rrs, err := h.upstreamCoordinator.QueryRRs(ctx, zoneHint, fqdn, dns.TypeKEY)
+func (h *UpdateHandler) authoritativeHasKeyAtName(ctx context.Context, fqdn string) (bool, error) {
+	rrs, err := h.upstreamCoordinator.QueryRRs(ctx, h.upstreamZone, fqdn, dns.TypeKEY)
 	if err != nil {
 		return false, err
 	}
@@ -496,7 +496,7 @@ func (h *UpdateHandler) authoritativeHasKeyAtName(ctx context.Context, zoneHint 
 // falls through to a live authoritative-DNS check, to catch data that
 // exists outside our management (registered before this proxy existed, or
 // by some other process) rather than ours to claim.
-func (h *UpdateHandler) filterDuplicateRegistrations(ctx context.Context, keyName, zoneHint string, records []dns.RR) ([]dns.RR, []string, error) {
+func (h *UpdateHandler) filterDuplicateRegistrations(ctx context.Context, keyName string, records []dns.RR) ([]dns.RR, []string, error) {
 	accepted := make([]dns.RR, 0, len(records))
 	notes := make([]string, 0)
 
@@ -515,7 +515,7 @@ func (h *UpdateHandler) filterDuplicateRegistrations(ctx context.Context, keyNam
 
 		// Not under our control locally: fail the whole request if the
 		// authoritative zone already contains an identical RR anyway.
-		if err := h.refuseAuthoritativeDuplicate(ctx, zoneHint, rr); err != nil {
+		if err := h.refuseAuthoritativeDuplicate(ctx, rr); err != nil {
 			return nil, nil, err
 		}
 		accepted = append(accepted, rr)
@@ -544,21 +544,20 @@ const (
 //
 // Resolution follows the three-stage fallback: request-provided KEY RRs
 // (Additional or Update), then the lease store, then authoritative DNS.
-func (h *UpdateHandler) extractAndValidateSig0(ctx context.Context, msg *dns.Msg, downstreamZone string, additionalSigningKeys []*dns.KEY, updateKeys []*dns.KEY) (*dns.SIG, *dns.KEY, signerKeySource, error) {
+func (h *UpdateHandler) extractAndValidateSig0(ctx context.Context, msg *dns.Msg, additionalSigningKeys []*dns.KEY, updateKeys []*dns.KEY) (*dns.SIG, *dns.KEY, signerKeySource, error) {
 	sigRR, err := extractSig0(msg)
 	if err != nil {
 		return nil, nil, signerKeySourceUnknown, err
-	}
-	downstreamZoneCanon := dnsname.Normalize(downstreamZone)
-	if downstreamZoneCanon == "" {
-		return nil, nil, signerKeySourceUnknown, fmt.Errorf("empty downstream zone")
 	}
 	signerCanon := dnsname.Normalize(sigRR.SignerName)
 	if signerCanon == "" {
 		return nil, nil, signerKeySourceUnknown, fmt.Errorf("SIG(0) signer name is empty")
 	}
-	if !dnsname.IsAtOrBelow(downstreamZoneCanon, signerCanon) {
-		return nil, nil, signerKeySourceUnknown, fmt.Errorf("SIG(0) signer %q is outside allowed hierarchy for downstream zone %q", sigRR.SignerName, downstreamZone)
+	// A signer writes only at and below its own name (validateSignerHierarchyForUpdateRecords),
+	// and only names this handler serves: it must be one of them, as an SRP signer, the host,
+	// must (SRPHandler.takes).
+	if err := h.notServed(sigRR.SignerName); err != nil {
+		return nil, nil, signerKeySourceUnknown, fmt.Errorf("SIG(0) signer: %w", err)
 	}
 
 	verifyFromCandidates := func(candidates []*dns.KEY) (*dns.KEY, error) {
@@ -618,7 +617,7 @@ func (h *UpdateHandler) extractAndValidateSig0(ctx context.Context, msg *dns.Msg
 	}
 
 	// Check if the key is present online
-	authRRS, err := h.upstreamCoordinator.QueryRRs(ctx, downstreamZone, sigRR.SignerName, dns.TypeKEY)
+	authRRS, err := h.upstreamCoordinator.QueryRRs(ctx, h.upstreamZone, sigRR.SignerName, dns.TypeKEY)
 	if err != nil {
 		return nil, nil, signerKeySourceUnknown, &authoritativeLookupError{err: fmt.Errorf("failed to resolve signer KEY from authoritative DNS: %w", err)}
 	}

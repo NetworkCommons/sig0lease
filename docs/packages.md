@@ -658,6 +658,15 @@ func Diff(before, after []dns.RR) []dns.RR
     proxy's lease store does (lease.RecordKey: owner, class, type and data,
     not the TTL).
 
+func ParseRecords(name string, specs []string, bad func(i int, err error)) []dns.RR
+    ParseRecords reads specs as records of name, the fully qualified name,
+    the way a template's records: and sig0lease-client name's -record give them:
+    "<owner> <type> <data>", the owner @ for name itself or relative to
+    it (_dnslink, www), the data in zone-file format. A record must be one
+    CheckRecords takes, not an A or AAAA at name, whose addresses are given
+    apart (WithAddresses), and given once. It returns the records it read, in
+    order, and calls bad with the index of each spec it could not read and why.
+
 func Release(cfg NameConfig) error
     Release frees a name that is not running and may still be held from an
     earlier run: one deregistration of the KEY alone with both leases 0 (Case
@@ -666,6 +675,10 @@ func Release(cfg NameConfig) error
     it, or answers that another key holds it now. Release returns an error only
     for a client configuration NewClient refuses; a deregistration that fails is
     logged, and the name stays recorded as held.
+
+func WithAddresses(name string, addrs []netip.Addr, records []dns.RR) []dns.RR
+    WithAddresses returns what name registers: an A or AAAA record at name for
+    each of addrs, then records.
 
 
 TYPES
@@ -705,7 +718,7 @@ func (c *Client) Withdraw(ctx context.Context, records []dns.RR) (*dns.Msg, base
     its KEY (Case D).
 
 type Config struct {
-	Zone  string // the zone the name is in (the Zone Section); trailing dot optional
+	Zone  string // the zone the name is in, sent as the Zone Section; trailing dot optional
 	Label string // the name's single label: the name is Label.Zone
 	// Key is the name's SIG(0) key: required, as the key is what holds the name.
 	Key *keyrec.LoadedKey
@@ -1086,6 +1099,122 @@ type Labels struct {
 
 ```
 
+## github.com/NetworkCommons/sig0lease/cmd/internal/cli
+```
+package cli // import "github.com/NetworkCommons/sig0lease/cmd/internal/cli"
+
+Package cli has what this project's client commands share, so that they read
+alike: sig0lease-client and sig0lease-srp-client take "<command> [flags]
+[args]" (the SRP client has no command), with the same flags for the same
+things (-server, -transport, -keystore, -k, -lease, -key-lease, -ttl), the same
+signing-key convention, the same reply printing, and, for the commands that keep
+a registration, the same modes (-once, -deregister, -keep-names).
+
+FUNCTIONS
+
+func DefineKeystore(fs *flag.FlagSet, dir *string)
+    DefineKeystore defines -keystore on fs, read into dir: the directory holding
+    the signing keys (KeystoreDir).
+
+func Exit(resp *dns.Msg, outcome client.Outcome, err error)
+    Exit prints the reply to a single request, and exits non-zero unless it
+    succeeded.
+
+func Fail(err error)
+    Fail prints err and exits 1.
+
+func KeystoreDir(given string) (string, error)
+    KeystoreDir is the keystore given, else the one CLIENT_KEYSTORE_DIR names
+    (keyrec.KeystoreDir).
+
+func PrintEDEs(resp *dns.Msg)
+    PrintEDEs prints the Extended DNS Errors (RFC 8914) in resp, one per line:
+    the reason for a refusal, or a success's notes.
+
+func PrintReply(resp *dns.Msg, outcome client.Outcome)
+    PrintReply prints resp's status and Extended DNS Errors, and, for a success,
+    the leases granted.
+
+func Stamp() string
+    Stamp prefixes a line a running command prints with the time.
+
+
+TYPES
+
+type Endpoint struct {
+	Server    string
+	Transport client.Network
+}
+    Endpoint holds the flags saying where a command sends: -server and
+    -transport.
+
+func (e *Endpoint) Define(fs *flag.FlagSet, server string)
+    Define defines Endpoint's flags on fs; server says what -server is for that
+    command.
+
+func (e *Endpoint) RequireServer() error
+    RequireServer reports a missing -server, for the commands that cannot
+    discover one.
+
+type Modes struct {
+	Once       bool
+	Deregister bool
+	KeepNames  bool
+}
+    Modes holds the flags that choose what such a command does: by default
+    it keeps the registration until Ctrl-C or SIGTERM; -once registers once,
+    -deregister deregisters.
+
+func (m *Modes) Check() error
+    Check reports flags that do not go together.
+
+func (m *Modes) Define(fs *flag.FlagSet, what string)
+    Define defines Modes' flags on fs; what names what -deregister withdraws.
+
+func (m *Modes) Run(c Requester)
+    Run does with c what the modes say, printing each reply, and exits
+    non-zero when that failed. Kept registered, c prints its own replies (its
+    OnRegistered and OnError).
+
+type Repeatable []string
+    Repeatable collects every occurrence of a flag, in order.
+
+func (r *Repeatable) Set(v string) error
+
+func (r *Repeatable) String() string
+
+type Request struct {
+	Endpoint
+	Keystore string
+	KeyAlg   uint
+	Lease    uint
+	KeyLease uint
+	TTL      uint
+}
+    Request holds the flags of a command that sends signed updates: Endpoint's,
+    -keystore, -k, -lease, -key-lease and -ttl.
+
+func (r *Request) Check() error
+    Check reports a flag value a request cannot carry.
+
+func (r *Request) Define(fs *flag.FlagSet, server string)
+    Define defines Request's flags on fs; server says what -server is for that
+    command.
+
+func (r *Request) Key(owner string) (*keyrec.LoadedKey, error)
+    Key finds owner's signing key in the keystore or, with -k, generates one
+    there (keyrec.ResolveOrCreateKey), and says when it did.
+
+type Requester interface {
+	Register(ctx context.Context) (*dns.Msg, client.Outcome, error)
+	Deregister(ctx context.Context, keepNames bool) (*dns.Msg, client.Outcome, error)
+	Run(ctx context.Context) error
+}
+    Requester is what a command that keeps a registration drives: client/srp's
+    Client or client/rfc9664's.
+
+```
+
 ## github.com/NetworkCommons/sig0lease/cmd/sig0lease
 ```
 Package main implements the DNS proxy server.
@@ -1101,8 +1230,12 @@ names and their records through the sig0lease proxy's RFC 9664 handler
 
 ## github.com/NetworkCommons/sig0lease/cmd/sig0lease-client
 ```
-Package main implements a sig0lease client for sending UPDATE-LEASE requests
-with SIG(0) authentication to the sig0lease proxy.
+Package main implements sig0lease-client, the RFC 9664 client of this project's
+proxy. Its update commands (register, refresh, register-tamper) send exactly
+the update their arguments describe, the shapes the proxy must refuse included,
+so the test suites can check its answers; name keeps a name registered through
+client/rfc9664, as sig0lease-srp-client does a host through client/srp. Both
+spell their flags alike (cmd/internal/cli).
 ```
 
 ## github.com/NetworkCommons/sig0lease/cmd/sig0lease-srp-client
@@ -1110,8 +1243,8 @@ with SIG(0) authentication to the sig0lease proxy.
 Package main implements sig0lease-srp-client, a thin CLI over client/srp
 -- a dev/test tool, not a shipped product. The library is the deliverable;
 this just exercises it. The long-running client that keeps a machine's
-services registered, mirroring what the local mDNSResponder sees among them,
-is sig0lease-agent.
+services registered, mirroring what the local mDNSResponder sees among them, is
+sig0lease-agent. Its flags are spelled as sig0lease-client's (cmd/internal/cli).
 ```
 
 ## github.com/NetworkCommons/sig0lease/config
@@ -2087,8 +2220,7 @@ func ResolveOrCreateKey(dir, owner string, createAlgorithm uint8, logger *loggin
     a new key was generated, so callers can tell the user which happened.
     createAlgorithm == 0 means "never create" -- a missing key is then an error,
     not silently generated, matching this package's existing strict-by-default
-    convention (see cmd/sig0lease-client's historical behavior, which this
-    generalizes).
+    convention (cmd/sig0lease-client's, which this generalizes).
 
     This is shared, rather than reimplemented per caller, because both of this
     project's CLI clients (cmd/sig0lease-client, cmd/sig0lease-srp-client) need

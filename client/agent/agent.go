@@ -18,7 +18,6 @@ import (
 	"github.com/NetworkCommons/sig0lease/client/rfc9664"
 	clientsrp "github.com/NetworkCommons/sig0lease/client/srp"
 	"github.com/NetworkCommons/sig0lease/logging"
-	"github.com/NetworkCommons/sig0lease/pkg/dnsmsg"
 	"github.com/NetworkCommons/sig0lease/pkg/dnsname"
 	"github.com/NetworkCommons/sig0lease/pkg/keyrec"
 )
@@ -506,11 +505,7 @@ func (a *agent) publish(hr *hostRun) {
 // publishName hands nr's records to its name, its addresses' first, if they changed.
 func (a *agent) publishName(nr *nameRun) {
 	owner := nr.registrar.Owner(nr.name.Name)
-	var records []dns.RR
-	for _, addr := range a.addresses(nr.name.Auto, nr.name.Addresses) {
-		records = append(records, dnsmsg.AddressRR(owner, addr, 0))
-	}
-	records = append(records, nr.name.Records...)
+	records := rfc9664.WithAddresses(owner, a.addresses(nr.name.Auto, nr.name.Addresses), nr.name.Records)
 	if nr.set && reflect.DeepEqual(records, nr.records) {
 		return
 	}

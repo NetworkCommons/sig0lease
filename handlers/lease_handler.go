@@ -96,25 +96,52 @@ func SeparateZones(hs []ZoneHandler) error {
 	return nil
 }
 
+// notServed returns why this handler does not serve name -- it is outside upstreamZone, or in
+// a zone another handler serves below it (SeparateZones) -- or nil if it serves it.
+func (b *leaseHandler[C]) notServed(name string) error {
+	if !dnsname.IsAtOrBelow(name, b.upstreamZone) {
+		return fmt.Errorf("%s is outside zone %s, which %s serves", name, b.upstreamZone, b.Name())
+	}
+	for _, z := range b.deeperZones {
+		if dnsname.IsAtOrBelow(name, z.zone) {
+			return fmt.Errorf("%s is in zone %s, which %s serves", name, z.zone, z.handler)
+		}
+	}
+	return nil
+}
+
 // refuseNamesNotServed refuses r when its Update section names a record this handler does not
-// serve: one outside upstreamZone, or one in a zone another handler serves below it
-// (SeparateZones). Every owner name the requester sent counts, deletes included. Each handler
-// calls it once the names are final, before anything is looked up or locked.
+// serve (notServed). Every owner name the requester sent counts, deletes included. Each
+// handler calls it once the names are final, before anything is looked up or locked.
 func (b *leaseHandler[C]) refuseNamesNotServed(r *dns.Msg) *HandlerResult {
 	for _, rr := range r.Ns {
-		name := rr.Header().Name
-		var err error
-		if !dnsname.IsAtOrBelow(name, b.upstreamZone) {
-			err = fmt.Errorf("%s is outside zone %s, which %s serves", name, b.upstreamZone, b.Name())
-		}
-		for _, z := range b.deeperZones {
-			if err == nil && dnsname.IsAtOrBelow(name, z.zone) {
-				err = fmt.Errorf("%s is in zone %s, which %s serves", name, z.zone, z.handler)
-			}
-		}
-		if err != nil {
+		if err := b.notServed(rr.Header().Name); err != nil {
 			msg := makeErrorResponse(r, dns.RcodeRefused, dns.ExtendedErrorProhibited, err.Error())
 			return NewErrorResult(msg, "name not served by this handler", err)
+		}
+	}
+	return nil
+}
+
+// refuseOutsideZoneSection answers NOTZONE when r's Update section names a record outside the
+// zone its Zone Section names (RFC 2136 S3.4.1.3), and FORMERR when r has no single Zone
+// Section entry. That is all the Zone Section is used for, by every handler: which handler
+// takes an update, and what it may change, go by the names (notServed, the SIG(0) checks),
+// and the update sent upstream names the handler's own zone. A requester may therefore name
+// the zone apex, as RFC 2136 and RFC 9665 S3.3 ask, a handler's upstream_zone, or any name
+// above its records.
+func refuseOutsideZoneSection(r *dns.Msg) *HandlerResult {
+	if len(r.Question) != 1 {
+		err := fmt.Errorf("%d Zone Section entries, want exactly one", len(r.Question))
+		msg := makeErrorResponse(r, dns.RcodeFormatError, dns.ExtendedErrorOther, err.Error())
+		return NewErrorResult(msg, "invalid Zone Section", err)
+	}
+	zone := r.Question[0].Header().Name
+	for _, rr := range r.Ns {
+		if name := rr.Header().Name; !dnsname.IsAtOrBelow(name, zone) {
+			err := fmt.Errorf("%s is outside %s, the zone the Zone Section names", name, zone)
+			msg := makeErrorResponse(r, dns.RcodeNotZone, dns.ExtendedErrorOther, err.Error())
+			return NewErrorResult(msg, "name outside the Zone Section", err)
 		}
 	}
 	return nil

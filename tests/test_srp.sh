@@ -39,13 +39,20 @@ build_srp_binaries() {
 }
 
 # run_srp_client <identity-name> [extra sig0lease-srp-client flags...] -- sends one update
-# (-once) to the proxy. identity-name selects a keystore directory under a scratch dir: -k=13
-# creates a key there on first use and is a no-op after. Pass a never-before-used name for a
-# fresh identity, the same name again to reuse one (refresh / conflict scenarios).
+# (-once, or the -deregister given) to the proxy. identity-name selects a keystore directory
+# under a scratch dir: -k=13 creates a key there on first use and is a no-op after. Pass a
+# never-before-used name for a fresh identity, the same name again to reuse one (refresh /
+# conflict scenarios).
 run_srp_client() {
     local identity="$1"; shift
+    local mode=-once arg
+    for arg in "$@"; do
+        if [ "$arg" = -deregister ]; then
+            mode=
+        fi
+    done
     "$SRP_CLIENT_BIN" -server="$SRP_PROXY_URL" -domain="$SRP_ZONE" \
-        -keystore="${SRP_KEY_DIR}/${identity}" -k=13 -once "$@"
+        -keystore="${SRP_KEY_DIR}/${identity}" -k=13 ${mode:+"$mode"} "$@"
 }
 
 ################################
@@ -58,7 +65,7 @@ test_register_and_dig() {
 
     local out
     out="$(run_srp_client id1 -host=host1 -addr=192.0.2.1 -instance=Widget:_http._tcp:8080 -txt=Widget:path=/ \
-        -lease="$SRP_LEASE_SECONDS" -keylease="$SRP_KEY_LEASE_SECONDS")"
+        -lease="$SRP_LEASE_SECONDS" -key-lease="$SRP_KEY_LEASE_SECONDS")"
     echo "$out"
     echo "$out" | grep -q "Status: NOERROR (Rcode=0)" || { log_error "registration did not return NOERROR"; return 1; }
 
@@ -84,7 +91,7 @@ test_refresh() {
 
     local out
     out="$(run_srp_client id1 -host=host1 -addr=192.0.2.1 -instance=Widget:_http._tcp:8080 -txt=Widget:path=/ \
-        -lease="$SRP_LEASE_SECONDS" -keylease="$SRP_KEY_LEASE_SECONDS")"
+        -lease="$SRP_LEASE_SECONDS" -key-lease="$SRP_KEY_LEASE_SECONDS")"
     echo "$out"
     echo "$out" | grep -q "Status: NOERROR (Rcode=0)" || { log_error "refresh did not return NOERROR"; return 1; }
 
@@ -98,7 +105,7 @@ test_conflict() {
 
     local out
     out="$(run_srp_client id2-conflict -host=host1 -addr=192.0.2.1 -instance=Gadget:_http._tcp:8080 -txt=Gadget:path=/ \
-        -lease="$SRP_LEASE_SECONDS" -keylease="$SRP_KEY_LEASE_SECONDS")" || true
+        -lease="$SRP_LEASE_SECONDS" -key-lease="$SRP_KEY_LEASE_SECONDS")" || true
     echo "$out"
     echo "$out" | grep -q "Status: YXDOMAIN (Rcode=6)" || { log_error "expected YXDOMAIN for a conflicting registration"; return 1; }
     # The reason, from the Extended DNS Error: the config turns on server.diagnostics.
@@ -119,7 +126,7 @@ test_remove_one_instance() {
 
     local out
     out="$(run_srp_client id1 -host=host1 -addr=192.0.2.1 -remove=Widget:_http._tcp \
-        -lease="$SRP_LEASE_SECONDS" -keylease="$SRP_KEY_LEASE_SECONDS")"
+        -lease="$SRP_LEASE_SECONDS" -key-lease="$SRP_KEY_LEASE_SECONDS")"
     echo "$out"
     echo "$out" | grep -q "Status: NOERROR (Rcode=0)" || { log_error "instance removal did not return NOERROR"; return 1; }
 
@@ -147,7 +154,7 @@ test_remove_all() {
     log_section "$log_msg"
 
     local out
-    out="$(run_srp_client id1 -host=host1 -deregister -keep-names -keylease="$SRP_KEY_LEASE_SECONDS")"
+    out="$(run_srp_client id1 -host=host1 -deregister -keep-names -key-lease="$SRP_KEY_LEASE_SECONDS")"
     echo "$out"
     echo "$out" | grep -q "Status: NOERROR (Rcode=0)" || { log_error "host removal did not return NOERROR"; return 1; }
 
@@ -164,7 +171,7 @@ test_expiry() {
 
     local out
     out="$(run_srp_client id3-expiry -host=host3 -addr=192.0.2.1 -instance=Sprocket:_http._tcp:8080 -txt=Sprocket:path=/ \
-        -lease="$SRP_EXPIRY_LEASE_SECONDS" -keylease="$SRP_EXPIRY_LEASE_SECONDS")"
+        -lease="$SRP_EXPIRY_LEASE_SECONDS" -key-lease="$SRP_EXPIRY_LEASE_SECONDS")"
     echo "$out"
     echo "$out" | grep -q "Status: NOERROR (Rcode=0)" || { log_error "fresh registration for expiry test did not return NOERROR"; return 1; }
     [ -n "$(dig_srp host3.srp.test. A)" ] || { log_error "host A record not found right after registration"; return 1; }
@@ -201,7 +208,7 @@ test_lease_expiry_keeps_keys() {
 
     local out
     out="$(run_srp_client id4-lease-expiry -host=host4 -addr=192.0.2.1 -instance=Gizmo:_http._tcp:8080 -txt=Gizmo:path=/ \
-        -lease="$SRP_DATA_EXPIRY_LEASE_SECONDS" -keylease="$SRP_DATA_EXPIRY_KEY_LEASE_SECONDS")"
+        -lease="$SRP_DATA_EXPIRY_LEASE_SECONDS" -key-lease="$SRP_DATA_EXPIRY_KEY_LEASE_SECONDS")"
     echo "$out"
     echo "$out" | grep -q "Status: NOERROR (Rcode=0)" || { log_error "fresh registration for LEASE expiry test did not return NOERROR"; return 1; }
     wait_for_srp_state _services._dns-sd._udp.srp.test. PTR present 10 \
@@ -235,7 +242,7 @@ test_discovery() {
     out="$("$SRP_CLIENT_BIN" -resolver="${BIND9_ADDR}:${BIND9_PORT}" -domain="$SRP_ZONE" \
         -keystore="${SRP_KEY_DIR}/id5-discovery" -k=13 -once \
         -host=host5 -addr=192.0.2.5 -instance=Doohickey:_http._tcp:8080 -txt=Doohickey:path=/ \
-        -lease="$SRP_LEASE_SECONDS" -keylease="$SRP_KEY_LEASE_SECONDS")"
+        -lease="$SRP_LEASE_SECONDS" -key-lease="$SRP_KEY_LEASE_SECONDS")"
     echo "$out"
     echo "$out" | grep -q "Status: NOERROR (Rcode=0)" || { log_error "registration via discovery did not return NOERROR"; return 1; }
 
@@ -247,20 +254,20 @@ test_discovery() {
 }
 
 test_discovery_tls() {
-    # TEST 8 for a requester that uses TLS (-tls): SOA for srp.test., then the
+    # TEST 8 for a requester that uses TLS (-transport=tls): SOA for srp.test., then the
     # _dnssd-srp-tls._tcp.srp.test. SRV -> proxy.srp.test.:<proxy DoT port> (RFC 9665 S3.1.1),
     # then the update over DNS-over-TLS (S7). That port speaks only TLS, and the plain
     # _dnssd-srp._tcp record points at the proxy's plain-DNS port instead, so a NOERROR shows
     # the client both used the TLS record and completed the TLS handshake. Runs after TEST 7
     # for the same reason as TEST 8.
-    local log_msg="TEST 9: Registrar discovery and update over DNS-over-TLS (-tls, no -server)"
+    local log_msg="TEST 9: Registrar discovery and update over DNS-over-TLS (-transport=tls, no -server)"
     log_section "$log_msg"
 
     local out
-    out="$("$SRP_CLIENT_BIN" -tls -resolver="${BIND9_ADDR}:${BIND9_PORT}" -domain="$SRP_ZONE" \
+    out="$("$SRP_CLIENT_BIN" -transport=tls -resolver="${BIND9_ADDR}:${BIND9_PORT}" -domain="$SRP_ZONE" \
         -keystore="${SRP_KEY_DIR}/id6-discovery-tls" -k=13 -once \
         -host=host6 -addr=192.0.2.6 -instance=Thingamajig:_http._tcp:8080 -txt=Thingamajig:path=/ \
-        -lease="$SRP_LEASE_SECONDS" -keylease="$SRP_KEY_LEASE_SECONDS")"
+        -lease="$SRP_LEASE_SECONDS" -key-lease="$SRP_KEY_LEASE_SECONDS")"
     echo "$out"
     echo "$out" | grep -q "_dnssd-srp-tls._tcp" || { log_error "client did not report discovering via _dnssd-srp-tls._tcp"; return 1; }
     echo "$out" | grep -q "Status: NOERROR (Rcode=0)" || { log_error "registration over DNS-over-TLS did not return NOERROR"; return 1; }
@@ -284,10 +291,10 @@ test_concurrent_claims() {
     out_a="$(mktemp /tmp/sig0lease-srp-race-a.XXXXXX)"
     out_b="$(mktemp /tmp/sig0lease-srp-race-b.XXXXXX)"
     run_srp_client id7-race-a -host=host7 -addr=192.0.2.71 \
-        -lease="$SRP_LEASE_SECONDS" -keylease="$SRP_KEY_LEASE_SECONDS" > "$out_a" 2>&1 &
+        -lease="$SRP_LEASE_SECONDS" -key-lease="$SRP_KEY_LEASE_SECONDS" > "$out_a" 2>&1 &
     pid_a=$!
     run_srp_client id7-race-b -host=host7 -addr=192.0.2.72 \
-        -lease="$SRP_LEASE_SECONDS" -keylease="$SRP_KEY_LEASE_SECONDS" > "$out_b" 2>&1 &
+        -lease="$SRP_LEASE_SECONDS" -key-lease="$SRP_KEY_LEASE_SECONDS" > "$out_b" 2>&1 &
     pid_b=$!
     wait "$pid_a" || true
     wait "$pid_b" || true
@@ -324,14 +331,14 @@ test_foreign_data_takeover() {
 
     local out
     out="$(run_srp_client id8-takeover -host=legacy -addr=192.0.2.8 \
-        -lease="$SRP_LEASE_SECONDS" -keylease="$SRP_KEY_LEASE_SECONDS")"
+        -lease="$SRP_LEASE_SECONDS" -key-lease="$SRP_KEY_LEASE_SECONDS")"
     echo "$out"
     echo "$out" | grep -q "Status: NOERROR (Rcode=0)" || { log_error "takeover of non-SRP data did not return NOERROR"; return 1; }
     [ "$(dig_srp legacy.srp.test. A)" = "192.0.2.8" ] || { log_error "expected the claimant's address to replace the non-SRP A record"; return 1; }
     [ -n "$(dig_srp legacy.srp.test. KEY)" ] || { log_error "claimant's KEY not found at legacy.srp.test."; return 1; }
 
     out="$(run_srp_client id8-takeover-late -host=legacy -addr=192.0.2.9 \
-        -lease="$SRP_LEASE_SECONDS" -keylease="$SRP_KEY_LEASE_SECONDS")" || true
+        -lease="$SRP_LEASE_SECONDS" -key-lease="$SRP_KEY_LEASE_SECONDS")" || true
     echo "$out"
     echo "$out" | grep -q "Status: YXDOMAIN (Rcode=6)" || { log_error "a second identity's claim after the takeover should get YXDOMAIN"; return 1; }
 

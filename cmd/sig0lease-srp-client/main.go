@@ -1,54 +1,36 @@
 // Package main implements sig0lease-srp-client, a thin CLI over client/srp -- a dev/test tool,
 // not a shipped product. The library is the deliverable; this just exercises it. The
 // long-running client that keeps a machine's services registered, mirroring what the local
-// mDNSResponder sees among them, is sig0lease-agent.
+// mDNSResponder sees among them, is sig0lease-agent. Its flags are spelled as
+// sig0lease-client's (cmd/internal/cli).
 package main
 
 import (
-	"context"
 	"flag"
 	"fmt"
 	"net/netip"
 	"os"
-	"os/signal"
 	"strconv"
 	"strings"
-	"syscall"
-	"time"
 
 	"codeberg.org/miekg/dns"
+	"codeberg.org/miekg/dns/dnsutil"
 	baseclient "github.com/NetworkCommons/sig0lease/client"
 	clientsrp "github.com/NetworkCommons/sig0lease/client/srp"
-	"github.com/NetworkCommons/sig0lease/logging"
+	"github.com/NetworkCommons/sig0lease/cmd/internal/cli"
 	_ "github.com/NetworkCommons/sig0lease/pkg/dnscompat" // registers EDNS0 code 2 (UPDATE-LEASE); matches cmd/sig0lease/main.go and cmd/sig0lease-client/main.go's own convention (client/srp also self-registers this, so it's redundant here, not load-bearing)
-	"github.com/NetworkCommons/sig0lease/pkg/dnsmsg"
-	"github.com/NetworkCommons/sig0lease/pkg/keyrec"
 )
 
-// repeatableFlag collects every occurrence of a flag.Value flag, in order.
-type repeatableFlag []string
-
-func (r *repeatableFlag) String() string     { return strings.Join(*r, ",") }
-func (r *repeatableFlag) Set(v string) error { *r = append(*r, v); return nil }
-
 func main() {
+	var req cli.Request
+	var modes cli.Modes
+	req.Define(flag.CommandLine, `explicit registrar "host:port"; empty: discovered through _dnssd-srp._tcp (_dnssd-srp-tls._tcp with -transport tls)`)
+	modes.Define(flag.CommandLine, "the host and every -instance")
 	domain := flag.String("domain", "", "registration domain (required)")
 	host := flag.String("host", "", "base host label, e.g. \"myhost\" (required)")
-	server := flag.String("server", "", "explicit registrar \"host:port\"; empty triggers _dnssd-srp._tcp discovery (_dnssd-srp-tls._tcp with -tls)")
 	discovery := flag.String("discovery", "closest", `where discovery looks for the registrar's SRV: "closest" (the domain, then each parent up to its zone apex) or "apex" (the zone apex only, as RFC 9665 S3.1.1 specifies)`)
-	lease := flag.Uint("lease", 3600, "requested LEASE seconds")
-	keylease := flag.Uint("keylease", 1209600, "requested KEY-LEASE seconds")
-	ttl := flag.Uint("ttl", 300, "TTL seconds suggested for every registered record, KEYs included; independent of the leases, and the registrar may override it")
-	udp := flag.Bool("udp", false, "use UDP instead of TCP (SRP requires TCP by default, S3.5)")
-	useTLS := flag.Bool("tls", false, "use DNS-over-TLS (RFC 7858, opportunistic: the registrar's certificate is not checked) instead of TCP; discovery then looks for _dnssd-srp-tls._tcp")
-	once := flag.Bool("once", false, "send exactly one registration and exit, instead of running the full refresh lifecycle")
-	deregister := flag.Bool("deregister", false, "send exactly one Deregister (withdraw host + every -instance) and exit, instead of registering; implies -once")
-	keepNames := flag.Bool("keep-names", false, "with -deregister: keep the names for this identity's key, asking for -keylease instead of a KEY-LEASE of 0")
-	keystoreDir := flag.String("keystore", "", "directory to load this identity's signing key from; falls back to CLIENT_KEYSTORE_DIR if unset")
-	keyAlg := flag.Uint("k", 0, "DNSSEC algorithm (13=ECDSAP256SHA256, 15=ED25519) to generate a NEW signing key with if none exists yet; omit to require an existing key")
 	maxRenames := flag.Int("max-renames", 5, "rename-retry attempts on YXDOMAIN before giving up")
-
-	var addrs, instances, removes, txts, subtypes, resolvers repeatableFlag
+	var addrs, resolvers, instances, removes, txts, subtypes cli.Repeatable
 	flag.Var(&addrs, "addr", "host A/AAAA address to publish (repeatable)")
 	flag.Var(&resolvers, "resolver", "resolver \"host:port\" for every discovery lookup -- zone apex SOA, registrar SRV, registrar address (repeatable); default 8.8.8.8:53, 8.8.4.4:53")
 	flag.Var(&instances, "instance", `service instance "Label:_svctype._proto:port" (repeatable)`)
@@ -62,23 +44,16 @@ func main() {
 	if *domain == "" || *host == "" {
 		fmt.Fprintln(os.Stderr, "ERROR: -domain and -host are required")
 		printUsage()
-		os.Exit(1)
+		os.Exit(2)
 	}
-	if *ttl == 0 {
-		// client/srp reads a zero TTL as "unset" and would send its default instead.
-		fmt.Fprintln(os.Stderr, "ERROR: -ttl must be at least 1")
-		os.Exit(1)
+	if flag.NArg() != 0 {
+		cli.Fail(fmt.Errorf("unexpected arguments %q: everything is a flag", flag.Args()))
 	}
-
-	network := baseclient.NetworkTCP
-	switch {
-	case *udp && *useTLS:
-		fmt.Fprintln(os.Stderr, "ERROR: -udp and -tls are mutually exclusive")
-		os.Exit(1)
-	case *udp:
-		network = baseclient.NetworkUDP
-	case *useTLS:
-		network = baseclient.NetworkTLS
+	if err := req.Check(); err != nil {
+		cli.Fail(err)
+	}
+	if err := modes.Check(); err != nil {
+		cli.Fail(err)
 	}
 
 	var discoveryMode clientsrp.DiscoveryMode
@@ -88,45 +63,31 @@ func main() {
 	case "apex":
 		discoveryMode = clientsrp.DiscoveryApexOnly
 	default:
-		fmt.Fprintf(os.Stderr, "ERROR: invalid -discovery %q, want \"closest\" or \"apex\"\n", *discovery)
-		os.Exit(1)
+		cli.Fail(fmt.Errorf("invalid -discovery %q, want \"closest\" or \"apex\"", *discovery))
 	}
 
 	var parsedAddrs []netip.Addr
 	for _, a := range addrs {
 		addr, err := netip.ParseAddr(a)
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "ERROR: invalid -addr %q: %v\n", a, err)
-			os.Exit(1)
+			cli.Fail(fmt.Errorf("invalid -addr %q: %v", a, err))
 		}
 		parsedAddrs = append(parsedAddrs, addr)
 	}
 	// RFC 9665 S3.3.1.3: a Host Description without an address is a removal.
-	if len(parsedAddrs) == 0 && !*deregister {
-		fmt.Fprintln(os.Stderr, "ERROR: -addr is required to register: a host without an address is a removal (RFC 9665 S3.3.1.3); use -deregister")
-		os.Exit(1)
-	}
-	if *keepNames && !*deregister {
-		fmt.Fprintln(os.Stderr, "ERROR: -keep-names is for -deregister")
-		os.Exit(1)
+	if len(parsedAddrs) == 0 && !modes.Deregister {
+		cli.Fail(fmt.Errorf("-addr is required to register: a host without an address is a removal (RFC 9665 S3.3.1.3); use -deregister"))
 	}
 
 	instCfgs, err := parseInstances(instances, removes, txts, subtypes)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "ERROR: %v\n", err)
-		os.Exit(1)
+		cli.Fail(err)
 	}
 
 	// Every identity is kept in a keystore (keyrec.KeystoreDir), none is an unsaved one-off.
-	dir, err := keyrec.KeystoreDir(*keystoreDir, "pass -keystore=<dir>")
+	key, err := req.Key(*host + "." + dnsutil.Fqdn(*domain))
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "ERROR: %v\n", err)
-		os.Exit(1)
-	}
-	key, err := resolveKey(dir, *host, *domain, uint8(*keyAlg))
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "ERROR: %v\n", err)
-		os.Exit(1)
+		cli.Fail(err)
 	}
 
 	cfg := clientsrp.Config{
@@ -135,119 +96,47 @@ func main() {
 		Addresses:         parsedAddrs,
 		Instances:         instCfgs,
 		Key:               key,
-		RequestedLease:    uint32(*lease),
-		RequestedKeyLease: uint32(*keylease),
-		TTL:               uint32(*ttl),
-		RegistrarAddr:     *server,
+		RequestedLease:    uint32(req.Lease),
+		RequestedKeyLease: uint32(req.KeyLease),
+		TTL:               uint32(req.TTL),
+		RegistrarAddr:     req.Server,
 		Discovery:         discoveryMode,
 		Resolvers:         []string(resolvers),
-		Network:           network,
+		Network:           req.Transport,
 		MaxRenames:        *maxRenames,
 		OnRegistered: func(resp *dns.Msg) {
-			fmt.Printf("[%s] ", time.Now().Format(time.RFC3339))
-			printResult(resp, baseclient.OutcomeSuccess)
+			fmt.Print(cli.Stamp())
+			cli.PrintReply(resp, baseclient.OutcomeSuccess)
 		},
 		OnError: func(err error) {
-			fmt.Fprintf(os.Stderr, "[%s] ERROR: %v\n", time.Now().Format(time.RFC3339), err)
+			fmt.Fprintf(os.Stderr, "%sERROR: %v\n", cli.Stamp(), err)
 		},
 	}
 	c, err := clientsrp.NewClient(cfg)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "ERROR: %v\n", err)
-		os.Exit(1)
+		cli.Fail(err)
 	}
 
 	fmt.Printf("=== sig0lease-srp-client ===\n")
 	fmt.Printf("Domain: %s\n", *domain)
 	fmt.Printf("Host: %s.%s\n", *host, strings.TrimSuffix(*domain, "."))
-	fmt.Printf("Keystore: %s\n", dir)
 	fmt.Printf("Key: %s (algorithm %d, keytag %d)\n", key.Name, key.PublicKey.Algorithm, key.PublicKey.KeyTag())
-	if *server != "" {
-		fmt.Printf("Registrar: %s (explicit)\n", *server)
+	if req.Server != "" {
+		fmt.Printf("Registrar: %s (explicit)\n", req.Server)
 	} else if discoveryMode == clientsrp.DiscoveryApexOnly {
-		fmt.Printf("Registrar: discovered via %s.<zone apex enclosing %s>\n", clientsrp.DiscoveryService(network), strings.TrimSuffix(*domain, "."))
+		fmt.Printf("Registrar: discovered via %s.<zone apex enclosing %s>\n", clientsrp.DiscoveryService(req.Transport), strings.TrimSuffix(*domain, "."))
 	} else {
-		fmt.Printf("Registrar: discovered via the closest %s SRV from %s up to its zone apex\n", clientsrp.DiscoveryService(network), strings.TrimSuffix(*domain, "."))
+		fmt.Printf("Registrar: discovered via the closest %s SRV from %s up to its zone apex\n", clientsrp.DiscoveryService(req.Transport), strings.TrimSuffix(*domain, "."))
 	}
-	fmt.Printf("Transport: %s\n", network)
+	fmt.Printf("Transport: %s\n", req.Transport)
 	fmt.Printf("Instances: %d\n\n", len(instCfgs))
 
-	if *deregister {
-		resp, outcome, err := c.Deregister(context.Background(), *keepNames)
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "ERROR: %v\n", err)
-			os.Exit(1)
-		}
-		printResult(resp, outcome)
-		if outcome != baseclient.OutcomeSuccess {
-			os.Exit(1)
-		}
-		return
-	}
-
-	if *once {
-		resp, outcome, err := c.Register(context.Background())
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "ERROR: %v\n", err)
-			os.Exit(1)
-		}
-		printResult(resp, outcome)
-		if outcome != baseclient.OutcomeSuccess {
-			os.Exit(1)
-		}
-		return
-	}
-
-	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
-	defer cancel()
-	fmt.Println("Running full lifecycle (initial delay, refresh clock, rename-retry). Ctrl-C to stop.")
-	if err := c.Run(ctx); err != nil && ctx.Err() == nil {
-		fmt.Fprintf(os.Stderr, "ERROR: %v\n", err)
-		os.Exit(1)
-	}
-	fmt.Println("Stopped.")
-}
-
-func printResult(resp *dns.Msg, outcome baseclient.Outcome) {
-	fmt.Printf("Status: %s (Rcode=%d)\n", dns.RcodeToString[resp.Rcode], resp.Rcode)
-	for _, ede := range dnsmsg.EDEs(resp) {
-		fmt.Printf("EDE %s\n", dnsmsg.FormatEDE(ede))
-	}
-	if outcome == baseclient.OutcomeSuccess {
-		if lease, keyLease, ok := baseclient.GrantedLease(resp); ok {
-			fmt.Printf("Granted: LEASE=%d KEY-LEASE=%d\n", lease, keyLease)
-		}
-	}
-}
-
-// resolveKey finds an existing signing key for host+domain in dir, or -- only when
-// algorithm is non-zero (the -k flag was passed) -- generates and persists a new one at that
-// algorithm. A missing key with no -k given is an error, matching sig0lease-client's own
-// strict default (see the keyrec.ResolveOrCreateKey doc comment for the shared logic).
-// The logger carries ResolveOrCreateKey's warning when more than one key in dir matches.
-func resolveKey(dir, host, domain string, algorithm uint8) (*keyrec.LoadedKey, error) {
-	owner := ensureFQDN(host + "." + strings.TrimSuffix(domain, "."))
-	k, created, err := keyrec.ResolveOrCreateKey(dir, owner, algorithm, logging.NewLogger("info"))
-	if err != nil {
-		return nil, err
-	}
-	if created {
-		fmt.Printf("Generated new signing key: %s (algorithm %d)\n", k.Name, k.PublicKey.Algorithm)
-	}
-	return k, nil
-}
-
-// ensureFQDN appends a trailing dot if name doesn't already have one.
-func ensureFQDN(name string) string {
-	if strings.HasSuffix(name, ".") {
-		return name
-	}
-	return name + "."
+	modes.Run(c)
 }
 
 // parseInstances assembles InstanceConfig entries from -instance/-remove/-txt/-subtype,
 // matched by label.
-func parseInstances(instances, removes, txts, subtypes repeatableFlag) ([]clientsrp.InstanceConfig, error) {
+func parseInstances(instances, removes, txts, subtypes cli.Repeatable) ([]clientsrp.InstanceConfig, error) {
 	byLabel := map[string]*clientsrp.InstanceConfig{}
 	var order []string
 
@@ -320,67 +209,69 @@ func printUsage() {
 	fmt.Fprintf(os.Stderr, `sig0lease-srp-client - RFC 9665 SRP requester (dev/test tool over client/srp)
 
 Usage:
-  sig0lease-srp-client -domain=<domain> -host=<label> [options]
+  sig0lease-srp-client -domain <domain> -host <label> [flags]
 
 A machine's services are kept registered, and what its mDNSResponder sees mirrored, by
-sig0lease-agent (docs/sig0lease-agent.md); this tool sends what its flags say.
+sig0lease-agent (docs/sig0lease-agent.md); this tool sends what its flags say. Its flags are
+spelled as sig0lease-client's.
 
-Required:
-  -domain string       registration domain, e.g. srp.dev.zenr.io.
-  -host string          base host label, e.g. myhost (not the full FQDN)
-
-Options:
-  -addr value            host A/AAAA address to publish (repeatable); at least one, unless
-                         -deregister
-  -instance value        service instance "Label:_svctype._proto:port" (repeatable); _proto is
-                         _tcp or _udp -- to narrow a type further, add a -subtype instead of a label
+What to register:
+  -domain string          registration domain, e.g. srp.dev.zenr.io. (required)
+  -host string            base host label, e.g. myhost, not the full name (required)
+  -addr value             host A/AAAA address to publish (repeatable); at least one, unless
+                          -deregister
+  -instance value         service instance "Label:_svctype._proto:port" (repeatable); _proto is
+                          _tcp or _udp -- to narrow a type further, add a -subtype instead of a label
   -remove value           service instance "Label:_svctype._proto" to withdraw in this update,
-                         keeping the host and every -instance (repeatable)
+                          keeping the host and every -instance (repeatable)
   -txt value              TXT string for a declared instance, "Label:content" (repeatable)
   -subtype value          DNS-SD subtype for a declared instance, "Label:subtypelabel" (repeatable)
-  -server string          explicit registrar "host:port"; empty triggers _dnssd-srp._tcp discovery
-                         (_dnssd-srp-tls._tcp with -tls)
+
+Where and how:
+  -server string          registrar "host:port"; empty: discovered through _dnssd-srp._tcp
+                          (_dnssd-srp-tls._tcp with -transport tls)
   -discovery string       where discovery looks for the registrar's SRV: "closest" (default:
-                         the domain, then each parent up to its zone apex; the first record
-                         wins) or "apex" (the zone apex only, as RFC 9665 S3.1.1 specifies --
-                         what a stock SRP client would find); ignored with -server
-  -resolver value          resolver "host:port" for every discovery lookup: zone apex SOA,
-                         registrar SRV, registrar address (repeatable; default 8.8.8.8:53,
-                         8.8.4.4:53); ignored with -server
-  -lease uint              requested LEASE seconds (default 3600)
-  -keylease uint            requested KEY-LEASE seconds (default 1209600)
-  -ttl uint                 TTL seconds suggested for every registered record, KEYs included
-                            (default 300). Independent of the leases; the registrar may
-                            override it (RFC 9665 S4)
-  -udp                      use UDP instead of TCP (SRP requires TCP by default, S3.5)
-  -tls                      use DNS-over-TLS (RFC 7858) instead of TCP. Opportunistic, as RFC 9665
-                            S7 specifies: encrypted, but the registrar's certificate is not
-                            checked. Discovery looks for _dnssd-srp-tls._tcp instead of
-                            _dnssd-srp._tcp and never falls back to plain TCP; with -server, give
-                            the registrar's DoT port. Not with -udp
-  -once                    send exactly one registration and exit, instead of running the full lifecycle
-  -deregister               send exactly one Deregister (withdraw host + every -instance) and exit; implies -once.
-                            The names are freed (KEY-LEASE 0), unless -keep-names
-  -keep-names               with -deregister: keep the names for this identity's key, asking for
-                            -keylease (RFC 9665 S3.2.5.5.1)
-  -keystore string          directory holding this identity's signing key; falls back to the
-                            CLIENT_KEYSTORE_DIR environment variable if unset (an explicit flag
-                            always wins); one of the two is required
-  -k uint                   DNSSEC algorithm (13=ECDSAP256SHA256, 15=ED25519) to generate a NEW
-                            signing key with if this identity (-host+-domain) doesn't have one
-                            in the keystore yet; omit to require an existing key (error if
-                            missing) -- same convention as sig0lease-client's -k
-  -max-renames int           rename-retry attempts on YXDOMAIN before giving up (default 5)
+                          the domain, then each parent up to its zone apex; the first record
+                          wins) or "apex" (the zone apex only, as RFC 9665 S3.1.1 specifies --
+                          what a stock SRP client would find); ignored with -server
+  -resolver value         resolver "host:port" for every discovery lookup: zone apex SOA,
+                          registrar SRV, registrar address (repeatable; default 8.8.8.8:53,
+                          8.8.4.4:53); ignored with -server
+  -transport string       tcp (default), udp or tls: DNS over TLS (RFC 7858), opportunistic as
+                          RFC 9665 S7 specifies, so the registrar's certificate is not checked.
+                          With tls, discovery looks for _dnssd-srp-tls._tcp and never falls back
+                          to plain TCP; with -server, give the registrar's DoT port
+  -lease uint             LEASE to ask for, in seconds (default 3600)
+  -key-lease uint         KEY-LEASE to ask for, in seconds (default 1209600)
+  -ttl uint               TTL suggested for every registered record, KEYs included, in seconds
+                          (default 300); independent of the leases, and the registrar may
+                          override it (RFC 9665 S4)
+  -max-renames int        rename-retry attempts on YXDOMAIN before giving up (default 5)
+
+Key:
+  -keystore string        directory holding this identity's signing key (default
+                          $CLIENT_KEYSTORE_DIR; one of the two is required)
+  -k uint                 DNSSEC algorithm (13=ECDSAP256SHA256, 15=ED25519) to generate a key
+                          with if this identity (-host + -domain) has none yet; left out, a
+                          missing key is an error
+
+What to do (default: keep it registered on the lease clock, renaming on YXDOMAIN, until
+Ctrl-C):
+  -once                   send one registration and exit
+  -deregister             send one deregistration of the host and every -instance and exit;
+                          the names are freed (KEY-LEASE 0), unless -keep-names
+  -keep-names             with -deregister: keep the names for this identity's key, asking for
+                          -key-lease (RFC 9665 S3.2.5.5.1)
 
 Examples:
-  // One-shot registration of a host with one service instance, against an explicit registrar;
+  // One registration of a host with one service instance, against an explicit registrar;
   // -k 13 generates an ECDSAP256SHA256 key on first run, reused on every later run
-  sig0lease-srp-client -domain=srp.test. -host=myhost -addr=192.0.2.1 -server=127.0.0.1:8059 \
-    -instance=Widget:_http._tcp:8080 -txt=Widget:path=/ -once -keystore=./srp-identity -k=13
+  sig0lease-srp-client -domain srp.test. -host myhost -addr 192.0.2.1 -server 127.0.0.1:8059 \
+    -instance Widget:_http._tcp:8080 -txt Widget:path=/ -once -keystore ./srp-identity -k 13
 
-  // Full lifecycle (persistent refresh + rename-retry), discovering the registrar; requires
-  // -host.myhost's key to already exist in ./srp-identity, since -k is not given here
-  sig0lease-srp-client -domain=srp.dev.zenr.io. -host=myhost -addr=192.0.2.1 \
-    -instance=Widget:_http._tcp:8080 -keystore=./srp-identity
+  // Kept registered, discovering the registrar; myhost's key must already be in
+  // ./srp-identity, since -k is not given
+  sig0lease-srp-client -domain srp.dev.zenr.io. -host myhost -addr 192.0.2.1 \
+    -instance Widget:_http._tcp:8080 -keystore ./srp-identity
 `)
 }

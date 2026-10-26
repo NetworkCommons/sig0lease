@@ -54,7 +54,7 @@ func GenerateKey(name string, algorithm uint8, flags uint16, bits int) (*LoadedK
 // created reports whether a new key was generated, so callers can tell
 // the user which happened. createAlgorithm == 0 means "never create" -- a missing key is then
 // an error, not silently generated, matching this package's existing strict-by-default
-// convention (see cmd/sig0lease-client's historical behavior, which this generalizes).
+// convention (cmd/sig0lease-client's, which this generalizes).
 //
 // This is shared, rather than reimplemented per caller, because both of this project's CLI
 // clients (cmd/sig0lease-client, cmd/sig0lease-srp-client) need the identical "find any existing

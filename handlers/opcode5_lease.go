@@ -61,8 +61,8 @@ func (h *UpdateHandler) authorizeKeyRefresh(clientKeyRR *dns.KEY, signerID keyID
 // time remains locally (floored at 1s so a near-expiry key isn't handed a
 // zero-length lease) when it has disappeared from authoritative DNS and
 // needs to be re-published rather than granted a fresh full-length lease.
-func (h *UpdateHandler) effectiveRefreshKeyLease(ctx context.Context, zone string, keyRR *dns.KEY, existingKey *leasepkg.Record, requestedKeyLease uint32) (effectiveKeyLease uint32, keyAtFQDN bool, err error) {
-	keyAtFQDN, err = h.authoritativeHasKeyAtName(ctx, zone, keyRR.Hdr.Name)
+func (h *UpdateHandler) effectiveRefreshKeyLease(ctx context.Context, keyRR *dns.KEY, existingKey *leasepkg.Record, requestedKeyLease uint32) (effectiveKeyLease uint32, keyAtFQDN bool, err error) {
+	keyAtFQDN, err = h.authoritativeHasKeyAtName(ctx, keyRR.Hdr.Name)
 	if err != nil {
 		return 0, false, err
 	}
@@ -680,7 +680,7 @@ func (h *UpdateHandler) expirer() leaseExpirer {
 //   - If UPDATE-LEASE is absent, packet is not sig0lease relevant → StatusNotRelevant
 //
 // Registration Flow (if UPDATE-LEASE present):
-//  1. Validate message structure (single question for downstream zone)
+//  1. Validate message structure: names this handler serves, a Zone Section enclosing them
 //  2. Parse 8-byte lease EDNS(0) option (RFC 9664)
 //  3. Extract and validate client SIG(0) signature (RFC 2931)
 //  4. Extract KEY RR from update records
@@ -691,7 +691,7 @@ func (h *UpdateHandler) expirer() leaseExpirer {
 //  9. Return response to client
 //
 // The DNS UPDATE message format:
-//   - Question section: Downstream zone name and class (typically ClassINET)
+//   - Question section: the Zone Section, any name enclosing the update's names (typically the zone)
 //   - Answer section: Prerequisite records (unused in this implementation)
 //   - Authority section: Update records (typically KEY RRs being registered)
 //   - Additional section: EDNS options (including 8-byte Update Lease and SIG(0))

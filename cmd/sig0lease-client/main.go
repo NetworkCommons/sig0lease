@@ -1,18 +1,25 @@
-// Package main implements a sig0lease client for sending UPDATE-LEASE requests
-// with SIG(0) authentication to the sig0lease proxy.
+// Package main implements sig0lease-client, the RFC 9664 client of this project's proxy. Its
+// update commands (register, refresh, register-tamper) send exactly the update their
+// arguments describe, the shapes the proxy must refuse included, so the test suites can check
+// its answers; name keeps a name registered through client/rfc9664, as sig0lease-srp-client
+// does a host through client/srp. Both spell their flags alike (cmd/internal/cli).
 package main
 
 import (
+	"context"
 	"encoding/base64"
+	"flag"
 	"fmt"
+	"net/netip"
 	"os"
-	"strconv"
 	"strings"
 	"time"
 
 	"codeberg.org/miekg/dns"
+	"codeberg.org/miekg/dns/dnsutil"
 	"github.com/NetworkCommons/sig0lease/client"
-	"github.com/NetworkCommons/sig0lease/logging"
+	"github.com/NetworkCommons/sig0lease/client/rfc9664"
+	"github.com/NetworkCommons/sig0lease/cmd/internal/cli"
 	_ "github.com/NetworkCommons/sig0lease/pkg/dnscompat"
 	"github.com/NetworkCommons/sig0lease/pkg/dnsmsg"
 	"github.com/NetworkCommons/sig0lease/pkg/dnsname"
@@ -20,80 +27,40 @@ import (
 	"github.com/NetworkCommons/sig0lease/pkg/sig0"
 )
 
-var (
-	keystoreDir = ""
-)
+const proxyUsage = `the proxy's "host:port" (required; its DoT address with -transport tls)`
 
 func main() {
-	if len(os.Args) < 3 {
+	if len(os.Args) < 2 {
 		printUsage()
-		os.Exit(1)
+		os.Exit(2)
 	}
-
-	proxyAddr := os.Args[1]
-	command := os.Args[2]
-	args, keystoreFlag := extractKeystoreFlag(os.Args[3:])
-
+	command, args := os.Args[1], os.Args[2:]
 	switch command {
-	case "register", "refresh", "register-tamper", "list-keys":
-		dir, err := keyrec.KeystoreDir(keystoreFlag, "pass --keystore=<dir>")
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "ERROR: %v\n", err)
-			os.Exit(1)
-		}
-		keystoreDir = dir
-	}
-
-	switch command {
-	case "register":
-		cmdRegister(proxyAddr, args)
-	case "refresh":
-		cmdRefresh(proxyAddr, args)
-	case "register-tamper":
-		cmdRegisterTamper(proxyAddr, args)
+	case "register", "refresh", "register-tamper":
+		cmdUpdate(command, args)
+	case "name":
+		cmdName(args)
 	case "verify":
-		cmdVerify(proxyAddr, args)
+		cmdVerify(args)
 	case "list-keys":
-		cmdListKeys()
-	case "help":
+		cmdListKeys(args)
+	case "help", "-h", "-help", "--help":
 		printUsage()
 	default:
-		fmt.Fprintf(os.Stderr, "Unknown command: %s\n", command)
+		fmt.Fprintf(os.Stderr, "ERROR: unknown command %q\n\n", command)
 		printUsage()
-		os.Exit(1)
+		os.Exit(2)
 	}
 }
 
-// extractKeystoreFlag pulls a --keystore=<dir> token out of args, wherever it appears,
-// returning the remaining positional args and the flag's value (empty if not given).
-func extractKeystoreFlag(args []string) ([]string, string) {
-	const prefix = "--keystore="
-	dir := ""
-	out := make([]string, 0, len(args))
-	for _, a := range args {
-		if strings.HasPrefix(a, prefix) {
-			dir = strings.TrimPrefix(a, prefix)
-			continue
-		}
-		out = append(out, a)
-	}
-	return out, dir
+// newFlagSet is a command's flag set: a bad flag prints the usage and exits 2.
+func newFlagSet(command string) *flag.FlagSet {
+	fs := flag.NewFlagSet(command, flag.ExitOnError)
+	fs.Usage = printUsage
+	return fs
 }
 
-// cmdRegister sends a sig0lease UPDATE-LEASE registration request
-func cmdRegister(proxyAddr string, args []string) {
-	cmdRegRefWithMode(proxyAddr, args, "register", false)
-}
-
-// cmdRegisterTamper sends a registration request but flips one bit in payload after signing.
-func cmdRegisterTamper(proxyAddr string, args []string) {
-	cmdRegRefWithMode(proxyAddr, args, "register", true)
-}
-func cmdRefresh(proxyAddr string, args []string) {
-	cmdRegRefWithMode(proxyAddr, args, "refresh", false)
-}
-
-// Signer key placement modes for --signer=<mode>. These exercise the three
+// Signer key placement modes for -signer. These exercise the three
 // ways the proxy can resolve a signer's KEY material: present directly in
 // the request (update or additional section), or absent from the request
 // entirely (resolved via the lease store or authoritative DNS instead).
@@ -103,23 +70,6 @@ const (
 	signerLocationAdditional = "additional"
 	signerLocationNone       = "none"
 )
-
-// extractSignerLocationFlag pulls a --signer=<mode> token out of args,
-// wherever it appears, returning the remaining positional args and the
-// requested mode (signerLocationAuto if not specified).
-func extractSignerLocationFlag(args []string) ([]string, string) {
-	const prefix = "--signer="
-	location := signerLocationAuto
-	out := make([]string, 0, len(args))
-	for _, a := range args {
-		if strings.HasPrefix(a, prefix) {
-			location = strings.TrimPrefix(a, prefix)
-			continue
-		}
-		out = append(out, a)
-	}
-	return out, location
-}
 
 // keyRRFromClientKey builds a *dns.KEY RR from the already-loaded signing
 // key, so callers don't need to re-derive or re-type its RDATA by hand.
@@ -141,141 +91,42 @@ func addSignerKeyToAdditional(msg *dns.Msg, clientKey *keyrec.LoadedKey, ttl uin
 	fmt.Printf("  ✓ Added signer KEY RR to Additional section: %s\n", signingKeyRR.String())
 }
 
-// extractSameKeyFlag pulls a bare --same-key token out of args, wherever it
-// appears, returning the remaining positional args and whether it was set.
-func extractSameKeyFlag(args []string) ([]string, bool) {
-	const flag = "--same-key"
-	sameKey := false
-	out := make([]string, 0, len(args))
-	for _, a := range args {
-		if a == flag {
-			sameKey = true
-			continue
-		}
-		out = append(out, a)
+// cmdUpdate sends the one update register, refresh or register-tamper describes: the
+// signing key, the KEY and other records given, on the leases given, the signer's KEY where
+// -signer puts it; register-tamper flips one bit of it after signing.
+func cmdUpdate(command string, args []string) {
+	fs := newFlagSet(command)
+	var req cli.Request
+	req.Define(fs, proxyUsage)
+	signerLocation := fs.String("signer", signerLocationAuto, "where the signer's KEY goes: update, additional or none (default: additional, unless a KEY rr-spec for it is in the Update section)")
+	sameKey := fs.Bool("same-key", false, "add the signing key's own KEY to the Update section, to lease it without typing its rr-spec")
+	zone := fs.String("zone", "", "the Zone Section (default: the signing key's name, which encloses every name it may write)")
+	if err := fs.Parse(args); err != nil {
+		os.Exit(2)
 	}
-	return out, sameKey
-}
-
-// extractKeyAlgFlag pulls a --k=<algorithm> token out of args, wherever it appears,
-// returning the remaining positional args, the parsed algorithm, and whether it was given.
-// When given, keyname (cmdRegRefWithMode's first positional arg) is treated as an owner
-// name to find-or-create a key for, rather than an exact keystore filename -- see that
-// function's own doc comment.
-func extractKeyAlgFlag(args []string) ([]string, uint8, bool) {
-	const prefix = "--k="
-	out := make([]string, 0, len(args))
-	var alg uint8
-	var provided bool
-	for _, a := range args {
-		if strings.HasPrefix(a, prefix) {
-			v := strings.TrimPrefix(a, prefix)
-			n, err := strconv.ParseUint(v, 10, 8)
-			if err != nil {
-				fmt.Fprintf(os.Stderr, "ERROR: invalid --k=%s: %v\n", v, err)
-				os.Exit(1)
-			}
-			alg = uint8(n)
-			provided = true
-			continue
-		}
-		out = append(out, a)
-	}
-	return out, alg, provided
-}
-
-// defaultKeyTTL is --ttl's default.
-const defaultKeyTTL = 300
-
-// extractTTLFlag pulls a --ttl=<seconds> token out of args, wherever it appears, returning
-// the remaining positional args and the TTL of the KEY RRs this client builds from the
-// signing key (--same-key, and the signer KEY it adds to the Additional section): the TTL
-// suggested to the proxy, which may override it, and never the key-lease, since a lease is
-// not a TTL. rr-spec records carry their own TTL. Without --ttl it is defaultKeyTTL.
-func extractTTLFlag(args []string) ([]string, uint32) {
-	const prefix = "--ttl="
-	out := make([]string, 0, len(args))
-	ttl := uint32(defaultKeyTTL)
-	for _, a := range args {
-		if strings.HasPrefix(a, prefix) {
-			v := strings.TrimPrefix(a, prefix)
-			n, err := strconv.ParseUint(v, 10, 32)
-			if err != nil || n == 0 {
-				fmt.Fprintf(os.Stderr, "ERROR: invalid --ttl=%s: want a positive number of seconds\n", v)
-				os.Exit(1)
-			}
-			ttl = uint32(n)
-			continue
-		}
-		out = append(out, a)
-	}
-	return out, ttl
-}
-
-// extractProtocolFlag pulls a bare --tcp or --tls token out of args, wherever it appears,
-// returning the remaining positional args and the protocol string client.New expects:
-// "tcp", "tls" (DNS-over-TLS, opportunistic -- see client.New), or, with neither, "udp".
-// Passing both exits with an error, since a request goes over exactly one of them.
-func extractProtocolFlag(args []string) ([]string, string) {
-	protocol := "udp"
-	out := make([]string, 0, len(args))
-	for _, a := range args {
-		var p string
-		switch a {
-		case "--tcp":
-			p = "tcp"
-		case "--tls":
-			p = "tls"
-		default:
-			out = append(out, a)
-			continue
-		}
-		if protocol != "udp" && protocol != p {
-			fmt.Fprintln(os.Stderr, "ERROR: --tcp and --tls are mutually exclusive")
-			os.Exit(1)
-		}
-		protocol = p
-	}
-	return out, protocol
-}
-
-func cmdRegRefWithMode(proxyAddr string, args []string, operation string, tamper bool) {
-	args, signerLocation := extractSignerLocationFlag(args)
-	switch signerLocation {
+	args = fs.Args()
+	switch *signerLocation {
 	case signerLocationAuto, signerLocationUpdate, signerLocationAdditional, signerLocationNone:
 	default:
-		fmt.Fprintf(os.Stderr, "ERROR: invalid --signer=%s (expected update|additional|none)\n", signerLocation)
-		os.Exit(1)
+		cli.Fail(fmt.Errorf("invalid -signer %q (want update, additional or none)", *signerLocation))
 	}
-	args, sameKey := extractSameKeyFlag(args)
-	args, protocol := extractProtocolFlag(args)
-	args, keyAlg, keyAlgProvided := extractKeyAlgFlag(args)
-	args, keyTTL := extractTTLFlag(args)
-
-	if len(args) < 3 {
-		fmt.Fprintf(os.Stderr, "Usage: sig0lease-client <proxy> register|register-tamper|refresh <keyname> [lease] [key-lease] [rr-spec...] [--signer=update|additional|none] [--same-key] [--ttl=<seconds>] [--tcp|--tls] [--k=<algorithm>]\n")
-		os.Exit(1)
+	if err := req.Check(); err != nil {
+		cli.Fail(err)
 	}
-
+	if err := req.RequireServer(); err != nil {
+		cli.Fail(err)
+	}
+	if len(args) < 1 {
+		cli.Fail(fmt.Errorf("give the signing key: %s [flags] <keyname> [rr-spec...]", command))
+	}
+	operation, tamper := command, command == "register-tamper"
+	if tamper {
+		operation = "register"
+	}
+	proxyAddr, keyTTL := req.Server, uint32(req.TTL)
+	leaseDuration, keyLeaseDuration := uint32(req.Lease), uint32(req.KeyLease)
 	keyname := args[0]
-
-	// Parse lease durations and optional rr-spec(s).
-	var keyLeaseDuration, leaseDuration uint32
-	if val, err := strconv.ParseUint(args[1], 10, 32); err == nil {
-		leaseDuration = uint32(val)
-	} else {
-		fmt.Fprintf(os.Stderr, "ERROR: Invalid lease duration %s: %v\n", args[1], err)
-		os.Exit(1)
-	}
-
-	if val, err := strconv.ParseUint(args[2], 10, 32); err == nil {
-		keyLeaseDuration = uint32(val)
-	} else {
-		fmt.Fprintf(os.Stderr, "ERROR: Invalid key-lease duration %s: %v\n", args[1], err)
-		os.Exit(1)
-	}
-
-	rrSpecs := args[3:]
+	rrSpecs := args[1:]
 	updateKeyRRs := make([]*dns.KEY, 0)
 	updateOtherRRs := make([]dns.RR, 0, len(rrSpecs))
 	for _, spec := range rrSpecs {
@@ -295,26 +146,23 @@ func cmdRegRefWithMode(proxyAddr string, args []string, operation string, tamper
 		updateOtherRRs = append(updateOtherRRs, rr)
 	}
 
-	// Load (or, with --k=<algorithm>, find-or-create) the client key used for SIG(0) signing.
-	// Without --k, keyname is the exact on-disk key filename, as it always has been --
-	// zero behavior change for existing callers. With --k, keyname is instead an owner
-	// name (e.g. "test.dev.zenr.io."): any existing key for that name is reused regardless
-	// of its algorithm, and a new one is generated at --k's algorithm only if none exists.
+	// Load (or, with -k, find-or-create) the client key used for SIG(0) signing. Without -k,
+	// keyname is the exact on-disk key filename. With -k, keyname is instead an owner name
+	// (e.g. "test.dev.zenr.io."): any existing key for that name is reused regardless of its
+	// algorithm, and a new one is generated at -k's algorithm only if none exists.
+	keystoreDir, err := cli.KeystoreDir(req.Keystore)
+	if err != nil {
+		cli.Fail(err)
+	}
 	var clientKey *keyrec.LoadedKey
-	if keyAlgProvided {
-		fmt.Printf("Resolving client key for owner name (%s) from keystore (%s), creating with algorithm %d if not found\n", keyname, keystoreDir, keyAlg)
-		// The logger carries ResolveOrCreateKey's warning when more than one key matches.
-		k, created, err := keyrec.ResolveOrCreateKey(keystoreDir, keyname, keyAlg, logging.NewLogger("info"))
+	if req.KeyAlg != 0 {
+		fmt.Printf("Resolving client key for owner name (%s) from keystore (%s), creating with algorithm %d if not found\n", keyname, keystoreDir, req.KeyAlg)
+		k, err := req.Key(keyname)
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "ERROR: %v\n", err)
-			os.Exit(1)
+			cli.Fail(err)
 		}
 		clientKey = k
-		if created {
-			fmt.Printf("  ✓ Generated new client key: %s\n", clientKey.Name)
-		} else {
-			fmt.Printf("  ✓ Found existing client key: %s\n", clientKey.Name)
-		}
+		fmt.Printf("  ✓ Client key: %s\n", clientKey.Name)
 	} else {
 		fmt.Printf("Loading client key for key name (%s) from keystore (%s)\n", keyname, keystoreDir)
 		if err := keyrec.KeyExists(keystoreDir, keyname, nil); err != nil {
@@ -331,19 +179,19 @@ func cmdRegRefWithMode(proxyAddr string, args []string, operation string, tamper
 		clientKey = k
 	}
 
-	if sameKey {
+	if *sameKey {
 		for _, rr := range updateKeyRRs {
 			if dnsname.EqualFold(rr.Hdr.Name, clientKey.KeyName()) {
-				fmt.Fprintf(os.Stderr, "ERROR: --same-key conflicts with an explicit KEY rr-spec for %s already among the rr-spec arguments\n", clientKey.KeyName())
+				fmt.Fprintf(os.Stderr, "ERROR: -same-key conflicts with an explicit KEY rr-spec for %s already among the rr-spec arguments\n", clientKey.KeyName())
 				os.Exit(1)
 			}
 		}
-		if signerLocation == signerLocationNone {
-			fmt.Fprintf(os.Stderr, "ERROR: --same-key conflicts with --signer=none: the signing key must appear in the Update section\n")
+		if *signerLocation == signerLocationNone {
+			fmt.Fprintf(os.Stderr, "ERROR: -same-key conflicts with -signer none: the signing key must appear in the Update section\n")
 			os.Exit(1)
 		}
 		updateKeyRRs = append(updateKeyRRs, keyRRFromClientKey(clientKey, keyTTL))
-		fmt.Printf("  ✓ --same-key: reusing signing key %s as the Update-section lease payload\n", clientKey.KeyName())
+		fmt.Printf("  ✓ -same-key: reusing signing key %s as the Update-section lease payload\n", clientKey.KeyName())
 	}
 
 	fmt.Printf("=== sig0lease Client %s ===\n", operation)
@@ -385,8 +233,14 @@ func cmdRegRefWithMode(proxyAddr string, args []string, operation string, tamper
 		}
 	}
 
-	// the zone is the name of the key, zone := clientKey.PublicKey.Hdr.Name
-	msg, err := dnsmsg.NewLeaseUpdate(clientKey.KeyName(), updateKeyRRs, updateOtherRRs, leaseDuration, keyLeaseDuration)
+	// The Zone Section only has to enclose every name in the update; the signing key's name
+	// encloses every name it may write (docs/siglease_rfc9664.md, "The Zone Section").
+	zoneSection := *zone
+	if zoneSection == "" {
+		zoneSection = clientKey.KeyName()
+	}
+	fmt.Printf("Zone Section: %s\n", zoneSection)
+	msg, err := dnsmsg.NewLeaseUpdate(zoneSection, updateKeyRRs, updateOtherRRs, leaseDuration, keyLeaseDuration)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "ERROR: Failed to build update packet for %s: %v\n", operation, err)
 		os.Exit(1)
@@ -407,11 +261,11 @@ func cmdRegRefWithMode(proxyAddr string, args []string, operation string, tamper
 		}
 	}
 
-	fmt.Printf("\nSigner KEY placement: --signer=%s\n", signerLocation)
-	switch signerLocation {
+	fmt.Printf("\nSigner KEY placement: -signer %s\n", *signerLocation)
+	switch *signerLocation {
 	case signerLocationUpdate:
 		if !signerKeyInUpdate {
-			fmt.Fprintf(os.Stderr, "ERROR: --signer=update requires a KEY rr-spec for %s among the rr-spec arguments\n", clientKey.KeyName())
+			fmt.Fprintf(os.Stderr, "ERROR: -signer update requires a KEY rr-spec for %s among the rr-spec arguments\n", clientKey.KeyName())
 			os.Exit(1)
 		}
 		fmt.Printf("  ✓ Signer KEY RR present in Update section\n")
@@ -419,7 +273,7 @@ func cmdRegRefWithMode(proxyAddr string, args []string, operation string, tamper
 		addSignerKeyToAdditional(msg, clientKey, keyTTL)
 	case signerLocationNone:
 		if signerKeyInUpdate {
-			fmt.Fprintf(os.Stderr, "ERROR: --signer=none conflicts with a KEY rr-spec for %s already among the rr-spec arguments\n", clientKey.KeyName())
+			fmt.Fprintf(os.Stderr, "ERROR: -signer none conflicts with a KEY rr-spec for %s already among the rr-spec arguments\n", clientKey.KeyName())
 			os.Exit(1)
 		}
 		fmt.Printf("  ✓ Signer KEY RR omitted from request; proxy must resolve it via the lease store or authoritative DNS\n")
@@ -479,7 +333,7 @@ func cmdRegRefWithMode(proxyAddr string, args []string, operation string, tamper
 	}
 
 	// Send to proxy
-	fmt.Printf("\nSending to proxy (%s) over %s\n", proxyAddr, protocol)
+	fmt.Printf("\nSending to proxy (%s) over %s\n", proxyAddr, req.Transport)
 
 	// Check message before packing
 	fmt.Printf("  Message structure before sending:\n")
@@ -493,7 +347,7 @@ func cmdRegRefWithMode(proxyAddr string, args []string, operation string, tamper
 	}
 	fmt.Printf("    Packed size: %d bytes\n", len(signedMsg.Data))
 
-	c := client.New(proxyAddr, protocol, 20*time.Second)
+	c := client.New(proxyAddr, req.Transport.String(), 20*time.Second)
 	resp, err := c.Query(signedMsg)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "ERROR: Failed to send query: %v\n", err)
@@ -532,17 +386,107 @@ func cmdRegRefWithMode(proxyAddr string, args []string, operation string, tamper
 	}
 }
 
+// cmdName keeps one name registered through client/rfc9664, as sig0lease-srp-client keeps
+// a host through client/srp: the name, one label below the zone, with its own key, its
+// addresses and records; or it registers, withdraws or deregisters them once.
+func cmdName(args []string) {
+	fs := newFlagSet("name")
+	var req cli.Request
+	var modes cli.Modes
+	req.Define(fs, proxyUsage)
+	modes.Define(fs, "the name: its records go, and its KEY too unless -keep-names")
+	zone := fs.String("zone", "", "the proxy's zone, its update_handler's upstream_zone (required)")
+	label := fs.String("name", "", "the name's label, one below the zone (required)")
+	withdraw := fs.Bool("withdraw", false, "send one withdrawal of the -addr and -record records and exit, keeping the name and anything else it has")
+	var addrs, records cli.Repeatable
+	fs.Var(&addrs, "addr", "an address of the name: an A or AAAA record at it (repeatable)")
+	fs.Var(&records, "record", `a record "<owner> <type> <data>", the owner @ for the name itself or relative to it (repeatable)`)
+	if err := fs.Parse(args); err != nil {
+		os.Exit(2)
+	}
+	switch {
+	case *zone == "" || *label == "":
+		cli.Fail(fmt.Errorf("-zone and -name are required"))
+	case fs.NArg() != 0:
+		cli.Fail(fmt.Errorf("unexpected arguments %q: everything is a flag", fs.Args()))
+	case *withdraw && (modes.Once || modes.Deregister):
+		cli.Fail(fmt.Errorf("-withdraw, -once and -deregister are different requests: give one"))
+	}
+	for _, check := range []func() error{req.Check, req.RequireServer, modes.Check} {
+		if err := check(); err != nil {
+			cli.Fail(err)
+		}
+	}
+
+	name := *label + "." + dnsutil.Fqdn(*zone)
+	var problems []string
+	var parsed []netip.Addr
+	for _, a := range addrs {
+		addr, err := netip.ParseAddr(a)
+		if err != nil {
+			problems = append(problems, fmt.Sprintf("-addr %q: %v", a, err))
+			continue
+		}
+		parsed = append(parsed, addr)
+	}
+	recs := rfc9664.ParseRecords(name, records, func(_ int, err error) {
+		problems = append(problems, fmt.Sprintf("-record %v", err))
+	})
+	if len(problems) > 0 {
+		cli.Fail(fmt.Errorf("%s", strings.Join(problems, "; ")))
+	}
+	all := rfc9664.WithAddresses(name, parsed, recs)
+
+	key, err := req.Key(name)
+	if err != nil {
+		cli.Fail(err)
+	}
+	c, err := rfc9664.NewClient(rfc9664.Config{
+		Zone:              *zone,
+		Label:             *label,
+		Key:               key,
+		Records:           all,
+		RequestedLease:    uint32(req.Lease),
+		RequestedKeyLease: uint32(req.KeyLease),
+		TTL:               uint32(req.TTL),
+		Server:            req.Server,
+		Network:           req.Transport,
+		OnRegistered: func(resp *dns.Msg) {
+			fmt.Print(cli.Stamp())
+			cli.PrintReply(resp, client.OutcomeSuccess)
+		},
+		OnError: func(err error) {
+			fmt.Fprintf(os.Stderr, "%sERROR: %v\n", cli.Stamp(), err)
+		},
+	})
+	if err != nil {
+		cli.Fail(err)
+	}
+
+	fmt.Printf("=== sig0lease-client name ===\n")
+	fmt.Printf("Name: %s\n", name)
+	fmt.Printf("Key: %s (algorithm %d, keytag %d)\n", key.Name, key.PublicKey.Algorithm, key.PublicKey.KeyTag())
+	fmt.Printf("Proxy: %s over %s\n", req.Server, req.Transport)
+	for _, rr := range all {
+		fmt.Printf("Record: %s\n", rfc9664.Describe(rr))
+	}
+	fmt.Println()
+
+	if *withdraw {
+		cli.Exit(c.Withdraw(context.Background(), all))
+		return
+	}
+	modes.Run(c)
+}
+
 // printExtendedErrors prints the Extended DNS Errors (RFC 8914) in resp, if the proxy sent
 // any: the reason for a failure, or a success's status notes.
 func printExtendedErrors(resp *dns.Msg) {
-	edes := dnsmsg.EDEs(resp)
-	if len(edes) == 0 {
+	if len(dnsmsg.EDEs(resp)) == 0 {
 		return
 	}
 	fmt.Printf("\nExtended DNS Errors:\n")
-	for _, ede := range edes {
-		fmt.Printf("  EDE %s\n", dnsmsg.FormatEDE(ede))
-	}
+	cli.PrintEDEs(resp)
 }
 
 func flipOnePayloadBit(msg *dns.Msg) error {
@@ -584,14 +528,20 @@ func flipOnePayloadBit(msg *dns.Msg) error {
 }
 
 // cmdVerify checks if a key registration is active
-func cmdVerify(proxyAddr string, args []string) {
-	args, protocol := extractProtocolFlag(args)
-	if len(args) < 1 {
-		fmt.Fprintf(os.Stderr, "Usage: sig0lease-client <proxy> verify <zone> [--tcp|--tls]\n")
-		os.Exit(1)
+func cmdVerify(args []string) {
+	fs := newFlagSet("verify")
+	var to cli.Endpoint
+	to.Define(fs, proxyUsage)
+	if err := fs.Parse(args); err != nil {
+		os.Exit(2)
 	}
-
-	zone := args[0]
+	if err := to.RequireServer(); err != nil {
+		cli.Fail(err)
+	}
+	if fs.NArg() != 1 {
+		cli.Fail(fmt.Errorf("give one name: verify [flags] <name>"))
+	}
+	proxyAddr, protocol, zone := to.Server, to.Transport.String(), fs.Arg(0)
 
 	fmt.Printf("=== Verifying Key Registration ===\n")
 	fmt.Printf("Proxy: %s\n", proxyAddr)
@@ -630,8 +580,20 @@ func cmdVerify(proxyAddr string, args []string) {
 }
 
 // cmdListKeys lists available keys in the keystore
-func cmdListKeys() {
-	dir := keystoreDir
+func cmdListKeys(args []string) {
+	fs := newFlagSet("list-keys")
+	var keystore string
+	cli.DefineKeystore(fs, &keystore)
+	if err := fs.Parse(args); err != nil {
+		os.Exit(2)
+	}
+	if fs.NArg() != 0 {
+		cli.Fail(fmt.Errorf("list-keys takes no arguments"))
+	}
+	dir, err := cli.KeystoreDir(keystore)
+	if err != nil {
+		cli.Fail(err)
+	}
 
 	fmt.Printf("=== Available Keys in Keystore ===\n")
 	fmt.Printf("Directory: %s\n\n", dir)
@@ -659,135 +621,102 @@ func cmdListKeys() {
 }
 
 func printUsage() {
-	fmt.Fprintf(os.Stderr, `
-sig0lease Client - Register and verify DNS UPDATE-LEASE requests with SIG(0) authentication
+	fmt.Fprint(os.Stderr, `sig0lease-client - RFC 9664 client of the sig0lease proxy (dev/test tool)
 
 Usage:
-  sig0lease-client <proxy> <command> [args...]
+  sig0lease-client <command> [flags] [args]
+
+Flags come before the arguments. They are spelled as sig0lease-srp-client's.
 
 Commands:
-	register <keyname> [lease] [key-lease] [rr-spec...] [--signer=update|additional|none] [--same-key] [--ttl=<seconds>] [--tcp|--tls] [--k=<algorithm>]
-		Send a sig0lease UPDATE-LEASE registration request
+  name [flags]
+      Keep one name registered through client/rfc9664, as sig0lease-srp-client keeps a host:
+      the name, one label below the proxy's zone, with its own key, its addresses and records,
+      refreshed on the lease clock until Ctrl-C. A name another key holds is tried again
+      with a backoff, never renamed.
 
-		keyname: without --k, the exact filename of an existing key in the keystore
-			(e.g., Ktest.dev.zenr.io.+015+05044) -- unchanged from before, must already
-			exist. With --k, an owner name instead (e.g., test.dev.zenr.io.) -- see --k.
-		lease: lease duration in seconds
-		key-lease: key-lease duration in seconds
-			rr-spec: optional additional RR in DNS presentation format:
-				<owner> <ttl> <class> <type> <rdata...>
-			--signer: where the signer's KEY RR should appear in the request. Tests the
-				proxy's signer resolution: request-provided (--signer=update/additional) vs.
-				resolved server-side (lease store or authoritative DNS if --signer=none).
-					update:     signer's own KEY rr-spec must also be passed; no Additional copy
-					additional: signer KEY is placed in the Additional section (default when
-					            no matching KEY rr-spec is given)
-					none:       signer KEY is omitted entirely; proxy must resolve it from the
-					            lease store or authoritative DNS
-			--same-key: lease the same key used to sign the request, without retyping its
-				KEY rr-spec. Builds the KEY RR from the loaded signing key and adds it to
-				the Update section; conflicts with an explicit KEY rr-spec for the same
-				name and with --signer=none.
-			--ttl=<seconds>: TTL of the KEY RRs this client builds from the signing key
-				(--same-key, and the signer KEY in the Additional section), suggested to
-				the proxy, which may override it. Independent of key-lease. rr-spec
-				records carry their own TTL. Default 300.
-			--tcp: send the request over TCP instead of the default UDP.
-			--tls: send the request over DNS-over-TLS (RFC 7858) instead of the default
-				UDP; <proxy> must then be the proxy's DoT address (server.tls.address).
-				Opportunistic: encrypted, but the proxy's certificate is not checked.
-				Not with --tcp.
-			--k=<algorithm>: DNSSEC algorithm (13=ECDSAP256SHA256, 15=ED25519) to generate
-				a NEW signing key with if keyname (read as an owner name when --k is
-				given) doesn't have one in the keystore yet. Any existing key for that
-				owner name is reused regardless of algorithm; omit --k entirely to keep
-				keyname meaning an exact filename that must already exist (the default,
-				unchanged behavior). Same convention as sig0lease-srp-client's -k.
+      -zone string        the proxy's zone, its update_handler's upstream_zone (required)
+      -name string        the name's label (required)
+      -addr value         an address of the name, as an A or AAAA record at it (repeatable)
+      -record value       a record "<owner> <type> <data>", the owner @ for the name itself or
+                          relative to it: '_dnslink TXT "dnslink=/ipfs/bafy..."',
+                          "www CNAME site.dev.zenr.io." (repeatable)
+      -once               send one registration and exit
+      -withdraw           send one withdrawal of the -addr and -record records and exit, keeping
+                          the name and anything else it has (Case D)
+      -deregister         send one deregistration and exit: the records and the KEY go, so the
+                          name is free (Case C), unless -keep-names keeps the KEY (Case D)
+      -keep-names         with -deregister: keep the name for the key, asking for -key-lease
 
-		Note: the server dispatches on the LEASE/KEY-LEASE combination and
-		requires specific RR kinds to be present for each (handlers/opcode5_handle.go):
-			KEY-LEASE!=0 and LEASE!=0: requires >=1 KEY RR and >=1 non-KEY RR
-			KEY-LEASE=0  and LEASE!=0: requires >=1 non-KEY RR and 0 KEY RRs (signer must already be managed)
-			KEY-LEASE!=0 and LEASE=0:  requires >=1 KEY RR (KEY-only lease)
-		A duration with no matching RR present is rejected, not silently ignored.
+      Plus the request flags below; the key is the name's own, in the keystore.
 
-		Example:
-		// Key-only registration: lease the signing key itself (LEASE=0, KEY-LEASE!=0);
-		// --same-key supplies the required KEY RR without retyping it
-		sig0lease-client 127.0.0.1:8053 register Ktest.dev.zenr.io.+015+05044 0 3600 --same-key
-		// Same, repeating the key (no --same-key): the KEY rr-spec must be typed
-		// out in full
-		sig0lease-client 127.0.0.1:8053 register Ktest.dev.zenr.io.+015+05044 0 3600 "test.dev.zenr.io. 3600 IN KEY 512 3 15 s1Uf18NtAIacuPDIgMdw2SJ//8fm+xjLb5MPWqwxqzQ="
-		// Key and other RRs registration (LEASE!=0 and KEY-LEASE!=0 requires both kinds present)
-		sig0lease-client 127.0.0.1:8053 register Ktest.dev.zenr.io.+015+05044 300 3600 --same-key "client.test.dev.zenr.io. 300 IN TXT \"hello\""
-		// Non-KEY-only registration signed by an already-managed key, key omitted from the request
-		sig0lease-client 127.0.0.1:8053 register Ktest.dev.zenr.io.+015+05044 300 0 --signer=none "client.test.dev.zenr.io. 300 IN TXT \"hello\""
-		// Register a different key than the one signing the request (delegation),
-		// without --same-key: only the other key is leased, and the signer's own
-		// KEY RR is added to Additional so the proxy can still verify it
-		sig0lease-client 127.0.0.1:8053 register Ktest.dev.zenr.io.+015+05044 0 3600 "client.test.dev.zenr.io. 3600 IN KEY 512 3 15 c2yGNXxlrWu1LX/n9AqrCp+rIbm9FWcotgnMomlrM2E="
-		// Same, but also register the signer's own key-lease in the same request via
-		// --same-key: both KEY RRs end up in the Update section, no Additional copy
-		sig0lease-client 127.0.0.1:8053 register Ktest.dev.zenr.io.+015+05044 0 3600 --same-key "client.test.dev.zenr.io. 3600 IN KEY 512 3 15 c2yGNXxlrWu1LX/n9AqrCp+rIbm9FWcotgnMomlrM2E="
-		// Same request over TCP instead of UDP
-		sig0lease-client 127.0.0.1:8053 register Ktest.dev.zenr.io.+015+05044 0 3600 --same-key --tcp
-		// Same request over DNS-over-TLS, to the proxy's DoT listener
-		sig0lease-client 127.0.0.1:8853 register Ktest.dev.zenr.io.+015+05044 0 3600 --same-key --tls
-		// --k=13: keyname is an owner name here, not a filename -- generates an
-		// ECDSAP256SHA256 key on first run (reused on every later run for the same name)
-		sig0lease-client 127.0.0.1:8053 register test.dev.zenr.io. 0 3600 --same-key --k=13
+      sig0lease-client name -server 127.0.0.1:8053 -zone dev.zenr.io. -name mysite -k 13 \
+        -addr 192.0.2.10 -record '_dnslink TXT "dnslink=/ipfs/bafy..."'
 
-	refresh <keyname> [lease] [key-lease] [rr-spec...] [--signer=update|additional|none] [--same-key] [--ttl=<seconds>] [--tcp|--tls] [--k=<algorithm>]
-		Send a sig0lease UPDATE-LEASE refresh request (8-byte variant)
+  register [flags] <keyname> [rr-spec...]
+  refresh [flags] <keyname> [rr-spec...]
+  register-tamper [flags] <keyname> [rr-spec...]
+      Send exactly the update described, the shapes the proxy must refuse included: the
+      KEY and other records given, signed with keyname's key, on -lease and -key-lease.
+      register-tamper flips one bit of it after signing; refresh differs from register only
+      in the name it prints.
 
-		keyname: filename of the key in the keystore (e.g., Ktest.dev.zenr.io.+015+05044)
-		lease: new lease duration in seconds
-		key-lease: key-lease duration in seconds
-		--signer: see register above
-		--same-key: see register above
-		--ttl: see register above
-		--tcp, --tls: see register above
-		--k: see register above
+      keyname             without -k, the exact file name of a key in the keystore
+                          (Ktest.dev.zenr.io.+015+05044); with -k, an owner name
+                          (test.dev.zenr.io.) whose key is found or generated
+      rr-spec             a record in zone-file format, "<owner> <ttl> <class> <type> <rdata>"
+      -signer string      where the signer's KEY goes: update (a KEY rr-spec for it must be
+                          given), additional, or none (the proxy must find it in its lease store
+                          or the authoritative DNS). Default: additional, unless a KEY rr-spec
+                          for it is among the rr-specs
+      -same-key           add the signing key's own KEY to the Update section, to lease it
+                          without typing its rr-spec; not with a KEY rr-spec for it, nor
+                          -signer none
+      -zone string        the Zone Section, any name enclosing the update's names (default: the
+                          signing key's name)
 
-		Example:
-		// Key-only refresh: renew the signing key's own lease (LEASE=0, KEY-LEASE!=0);
-		// --same-key supplies the required KEY RR without retyping it
-        sig0lease-client 127.0.0.1:8053 refresh Ktest.dev.zenr.io.+015+05044 0 3600 --same-key
-	    // Key and other RRs refresh (LEASE!=0 and KEY-LEASE!=0 requires both kinds present)
-        sig0lease-client 127.0.0.1:8053 refresh Ktest.dev.zenr.io.+015+05044 300 3600 --same-key "client.test.dev.zenr.io. 300 IN TXT \"hello\""
+      Plus the request flags below; -ttl is the TTL of the KEYs the command builds from the
+      signing key (-same-key, -signer additional), rr-specs carry their own.
 
-		All the other register examples above (repetitive KEY rr-spec form,
-		non-KEY-only with --signer=none, registering a different key with and
-		without --same-key) apply the same way to refresh; just substitute the
-		command name.
+      The proxy dispatches on the two leases and requires records to match:
+        KEY-LEASE != 0, LEASE != 0   at least one KEY and one other record
+        KEY-LEASE = 0,  LEASE != 0   other records only, the signer already leased
+        KEY-LEASE != 0, LEASE = 0    at least one KEY
+        both 0                        KEYs only: delete them and what they registered
 
+      // Lease the signing key itself (-lease 0): -same-key adds its KEY
+      sig0lease-client register -server 127.0.0.1:8053 -lease 0 -key-lease 3600 -same-key \
+        Ktest.dev.zenr.io.+015+05044
+      // The key and a record
+      sig0lease-client register -server 127.0.0.1:8053 -lease 300 -key-lease 3600 -same-key \
+        Ktest.dev.zenr.io.+015+05044 'client.test.dev.zenr.io. 300 IN TXT "hello"'
+      // A record signed by a key already leased, the key left out of the request
+      sig0lease-client register -server 127.0.0.1:8053 -lease 300 -key-lease 0 -signer none \
+        Ktest.dev.zenr.io.+015+05044 'client.test.dev.zenr.io. 300 IN TXT "hello"'
+      // Another key, registered by the signer, whose KEY goes to Additional
+      sig0lease-client register -server 127.0.0.1:8053 -lease 0 -key-lease 3600 \
+        Ktest.dev.zenr.io.+015+05044 "client.test.dev.zenr.io. 3600 IN KEY 512 3 15 c2yG..."
+      // -k 13: an owner name, its ECDSAP256SHA256 key generated on first use
+      sig0lease-client register -server 127.0.0.1:8053 -lease 0 -key-lease 3600 -same-key -k 13 \
+        test.dev.zenr.io.
 
-  verify <zone> [--tcp|--tls]
-    Query if a key registration is active
+  verify [-server host:port] [-transport tcp|udp|tls] <name>
+      Ask the proxy for the KEY at name.
 
-    --tcp: send the query over TCP instead of the default UDP.
-    --tls: send the query over DNS-over-TLS to the proxy's DoT address (see register).
+  list-keys [-keystore dir]
+      List the keys in the keystore.
 
-    Example:
-      sig0lease-client 127.0.0.1:8053 verify test.dev.zenr.io.
-      sig0lease-client 127.0.0.1:8053 verify test.dev.zenr.io. --tcp
-
-  list-keys [--keystore=<dir>]
-    List available keys in keystore
-
-    Example:
-      sig0lease-client dummy list-keys --keystore=./keystore/client
-
-  help
-    Show this help message
-
-Keystore location (register, refresh, register-tamper, list-keys):
-  --keystore=<dir>: directory holding client keys. If omitted, falls back to the
-    CLIENT_KEYSTORE_DIR environment variable. One of the two is required; an explicit
-    flag always wins over the environment variable. Same convention as sig0lease-srp-client's
-    -keystore flag / CLIENT_KEYSTORE_DIR fallback.
-
-Environment:
-  CLIENT_KEYSTORE_DIR: fallback keystore directory path, used when --keystore= is not given.
+Request flags (name, register, refresh, register-tamper):
+  -server string          the proxy's "host:port" (required; its DoT address with -transport tls)
+  -transport string       tcp (default), udp or tls: DNS over TLS (RFC 7858), opportunistic, so
+                          the proxy's certificate is not checked
+  -keystore string        directory holding the signing keys (default $CLIENT_KEYSTORE_DIR; one
+                          of the two is required)
+  -k uint                 DNSSEC algorithm (13=ECDSAP256SHA256, 15=ED25519) to generate a key
+                          with when none exists; left out, a missing key is an error
+  -lease uint             LEASE to ask for, in seconds (default 3600)
+  -key-lease uint         KEY-LEASE to ask for, in seconds (default 1209600)
+  -ttl uint               TTL suggested for the records the command builds, in seconds (default
+                          300); independent of the leases, and the proxy may override it
 `)
 }

@@ -41,7 +41,7 @@ import (
 
 // Config configures a Client. See NewClient for the defaults.
 type Config struct {
-	Zone  string // the zone the name is in; trailing dot optional
+	Zone  string // the zone the name is in, sent as the Zone Section; trailing dot optional
 	Label string // the name's single label: the name is Label.Zone
 	// Key is the name's SIG(0) key: required, as the key is what holds the name.
 	Key *keyrec.LoadedKey
@@ -216,9 +216,7 @@ func (c *Client) send(ctx context.Context, records []dns.RR, lease, keyLease uin
 		update[i] = rr.Clone()
 		update[i].Header().TTL = c.cfg.TTL
 	}
-	// The Zone Section names the signer, as sig0lease-client's does: the handler refuses an
-	// update whose Zone Section is not at or below its signer, and builds its own upstream.
-	msg, err := dnsmsg.NewLeaseUpdate(c.name, []*dns.KEY{key}, update, lease, keyLease)
+	msg, err := dnsmsg.NewLeaseUpdate(c.cfg.Zone, []*dns.KEY{key}, update, lease, keyLease)
 	if err != nil {
 		return nil, 0, fmt.Errorf("rfc9664/client: %w", err)
 	}

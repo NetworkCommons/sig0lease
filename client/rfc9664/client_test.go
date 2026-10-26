@@ -132,7 +132,7 @@ func TestNewClient_Refuses(t *testing.T) {
 	}
 }
 
-// Every request carries the name's KEY, signed with it, and the name in its Zone Section; the
+// Every request carries the name's KEY, signed with it, and the zone in its Zone Section; the
 // cases differ in their records and leases (Behavior Specification item 5).
 func TestClient_Cases(t *testing.T) {
 	www := "www.site.example. CNAME site.example."
@@ -170,7 +170,7 @@ func TestClient_Cases(t *testing.T) {
 				t.Fatalf("update does not verify against the name's key: %v", err)
 			}
 			got := summarize(t, tr.sent[0])
-			tt.want.zone, tt.want.keys = "site.example.", []string{"site.example."}
+			tt.want.zone, tt.want.keys = "example.", []string{"site.example."}
 			if got.zone != tt.want.zone || !slices.Equal(got.keys, tt.want.keys) || !slices.Equal(got.records, tt.want.records) || got.lease != tt.want.lease || got.keyLease != tt.want.keyLease {
 				t.Fatalf("sent %+v, want %+v", got, tt.want)
 			}

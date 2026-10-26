@@ -59,7 +59,8 @@ server/
   router.go            opcode -> ordered list of handlers, tried in turn
 
 cmd/sig0lease-srp-client/main.go   thin SRP requester CLI (dev/test tool, not a shipped
-                                   product — the library is the deliverable)
+                                   product — the library is the deliverable); its flags are
+                                   spelled as sig0lease-client's (cmd/internal/cli)
 client/                            what both requesters share: lease_response.go (the granted
                                    LEASE/KEY-LEASE, outcomes), network.go (transports),
                                    lifecycle.go (refresh clock, backoff), keeper.go (Keeper:
@@ -84,8 +85,11 @@ processing_rules:
 `server/router.go` calls each configured handler for the opcode in turn; the first one to
 return `Processed` or `Error` wins. If every handler returns `NotRelevant`, the request falls
 through to plain upstream forwarding. `SRPHandler.Handle()` returns `NotRelevant` when
-`pkg/srp.Classify` decides the message isn't SRP-shaped, or when the request's zone isn't one
-this handler instance is configured to serve.
+`pkg/srp.Classify` decides the message isn't SRP-shaped, or when its host (the Host
+Description's name) is not in the zone this handler serves, nor under `default.service.arpa.`
+with `rewrite_default_service_arpa` on (`SRPHandler.takes`). The Zone Section plays no part in
+that: both handlers only require it to enclose every name in the update, answering `NOTZONE`
+otherwise (RFC 2136 §3.4.1.3; `docs/siglease_rfc9664.md`, "The Zone Section").
 
 Each handler serves exactly one zone, and the proxy refuses to start when `srp_handler` and
 `update_handler` serve the same one (`handlers.SeparateZones`). The zones may nest; the live
@@ -418,7 +422,7 @@ did not catch it: OpenThread is not in it, and mDNSResponder's `srp-client` neve
   transport-level listener that benefits this handler along with every other one — see
   `docs/siglease_rfc9664.md`. RFC 9665 §7 says a registrar MUST offer TLS; here it is a
   configuration choice (`server.networks` plus `server.tls`), off in the example `config.yaml`.
-  `client/srp` can use it (`Config.Network = NetworkTLS`, `-tls` on the CLI): it then discovers
+  `client/srp` can use it (`Config.Network = NetworkTLS`, `-transport tls` on the CLI): it then discovers
   the registrar through `_dnssd-srp-tls._tcp` (§13) and never falls back to plain TCP (§7: a
   requester able to use TLS SHOULD NOT). As §7 specifies, TLS gives Opportunistic Privacy only
   (RFC 7858 §4.1): the client does not check the registrar's certificate, so the connection is
@@ -608,7 +612,7 @@ Capabilities:
 - **Discovery** — SOA queries find the apex of the zone enclosing the domain (RFC 8765 §6.1,
   as RFC 9665 §3.1.1 specifies). SRV lookups for `_dnssd-srp._tcp.<name>.` then find the
   registrar, and an A (or AAAA) lookup gives its address. A client using DNS-over-TLS
-  (`NetworkTLS`, `-tls`) looks up `_dnssd-srp-tls._tcp.<name>.` instead and never falls back to
+  (`NetworkTLS`, `-transport tls`) looks up `_dnssd-srp-tls._tcp.<name>.` instead and never falls back to
   `_dnssd-srp._tcp` (§7); the same rules below apply to it. All of these queries go to the same
   resolvers (`-resolver`), so a registrar that only a lab DNS or the local BIND 9 test zone knows
   is still found. Used whenever no explicit registrar address is configured. Which names the SRV
@@ -635,19 +639,17 @@ Capabilities:
   per instance, and DNS-SD subtypes per instance. An instance marked for removal (`-remove`)
   goes out as a bare Delete All RRsets in the same update, withdrawing just that instance
   while the host and the other instances stay registered (RFC 9665 §3.2.5.5.2).
-- **Zone Section: a deviation from RFC 9665 §3.3** — every update names the registration
-  domain (`Config.Domain`, `-domain`) in its Zone Section. §3.3, like RFC 2136, wants the zone
-  being updated there, which is the apex discovery finds with its SOA queries: for
-  `srp.dev.zenr.io.` that is `zenr.io.`, not `srp.dev.zenr.io.`. The two only coincide when the
-  domain is itself a zone apex, as `srp.test.` is in the test suite. It stays this way on
-  purpose: the registrar accepts an update only when its Zone Section is the zone it serves
-  (`upstream_zone`) or `default.service.arpa.`, so naming the apex would stop the proxy from
-  matching it, and with `-server` the client never looks the apex up at all. Nothing upstream
-  sees the requester's Zone Section: the proxy builds a new UPDATE for the authoritative server,
-  with the real zone it resolved for `upstream_zone` ("Authoritative Forwarding" in
-  `docs/siglease_rfc9664.md`), so the updates the authoritative server receives follow RFC 2136. Real requesters use the field the same way:
-  `mDNSResponder`'s and OpenThread's clients send `default.service.arpa.`, which is not a zone
-  apex either.
+- **Zone Section** — every update names the registration domain (`Config.Domain`, `-domain`)
+  in its Zone Section. §3.3, like RFC 2136, wants the zone being updated there, which is the
+  apex discovery finds with its SOA queries: for `srp.dev.zenr.io.` that is `zenr.io.`, not
+  `srp.dev.zenr.io.`. The registrar takes either, since it only requires the Zone Section to
+  enclose every name in the update (§3); the domain is what the client knows without discovery,
+  as with `-server`, where it never looks the apex up. Nothing upstream sees the requester's
+  Zone Section: the proxy builds a new UPDATE for the authoritative server, with the real zone
+  it resolved for `upstream_zone` ("Authoritative Forwarding" in `docs/siglease_rfc9664.md`), so
+  the updates the authoritative server receives follow RFC 2136. Real requesters use the field
+  the same way: `mDNSResponder`'s and OpenThread's clients send `default.service.arpa.`, which is
+  not a zone apex either.
 - **TTL** — every record the client adds, KEYs included, carries `Config.TTL` (`-ttl`, default
   300), never a lease: a lease is not a TTL (§5.1). It is only a suggestion; a registrar may
   override it (§4), and this proxy does (§6, "TTLs").

@@ -98,7 +98,7 @@ func (stubResponseWriter) Hijack()                   {}
 func buildSignedLeaseUpdateForHandleTest(t *testing.T, signerKey *keyrec.LoadedKey, leaseOwner string, lo *leasepkg.LeaseOption, includeSignerKeyInUpdate bool) *dns.Msg {
 	t.Helper()
 
-	msg := dns.NewMsg("test.dev.zenr.io.", dns.TypeSOA)
+	msg := dns.NewMsg("dev.zenr.io.", dns.TypeSOA)
 	if msg == nil {
 		t.Fatalf("expected message")
 	}
@@ -131,7 +131,7 @@ func buildSignedLeaseUpdateForHandleTest(t *testing.T, signerKey *keyrec.LoadedK
 func buildSignedUpdateForTest(t *testing.T, signerKey *keyrec.LoadedKey, leaseOwner string) *dns.Msg {
 	t.Helper()
 
-	msg := dns.NewMsg("test.dev.zenr.io.", dns.TypeSOA)
+	msg := dns.NewMsg("dev.zenr.io.", dns.TypeSOA)
 	if msg == nil {
 		t.Fatalf("expected message")
 	}
@@ -150,7 +150,7 @@ func buildSignedUpdateForTest(t *testing.T, signerKey *keyrec.LoadedKey, leaseOw
 func buildSignedUpdateWithSignerKeyInUpdateForTest(t *testing.T, signerKey *keyrec.LoadedKey, leaseOwner string) *dns.Msg {
 	t.Helper()
 
-	msg := dns.NewMsg("test.dev.zenr.io.", dns.TypeSOA)
+	msg := dns.NewMsg("dev.zenr.io.", dns.TypeSOA)
 	if msg == nil {
 		t.Fatalf("expected message")
 	}
@@ -174,7 +174,7 @@ func buildSignedUpdateWithSignerKeyInUpdateForTest(t *testing.T, signerKey *keyr
 func buildSignedUpdateWithSignerKeyInAdditionalForTest(t *testing.T, signerKey *keyrec.LoadedKey, leaseOwner string) *dns.Msg {
 	t.Helper()
 
-	msg := dns.NewMsg("test.dev.zenr.io.", dns.TypeSOA)
+	msg := dns.NewMsg("dev.zenr.io.", dns.TypeSOA)
 	if msg == nil {
 		t.Fatalf("expected message")
 	}
@@ -213,7 +213,7 @@ func TestExtractAndValidateSig0_UsesAuthoritativeSignerKey(t *testing.T) {
 	}
 
 	signed := buildSignedUpdateForTest(t, loaded, "test.dev.zenr.io.")
-	sig, resolved, source, err := h.extractAndValidateSig0(context.Background(), signed, "test.dev.zenr.io.", nil, nil)
+	sig, resolved, source, err := h.extractAndValidateSig0(context.Background(), signed, nil, nil)
 	if err != nil {
 		t.Fatalf("expected validation success: %v", err)
 	}
@@ -228,7 +228,8 @@ func TestExtractAndValidateSig0_UsesAuthoritativeSignerKey(t *testing.T) {
 	}
 }
 
-func TestExtractAndValidateSig0_RejectsSignerOutsideLeaseHierarchy(t *testing.T) {
+// A signer must be a name the handler serves, whatever key it resolves to.
+func TestExtractAndValidateSig0_RejectsSignerOutsideItsZone(t *testing.T) {
 	keystoreDir, err := createTestKeystore(t)
 	if err != nil {
 		t.Fatalf("setup test keystore: %v", err)
@@ -255,9 +256,9 @@ func TestExtractAndValidateSig0_RejectsSignerOutsideLeaseHierarchy(t *testing.T)
 	}
 
 	signed := buildSignedUpdateForTest(t, outsideLoaded, "test.dev.zenr.io.")
-	_, _, _, err = h.extractAndValidateSig0(context.Background(), signed, "test.dev.zenr.io.", nil, nil)
-	if err == nil {
-		t.Fatalf("expected hierarchy validation failure")
+	_, _, _, err = h.extractAndValidateSig0(context.Background(), signed, nil, nil)
+	if err == nil || !strings.Contains(err.Error(), "outside zone dev.zenr.io.") {
+		t.Fatalf("extractAndValidateSig0() error = %v, want the signer refused as outside zone dev.zenr.io.", err)
 	}
 }
 
@@ -280,7 +281,7 @@ func TestExtractAndValidateSig0_DNSFailureFallsBackToLeaseStore(t *testing.T) {
 	}
 
 	signed := buildSignedUpdateForTest(t, loaded, "test.dev.zenr.io.")
-	_, resolved, source, err := h.extractAndValidateSig0(context.Background(), signed, "test.dev.zenr.io.", nil, nil)
+	_, resolved, source, err := h.extractAndValidateSig0(context.Background(), signed, nil, nil)
 	if err != nil {
 		t.Fatalf("expected lease-store fallback success when authoritative lookup fails: %v", err)
 	}
@@ -311,7 +312,7 @@ func TestExtractAndValidateSig0_DNSNoKeyFallsBackToLeaseStore(t *testing.T) {
 	}
 
 	signed := buildSignedUpdateForTest(t, loaded, "test.dev.zenr.io.")
-	_, resolved, source, err := h.extractAndValidateSig0(context.Background(), signed, "test.dev.zenr.io.", nil, nil)
+	_, resolved, source, err := h.extractAndValidateSig0(context.Background(), signed, nil, nil)
 	if err != nil {
 		t.Fatalf("expected lease-store fallback success when authoritative DNS has no signer key: %v", err)
 	}
@@ -343,7 +344,7 @@ func TestExtractAndValidateSig0_RequestKeyWorksWhenDnsAndLeaseStoreDontHaveSigne
 	signed := buildSignedUpdateWithSignerKeyInUpdateForTest(t, loaded, "test.dev.zenr.io.")
 	requestKey := loaded.PublicKey.Clone().(*dns.KEY)
 
-	_, resolved, source, err := h.extractAndValidateSig0(context.Background(), signed, "test.dev.zenr.io.", nil, []*dns.KEY{requestKey})
+	_, resolved, source, err := h.extractAndValidateSig0(context.Background(), signed, nil, []*dns.KEY{requestKey})
 	if err != nil {
 		t.Fatalf("expected validation success using request KEY only: %v", err)
 	}
@@ -374,7 +375,7 @@ func TestExtractAndValidateSig0_AdditionalSigningKeyWorksWithoutAuthoritativeMat
 	signed := buildSignedUpdateWithSignerKeyInAdditionalForTest(t, loaded, "test.dev.zenr.io.")
 	requestKey := loaded.PublicKey.Clone().(*dns.KEY)
 
-	_, resolved, source, err := h.extractAndValidateSig0(context.Background(), signed, "test.dev.zenr.io.", []*dns.KEY{requestKey}, nil)
+	_, resolved, source, err := h.extractAndValidateSig0(context.Background(), signed, []*dns.KEY{requestKey}, nil)
 	if err != nil {
 		t.Fatalf("expected validation success using Additional-section signing KEY: %v", err)
 	}
@@ -681,7 +682,7 @@ func TestHandle_DottedLabel_Refused(t *testing.T) {
 
 	// Build the update, put the dot into its wire form, and sign those bytes, as a client
 	// with a dotted label would.
-	msg := dns.NewMsg("test.dev.zenr.io.", dns.TypeSOA)
+	msg := dns.NewMsg("dev.zenr.io.", dns.TypeSOA)
 	msg.Opcode = dns.OpcodeUpdate
 	txt := &dns.TXT{Hdr: dns.Header{Name: "hostx1.test.dev.zenr.io.", Class: dns.ClassINET, TTL: 60}}
 	txt.TXT.Txt = []string{"payload"}
@@ -835,7 +836,7 @@ func TestGroupOtherRecordsByTargetKey_HierarchyRejectsUnmappedOwner(t *testing.T
 func buildSignedCaseCDeleteForHandleTest(t *testing.T, signerKey *keyrec.LoadedKey, keyRRToDelete *dns.KEY) *dns.Msg {
 	t.Helper()
 
-	// The signer's name in the Zone section, as cmd/sig0lease-client sends it.
+	// The signer's name in the Zone section, as cmd/sig0lease-client sends it by default.
 	msg := dns.NewMsg(signerKey.PublicKey.Hdr.Name, dns.TypeSOA)
 	if msg == nil {
 		t.Fatalf("expected message")
@@ -1066,7 +1067,7 @@ func TestHandle_CaseARefresh_ForeignSignerWithOwnRegistrationCannotHijackExistin
 	// signerInUpdate) while also resubmitting a byte-for-byte copy of the
 	// client's already-registered KEY RR in the same Update section, all
 	// signed only by its own new key. No special config is required.
-	msg := dns.NewMsg("test.dev.zenr.io.", dns.TypeSOA)
+	msg := dns.NewMsg("dev.zenr.io.", dns.TypeSOA)
 	if msg == nil {
 		t.Fatalf("expected message")
 	}
@@ -1165,7 +1166,7 @@ func TestHandle_CaseARefresh_OnlineAuthorizedSignerCannotHijackExistingKey(t *te
 
 	// Attack: "refresh" the client's already-registered KEY+TXT data, but
 	// sign the transaction with WRONG_CLIENT_KEY_NAME instead.
-	msg := dns.NewMsg("test.dev.zenr.io.", dns.TypeSOA)
+	msg := dns.NewMsg("dev.zenr.io.", dns.TypeSOA)
 	if msg == nil {
 		t.Fatalf("expected message")
 	}

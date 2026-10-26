@@ -13,15 +13,15 @@ source "$LIB_DIR/common.sh"
 
 CLIENT_BIN="${TESTS_DIR}/../bin/${OS}/sig0lease-client"
 
-# run_client <operation> <keyname> <lease> <key-lease> [rr-spec...] [--signer=update|additional|none]
-# Accepts zero or more trailing rr-specs and/or a --signer= flag, passed
-# through to the client binary as separate argv entries (no eval/string
-# concatenation, so rr-specs containing spaces/quotes are safe).
-# Transport is controlled by PROXY_PROTOCOL (see lib/common.sh; defaults to
-# udp, same udp-unless-told-otherwise mechanism as PROXY_ADDR/PROXY_PORT) --
-# every call site gets --tcp for free when PROXY_PROTOCOL=tcp, or --tls and
-# the proxy's DoT address (PROXY_TLS_URL) when PROXY_PROTOCOL=tls; no call
-# site needs to pass either itself.
+# run_client <operation> <keyname> <lease> <key-lease> [rr-spec...] [-signer=update|additional|none]
+# Accepts zero or more trailing rr-specs and/or client flags (an argument starting with "-"),
+# in any order: it passes the flags before keyname, as the client wants them, and every
+# argument as a separate argv entry (no eval/string concatenation, so rr-specs containing
+# spaces/quotes are safe).
+# Transport is controlled by PROXY_PROTOCOL (see lib/common.sh; defaults to udp, same
+# udp-unless-told-otherwise mechanism as PROXY_ADDR/PROXY_PORT) -- every call site gets
+# -transport for it, and the proxy's DoT address (PROXY_TLS_URL) when PROXY_PROTOCOL=tls; no
+# call site needs to pass either itself.
 run_client() {
     require_client_keystore_dir || return 1
 
@@ -30,24 +30,27 @@ run_client() {
     local lease_seconds="$3"
     local key_lease_seconds="$4"
     shift 4
-    local extra=("$@")
-    local url="$PROXY_URL"
+    local server="$PROXY_URL"
     case "$PROXY_PROTOCOL" in
-        udp) ;;
-        tcp) extra+=(--tcp) ;;
-        tls)
-            extra+=(--tls)
-            url="$PROXY_TLS_URL"
-            ;;
+        udp|tcp) ;;
+        tls) server="$PROXY_TLS_URL" ;;
         *)
             log_error "Unknown PROXY_PROTOCOL=$PROXY_PROTOCOL (want udp, tcp or tls)"
             return 1
             ;;
     esac
+    local flags=(-server "$server" -transport "$PROXY_PROTOCOL" -lease "$lease_seconds" -key-lease "$key_lease_seconds")
+    local specs=() arg
+    for arg in "$@"; do
+        case "$arg" in
+            -*) flags+=("$arg") ;;
+            *) specs+=("$arg") ;;
+        esac
+    done
 
-    log_file run_client "operation=$operation keyname=$keyname lease=$lease_seconds key_lease=$key_lease_seconds extra=${extra[*]:-}"
-    echo "CLIENT_KEYSTORE_DIR=\"$CLIENT_KEYSTORE_DIR\" \"$CLIENT_BIN\" \"$url\" $operation \"$keyname\" $lease_seconds $key_lease_seconds ${extra[*]:-}"
-    CLIENT_KEYSTORE_DIR="$CLIENT_KEYSTORE_DIR" "$CLIENT_BIN" "$url" "$operation" "$keyname" "$lease_seconds" "$key_lease_seconds" "${extra[@]}"
+    log_file run_client "operation=$operation keyname=$keyname flags=${flags[*]} rr-specs=${specs[*]:-}"
+    echo "CLIENT_KEYSTORE_DIR=\"$CLIENT_KEYSTORE_DIR\" \"$CLIENT_BIN\" $operation ${flags[*]} \"$keyname\" ${specs[*]:-}"
+    CLIENT_KEYSTORE_DIR="$CLIENT_KEYSTORE_DIR" "$CLIENT_BIN" "$operation" "${flags[@]}" "$keyname" ${specs[@]+"${specs[@]}"}
 }
 
 # assert_client_reply <client output> <rcode> <info-code> <reason> -- checks the reply
@@ -123,6 +126,6 @@ test_list_keys() {
     require_client_keystore_dir || return 1
     log_section "CHECK: Key Listing"
     log_step "Listing keys from real keystore"
-    CLIENT_KEYSTORE_DIR="$CLIENT_KEYSTORE_DIR" "$CLIENT_BIN" dummy list-keys "$CLIENT_KEYSTORE_DIR"
+    "$CLIENT_BIN" list-keys -keystore "$CLIENT_KEYSTORE_DIR"
     log_success "Key listing successful"
 }

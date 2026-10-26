@@ -56,8 +56,8 @@ func fcfsTestKey(t *testing.T, name string) *keyrec.LoadedKey {
 	return k
 }
 
-// buildFCFSUpdate builds an RFC 9664 update as cmd/sig0lease-client does, with the signer's
-// name in the Zone section, registering keys and records, signed by signer.
+// buildFCFSUpdate builds an RFC 9664 update as cmd/sig0lease-client does by default, with the
+// signer's name in the Zone section, registering keys and records, signed by signer.
 func buildFCFSUpdate(t *testing.T, signer *keyrec.LoadedKey, keys []*dns.KEY, records []dns.RR, lease, keyLease uint32) *dns.Msg {
 	t.Helper()
 	msg, err := dnsmsg.NewLeaseUpdate(signer.PublicKey.Hdr.Name, keys, records, lease, keyLease)

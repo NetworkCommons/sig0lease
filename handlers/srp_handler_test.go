@@ -955,17 +955,32 @@ func TestSRPHandle_NotSRPShaped_NotRelevant(t *testing.T) {
 	}
 }
 
-func TestSRPHandle_WrongZone_NotRelevant(t *testing.T) {
-	h, _ := newSRPTestHandler(t)
+// An update for this handler's host whose Zone Section does not enclose its names is answered
+// NOTZONE (RFC 2136 S3.4.1.3), before anything goes upstream.
+func TestSRPHandle_ZoneSectionNotEnclosing_NotZone(t *testing.T) {
+	h, coord := newSRPTestHandler(t)
 	id := newSRPTestIdentity(t)
 	const host = "srptest8.dev.zenr.io."
 
-	msg := buildSRPUpdate(t, srpTestZone, id, host, []string{"192.0.2.1"}, oneWidgetInstance(), 30, 1209600, host)
-	msg.Question[0].Header().Name = "other.example." // not this handler's configured zone
-
+	msg := buildSRPUpdate(t, "other.example.", id, host, []string{"192.0.2.1"}, oneWidgetInstance(), 30, 1209600, host)
 	res := h.Handle(context.Background(), stubTCPResponseWriter{}, msg)
-	if res.Status != StatusNotRelevant {
-		t.Fatalf("expected NotRelevant for a foreign zone, got %s (%s)", res.Status, res.Reason)
+	wantErrorReply(t, res, dns.RcodeNotZone, dns.ExtendedErrorOther, "srptest8.dev.zenr.io. is outside other.example.")
+	if len(coord.sent) != 0 {
+		t.Fatalf("expected nothing sent upstream, got %d UPDATE(s)", len(coord.sent))
+	}
+}
+
+// Any Zone Section enclosing the names will do: the zone apex, as RFC 2136 and RFC 9665 S3.3
+// ask, takes the same path as the handler's own zone.
+func TestSRPHandle_ZoneApexInZoneSection_Processed(t *testing.T) {
+	h, _ := newSRPTestHandler(t)
+	id := newSRPTestIdentity(t)
+	const host = "srptest9.dev.zenr.io."
+
+	msg := buildSRPUpdate(t, "zenr.io.", id, host, []string{"192.0.2.1"}, oneWidgetInstance(), 30, 1209600, host)
+	res := h.Handle(context.Background(), stubTCPResponseWriter{}, msg)
+	if res.Status != StatusProcessed || res.Message == nil || res.Message.Rcode != dns.RcodeSuccess {
+		t.Fatalf("expected Processed/NOERROR, got status=%s message=%+v err=%v", res.Status, res.Message, res.Error)
 	}
 }
 

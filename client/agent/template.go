@@ -38,7 +38,6 @@ import (
 	"github.com/NetworkCommons/sig0lease/pkg/dnsname"
 	"github.com/NetworkCommons/sig0lease/pkg/dnssd"
 	"github.com/NetworkCommons/sig0lease/pkg/keyrec"
-	leasepkg "github.com/NetworkCommons/sig0lease/pkg/lease"
 	"gopkg.in/yaml.v3"
 )
 
@@ -621,59 +620,14 @@ func parseName(d nameDoc, r Registrar, where string, problems *[]string) Name {
 		*problems = append(*problems, fmt.Sprintf("%s: name %q: one label of letters, digits and hyphens, not starting or ending with a hyphen, at most 63, right below the zone", where, d.Name))
 	}
 	n.Auto, n.Addresses = parseAddresses(d.Addresses, where, problems)
-	owner := r.Owner(d.Name)
-	seen := map[string]bool{}
-	for j, spec := range d.Records {
-		rr, err := parseRecord(spec, owner)
-		if err != nil {
-			*problems = append(*problems, fmt.Sprintf("%s: records[%d]: %v", where, j, err))
-			continue
-		}
-		key := leasepkg.RecordKey(rr)
-		if seen[key] {
-			*problems = append(*problems, fmt.Sprintf("%s: records[%d]: %q twice", where, j, spec))
-			continue
-		}
-		seen[key] = true
-		n.Records = append(n.Records, rr)
-	}
+	n.Records = rfc9664.ParseRecords(r.Owner(d.Name), d.Records, func(j int, err error) {
+		*problems = append(*problems, fmt.Sprintf("%s: records[%d]: %v", where, j, err))
+	})
 	if !n.Auto && len(n.Addresses) == 0 && len(d.Records) == 0 {
 		*problems = append(*problems, where+": nothing to register: give addresses:, records: or both")
 	}
 	n.Lifetime = parseLifetime(d.Lease, d.KeyLease, d.OnStop, r.Lifetime, where, problems)
 	return n
-}
-
-// parseRecord reads spec, "<owner> <type> <data>" with the owner "@" for owner itself, or
-// relative to it, as one of owner's records (rfc9664.CheckRecords).
-func parseRecord(spec, owner string) (dns.RR, error) {
-	spec = strings.TrimSpace(spec)
-	rel, rest, _ := strings.Cut(spec, " ")
-	rest = strings.TrimSpace(rest)
-	if rest == "" {
-		return nil, fmt.Errorf("%q: want <owner> <type> <data>, the owner @ for the name or relative to it", spec)
-	}
-	if strings.HasSuffix(rel, ".") {
-		return nil, fmt.Errorf("%q: owner %s: relative to the name (@ for the name itself), not fully qualified", spec, rel)
-	}
-	fq := owner
-	if rel != "@" {
-		fq = rel + "." + owner
-	}
-	rr, err := dns.New(fq + " " + rest)
-	if err != nil {
-		return nil, fmt.Errorf("%q: %v", spec, err)
-	}
-	if err := rfc9664.CheckRecords(owner, []dns.RR{rr}); err != nil {
-		return nil, fmt.Errorf("%q: %v", spec, err)
-	}
-	switch rr.(type) {
-	case *dns.A, *dns.AAAA:
-		if dnsname.EqualFold(fq, owner) {
-			return nil, fmt.Errorf("%q: the name's addresses go in addresses:", spec)
-		}
-	}
-	return rr, nil
 }
 
 // checkRegistrars reports what registrars cannot all have: two for the same domain or zone,

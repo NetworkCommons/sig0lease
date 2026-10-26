@@ -729,7 +729,7 @@ test_case_signer_location_matrix() {
     txt1="${DOWNSTREAM_ZONE} ${LEASE_SECONDS} IN TXT \"${needle1}\""
 
     log_step "Signer location 1/4: Update section (self-registration, Case A)"
-    run_client register "$CLIENT_KEY_NAME" $LEASE_SECONDS $LONG_KEY_LEASE_SECONDS "$(make_rr KEY $LONG_KEY_LEASE_SECONDS)" "$txt1" --signer=update
+    run_client register "$CLIENT_KEY_NAME" $LEASE_SECONDS $LONG_KEY_LEASE_SECONDS "$(make_rr KEY $LONG_KEY_LEASE_SECONDS)" "$txt1" -signer=update
     wait_for_rr_state KEY "$CLIENT_KEY_RR" present
     if ! rr_at_authoritative TXT "$txt1"; then
         log_error "Signer-location[update]: expected TXT record not found"
@@ -741,7 +741,7 @@ test_case_signer_location_matrix() {
     txt2="${DOWNSTREAM_ZONE} ${LEASE_SECONDS} IN TXT \"${needle2}\""
     
     log_step "Signer location 2/4: Additional section (non-KEY-only refresh, Case B)"
-    run_client register "$CLIENT_KEY_NAME" $LEASE_SECONDS 0 "$txt2" --signer=additional
+    run_client register "$CLIENT_KEY_NAME" $LEASE_SECONDS 0 "$txt2" -signer=additional
     if ! wait_for_rr_state TXT "$txt2" present; then
         log_error "Signer-location[additional]: expected TXT record not found"
         return 1
@@ -752,7 +752,7 @@ test_case_signer_location_matrix() {
     txt3="${DOWNSTREAM_ZONE} ${LEASE_SECONDS} IN TXT \"${needle3}\""
     
     log_step "Signer location 3/4: omitted from request, resolved via lease store (Case B)"
-    run_client register "$CLIENT_KEY_NAME" $LEASE_SECONDS 0 "$txt3" --signer=none
+    run_client register "$CLIENT_KEY_NAME" $LEASE_SECONDS 0 "$txt3" -signer=none
     if ! wait_for_rr_state TXT "$txt3" present; then
         log_error "Signer-location[lease-store]: expected TXT record not found"
         return 1
@@ -772,7 +772,7 @@ test_case_signer_location_matrix() {
     # (Rcode=Success, "record not found for delete" note) once SIG(0)
     # authenticates -- it is not gated by AllowOnlineKeyRegistration, which
     # only applies to *new registrations* (Case A/D), not Case C deletes.
-    if ! probe_out=$(run_client refresh "$WRONG_CLIENT_KEY_NAME" 0 0 "$probe_txt_rr" --signer=none 2>&1); then
+    if ! probe_out=$(run_client refresh "$WRONG_CLIENT_KEY_NAME" 0 0 "$probe_txt_rr" -signer=none 2>&1); then
         log_error "Signer-location[online-only]: request signed by an online-only, never-registered key was unexpectedly rejected"
         echo "$probe_out"
         delete_rr "$wrong_key_payload"

@@ -174,13 +174,11 @@ claim_as_holder() {
 }
 
 # claim_name_as_holder <label> -- the other key registers <label>.NAME_ZONE with a TXT record
-# "holder" through the RFC 9664 handler (sig0lease-client), with a key it generates; exits
-# non-zero unless the proxy answers NOERROR.
+# "holder" (sig0lease-client name -once, on client/rfc9664 as the agent's names are), printing
+# the proxy's answer; exits non-zero unless it is NOERROR.
 claim_name_as_holder() {
-    local name="$1.${NAME_ZONE}" key
-    key="$(dnssec-keygen -q -K "$HOLDER_KEY_DIR" -a ECDSAP256SHA256 -n HOST -T KEY "$name")" || return 1
-    "$CLIENT_BIN" "$SRP_PROXY_URL" register "$key" 3600 1209600 --same-key \
-        "$name 300 IN TXT \"holder\"" --tcp --keystore="$HOLDER_KEY_DIR"
+    "$CLIENT_BIN" name -server="$SRP_PROXY_URL" -zone="$NAME_ZONE" -name="$1" -keystore="$HOLDER_KEY_DIR" -k=13 -once \
+        -record='@ TXT "holder"'
 }
 
 # wait_state <name> <type> <present|absent> -- wait_for_srp_state with CHANGE_TIMEOUT, showing
@@ -532,7 +530,6 @@ run_all_tests() {
     require_command named
     require_command go
     require_command python3
-    require_command dnssec-keygen
 
     srp_run_prepare
     mkdir -p "$AGENT_DIR" "$AGENT_HTTP_DIR" "$HOLDER_KEY_DIR"

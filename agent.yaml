@@ -60,7 +60,8 @@ registrars:
   # right below the zone, held by its own key, with its addresses and records.
   - protocol: rfc9664
     zone: dev.zenr.io.
-    server: proxy.dev.zenr.io:53        # required: RFC 9664 has no registrar discovery
+    server: 127.0.0.1:8053              # the proxy, run here (docs/srp-live-demo.md); required:
+                                        # RFC 9664 has no registrar discovery
     transport: tcp
     lease: 1h
     key_lease: 336h

@@ -95,19 +95,16 @@ func NewSRPHandler() *SRPHandler {
 // lower-case -- every comparison/rewrite against it below matches on that same shape.
 const defaultServiceARPA = "default.service.arpa."
 
-// zoneEnabled reports whether zone (from the request's own Zone Section) is one this
-// handler instance will accept: the one zone it's configured to serve (one zone, one
-// protocol per handler instance -- enforced here, in each handler's own early checks,
-// rather than by a central dispatcher), or -- when rewriteDefaultServiceARPA is
-// on -- default.service.arpa. as well, an alias Handle rewrites away before anything else
-// sees it. Compared canonically since the request's own casing/trailing dot can't be
-// assumed to match the configured value.
-func (h *SRPHandler) zoneEnabled(zone string) bool {
-	z := dnsname.Normalize(zone)
-	if z == dnsname.Normalize(h.upstreamZone) {
+// takes reports whether an SRP update for host, its Host Description name, is this handler's:
+// host is in the zone it serves (notServed: deepest zone wins), or, with
+// rewriteDefaultServiceARPA, under default.service.arpa., an alias Handle rewrites into that
+// zone before anything else sees it. An update it does not take goes to the next handler. The
+// Zone Section plays no part in it (refuseOutsideZoneSection).
+func (h *SRPHandler) takes(host string) bool {
+	if h.rewriteDefaultServiceARPA && dnsname.IsAtOrBelow(host, defaultServiceARPA) {
 		return true
 	}
-	return h.rewriteDefaultServiceARPA && z == dnsname.Normalize(defaultServiceARPA)
+	return h.notServed(host) == nil
 }
 
 // rewriteDefaultServiceARPA rewrites every name msg.Ns's records carry that ends in
@@ -178,21 +175,21 @@ func (h *SRPHandler) Handle(ctx context.Context, w dns.ResponseWriter, r *dns.Ms
 		return NewNotRelevantResult(fmt.Sprintf("not an SRP update: %v", err))
 	}
 
-	if len(r.Question) != 1 {
-		return NewNotRelevantResult("not an SRP update: expected exactly one Zone Section entry")
-	}
-	zone := r.Question[0].Header().Name
-	if !h.zoneEnabled(zone) {
-		h.logger.Debugf("SRP handler: zone %s is not the configured zone %s, declining", zone, h.upstreamZone)
-		return NewNotRelevantResult(fmt.Sprintf("zone %s not enabled for SRP on this handler", zone))
+	if !h.takes(cu.Host.Name) {
+		h.logger.Debugf("SRP handler: host %s is not in zone %s, declining", cu.Host.Name, h.upstreamZone)
+		return NewNotRelevantResult(fmt.Sprintf("host %s not in zone %s, which this handler serves", cu.Host.Name, h.upstreamZone))
 	}
 	// From here on the request is this handler's, and everything below needs the upstream.
 	requireUpstream(h.Name(), h.upstreamCoordinator != nil, h.upstreamKeyRecord != nil)
 
 	h.logger.Infof("SRP UPDATE for zone %s: host=%s instances=%d discovery=%d",
-		zone, cu.Host.Name, len(cu.Instances), len(cu.Discovery))
+		h.upstreamZone, cu.Host.Name, len(cu.Instances), len(cu.Discovery))
 
 	if res := refuseDottedLabels(r); res != nil {
+		h.logger.Debugf("SRP handler: %v", res.Error)
+		return res
+	}
+	if res := refuseOutsideZoneSection(r); res != nil {
 		h.logger.Debugf("SRP handler: %v", res.Error)
 		return res
 	}
@@ -211,9 +208,9 @@ func (h *SRPHandler) Handle(ctx context.Context, w dns.ResponseWriter, r *dns.Ms
 	// wire the call site, leave the list empty (= allow all) until real filtering is needed.
 	if !h.allowUDP {
 		if _, isUDP := w.RemoteAddr().(*net.UDPAddr); isUDP {
-			h.logger.Debugf("SRP handler: rejecting UDP request for zone %s (allow_udp not set)", zone)
+			h.logger.Debugf("SRP handler: rejecting UDP request for zone %s (allow_udp not set)", h.upstreamZone)
 			msg := makeErrorResponse(r, dns.RcodeRefused, dns.ExtendedErrorNotSupported, "TCP required for SRP on this zone")
-			return NewErrorResult(msg, "TCP required, got UDP", fmt.Errorf("UDP rejected: allow_udp not set for zone %s", zone))
+			return NewErrorResult(msg, "TCP required, got UDP", fmt.Errorf("UDP rejected: allow_udp not set for zone %s", h.upstreamZone))
 		}
 	}
 	// TODO(srp): srp.allowed_source_prefixes source-address allow-list (stub, not yet enforced).
@@ -251,12 +248,11 @@ func (h *SRPHandler) Handle(ctx context.Context, w dns.ResponseWriter, r *dns.Ms
 	// addressed: a constrained client (default.service.arpa.) and a direct client
 	// (h.upstreamZone) naming the same host correctly collide in FCFS instead of silently
 	// writing two different local nodes that both resolve to the same upstream name.
-	// zoneEnabled already confirmed the incoming zone is either h.upstreamZone or (when
-	// rewriteDefaultServiceARPA is set) default.service.arpa. -- checking the latter here
-	// is enough to decide whether a rewrite is needed; no need to re-check the config
-	// flag itself. Harmless no-op if h.upstreamZone happens to literally be
-	// default.service.arpa. too (an explicitly-configured real zone of that name).
-	if dnsname.Normalize(zone) == dnsname.Normalize(defaultServiceARPA) {
+	// The host decides, as it decided that the update is this handler's (takes); a name the
+	// rewrite leaves outside the zone is refused below (refuseNamesNotServed).
+	// Harmless no-op if h.upstreamZone happens to literally be default.service.arpa. too (an
+	// explicitly-configured real zone of that name).
+	if h.rewriteDefaultServiceARPA && dnsname.IsAtOrBelow(cu.Host.Name, defaultServiceARPA) {
 		rewriteDefaultServiceARPA(r, h.upstreamZone)
 		cu, err = srp.Validate(r)
 		if err != nil {

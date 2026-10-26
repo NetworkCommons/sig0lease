@@ -47,8 +47,8 @@ PROXY_PORT="${PROXY_PORT:-8053}"
 PROXY_URL="$PROXY_ADDR:$PROXY_PORT"
 # Transport run_client (tests/lib/client.sh) uses to reach the proxy.
 # Defaults to udp; set PROXY_PROTOCOL=tcp to run the whole suite over TCP
-# instead (passes --tcp through to sig0lease-client), or PROXY_PROTOCOL=tls
-# for DNS-over-TLS (--tls), sent to PROXY_TLS_URL: the proxy's DoT listener,
+# instead (passes -transport tcp to sig0lease-client), or PROXY_PROTOCOL=tls
+# for DNS-over-TLS (-transport tls), sent to PROXY_TLS_URL: the proxy's DoT listener,
 # which prepare_lease_config turns on in the scratch config it writes.
 PROXY_PROTOCOL="${PROXY_PROTOCOL:-udp}"
 PROXY_TLS_PORT="${PROXY_TLS_PORT:-8853}"

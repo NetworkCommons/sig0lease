@@ -356,7 +356,7 @@ test_d2_register() {
     # auto-generates a missing key by default -- see the -k flag doc); the deregister
     # call below reuses the same key without needing -k again.
     local out
-    out="$("$D2_CLIENT_BIN" -domain=default.service.arpa. -host=d2-register -addr=192.0.2.111 -udp \
+    out="$("$D2_CLIENT_BIN" -domain=default.service.arpa. -host=d2-register -addr=192.0.2.111 -transport=udp \
         -server="127.0.0.1:${D2_MDNS_PROXY_PORT}" -instance=Gizmo:_http._tcp:8080 -txt=Gizmo:path=/d2 -once \
         -keystore="${D2_KEY_DIR}/d2-register" -k=13 2>&1)" || { echo "$out"; log_error "register did not succeed"; return 1; }
     echo "$out"
@@ -386,7 +386,7 @@ test_d2_deregister() {
     log_section "$log_msg"
 
     local out
-    out="$("$D2_CLIENT_BIN" -domain=default.service.arpa. -host=d2-register -addr=192.0.2.111 -udp \
+    out="$("$D2_CLIENT_BIN" -domain=default.service.arpa. -host=d2-register -addr=192.0.2.111 -transport=udp \
         -server="127.0.0.1:${D2_MDNS_PROXY_PORT}" -instance=Gizmo:_http._tcp:8080 -deregister \
         -keystore="${D2_KEY_DIR}/d2-register" 2>&1)"
     echo "$out"

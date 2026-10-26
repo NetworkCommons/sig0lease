@@ -61,46 +61,35 @@ A dump writes nothing: it reads a file store's snapshot as it is, without saving
 creating its directory, so it is safe beside a running proxy. It still runs each handler's
 `Setup`, so it needs the same keystore as the proxy itself.
 
-Run the client against a proxy:
+Run the client against a proxy. Its commands take `<command> [flags] [args]`, the flags first,
+spelled as `sig0lease-srp-client`'s (`cmd/internal/cli`): `-server`, `-transport tcp|udp|tls`
+(default `tcp`), `-keystore`, `-k`, `-lease`, `-key-lease`, `-ttl`. `sig0lease-client help`
+lists them all. A keystore is required, given with `-keystore <dir>` or `CLIENT_KEYSTORE_DIR`
+(the flag wins if both are given; `sig0lease-srp-client` and `sig0lease-agent` follow the same
+convention):
 
 ```bash
-make run-client ADDR=127.0.0.1:8053 CMD="register test.dev.zenr.io. test.dev.zenr.io."
-```
-
-The client requires an explicit keystore directory, either via `--keystore=<dir>` or the
-`CLIENT_KEYSTORE_DIR` environment variable (an explicit flag wins if both are given;
-`sig0lease-srp-client`'s `-keystore` flag follows the identical convention):
-
-```bash
-./bin/<your OS>/sig0lease-client 127.0.0.1:8053 register test.dev.zenr.io. test.dev.zenr.io. --keystore=/path/to/keystore
-# or
-CLIENT_KEYSTORE_DIR=/path/to/keystore ./bin/<your OS>/sig0lease-client 127.0.0.1:8053 register test.dev.zenr.io. test.dev.zenr.io.
+./bin/<your OS>/sig0lease-client register -server 127.0.0.1:8053 -keystore /path/to/keystore \
+  -lease 300 -key-lease 3600 -same-key Ktest.dev.zenr.io.+015+05044 'client.test.dev.zenr.io. 300 IN TXT "hello"'
 ```
 
 By default a key must already exist under that keyname in the keystore
-(`register`/`refresh`/`register-tamper` all error out rather than creating one). Pass
-`--k=13` (ECDSAP256SHA256) or `--k=15` (ED25519) to generate one on first use instead — when
-`--k` is given, the keyname argument is read as an owner name (e.g. `test.dev.zenr.io.`) rather
-than an exact key filename, and any existing key for that name is reused regardless of its
-algorithm:
+(`register`/`refresh`/`register-tamper` all error out rather than creating one). Pass `-k 13`
+(ECDSAP256SHA256) or `-k 15` (ED25519) to generate one on first use instead — with `-k`, the
+keyname argument is read as an owner name (e.g. `test.dev.zenr.io.`) rather than an exact key
+filename, and any existing key for that name is reused regardless of its algorithm:
 
 ```bash
-./bin/<your OS>/sig0lease-client 127.0.0.1:8053 register test.dev.zenr.io. 300 3600 --same-key --k=13 --keystore=/path/to/keystore
-```
-
-Useful end-to-end commands:
-
-```bash
-make test-register ADDR=127.0.0.1:8053 CLIENT_KEYSTORE_DIR=/path/to/keystore ZONE=test.dev.zenr.io. KEYNAME=test.dev.zenr.io.
-make test-register-badsig ADDR=127.0.0.1:8053 CLIENT_KEYSTORE_DIR=/path/to/keystore ZONE=test.dev.zenr.io. KEYNAME=test.dev.zenr.io.
-make test-integration
+./bin/<your OS>/sig0lease-client register -server 127.0.0.1:8053 -keystore /path/to/keystore \
+  -lease 0 -key-lease 3600 -same-key -k 13 test.dev.zenr.io.
 ```
 
 ## Client Use Cases
 
-The client binary currently supports these flows:
+The client binary supports these commands:
 
-- `register` - create and send a signed UPDATE-LEASE registration request.
+- `name` - keep one name registered through the `client/rfc9664` library, as `sig0lease-srp-client` keeps a host through `client/srp`: the name, one label below the zone, with its own key, its addresses (`-addr`) and records (`-record`, written as in a `sig0lease-agent` template), refreshed on the lease clock until stopped. `-once`, `-withdraw` and `-deregister [-keep-names]` send one request instead (Cases A, D, and C or D).
+- `register`, `refresh` - send exactly the signed UPDATE-LEASE request described: the KEY and other records given (`rr-spec`), the signer's KEY where `-signer` puts it, the Zone Section `-zone` names (default: the signing key's name). The test suite uses them to send the shapes the proxy must refuse.
 - `register-tamper` - sign the request, then flip one payload bit to confirm the proxy rejects a bad SIG(0).
 - `verify` - query whether a registration is currently active.
 - `list-keys` - list available keystore entries.
@@ -108,10 +97,13 @@ The client binary currently supports these flows:
 Examples:
 
 ```bash
-sig0lease-client 127.0.0.1:8053 register test.dev.zenr.io. test.dev.zenr.io. 300 3600
-sig0lease-client 127.0.0.1:8053 register-tamper test.dev.zenr.io. test.dev.zenr.io. 300 3600
-sig0lease-client 127.0.0.1:8053 verify test.dev.zenr.io. test.dev.zenr.io.
-sig0lease-client 127.0.0.1:8053 list-keys --keystore=/path/to/keystore
+sig0lease-client name -server 127.0.0.1:8053 -zone dev.zenr.io. -name mysite -k 13 \
+  -addr 192.0.2.10 -record '_dnslink TXT "dnslink=/ipfs/bafy..."'
+sig0lease-client register -server 127.0.0.1:8053 -lease 300 -key-lease 3600 -same-key \
+  Ktest.dev.zenr.io.+015+05044 'client.test.dev.zenr.io. 300 IN TXT "hello"'
+sig0lease-client register-tamper -server 127.0.0.1:8053 -lease 0 -key-lease 3600 -same-key Ktest.dev.zenr.io.+015+05044
+sig0lease-client verify -server 127.0.0.1:8053 test.dev.zenr.io.
+sig0lease-client list-keys -keystore /path/to/keystore
 ```
 
 ## Proxy Use Cases
@@ -192,8 +184,9 @@ the corresponding entry here), so the numbering is kept stable.
 6. If the proxy attemps to register a record that already exists at the DNS server, the request must fail also in the parts that would be successful if performed alone, because the consistency of the LeaseStore cannot be guaranteed, especially in case of already existing KEY RR.
    1. This implies that the proxy needs to verify whether in case of a registration, an identical record is already at the FQDN.
 7. For all attempts of deleting records, if the record does not exist in the lease-store, we assume the record is either outside our control, or it has been removed after expiry. The request does not fail but the user needs to be informed about this. If the record exists in the lease-store but not at the DNS, do not fail the request but signal the situation. Missing local records do not force whole-request failure.
-8. Every name in the Update section must be in the handler's zone, and not in a zone another handler of the same proxy serves below it: the deepest zone wins. Otherwise the request is refused.
+8. Every name in the Update section must be in the handler's zone, and not in a zone another handler of the same proxy serves below it: the deepest zone wins. Otherwise the request is refused. So must the SIG(0) signer's name.
 9. With `fcfs_naming` on, a KEY holds its name: a KEY registered anew is refused if a different KEY is at its name or at a name above it, unless the key holding that name registers it. A KEY may register itself only one label below the zone; deeper names are registered by the key holding the name above.
+10. The Zone Section must enclose every name in the Update section (RFC 2136 §3.4.1.3); otherwise the answer is `NOTZONE`. It may be the zone apex, the handler's zone, a name above the records, such as the signer's, or the root, and plays no other part.
 
 ### Storage Model
 
@@ -219,7 +212,7 @@ deferred-mutation write ordering) that goes beyond the rule statement itself.
 
 ### Signer Resolution (Three-Stage Fallback)
 
-Before processing the case matrix, the proxy validates the SIG(0) signature on the UPDATE packet (`UpdateHandler.extractAndValidateSig0`). The signer key must be at or above the FQDN of every record in the Update section. Candidate signer key material is tried in order:
+Before processing the case matrix, the proxy validates the SIG(0) signature on the UPDATE packet (`UpdateHandler.extractAndValidateSig0`). The signer's name must be one the handler serves (Behavior Specification item 8), and the signer key must be at or above the FQDN of every record in the Update section. Candidate signer key material is tried in order:
 
 1. **Request-provided:** a KEY RR matching the SIG(0) signer identity (name, algorithm, key tag) present in the Update or Additional section.
 2. **Lease store:** a KEY previously registered under that identity.
@@ -255,6 +248,12 @@ Additional rules:
 A proxy can run both handlers, each with its own zone (`upstream_zone`). The zones may nest: the live deployment has SRP's `srp.dev.zenr.io.` inside this handler's `dev.zenr.io.`. A name belongs to the handler whose zone is closest above it, as a delegated subzone does in DNS (Behavior Specification item 8). After setting the handlers up, `cmd/sig0lease` tells each one the zones the others serve below its own (`handlers.SeparateZones`), and refuses to start when two handlers serve the same zone.
 
 Each handler refuses an UPDATE that names anything outside its zone, or inside a zone another handler serves, with `REFUSED` and Extended DNS Error 18 (`leaseHandler.refuseNamesNotServed`). This handler checks before the case dispatch and its node locks; SRP checks after its `default.service.arpa` rewrite has made the names final. Before this check only the authoritative server's update-policy kept the handlers apart. This handler could add a second KEY at a name SRP holds First-Come First-Served, or records SRP's lease store knows nothing about, whenever its signing key was allowed to write below its zone.
+
+### The Zone Section
+
+Both handlers read the Zone Section the same way (`handlers.refuseOutsideZoneSection`): it must enclose every name in the Update section, as RFC 2136 §3.4.1.3 requires, or the answer is `NOTZONE`; anything but one entry is `FORMERR`. Nothing else reads it. Which handler takes an UPDATE, and what it may change, go by the names: this handler's zone check (above), the signer's name and the SIG(0) checks; SRP takes an update by its host name (`docs/siglease_rfc9665.md` §3). The UPDATE sent upstream names the handler's own zone, and its lookups ask that zone's server.
+
+A requester may therefore send the zone apex, as RFC 2136 asks and as `nsupdate` and other stock clients do, the handler's `upstream_zone` (`client/rfc9664`, `client/srp`), or any name above its records, such as its key's name (`sig0lease-client`'s default). Until 2026-10, this handler required the Zone Section at or below the signer's name, from the first design, in which each client had its own "downstream zone" named like its key; that refused the zone apex, and checked a field the requester chooses freely, so it constrained nothing the per-name checks did not.
 
 ### First-Come First-Served Naming (`fcfs_naming`)
 
@@ -330,7 +329,7 @@ This handler's status notes (for example `record not found for delete: ...`) tra
 
 TTLs are not leases, and the proxy does not forward the requester's. A requester may send its
 lease as the TTL, which would let resolvers cache a record for as long as its lease.
-(`sig0lease-client` does not: the KEY RRs it builds from the signing key carry `--ttl`, default
+(`sig0lease-client` does not: the KEY RRs it builds from the signing key carry `-ttl`, default
 300, and rr-spec records carry the TTL written in them.) Once
 SIG(0) verification passes, both handlers set every record they write upstream to
 `record_ttl_sec` (default 300, `handlers/record_ttl.go`), cut to the granted KEY-LEASE on KEYs
@@ -449,8 +448,8 @@ one keeps the option of key pinning (RFC 7858 §4.2), where a client is configur
 proxy's key in advance, and pinning needs a key that does not change. RFC 9665 §6.5 mentions
 pinning for SRP registrars and leaves it out of scope; it is not implemented here.
 
-Both clients can send over DoT: `sig0lease-client <dot-address> ... --tls` and
-`sig0lease-srp-client -tls` (with `-server`, give the DoT address; without it, discovery uses the
+Both clients can send over DoT, with `-transport tls`: `sig0lease-client` to the `-server` DoT
+address, `sig0lease-srp-client` too (with `-server`, give the DoT address; without it, discovery uses the
 `_dnssd-srp-tls._tcp` record, see `docs/siglease_rfc9665.md`). Both use RFC 7858 §4.1's
 Opportunistic Privacy profile, the only one RFC 9665 §7 uses for SRP: the client encrypts but
 does not check the server's certificate, so it is protected against passive eavesdroppers but
@@ -466,7 +465,9 @@ through `_dnssd-srp-tls._tcp` and registers over DoT.
 ## Project Layout
 
 - `cmd/sig0lease/` - proxy entrypoint
-- `cmd/sig0lease-client/` - client entrypoint (RFC 9664 lease flow)
+- `cmd/sig0lease-client/` - client entrypoint (RFC 9664: raw updates for the tests, and `name`
+  over `client/rfc9664`)
+- `cmd/internal/cli/` - the flags, key lookup and reply printing both client commands share
 - `client/` - what the RFC 9664 and SRP requesters share (granted leases, transports, refresh
   clock, `Keeper`); `client/rfc9664` is the RFC 9664 library requester, `client/srp` the SRP
   one, `client/agent` the template agent on both

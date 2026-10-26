@@ -41,7 +41,7 @@ In another terminal, from `./main`:
   -instance=DemoWidget:_http._tcp:8080 \
   -txt=DemoWidget:path=/demo \
   -server=127.0.0.1:8053 \
-  -lease=60 -keylease=120 \
+  -lease=60 -key-lease=120 \
   -keystore=./keystore/client -k=15 \
   -once
 ```
@@ -56,7 +56,7 @@ In another terminal, from `./main`:
   gitignored — so it's local, persistent-across-runs on whichever machine runs the demo.
   If a key for the domain (`demo.srp.dev.zenr.io.` in this case) already exists, no matter 
   the type (13 or 15), **no new key** is generated and the existing key is used. 
-- `-lease`/`-keylease` are short on purpose for a demo (1/2 minutes) so a stale record
+- `-lease`/`-key-lease` are short on purpose for a demo (1/2 minutes) so a stale record
   cleans itself up if you forget to deregister (step 6).
 - A real device would normally omit `-server` and let the client discover the registrar via
   SRV lookups for `_dnssd-srp._tcp.<name>.`, trying `-domain` first and then each parent name up
@@ -78,12 +78,12 @@ narrower and wider shapes too, all against the same running proxy:
 ```bash
 # Host-only: no service instance at all, just an address record for the host
 ./bin/$(uname)/sig0lease-srp-client -domain=srp.dev.zenr.io. -host=demo-host-only \
-  -addr=192.0.2.43 -server=127.0.0.1:8053 -lease=60 -keylease=120 -keystore=./keystore/client -k=13 -once
+  -addr=192.0.2.43 -server=127.0.0.1:8053 -lease=60 -key-lease=120 -keystore=./keystore/client -k=13 -once
 
 # A DNS-SD subtype on the same instance (repeatable -subtype/-txt/-instance, matched by label)
 ./bin/$(uname)/sig0lease-srp-client -domain=srp.dev.zenr.io. -host=demo \
   -addr=192.0.2.42 -instance=DemoWidget:_http._tcp:8080 \
-  -subtype=DemoWidget:_printer -server=127.0.0.1:8053 -lease=60 -keylease=120 -keystore=./keystore/client -once
+  -subtype=DemoWidget:_printer -server=127.0.0.1:8053 -lease=60 -key-lease=120 -keystore=./keystore/client -once
 ```
 
 Expected output ends with:
@@ -173,7 +173,7 @@ Drop `-once` to watch the client run unattended: initial delay, then automatic r
 ```bash
 ./bin/$(uname)/sig0lease-srp-client -domain=srp.dev.zenr.io. -host=demo -addr=192.0.2.42 \
   -instance=DemoWidget:_http._tcp:8080 -server=127.0.0.1:8053 \
-  -lease=60 -keylease=120 -keystore=./keystore/client
+  -lease=60 -key-lease=120 -keystore=./keystore/client
 ```
 
 ## 5. Try a conflict (optional)
@@ -185,7 +185,7 @@ already holds:
 
 ```bash
 ./bin/$(uname)/sig0lease-srp-client -domain=srp.dev.zenr.io. -host=demo -addr=192.0.2.99 \
-  -server=127.0.0.1:8053 -lease=60 -keylease=120 -keystore=$(mktemp -d) -k=13 -once
+  -server=127.0.0.1:8053 -lease=60 -key-lease=120 -keystore=$(mktemp -d) -k=13 -once
 ```
 
 Drop `-once` from that same command to see the other side of a conflict instead: the client

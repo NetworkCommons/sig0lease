@@ -34,22 +34,16 @@ func (h *UpdateHandler) Handle(ctx context.Context, w dns.ResponseWriter, r *dns
 		h.logger.Debugf("Refusing UPDATE: %v", res.Error)
 		return res
 	}
+	// Whether the names are this handler's first, then whether the Zone Section encloses
+	// them: RFC 2136 S3.1 then S3.4.1.3.
 	if res := h.refuseNamesNotServed(r); res != nil {
 		h.logger.Debugf("Refusing UPDATE: %v", res.Error)
 		return res
 	}
-
-	if len(r.Question) != 1 {
-		msg := makeErrorResponse(r, dns.RcodeFormatError, dns.ExtendedErrorOther, "exactly one question required")
-		return NewErrorResult(msg, "invalid question count", fmt.Errorf("multiple questions"))
+	if res := refuseOutsideZoneSection(r); res != nil {
+		h.logger.Debugf("Refusing UPDATE: %v", res.Error)
+		return res
 	}
-
-	// Extract zone and class from question
-	qHeader := r.Question[0].Header()
-	zone := qHeader.Name
-	class := qHeader.Class
-
-	h.logger.Debugf("UPDATE for zone: %s (class: %d)", zone, class)
 
 	requestedLease, rcode, err := h.decodeLease(r)
 	if err != nil {
@@ -97,7 +91,7 @@ func (h *UpdateHandler) Handle(ctx context.Context, w dns.ResponseWriter, r *dns
 	h.logger.Debugf("Parsed lease duration: %d seconds key-lease=%d", leaseDuration, keyLeaseDuration)
 
 	h.logger.Infof("UPDATE request for zone %s: LEASE=%d KEY-LEASE=%d RRs=%s",
-		zone, leaseDuration, keyLeaseDuration, summarizeRRTypes(updateKeyRRs, updateOtherRRs))
+		h.upstreamZone, leaseDuration, keyLeaseDuration, summarizeRRTypes(updateKeyRRs, updateOtherRRs))
 
 	additionalSigningKeys, err := extractAdditionalSigningKeys(r)
 	if err != nil {
@@ -106,7 +100,7 @@ func (h *UpdateHandler) Handle(ctx context.Context, w dns.ResponseWriter, r *dns
 		return NewErrorResult(msg, err.Error(), err)
 	}
 
-	sigRR, signerKey, signerSource, err := h.extractAndValidateSig0(ctx, r, zone, additionalSigningKeys, updateKeyRRs)
+	sigRR, signerKey, signerSource, err := h.extractAndValidateSig0(ctx, r, additionalSigningKeys, updateKeyRRs)
 	if err != nil {
 		h.logger.Debugf("SIG(0) validation failed: %v", err)
 		return refusalResult(r, "SIG(0) validation failed", fmt.Errorf("SIG(0) validation failed: %w", err))
@@ -161,7 +155,7 @@ func (h *UpdateHandler) Handle(ctx context.Context, w dns.ResponseWriter, r *dns
 	// now, after SIG(0) verification, so an unverified request can never hold a lock.
 	locks, err := h.nodeLocks.Acquire(ctx, h.requestLockSet(leaseDuration, keyLeaseDuration, signerID, updateKeyRRs, updateOtherRRs))
 	if err != nil {
-		h.logger.Warnf("UPDATE for zone %s: %v", zone, err)
+		h.logger.Warnf("UPDATE for zone %s: %v", h.upstreamZone, err)
 		msg := makeErrorResponse(r, dns.RcodeServerFailure, dns.ExtendedErrorOther, "lease store busy, try again")
 		return NewErrorResult(msg, "lease-store node lock contention", err)
 	}
@@ -228,7 +222,7 @@ func (h *UpdateHandler) Handle(ctx context.Context, w dns.ResponseWriter, r *dns
 					return NewErrorResult(msg, err.Error(), err)
 				}
 			} else {
-				prereqs, res := h.refuseNewKey(ctx, r, zone, keyRR, signerID, sigRR.SignerName)
+				prereqs, res := h.refuseNewKey(ctx, r, keyRR, signerID, sigRR.SignerName)
 				if res != nil {
 					return res
 				}
@@ -242,7 +236,7 @@ func (h *UpdateHandler) Handle(ctx context.Context, w dns.ResponseWriter, r *dns
 			// applied them, when a store write must no longer fail (see the mutation loop at
 			// the end): refuse now, before anything is sent, a record the store holds under
 			// another key, or the authoritative server holds outside this proxy's management.
-			acceptedRecords, notes, err := h.filterDuplicateRegistrations(ctx, leasepkg.NodeKey(keyRR), zone, updateOtherRRsByKeyOwner[keyIDFromKEY(keyRR)])
+			acceptedRecords, notes, err := h.filterDuplicateRegistrations(ctx, leasepkg.NodeKey(keyRR), updateOtherRRsByKeyOwner[keyIDFromKEY(keyRR)])
 			if err != nil {
 				return refusalResult(r, "duplicate registration rejected", err)
 			}
@@ -253,7 +247,7 @@ func (h *UpdateHandler) Handle(ctx context.Context, w dns.ResponseWriter, r *dns
 			pendingRecords := acceptedRecords
 
 			if keyIsRefresh {
-				effectiveKeyLease, keyAtFQDN, err := h.effectiveRefreshKeyLease(ctx, zone, keyRR, existingKey, keyLeaseDuration)
+				effectiveKeyLease, keyAtFQDN, err := h.effectiveRefreshKeyLease(ctx, keyRR, existingKey, keyLeaseDuration)
 				if err != nil {
 					msg := makeErrorResponse(r, dns.RcodeServerFailure, dns.ExtendedErrorNoReachableAuthority, fmt.Sprintf("authoritative key lookup failed: %v", err))
 					return NewErrorResult(msg, "authoritative key lookup failed", err)
@@ -339,7 +333,7 @@ func (h *UpdateHandler) Handle(ctx context.Context, w dns.ResponseWriter, r *dns
 			dataForSigner := updateOtherRRsByKeyOwner[signerID]
 			if len(dataForSigner) > 0 {
 				signerNodeKey := leasepkg.NodeKeyFromSIG(sigRR.SignerName, sigRR.Algorithm, sigRR.KeyTag)
-				acceptedRecords, notes, err := h.filterDuplicateRegistrations(ctx, signerNodeKey, zone, dataForSigner)
+				acceptedRecords, notes, err := h.filterDuplicateRegistrations(ctx, signerNodeKey, dataForSigner)
 				if err != nil {
 					return refusalResult(r, "duplicate registration rejected", err)
 				}
@@ -378,7 +372,7 @@ func (h *UpdateHandler) Handle(ctx context.Context, w dns.ResponseWriter, r *dns
 		}
 
 		signerOwnerKey := leasepkg.NodeKey(signerKey)
-		keyExists, err := h.authoritativeHasKeyAtName(ctx, zone, signerKey.Hdr.Name)
+		keyExists, err := h.authoritativeHasKeyAtName(ctx, signerKey.Hdr.Name)
 		if err != nil {
 			msg := makeErrorResponse(r, dns.RcodeServerFailure, dns.ExtendedErrorNoReachableAuthority, fmt.Sprintf("authoritative key lookup failed: %v", err))
 			return NewErrorResult(msg, "authoritative key lookup failed", err)
@@ -407,7 +401,7 @@ func (h *UpdateHandler) Handle(ctx context.Context, w dns.ResponseWriter, r *dns
 			allNotes = append(allNotes, fmt.Sprintf("KEY %s was missing at the authoritative DNS and has been re-registered with remaining lease", pendingKeyRR.Hdr.Name))
 		}
 
-		acceptedRecords, notes, err := h.filterDuplicateRegistrations(ctx, signerOwnerKey, zone, updateOtherRRs)
+		acceptedRecords, notes, err := h.filterDuplicateRegistrations(ctx, signerOwnerKey, updateOtherRRs)
 		if err != nil {
 			return refusalResult(r, "duplicate registration rejected", err)
 		}
@@ -552,7 +546,7 @@ func (h *UpdateHandler) Handle(ctx context.Context, w dns.ResponseWriter, r *dns
 			if !keyIsRefresh {
 				// New KEY registration: the same checks as Case A's
 				// (docs/siglease_rfc9664.md item 6 applies to every case, not just Case A).
-				prereqs, res := h.refuseNewKey(ctx, r, zone, keyRR, signerID, sigRR.SignerName)
+				prereqs, res := h.refuseNewKey(ctx, r, keyRR, signerID, sigRR.SignerName)
 				if res != nil {
 					return res
 				}
@@ -571,7 +565,7 @@ func (h *UpdateHandler) Handle(ctx context.Context, w dns.ResponseWriter, r *dns
 				// Key is managed locally but missing at the DNS server: put it
 				// back with the lease time still remaining, rather than granting
 				// the full newly-requested duration.
-				lease, _, err := h.effectiveRefreshKeyLease(ctx, zone, keyRR, existingKey, keyLeaseDuration)
+				lease, _, err := h.effectiveRefreshKeyLease(ctx, keyRR, existingKey, keyLeaseDuration)
 				if err != nil {
 					msg := makeErrorResponse(r, dns.RcodeServerFailure, dns.ExtendedErrorNoReachableAuthority, fmt.Sprintf("authoritative key lookup failed: %v", err))
 					return NewErrorResult(msg, "authoritative key lookup failed", err)

@@ -331,7 +331,7 @@ registrars:
 		`names[0] (a.b): name "a.b": one label`,
 		"names[1] (empty): nothing to register",
 		"records[0]: \"x.dev.test. TXT abs\": owner x.dev.test.: relative to the name",
-		"records[1]: \"@ A 192.0.2.1\": the name's addresses go in addresses:",
+		"records[1]: \"@ A 192.0.2.1\": an address of the name itself: give it with the name's addresses",
 		"records[2]: \"@ KEY",
 		"records[3]: \"@ MX ten mail.example.\"",
 		"records[4]: \"@ NOPE x\"",

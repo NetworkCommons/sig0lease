@@ -13,8 +13,8 @@ It then keeps the registrations alive, follows the template as it changes, and d
 everything when it stops. Services are described by type: a template names a built-in preset
 (`ssh`, `http`, ...) or a type it defines itself, and overrides whatever fields it needs.
 
-`sig0lease-srp-client` and `sig0lease-client` remain the low-level tools: they send what their
-flags say and keep nothing.
+`sig0lease-srp-client` and `sig0lease-client name` keep one host or one name registered, on
+the same libraries, as their flags say; the agent keeps a template's worth, and follows it.
 
 Code: `client/agent` (template, run loop, probes, state), `cmd/sig0lease-agent`; each host is
 a `client/srp` `Host`, each name a `client/rfc9664` `Name` (both on `client.Keeper`), the

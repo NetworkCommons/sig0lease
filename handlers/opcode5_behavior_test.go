@@ -431,7 +431,7 @@ func TestFilterDuplicateRegistrations_RejectsDuplicateRecord(t *testing.T) {
 		return []dns.RR{existing}, nil
 	}
 
-	accepted, notes, err := h.filterDuplicateRegistrations(context.Background(), "test.dev.zenr.io.", "test.dev.zenr.io.", []dns.RR{existing, newRec})
+	accepted, notes, err := h.filterDuplicateRegistrations(context.Background(), "test.dev.zenr.io.", []dns.RR{existing, newRec})
 	if err == nil {
 		t.Fatal("expected duplicate registration to be rejected")
 	}
@@ -455,7 +455,7 @@ func TestFilterDuplicateRegistrations_RejectsAuthoritativeDuplicateRecord(t *tes
 		return []dns.RR{record}, nil
 	}
 
-	accepted, notes, err := h.filterDuplicateRegistrations(context.Background(), "test.dev.zenr.io.", "test.dev.zenr.io.", []dns.RR{record})
+	accepted, notes, err := h.filterDuplicateRegistrations(context.Background(), "test.dev.zenr.io.", []dns.RR{record})
 	if err == nil {
 		t.Fatal("expected duplicate registration to be rejected")
 	}
