@@ -25,6 +25,9 @@ body, header, article, p, h1, h2, h3, h4, h5 {
 .avenir, .athelas {
   font-family: 'IBM Plex Sans', sans-serif;
 }
+main.pb7 {
+	padding-bottom: 6rem;
+}
 
 /* header adaption */
 header.cover {
