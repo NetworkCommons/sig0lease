@@ -2919,7 +2919,7 @@ func Names(cu *ClassifiedUpdate) []string
     instruction is authorized transitively through its target instance's own
     check.
 
-func RemoveHost(msg *dns.Msg, cu *ClassifiedUpdate) []dns.RR
+func RemoveHost(msg *dns.Msg, cu *ClassifiedUpdate, freeNames bool) []dns.RR
     RemoveHost makes msg and cu, an update with a LEASE of 0, the removal of
     its host and of every service instance it lists. S3.2.5.5.1 defines the
     removal as "an SRP Update ... with an Update Lease option that has a LEASE
@@ -2928,10 +2928,13 @@ func RemoveHost(msg *dns.Msg, cu *ClassifiedUpdate) []dns.RR
     do (srp-mdns-proxy's host_lease == 0, OpenThread's Host::IsDeleted);
     OpenThread's client sends its addresses with every removal. Dropped:
     the Host Description's addresses, each listed instance's SRV and TXT,
-    which leaves it a removal (Removal), and every Service Discovery add.
-    KEY adds stay, for the KEY-LEASE to keep or free the names, and so do the
-    Delete All RRsets and the Service Discovery deletes. RemoveHost returns the
-    adds it dropped from msg's Update section.
+    which leaves it a removal (Removal), and every Service Discovery add. The
+    Delete All RRsets and the Service Discovery deletes stay. KEY adds stay too,
+    holding the names (a KEY-LEASE that is not 0), unless freeNames (a KEY-LEASE
+    of 0): the KEYs then go with the rest, and adding them back after their
+    names' Delete All RRsets would undo that. cu keeps its KEYs either way,
+    for FCFS. RemoveHost returns the adds it dropped from msg's Update section,
+    KEYs aside: every removal carries those.
 
 func ValidateClassified(msg *dns.Msg, cu *ClassifiedUpdate) error
     ValidateClassified runs every check Validate performs beyond Classify

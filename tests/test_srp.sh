@@ -318,7 +318,8 @@ test_foreign_data_takeover() {
     # but no KEY (legacy.srp.test.'s A record, from the zone template), and its UPDATE then
     # carries a "KEY RRset does not exist" prerequisite (RFC 2136 S2.4.3), sent as a generic
     # RR with empty RDATA. BIND must accept it: a malformed prerequisite would be a FORMERR,
-    # and the claim would fail. Runs last: it restarts the proxy with that setting.
+    # and the claim would fail. It restarts the proxy with that setting, which no later test
+    # depends on.
     local log_msg="TEST 11: Foreign-data takeover (refuse_on_foreign_data: false) -> KEY prerequisite accepted by BIND"
     log_section "$log_msg"
 
@@ -343,6 +344,38 @@ test_foreign_data_takeover() {
     echo "$out" | grep -q "Status: YXDOMAIN (Rcode=6)" || { log_error "a second identity's claim after the takeover should get YXDOMAIN"; return 1; }
 
     log_success "Non-SRP data taken over with the KEY prerequisite; a later claim by another key got YXDOMAIN"
+    PERFORMED_TESTS="$PERFORMED_TESTS\n  [OK] $log_msg"
+}
+
+test_release() {
+    # RFC 9665 S3.2.5.5.1: a removal with a KEY-LEASE of 0 frees the names, and is done once
+    # answered: the registrar deletes the KEYs in the removal's own UPDATE, the unlisted
+    # instance's too, leaving nothing for a timer, so a proxy stopped right after the answer
+    # leaves no KEY holding the names. Before, their expiry timers deleted them after it.
+    local log_msg="TEST 12: Release the host, freeing its names (LEASE 0, KEY-LEASE 0) -> KEYs gone once answered"
+    log_section "$log_msg"
+
+    local out
+    out="$(run_srp_client id9-release -host=host9 -addr=192.0.2.9 -instance=Whatsit:_http._tcp:8080 -txt=Whatsit:path=/ \
+        -lease="$SRP_LEASE_SECONDS" -key-lease="$SRP_KEY_LEASE_SECONDS")"
+    echo "$out"
+    echo "$out" | grep -q "Status: NOERROR (Rcode=0)" || { log_error "registration for the release test did not return NOERROR"; return 1; }
+    [ -n "$(dig_srp host9.srp.test. KEY)" ] || { log_error "host KEY not found right after registration"; return 1; }
+    [ -n "$(dig_srp Whatsit._http._tcp.srp.test. KEY)" ] || { log_error "instance KEY not found right after registration"; return 1; }
+
+    out="$(run_srp_client id9-release -host=host9 -deregister)"
+    echo "$out"
+    echo "$out" | grep -q "Status: NOERROR (Rcode=0)" || { log_error "release did not return NOERROR"; return 1; }
+
+    # Asked once, right after the answer: nothing is waited for.
+    local name rr_type
+    for name in host9.srp.test. Whatsit._http._tcp.srp.test.; do
+        for rr_type in KEY A SRV; do
+            [ -z "$(dig_srp "$name" "$rr_type")" ] || { log_error "$name $rr_type still at the authoritative server once the release was answered"; return 1; }
+        done
+    done
+
+    log_success "Release answered with the host's and its instance's KEYs, address and SRV already gone at authoritative"
     PERFORMED_TESTS="$PERFORMED_TESTS\n  [OK] $log_msg"
 }
 
@@ -379,6 +412,7 @@ run_all_tests() {
     test_discovery_tls
     test_concurrent_claims
     test_foreign_data_takeover
+    test_release
 
     bind9_report_rejections || return 1
     BIND9_REJECTIONS_REPORTED=1

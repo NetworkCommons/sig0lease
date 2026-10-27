@@ -398,7 +398,7 @@ it in three shapes:
 §3.2.5.5.1 has the requester send "no 'Add to an RRSet' instructions for that hostname", so the
 handler drops any adds a removal carries (`pkg/srp.RemoveHost`, logged): the host's addresses,
 a listed instance's SRV and TXT, which leaves it a removal, and Service Discovery adds. The
-KEY adds stay, for the `KEY-LEASE` to keep or free the names. Then, for each live instance of
+KEY adds stay while the `KEY-LEASE` is not 0, holding the names. Then, for each live instance of
 the host's in the lease store that the update does not list, the handler (under the host's
 node locks, which cover its instances) adds to the classified update the removal its requester
 would have sent (`pkg/srp.Removal`, a bare Delete All RRsets), and to the upstream UPDATE its
@@ -409,6 +409,17 @@ expiry, but the instances it did not list stayed until their own lease ended, so
 device removing itself and keeping its name left its services published. The interop suite
 did not catch it: OpenThread is not in it, and mDNSResponder's `srp-client` never removes there
 (§12).
+
+A removal with a `KEY-LEASE` of 0 frees the names, and is done before it is answered, as an
+RFC 9664 Case C delete is: the handler drops the KEY adds too, and the same UPDATE deletes,
+record by record, every KEY and record the lease store holds at and below the host
+(`subtreeDeletes`), also an instance no longer advertised that still holds its name, which no
+Delete All RRsets reaches. Once the authoritative server confirms it, the store forgets the
+host's subtree (`forgetSubtree`), and the requester is answered; if not, nothing changes and the
+request fails. Before, the KEYs were added back and stored with a `KEY-LEASE` of 0, and their
+expiry timers deleted them after the answer: a proxy stopped in between, as the demo script
+stopped it right after the agent, left them in the zone until it started again with the same
+store, so the names stayed held.
 
 ## 8. Transport and crypto
 

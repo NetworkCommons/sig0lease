@@ -155,8 +155,29 @@ type dueRecord struct {
 	rr    dns.RR
 }
 
+// subtreeDeletes returns the UPDATE instructions that delete, record by record, every KEY and
+// non-KEY record at and below nodeKey (subtreeLeases): what a KEY's delete sends, an RFC 9664
+// Case C or an SRP removal with a KEY-LEASE of 0.
+func subtreeDeletes(store LeaseManager, nodeKey string) []dns.RR {
+	keys, records := subtreeLeases(store, nodeKey)
+	return append(asDeletes(keys...), recordDeletes(records)...)
+}
+
+// forgetSubtree forgets nodeKey and every node below it, and disarms their timers, once the
+// authoritative server has confirmed the UPDATE that deleted them: a KEY's expiry, its Case C
+// delete, or an SRP removal with a KEY-LEASE of 0. DNS has already changed, so a store write
+// that fails panics; event names the deletion in that panic.
+func forgetSubtree(store LeaseManager, timers *expiryTimers, nodeKey, event string) {
+	for _, node := range append([]string{nodeKey}, store.ListSubtreeKeys(nodeKey)...) {
+		timers.disarm(node)
+	}
+	if err := store.DeleteSubtree(nodeKey); err != nil {
+		panic(fmt.Sprintf("%s of %s: %v", event, nodeKey, err))
+	}
+}
+
 // subtreeLeases returns every KEY and non-KEY record at and below nodeKey: what a KEY's
-// expiry, or its Case C delete, takes away.
+// expiry, or its delete, takes away.
 func subtreeLeases(store LeaseManager, nodeKey string) ([]*dns.KEY, []dueRecord) {
 	var keys []*dns.KEY
 	var records []dueRecord
@@ -253,12 +274,7 @@ func (e leaseExpirer) expire(ctx context.Context, nodeKey string) bool {
 		if rec := e.store.Get(nodeKey); rec != nil && !rec.IsExpired() {
 			panic(fmt.Sprintf("%s: %s was refreshed while its expiry held its node locks and was deleting it upstream", e.upstream.handler, nodeKey))
 		}
-		for _, descendant := range e.store.ListSubtreeKeys(nodeKey) {
-			e.timers.disarm(descendant)
-		}
-		if err := e.store.DeleteSubtree(nodeKey); err != nil {
-			panic(fmt.Sprintf("%s: lease expiry of %s: %v", e.upstream.handler, nodeKey, err))
-		}
+		forgetSubtree(e.store, e.timers, nodeKey, e.upstream.handler+": lease expiry")
 	} else {
 		for _, r := range records {
 			if err := e.store.RemoveSingleNonKEYRecord(r.owner, r.rrKey); err != nil {

@@ -308,9 +308,11 @@ func (h *SRPHandler) Handle(ctx context.Context, w dns.ResponseWriter, r *dns.Ms
 	lease, keyLease = h.LeasePolicy.clamp(lease, keyLease)
 
 	// S3.2.5.5.1: a LEASE of 0 removes the host, with its service instances, listed or not.
+	// A KEY-LEASE of 0, which only a removal has (LEASE <= KEY-LEASE), frees the names too.
 	var unlistedDeletes []dns.RR
+	freeNames := keyLease == 0
 	if lease == 0 {
-		unlistedDeletes = h.removeHost(r, cu)
+		unlistedDeletes = h.removeHost(r, cu, freeNames)
 	}
 
 	// Step 6: FCFS (S3.3.3). Checked names are the host and each service instance name
@@ -373,6 +375,15 @@ func (h *SRPHandler) Handle(ctx context.Context, w dns.ResponseWriter, r *dns.Ms
 	forwardRecords = append(forwardRecords, unlistedDeletes...)
 	forwardRecords = append(forwardRecords, h.ptrDeleteDiff(cu)...)
 	forwardRecords = append(forwardRecords, synthesizeOmittedInstanceKeys(cu, keyLease)...)
+	// Freeing the names, the same UPDATE also deletes, record by record, every KEY and record
+	// the store holds at and below the host, as an RFC 9664 Case C delete does: the
+	// requester's Delete All RRsets miss an instance that is no longer advertised but still
+	// holds its name (removeHost adds only live ones). The answer then means the names are
+	// free, with nothing left for a timer to delete after it.
+	hostNodeKey := leasepkg.NodeKey(cu.Host.Key)
+	if freeNames {
+		forwardRecords = append(forwardRecords, subtreeDeletes(h.leaseManager, hostNodeKey)...)
+	}
 
 	if upstreamResp, err := h.upstream().send(ctx, prereqs, forwardRecords); err != nil {
 		h.logger.Errorf("SRP handler: UPDATE for zone %s: %v", h.upstreamZone, err)
@@ -395,12 +406,17 @@ func (h *SRPHandler) Handle(ctx context.Context, w dns.ResponseWriter, r *dns.Ms
 	// touched by a Delete All RRsets in this update is wiped and reinserted
 	// uniformly (RemoveNonKEYRecords then UpsertNonKEYRecords, both pre-existing, no
 	// new store method needed). A node the update doesn't mention (an omitted
-	// service instance) is simply never touched here.
-	touchedNodeKeys := h.applyLocalMutations(cu, lease, keyLease, h.upstreamZone)
+	// service instance) is simply never touched here. Freeing the names, the host and every
+	// node below it are forgotten instead, as the UPDATE deleted them all.
+	if freeNames {
+		forgetSubtree(h.leaseManager, h.timers, hostNodeKey, h.Name()+": removal")
+	} else {
+		touchedNodeKeys := h.applyLocalMutations(cu, lease, keyLease, h.upstreamZone)
 
-	// Step 9: schedule expiry timers for every node this update touched.
-	for _, nodeKey := range touchedNodeKeys {
-		h.scheduleLeaseExpiry(nodeKey)
+		// Step 9: schedule expiry timers for every node this update touched.
+		for _, nodeKey := range touchedNodeKeys {
+			h.scheduleLeaseExpiry(nodeKey)
+		}
 	}
 	unlock()
 
@@ -684,9 +700,10 @@ func synthesizeOmittedInstanceKeys(cu *srp.ClassifiedUpdate, keyLease uint32) []
 // service instances, even if the SRP requester doesn't list them explicitly". From here on
 // every instance takes the path a listed removal does: FCFS, the PTR deletes (ptrDeleteDiff),
 // the KEY kept while KEY-LEASE is not 0 (synthesizeOmittedInstanceKeys), the lease store.
+// freeNames (a KEY-LEASE of 0) has srp.RemoveHost drop the KEY adds as well.
 // Called holding the host's node locks, which cover its instances (lockNames).
-func (h *SRPHandler) removeHost(r *dns.Msg, cu *srp.ClassifiedUpdate) []dns.RR {
-	if dropped := srp.RemoveHost(r, cu); len(dropped) > 0 {
+func (h *SRPHandler) removeHost(r *dns.Msg, cu *srp.ClassifiedUpdate, freeNames bool) []dns.RR {
+	if dropped := srp.RemoveHost(r, cu, freeNames); len(dropped) > 0 {
 		h.logger.Infof("SRP handler: removal of %s (LEASE 0) carries %d adds; dropped, as a removal adds nothing (RFC 9665 S3.2.5.5.1)", cu.Host.Name, len(dropped))
 	}
 	listed := map[string]bool{}

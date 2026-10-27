@@ -91,10 +91,13 @@ type ClassifiedUpdate struct {
 // reference registrars do (srp-mdns-proxy's host_lease == 0, OpenThread's Host::IsDeleted);
 // OpenThread's client sends its addresses with every removal. Dropped: the Host
 // Description's addresses, each listed instance's SRV and TXT, which leaves it a removal
-// (Removal), and every Service Discovery add. KEY adds stay, for the KEY-LEASE to keep or
-// free the names, and so do the Delete All RRsets and the Service Discovery deletes.
-// RemoveHost returns the adds it dropped from msg's Update section.
-func RemoveHost(msg *dns.Msg, cu *ClassifiedUpdate) []dns.RR {
+// (Removal), and every Service Discovery add. The Delete All RRsets and the Service Discovery
+// deletes stay. KEY adds stay too, holding the names (a KEY-LEASE that is not 0), unless
+// freeNames (a KEY-LEASE of 0): the KEYs then go with the rest, and adding them back after
+// their names' Delete All RRsets would undo that. cu keeps its KEYs either way, for FCFS.
+// RemoveHost returns the adds it dropped from msg's Update section, KEYs aside: every
+// removal carries those.
+func RemoveHost(msg *dns.Msg, cu *ClassifiedUpdate, freeNames bool) []dns.RR {
 	var kept, dropped []dns.RR
 	for _, rr := range msg.Ns {
 		switch rr.(type) {
@@ -104,6 +107,10 @@ func RemoveHost(msg *dns.Msg, cu *ClassifiedUpdate) []dns.RR {
 		case *dns.PTR:
 			if rr.Header().Class == dns.ClassINET {
 				dropped = append(dropped, rr)
+				continue
+			}
+		case *dns.KEY:
+			if freeNames && rr.Header().Class == dns.ClassINET {
 				continue
 			}
 		}

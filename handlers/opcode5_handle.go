@@ -474,9 +474,7 @@ func (h *UpdateHandler) Handle(ctx context.Context, w dns.ResponseWriter, r *dns
 		// confirmed; if it is not, the request fails and nothing has changed.
 		deletes := asDeletes(recordsToDelete...)
 		for _, keyRR := range keysToDelete {
-			keys, records := subtreeLeases(h.leaseManager, leasepkg.NodeKey(keyRR))
-			deletes = append(deletes, asDeletes(keys...)...)
-			deletes = append(deletes, recordDeletes(records)...)
+			deletes = append(deletes, subtreeDeletes(h.leaseManager, leasepkg.NodeKey(keyRR))...)
 		}
 		if _, err := h.upstream().send(ctx, nil, deletes); err != nil {
 			msg := makeErrorResponse(r, dns.RcodeServerFailure, dns.ExtendedErrorNoReachableAuthority, err.Error())
@@ -494,13 +492,7 @@ func (h *UpdateHandler) Handle(ctx context.Context, w dns.ResponseWriter, r *dns
 			}
 		}
 		for _, keyRR := range keysToDelete {
-			nodeKey := leasepkg.NodeKey(keyRR)
-			for _, descendant := range append([]string{nodeKey}, h.leaseManager.ListSubtreeKeys(nodeKey)...) {
-				h.timers.disarm(descendant)
-			}
-			if err := h.leaseManager.DeleteSubtree(nodeKey); err != nil {
-				panic(fmt.Sprintf("Case C delete of %s: %v", nodeKey, err))
-			}
+			forgetSubtree(h.leaseManager, h.timers, leasepkg.NodeKey(keyRR), "Case C delete")
 			h.logger.Debugf("Deleted key for %s (KEY-LEASE=0, LEASE=0)", keyRR.Hdr.Name)
 		}
 

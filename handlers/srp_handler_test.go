@@ -453,6 +453,71 @@ func TestSRPHandle_HostRemovalRemovesEveryInstance(t *testing.T) {
 	}
 }
 
+// A removal with a KEY-LEASE of 0 frees the names (RFC 9665 S3.2.5.5.1) before it is answered,
+// as an RFC 9664 Case C delete does: its one UPDATE deletes every KEY the store holds at and
+// below the host -- also that of an instance no longer advertised that still holds its name,
+// which no Delete All RRsets reaches -- and adds none back, and the store forgets them, leaving
+// no timer to delete anything after the answer. If the authoritative server refuses that
+// UPDATE, nothing is forgotten. Before, the KEYs were stored with a KEY-LEASE of 0 and deleted
+// by their timers after the answer, so a proxy stopped in between left them in the zone.
+func TestSRPHandle_FreeingTheNamesDeletesEveryKEYBeforeTheAnswer(t *testing.T) {
+	widget := oneWidgetInstance()[0]
+	gadget := srpInstanceSpec{name: "Gadget._ipp._tcp.dev.zenr.io.", port: 631, txt: "rp=x", svctype: "_ipp._tcp.dev.zenr.io."}
+	for _, tt := range []struct {
+		name  string
+		rcode int
+	}{{"accepted", dns.RcodeSuccess}, {"refused", dns.RcodeRefused}} {
+		t.Run(tt.name, func(t *testing.T) {
+			h, coord := newSRPTestHandler(t)
+			id := newSRPTestIdentity(t)
+			const host = "srptest1f.dev.zenr.io."
+			register := buildSRPUpdate(t, srpTestZone, id, host, []string{"192.0.2.1"}, []srpInstanceSpec{widget, gadget}, 30, 1209600, host)
+			if res := h.Handle(context.Background(), stubTCPResponseWriter{}, register); res.Status != StatusProcessed {
+				t.Fatalf("register: expected Processed, got %s: %v", res.Status, res.Error)
+			}
+			// The gadget is no longer advertised; its KEY holds its name.
+			withdraw := buildSRPUpdate(t, srpTestZone, id, host, []string{"192.0.2.1"}, []srpInstanceSpec{{name: gadget.name, removalShaped: true}}, 30, 1209600, host)
+			if res := h.Handle(context.Background(), stubTCPResponseWriter{}, withdraw); res.Status != StatusProcessed {
+				t.Fatalf("withdraw: expected Processed, got %s: %v", res.Status, res.Error)
+			}
+
+			coord.sendResp = &dns.Msg{MsgHeader: dns.MsgHeader{Rcode: uint16(tt.rcode)}}
+			sentBefore := len(coord.sent)
+			res := h.Handle(context.Background(), stubTCPResponseWriter{}, buildSRPUpdate(t, srpTestZone, id, host, nil, nil, 0, 0, host))
+			if accepted := tt.rcode == dns.RcodeSuccess; (res.Status == StatusProcessed) != accepted {
+				t.Fatalf("removal: got %s (%v), want processed %v", res.Status, res.Error, accepted)
+			}
+
+			for _, name := range []string{host, widget.name, gadget.name} {
+				node := leasepkg.NodeKey(id.keyAt(name))
+				if tt.rcode != dns.RcodeSuccess {
+					if h.leaseManager.Get(node) == nil {
+						t.Errorf("%s: forgotten, though the authoritative server refused the removal", name)
+					}
+					continue
+				}
+				var deleted bool
+				for _, rr := range coord.sent[sentBefore].Ns {
+					key, ok := rr.(*dns.KEY)
+					if !ok || !dnsname.EqualFold(key.Hdr.Name, name) {
+						continue
+					}
+					if key.Hdr.Class == dns.ClassINET {
+						t.Errorf("%s: the removal added its KEY back", name)
+					}
+					deleted = deleted || key.Hdr.Class == dns.ClassNONE
+				}
+				if !deleted {
+					t.Errorf("%s: the removal's UPDATE did not delete its KEY", name)
+				}
+				if h.leaseManager.Get(node) != nil || h.timers.armed(node) {
+					t.Errorf("%s: in the lease store %v, timer armed %v, after the answer; want neither", name, h.leaseManager.Get(node) != nil, h.timers.armed(node))
+				}
+			}
+		})
+	}
+}
+
 // RFC 9665 S3.3.1.3 allows a Host Description without an address only in a removal (LEASE
 // 0): with a LEASE, the update is not an SRP Update, refused (S3.3.2), and nothing is sent.
 func TestSRPHandle_HostWithoutAddressNeedsLeaseZero(t *testing.T) {
