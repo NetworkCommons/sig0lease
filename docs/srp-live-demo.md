@@ -23,7 +23,7 @@ make build build-client
 ## 1. Start the proxy
 
 ```bash
-./bin/$(uname)/sig0lease
+./bin/$(uname -s | tr A-Z a-z)/sig0lease
 ```
 
 Leave this running in its own terminal. It listens on `:8053` and logs both `srp_handler`
@@ -34,7 +34,7 @@ and `update_handler` registering for opcode 5 (UPDATE).
 In another terminal, from `./main`:
 
 ```bash
-./bin/$(uname)/sig0lease-srp-client \
+./bin/$(uname -s | tr A-Z a-z)/sig0lease-srp-client \
   -domain=srp.dev.zenr.io. \
   -host=demo \
   -addr=192.0.2.42 \
@@ -77,11 +77,11 @@ narrower and wider shapes too, all against the same running proxy:
 
 ```bash
 # Host-only: no service instance at all, just an address record for the host
-./bin/$(uname)/sig0lease-srp-client -domain=srp.dev.zenr.io. -host=demo-host-only \
+./bin/$(uname -s | tr A-Z a-z)/sig0lease-srp-client -domain=srp.dev.zenr.io. -host=demo-host-only \
   -addr=192.0.2.43 -server=127.0.0.1:8053 -lease=60 -key-lease=120 -keystore=./keystore/client -k=13 -once
 
 # A DNS-SD subtype on the same instance (repeatable -subtype/-txt/-instance, matched by label)
-./bin/$(uname)/sig0lease-srp-client -domain=srp.dev.zenr.io. -host=demo \
+./bin/$(uname -s | tr A-Z a-z)/sig0lease-srp-client -domain=srp.dev.zenr.io. -host=demo \
   -addr=192.0.2.42 -instance=DemoWidget:_http._tcp:8080 \
   -subtype=DemoWidget:_printer -server=127.0.0.1:8053 -lease=60 -key-lease=120 -keystore=./keystore/client -once
 ```
@@ -171,7 +171,7 @@ Drop `-once` to watch the client run unattended: initial delay, then automatic r
 ~80% of the granted lease (RFC 9664 §5.2), forever, until you `Ctrl-C`:
 
 ```bash
-./bin/$(uname)/sig0lease-srp-client -domain=srp.dev.zenr.io. -host=demo -addr=192.0.2.42 \
+./bin/$(uname -s | tr A-Z a-z)/sig0lease-srp-client -domain=srp.dev.zenr.io. -host=demo -addr=192.0.2.42 \
   -instance=DemoWidget:_http._tcp:8080 -server=127.0.0.1:8053 \
   -lease=60 -key-lease=120 -keystore=./keystore/client
 ```
@@ -184,7 +184,7 @@ key). It fails -- FCFS rejects a second identity trying to claim a name the firs
 already holds:
 
 ```bash
-./bin/$(uname)/sig0lease-srp-client -domain=srp.dev.zenr.io. -host=demo -addr=192.0.2.99 \
+./bin/$(uname -s | tr A-Z a-z)/sig0lease-srp-client -domain=srp.dev.zenr.io. -host=demo -addr=192.0.2.99 \
   -server=127.0.0.1:8053 -lease=60 -key-lease=120 -keystore=$(mktemp -d) -k=13 -once
 ```
 
@@ -201,7 +201,7 @@ Explicitly withdraw the host and every instance in one message (`LEASE=0`), rath
 waiting for the short demo lease to expire:
 
 ```bash
-./bin/$(uname)/sig0lease-srp-client \
+./bin/$(uname -s | tr A-Z a-z)/sig0lease-srp-client \
   -domain=srp.dev.zenr.io. -host=demo \
   -instance=DemoWidget:_http._tcp:8080 \
   -server=127.0.0.1:8053 -keystore=./keystore/client \

@@ -9,3 +9,5 @@ __debug_bin*
 .vscode
 data
 .DS_Store
+demo/keys*
+demo/mac.yaml

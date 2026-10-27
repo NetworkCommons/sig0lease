@@ -23,6 +23,7 @@ package rfc9664
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"math/rand"
 	"slices"
@@ -192,6 +193,9 @@ func (c *Client) Run(ctx context.Context) error {
 	}.Run(ctx, c.register)
 }
 
+// errHeld is the error Run reports while another key holds the name (YXDOMAIN).
+var errHeld = errors.New("held by another key (YXDOMAIN)")
+
 // register is one of Run's registrations: an error unless the proxy accepted it.
 func (c *Client) register(ctx context.Context) (*dns.Msg, error) {
 	resp, outcome, err := c.Register(ctx)
@@ -199,7 +203,7 @@ func (c *Client) register(ctx context.Context) (*dns.Msg, error) {
 	case err != nil:
 		return nil, err
 	case outcome == baseclient.OutcomeConflict:
-		return resp, fmt.Errorf("rfc9664/client: %s is held by another key (YXDOMAIN); trying again later: the name is registered once that key's lease ends", c.name)
+		return resp, fmt.Errorf("rfc9664/client: %s is %w; trying again later: the name is registered once that key's lease ends", c.name, errHeld)
 	case outcome != baseclient.OutcomeSuccess:
 		return resp, fmt.Errorf("rfc9664/client: registering %s failed: %s", c.name, baseclient.DescribeAnswer(resp, outcome))
 	}

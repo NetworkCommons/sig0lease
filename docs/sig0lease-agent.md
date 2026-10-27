@@ -265,7 +265,8 @@ stored in links, IPNS paths and user IDs, which nothing would point at `mysite-2
 logs `mysite.dev.zenr.io. is held by another key (YXDOMAIN)` and tries the name again, with a
 backoff from 5 seconds up to 5 minutes, then on every refresh. If the holder is an old key of
 the agent's own (a keystore deleted or replaced), the name registers by itself once that key's
-lease ends.
+lease ends. Meanwhile nothing at the name is the agent's: a template change withdraws nothing
+from it, and stopping deregisters nothing (the agent logs `another key holds the name`).
 
 ## The state file
 

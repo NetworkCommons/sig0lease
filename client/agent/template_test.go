@@ -64,6 +64,22 @@ func TestLoad_ExampleTemplate(t *testing.T) {
 	}
 }
 
+// The demo's templates (docs/demo.md) stay valid: each an srp registrar with host demo and an
+// rfc9664 one with name demo, both through the proxy on the same machine.
+func TestLoad_DemoTemplates(t *testing.T) {
+	for _, file := range []string{"demo.yaml", "conflict.yaml"} {
+		p, err := Load(filepath.Join("..", "..", "demo", file))
+		if err != nil {
+			t.Fatalf("%s: %v", file, err)
+		}
+		if len(p.Registrars) != 2 || len(p.Registrars[0].Hosts) != 1 || p.Registrars[0].Hosts[0].Name != "demo" ||
+			len(p.Registrars[1].Names) != 1 || p.Registrars[1].Names[0].Name != "demo" ||
+			p.Registrars[0].Server != "127.0.0.1:8053" || p.Registrars[1].Server != "127.0.0.1:8053" {
+			t.Fatalf("%s: %+v, want host demo and name demo, through 127.0.0.1:8053", file, p.Registrars)
+		}
+	}
+}
+
 func TestParse_RegistrarDefaults(t *testing.T) {
 	r := mustParse(t, "registrars: [{protocol: srp, domain: srp.test}]\n").Registrars[0]
 	if r.Protocol != SRP || r.Domain != "srp.test." || r.Transport != baseclient.NetworkTCP || r.Server != "" || r.Resolvers != nil || r.Lifetime != (Lifetime{Lease: 3600, KeyLease: 1209600, KeepNames: true}) {

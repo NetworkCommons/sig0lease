@@ -95,10 +95,10 @@ func (m *memNames) state(name string) (bool, []string) {
 func startTestName(t *testing.T, reg *nameRegistrar, store NameStore, keepNames bool) *Name {
 	t.Helper()
 	cfg := testConfig(t, reg.Send)
-	// The initial 0-3s delay passes at once; the refresh wait lasts until the client is
-	// stopped.
+	// The initial 0-3s delay passes at once; a retry's backoff (5s and up) and the refresh
+	// wait last until the client is stopped.
 	cfg.Sleep = func(ctx context.Context, d time.Duration) error {
-		if d < 10*time.Second {
+		if d < 4*time.Second {
 			return ctx.Err()
 		}
 		<-ctx.Done()
@@ -158,6 +158,46 @@ func TestName_KeepNames(t *testing.T) {
 	n.Stop()
 	n.Wait()
 	expect(t, "update on Stop", reg.next(t), []string{siteA}, 0, 600)
+}
+
+// While the registrar answers that another key holds the name, nothing at it is the Name's:
+// a change of records withdraws nothing, and Stop deregisters nothing and records the name as
+// not held. Any other refusal leaves it unknown, so Stop deregisters.
+func TestName_HeldByAnotherKey(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		answer     *dns.Msg
+		deregister bool
+	}{
+		{"held by another key", clienttest.Answer(dns.RcodeYXDomain), false},
+		{"refused", clienttest.Answer(dns.RcodeRefused), true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			reg := newNameRegistrar()
+			reg.answer = tc.answer
+			store := newMemNames()
+			n := startTestName(t, reg, store, false)
+
+			n.Set(records(t, siteA, wwwA))
+			expect(t, "registration", reg.next(t), []string{siteA, wwwA}, 30, 600)
+			n.Set(records(t, siteA))
+			if !tc.deregister {
+				expect(t, "registration after the change", reg.next(t), []string{siteA}, 30, 600)
+			} else {
+				expect(t, "withdrawal", reg.next(t), []string{wwwA}, 0, 600)
+				expect(t, "registration after it", reg.next(t), []string{siteA}, 30, 600)
+			}
+			n.Stop()
+			n.Wait()
+			if tc.deregister {
+				expect(t, "update on Stop", reg.next(t), nil, 0, 0)
+			}
+			reg.none(t, 50*time.Millisecond)
+			if held, recs := store.state("site.example."); held || recs != nil {
+				t.Fatalf("store: held %v, records %q; want neither", held, recs)
+			}
+		})
+	}
 }
 
 // The records an earlier run registered, which Store kept, are withdrawn when the first Set

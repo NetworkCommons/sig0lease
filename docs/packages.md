@@ -758,6 +758,8 @@ type Name struct {
     lease clock), first withdrawing those that are gone, those Store kept from
     an earlier run included. No records means no registration: the name is
     deregistered, as it is when the Name stops (the Keeper's Stop and Wait).
+    While the registrar answers that another key holds the name, nothing at it
+    is this key's: no withdrawal or deregistration is sent.
 
 func StartName(cfg NameConfig) (*Name, error)
     StartName starts keeping cfg.Client's name registered. It registers nothing

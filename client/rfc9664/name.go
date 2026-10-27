@@ -2,6 +2,7 @@ package rfc9664
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"slices"
 	"strings"
@@ -39,11 +40,17 @@ type NameConfig struct {
 // the Name registers them (Client.Run, refreshing on the lease clock), first withdrawing those
 // that are gone, those Store kept from an earlier run included. No records means no
 // registration: the name is deregistered, as it is when the Name stops (the Keeper's Stop
-// and Wait).
+// and Wait). While the registrar answers that another key holds the name, nothing at it is
+// this key's: no withdrawal or deregistration is sent.
 type Name struct {
 	*baseclient.Keeper[[]dns.RR]
 	cfg     NameConfig
-	applied []dns.RR // what was last registered; nil: nothing
+	applied []dns.RR // what was last sent to be registered; nil: nothing
+	// heldByOther is whether the registrar's last answer to registering applied was that
+	// another key holds the name: then nothing at the name is this key's, to withdraw or
+	// deregister. The running client's callbacks write it; to and leave read it once the
+	// Keeper has stopped that client.
+	heldByOther bool
 }
 
 // StartName starts keeping cfg.Client's name registered. It registers nothing until the
@@ -102,16 +109,21 @@ func (n *Name) client(records []dns.RR) (*Client, error) {
 	c := n.cfg.Client
 	c.Records = records
 	c.OnRegistered = func(resp *dns.Msg) {
+		n.heldByOther = false
 		save(n.cfg, true, records)
 		lease, keyLease, _ := baseclient.GrantedLease(resp)
 		n.cfg.logf("registered %s, lease %ds, key lease %ds", describe(records), lease, keyLease)
 	}
-	c.OnError = func(err error) { n.cfg.logf("%v", err) }
+	c.OnError = func(err error) {
+		n.heldByOther = errors.Is(err, errHeld)
+		n.cfg.logf("%v", err)
+	}
 	return NewClient(c)
 }
 
 // to moves the name to next (Moves.To): it deregisters the name if next has no records, and
-// otherwise withdraws the records next lacks, then keeps next registered.
+// otherwise withdraws the records next lacks, unless another key holds the name, then keeps
+// next registered.
 func (n *Name) to(next []dns.RR) (func(context.Context), error) {
 	if len(next) == 0 {
 		err := n.leave()
@@ -122,7 +134,7 @@ func (n *Name) to(next []dns.RR) (func(context.Context), error) {
 	if err != nil {
 		return nil, err
 	}
-	if gone := Diff(n.applied, next); len(gone) > 0 {
+	if gone := Diff(n.applied, next); len(gone) > 0 && !n.heldByOther {
 		ctx, cancel := context.WithTimeout(context.Background(), n.cfg.StopTimeout)
 		_, outcome, err := c.Withdraw(ctx, gone)
 		cancel()
@@ -135,9 +147,15 @@ func (n *Name) to(next []dns.RR) (func(context.Context), error) {
 	}, nil
 }
 
-// leave deregisters what was last registered, if anything (Moves.Leave).
+// leave deregisters what was last registered, if anything (Moves.Leave): nothing when
+// another key holds the name.
 func (n *Name) leave() error {
 	if len(n.applied) == 0 {
+		return nil
+	}
+	if n.heldByOther {
+		n.cfg.logf("another key holds the name; nothing of this name's to deregister")
+		save(n.cfg, false, nil)
 		return nil
 	}
 	c, err := n.client(n.applied)

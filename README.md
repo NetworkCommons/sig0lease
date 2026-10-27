@@ -87,6 +87,9 @@ DNS update applied: zone=zenr.io. server=ns1.free2air.org:53 added test.dev.zenr
 
 ## 🎮 Quick start
 
+To see it working, a laptop publishing its site, services and a name on the live `zenr.io`
+zone, follow [docs/demo.md](docs/demo.md); `demo/run.sh` runs its first part in one terminal.
+
 ### Lease Registration of a named KEY Resource Record
 
 ```mermaid

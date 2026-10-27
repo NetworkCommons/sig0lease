@@ -1,0 +1,41 @@
+# The demo's template (docs/demo.md): the presenter's machine publishes itself on the live
+# zenr.io zone, through the proxy running on it.
+#
+#   sig0lease-agent run -probe-interval 5s demo/demo.yaml
+
+keystore: keys                          # demo/keys: one key per host and name, and the agent's state
+
+registrars:
+  # Found by browsing: srp.dev.zenr.io. and its services.
+  - protocol: srp
+    domain: srp.dev.zenr.io.
+    server: 127.0.0.1:8053              # the proxy on this machine; left empty, discovery would find
+                                        # another proxy serving the zone
+    lease: 10m
+    on_stop: release                       # stopping keeps the names for these keys; release frees them
+    hosts:
+      - name: demo                      # demo.srp.dev.zenr.io., this machine's addresses
+        addresses: [auto]
+        services:
+          - type: http                  # instance "demo http", registered while the site answers
+            port: 8000
+            txt: {path: /}
+            probe: {http: /}
+          - type: ipfs-gateway          # instance "demo ipfs-gateway": kubo's gateway, once it
+                                        # listens beyond 127.0.0.1 (docs/demo.md, D3)
+
+  # Typed or linked: demo.dev.zenr.io. and records under it.
+  - protocol: rfc9664
+    zone: dev.zenr.io.
+    server: 127.0.0.1:8053
+    lease: 10m
+    on_stop: release
+    names:
+      - name: demo
+        addresses: [auto]
+        records:
+          - '@ TXT "published by sig0lease-agent"'
+          # D3: the site's CID, from ipfs add -r -Q demo/site
+          # - '_dnslink TXT "dnslink=/ipfs/CID"'
+          # D1, during the demo: uncomment and save
+          # - 'hello TXT "added while the agent runs"'

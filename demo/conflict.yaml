@@ -1,0 +1,31 @@
+# A second identity wanting what demo.yaml holds (docs/demo.md, D1): the same host and name,
+# under other keys. The host is renamed (demo-2); the name is not, it is tried again later.
+#
+#   sig0lease-agent run demo/conflict.yaml
+
+keystore: keys-other
+
+registrars:
+  - protocol: srp
+    domain: srp.dev.zenr.io.
+    server: 127.0.0.1:8053
+    lease: 10m
+    on_stop: release                    # stopping frees whatever it got
+    hosts:
+      - name: demo
+        addresses: [auto]
+        services:
+          - type: http
+            port: 8000
+            txt: {path: /}
+            probe: {http: /}
+
+  - protocol: rfc9664
+    zone: dev.zenr.io.
+    server: 127.0.0.1:8053
+    lease: 10m
+    on_stop: release
+    names:
+      - name: demo
+        records:
+          - '@ TXT "the other key"'
