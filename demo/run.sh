@@ -1,10 +1,11 @@
 #!/bin/bash
-# demo/run.sh -- D1 of docs/demo.md in one terminal. It starts the proxy, the site and the agent
-# (demo/demo.yaml), runs D1's steps, each after Enter, and after each one waits until the zone's
-# authoritative server answers with the change, printing how long that took. The last Enter, or
-# Ctrl-C, stops the agents first, so they deregister what they published, then the site and the
-# proxy. The logs, and the agent's copy of the template that step 3 edits, go to a temporary
-# directory, printed at the start. Run it after make build build-client.
+# demo/run.sh -- D1 of docs/demo.md in one terminal, and D2 on a Mac. It starts the proxy, the
+# site and the agent (demo/demo.yaml), runs the steps, each after Enter, and after each one waits
+# until the zone's authoritative server answers with the change, printing how long that took.
+# The last Enter, or Ctrl-C, stops the agents first, so they deregister what they published, then
+# the site and the proxy. The logs, and the agent's copy of the template that step 3 edits, go to
+# a temporary directory, printed at the start. On a Mac it writes demo/mac.yaml, D2's template,
+# when there is none. Run it after make build build-client.
 #
 # NS, DOMAIN, ZONE and NAME change what it asks, as for watch.sh.
 
@@ -24,11 +25,33 @@ for bin in sig0lease sig0lease-agent; do
     fi
 done
 
+# D2's template names this Mac, so it is not in the repository.
+machost=
+if [ "$(uname -s)" = Darwin ]; then
+    machost="$(scutil --get LocalHostName)" || exit 1
+    if [ ! -e demo/mac.yaml ]; then
+        cat > demo/mac.yaml << EOF
+# This Mac's template (docs/demo.md, D2), written by demo/run.sh: the mDNS mirror publishes the
+# sharing services macOS advertises for $machost.local.
+keystore: keys-mac
+registrars:
+  - protocol: srp
+    domain: $domain.
+    server: 127.0.0.1:8053
+    lease: 10m
+    mirrors:
+      - type: mdns
+        hosts: [$machost.local.]
+        services: [_ssh._tcp, _smb._tcp, _rfb._tcp]
+EOF
+    fi
+fi
+
 # Each program runs in its own process group (set -m), so Ctrl-C reaches only this script, which
 # then stops them in order: the proxy has to outlive the agents' deregistrations.
 set -m
 log="$(mktemp -d "${TMPDIR:-/tmp}/sig0lease-demo.XXXXXX")" || exit 1
-proxy= site= agent= other=
+proxy= site= agent= other= mirror=
 
 # start <var> <log> <command...> -- runs the command in the background, its pid in <var>.
 start() {
@@ -59,6 +82,7 @@ finish() {
     echo
     echo "Stopping."
     stop other
+    stop mirror
     stop agent
     stop site
     stop proxy
@@ -77,6 +101,15 @@ ask() { dig +short +time=2 +tries=1 "@$ns" "$@"; }
 answers() { [ -n "$(ask "$@")" ]; }
 listed() { ask PTR "_http._tcp.$domain" | grep -qF "$1._http._tcp.$domain."; }
 not() { ! "$@"; }
+
+# mirrored <type> -- whether an instance of <type> on this Mac's host is listed.
+mirrored() {
+    local instance
+    for instance in $(ask PTR "$1.$domain"); do
+        ask SRV "$instance" | grep -qiF " $machost.$domain." && return 0
+    done
+    return 1
+}
 
 # wait_until <what> <command...> -- runs the command every second until it succeeds, and prints
 # how long that took; after 90 s it gives up, showing the agents' last log lines.
@@ -152,6 +185,19 @@ stop other
 wait_until "\"$name http-2\" is gone" not listed "$renamed"
 echo "  dig +short TXT $name.$zone: $(ask TXT "$name.$zone")"
 
-step "5. Stop the agent: it deregisters what it published; demo/keys keep the names."
+if [ -n "$machost" ]; then
+    step "5. This Mac's own services: a second agent (demo/mac.yaml) publishes what macOS advertises on the local network for $machost.local: Remote Login, File Sharing, Screen Sharing."
+    start mirror mac-agent.log "$B/sig0lease-agent" run demo/mac.yaml
+    wait_until "its Screen Sharing is listed" mirrored _rfb._tcp
+    echo
+    demo/watch.sh once
+    step "   Turn Screen Sharing off (System Settings > General > Sharing)."
+    wait_until "it is gone" not mirrored _rfb._tcp
+    step "   Turn it on again."
+    wait_until "it is listed" mirrored _rfb._tcp
+fi
+
+step "Last, stop the agents: they deregister what they published; their keys keep the names."
+stop mirror
 stop agent
 wait_until "\"$name http\" is gone" not listed "$instance"

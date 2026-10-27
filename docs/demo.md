@@ -37,8 +37,8 @@ D3.
    name's KEY. If another key holds them, change `name: demo` in `demo/demo.yaml` (both
    registrars) and run `watch.sh` with `NAME=<the new label>`.
 
-4. Rehearse once, with the same `demo/keys` you will use on the day. Those keys then hold the
-   names: the host for 14 days and the name for 30 minutes after the agent stops (the proxy's
+4. Rehearse once with `demo/run.sh`, with the same `demo/keys` you will use on the day. Those
+   keys then hold the names: the host for 14 days and the name for 30 minutes after the agent stops (the proxy's
    `config.yaml` caps an RFC 9664 key lease at 1800 s). Keep `demo/keys` until the demo.
 
 5. For D3, once: `ipfs init`, then let kubo's gateway listen beyond 127.0.0.1, so the agent's
@@ -48,32 +48,17 @@ D3.
    ipfs config Addresses.Gateway /ip4/0.0.0.0/tcp/8080
    ```
 
-6. For D2, write the Mac's template (it names this Mac, so it is not in the repository):
-
-   ```bash
-   cat > demo/mac.yaml <<EOF
-   keystore: keys-mac
-   registrars:
-     - protocol: srp
-       domain: srp.dev.zenr.io.
-       server: 127.0.0.1:8053
-       lease: 10m
-       mirrors:
-         - type: mdns
-           hosts: [$(scutil --get LocalHostName).local.]
-           services: [_ssh._tcp, _smb._tcp, _rfb._tcp]
-   EOF
-   ```
-
-   On first use macOS asks whether Terminal may find devices on the local network: allow it.
+6. For D2, the rehearsal on a Mac writes the Mac's template, `demo/mac.yaml`: it names this Mac,
+   so it is not in the repository. On first use macOS asks whether Terminal may find
+   devices on the local network: allow it.
 
 7. Record the rehearsal: if the venue's network blocks port 53, the recording is the demo.
 
 ## The terminals
 
-For D1 alone, one terminal is enough: `demo/run.sh` starts the proxy, the site and the agent,
-pauses before each step until Enter, and prints how long `ns1.free2air.org` took to show it. The
-last Enter, or Ctrl-C, stops everything. For the full demo, use these terminals:
+For D1, and D2 on a Mac, one terminal is enough: `demo/run.sh` starts the proxy, the site and
+the agents, pauses before each step until Enter, and prints how long `ns1.free2air.org` took to
+show it. The last Enter, or Ctrl-C, stops everything. For the full demo, use these terminals:
 
 | | Command | What it is |
 |---|---|---|
