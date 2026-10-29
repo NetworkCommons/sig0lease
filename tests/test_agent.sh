@@ -7,9 +7,10 @@
 # srp.test. and update.test. (lib/srp.sh, as test_srp.sh): validate and plan -> run registers
 # the template's hosts and services -> a
 # probed service that stops answering is withdrawn, and registered again when it answers ->
-# template edits are applied, an invalid one is ignored -> a name another key holds is renamed,
-# and the rename kept across a restart -> stopping deregisters everything, keeping the names for
-# the agent's keys (on_stop: keep) -> a host removed from the template frees its names, and with
+# template edits are applied, an invalid one is ignored -> a name another key holds is renamed;
+# a restart frees the rename's names and asks for the name again, renamed again while the other
+# key holds it, its own once that key frees it -> stopping deregisters everything, keeping the
+# names for the agent's keys (on_stop: keep) -> a host removed from the template frees its names, and with
 # on_stop: release so does stopping -> a host removed while the agent was stopped has its names
 # freed at the next start -> an RFC 9664 name is registered with its records, one another key
 # holds is tried again rather than renamed, stopping keeps the name and removing it frees it.
@@ -173,6 +174,13 @@ claim_as_holder() {
         -host="$1" -addr=192.0.2.70
 }
 
+# release_as_holder <host> -- the other key frees host (sig0lease-srp-client -deregister,
+# KEY-LEASE 0), as claim_as_holder.
+release_as_holder() {
+    "$SRP_CLIENT_BIN" -server="$SRP_PROXY_URL" -domain="$SRP_ZONE" -keystore="$HOLDER_KEY_DIR" -k=13 -deregister \
+        -host="$1"
+}
+
 # claim_name_as_holder <label> -- the other key registers <label>.NAME_ZONE with a TXT record
 # "holder" (sig0lease-client name -once, on client/rfc9664 as the agent's names are), printing
 # the proxy's answer; exits non-zero unless it is NOERROR.
@@ -303,8 +311,8 @@ EOF
     PERFORMED_TESTS="$PERFORMED_TESTS\n  [OK] $log_msg"
 }
 
-test_rename_kept() {
-    local log_msg="AGENT-TEST 5: a name another key holds is renamed, and the new name kept across a restart"
+test_rename_starts_over() {
+    local log_msg="AGENT-TEST 5: a name another key holds is renamed; a restart frees the rename's names and asks for the name again: renamed again while the other key holds it, its own once that key frees it"
     log_section "$log_msg"
 
     claim_as_holder taken || { log_error "the other key could not register taken.${SRP_ZONE}"; return 1; }
@@ -323,21 +331,36 @@ EOF
     [ "$(dig_srp "taken-2.${SRP_ZONE}" A)" = "192.0.2.77" ] || { log_error "taken-2 does not have the template's address"; return 1; }
     [ "$(dig_srp "taken.${SRP_ZONE}" A)" = "192.0.2.70" ] || { log_error "the other key's taken.${SRP_ZONE} changed"; return 1; }
     agent_log_has "taken: renamed: now host taken-2" || { log_error "the agent did not log the rename"; return 1; }
-    grep -qF '"host": "taken-2"' "$AGENT_DIR/keys/sig0lease-agent-state.json" || { log_error "the state file does not keep taken-2"; return 1; }
+    grep -qF '"host": "taken-2"' "$AGENT_DIR/keys/sig0lease-agent-state.json" || { log_error "the state file does not record taken held as taken-2"; return 1; }
 
     stop_agent || { log_error "the agent exited non-zero"; cat "$AGENT_LOG"; return 1; }
     wait_state "taken-2.${SRP_ZONE}" A absent || return 1
-    local out renames
-    renames="$(grep -cF "renamed: now" "$AGENT_LOG")"
-    start_agent
-    wait_state "taken-2.${SRP_ZONE}" A present || return 1
-    [ "$(grep -cF "renamed: now" "$AGENT_LOG")" = "$renames" ] || { log_error "the restarted agent renamed again"; return 1; }
-    agent_log_has "taken: registering the host alone at [192.0.2.77] (renamed: host taken-2)" \
-        || { log_error "the restarted agent's log does not say taken registers as taken-2"; return 1; }
+    [ -n "$(dig_srp "taken-2.${SRP_ZONE}" KEY)" ] || { log_error "taken-2's KEY went on stopping: on_stop: keep did not keep it"; return 1; }
+    local out renames registered
     out="$("$AGENT_BIN" plan "$AGENT_TEMPLATE")"
-    grep -qF "host taken.${SRP_ZONE}, registered as taken-2.${SRP_ZONE}" <<< "$out" || { log_error "plan does not show the rename:"; echo "$out"; return 1; }
+    grep -qF "renamed:   an earlier run's rename holds host taken-2.${SRP_ZONE}; run frees its names and asks for these again" <<< "$out" \
+        || { log_error "plan does not say taken-2 will be freed:"; echo "$out"; return 1; }
+    renames="$(grep -cF "taken: renamed: now host taken-2" "$AGENT_LOG")"
+    start_agent
+    wait_log "taken: renamed: now host taken-2" $(( renames + 1 )) || return 1
+    agent_log_has "taken: freeing host taken-2, held from an earlier run, to ask for the requested names again" \
+        || { log_error "the restarted agent did not log freeing taken-2"; return 1; }
+    wait_state "taken-2.${SRP_ZONE}" A present || return 1
 
-    log_success "taken became taken-2 beside the other key's taken, and stayed taken-2 after a restart"
+    stop_agent || { log_error "the agent exited non-zero"; cat "$AGENT_LOG"; return 1; }
+    wait_state "taken-2.${SRP_ZONE}" A absent || return 1
+    release_as_holder taken || { log_error "the other key could not free taken.${SRP_ZONE}"; return 1; }
+    wait_state "taken.${SRP_ZONE}" KEY absent || return 1
+    registered="$(grep -cF "taken: registered" "$AGENT_LOG")"
+    start_agent
+    wait_log "taken: registered" $(( registered + 1 )) || return 1
+    [ "$(dig_srp "taken.${SRP_ZONE}" A)" = "192.0.2.77" ] || { log_error "taken.${SRP_ZONE} does not have the template's address"; return 1; }
+    wait_state "taken-2.${SRP_ZONE}" KEY absent || return 1
+    if grep -qF '"host": "taken-2"' "$AGENT_DIR/keys/sig0lease-agent-state.json"; then
+        log_error "the state file still records taken-2"; return 1
+    fi
+
+    log_success "taken became taken-2 beside the other key's taken; a restart freed taken-2 and was renamed taken-2 again; once the other key freed taken, the next restart freed taken-2 and got taken"
     PERFORMED_TESTS="$PERFORMED_TESTS\n  [OK] $log_msg"
 }
 
@@ -350,15 +373,14 @@ test_stop_keeps_names() {
     for name in "Web._http._tcp" "Shell._ssh._tcp"; do
         wait_state "${name}.${SRP_ZONE}" SRV absent || return 1
     done
-    for host in agent1 taken-2; do
+    for host in agent1 taken; do
         wait_state "${host}.${SRP_ZONE}" A absent || return 1
     done
-    for name in agent1 taken-2 "Web._http._tcp" "Shell._ssh._tcp"; do
+    for name in agent1 taken "Web._http._tcp" "Shell._ssh._tcp"; do
         [ -n "$(dig_srp "${name}.${SRP_ZONE}" KEY)" ] || { log_error "${name}.${SRP_ZONE}'s KEY went: its name was not kept"; return 1; }
     done
     agent_log_has "agent1: deregistered \"Web\" _http._tcp, \"Shell\" _ssh._tcp; names kept for its key" \
         || { log_error "the agent did not log agent1 deregistering and keeping its names:"; cat "$AGENT_LOG"; return 1; }
-    [ "$(dig_srp "taken.${SRP_ZONE}" A)" = "192.0.2.70" ] || { log_error "the other key's taken.${SRP_ZONE} went too"; return 1; }
     local out
     if out="$(claim_as_holder agent1)"; then
         echo "$out"; log_error "the other key took agent1.${SRP_ZONE}, which the agent's key holds"; return 1
@@ -366,7 +388,7 @@ test_stop_keeps_names() {
     echo "$out"
     grep -q "Status: YXDOMAIN" <<< "$out" || { log_error "the other key's claim of agent1 was not refused with YXDOMAIN"; return 1; }
 
-    log_success "stopping the agent removed agent1, taken-2 and their services, kept their KEYs, so the other key could not take agent1"
+    log_success "stopping the agent removed agent1, taken and their services, kept their KEYs, so the other key could not take agent1"
     PERFORMED_TESTS="$PERFORMED_TESTS\n  [OK] $log_msg"
 }
 
@@ -378,7 +400,7 @@ test_names_freed() {
     renames="$(grep -cF "renamed: now" "$AGENT_LOG")"
     start_agent
     wait_state "agent1.${SRP_ZONE}" A present || return 1
-    wait_state "taken-2.${SRP_ZONE}" A present || return 1
+    wait_state "taken.${SRP_ZONE}" A present || return 1
     [ "$(grep -cF "renamed: now" "$AGENT_LOG")" = "$renames" ] || { log_error "the restarted agent renamed a host"; return 1; }
 
     registered="$(grep -cF "agent1: registered" "$AGENT_LOG")"
@@ -390,7 +412,7 @@ hosts:
       - {type: http, instance: Web, port: ${AGENT_HTTP_PORT}, txt: {path: /}, probe: {http: /health}}
       - {type: ssh, instance: Shell, port: 2222, probe: none}
 EOF
-    wait_state "taken-2.${SRP_ZONE}" KEY absent || return 1
+    wait_state "taken.${SRP_ZONE}" KEY absent || return 1
     agent_log_has "template: taken.${SRP_ZONE} removed; freeing its names" || { log_error "the agent did not log taken's removal"; return 1; }
     agent_log_has "template: the srp registrar for ${SRP_ZONE} changed" || { log_error "the agent did not log the registrar's change"; return 1; }
     wait_log "agent1: registered" $(( registered + 1 )) || return 1
@@ -401,7 +423,7 @@ EOF
     done
     claim_as_holder agent1 || { log_error "the other key could not take agent1.${SRP_ZONE}, which the agent released"; return 1; }
 
-    log_success "agent1 and taken-2 came back unrenamed; removing taken freed taken-2, and stopping with on_stop: release freed agent1 for the other key"
+    log_success "agent1 and taken came back unrenamed; removing taken freed it, and stopping with on_stop: release freed agent1 for the other key"
     PERFORMED_TESTS="$PERFORMED_TESTS\n  [OK] $log_msg"
 }
 
@@ -543,7 +565,7 @@ run_all_tests() {
     test_run_registers
     test_probe_withdraws_and_restores
     test_template_changes
-    test_rename_kept
+    test_rename_starts_over
     test_stop_keeps_names
     test_names_freed
     test_freed_after_restart

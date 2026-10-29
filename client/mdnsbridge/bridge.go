@@ -77,7 +77,7 @@ type Config struct {
 	// Key returns the signing key for a host's name in SRP.Domain, e.g. from a keystore
 	// (keyrec.ResolveOrCreateKey), so that a restarted bridge keeps its names.
 	Key func(owner string) (*keyrec.LoadedKey, error)
-	// Store, if set, keeps each host's labels across restarts, and whether its names are held
+	// Store, if set, keeps whether each host's names are held, and under which labels
 	// (clientsrp.HostConfig.Store).
 	Store clientsrp.HostStore
 	// Exclude lists host labels never to mirror, compared without regard to case: hosts

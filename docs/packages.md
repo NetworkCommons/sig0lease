@@ -245,11 +245,12 @@ CONSTANTS
 const StateFile = "sig0lease-agent-state.json"
     StateFile is the agent's state, in the keystore: every host it registered,
     mirrored ones included, by requested host name, while its names may be held
-    for its key or it was renamed, and every name, while it may be held or has
-    records registered. With it the agent frees the names of hosts and names
-    the template no longer registers, even after a restart (agent.release),
-    a renamed host keeps its new names, and a name's records the template no
-    longer has are withdrawn.
+    for its key, and under which labels if a rename changed any, and every name,
+    while it may be held or has records registered. With it the agent frees
+    the names of hosts and names the template no longer registers, even after
+    a restart (agent.release), a host restarted frees the names a rename held
+    before asking for its own again (clientsrp.StartHost), and a name's records
+    the template no longer has are withdrawn.
 
 
 FUNCTIONS
@@ -257,9 +258,9 @@ FUNCTIONS
 func Describe(w io.Writer, plan *Plan, interfaces func() ([]netip.Addr, error), logger *logging.Logger) error
     Describe writes what Run would register for plan. It reads, and changes
     nothing: this machine's addresses for auto (interfaces, InterfaceAddresses
-    if nil), the keys the keystore holds, and in StateFile the names hosts
-    were renamed to, and the hosts and names holding names that Run frees
-    (agent.release).
+    if nil), the keys the keystore holds, and in StateFile the names that Run
+    frees: those an earlier run's renames hold (clientsrp.StartHost), and those
+    of hosts and names the template no longer registers (agent.release).
 
 func InterfaceAddresses() ([]netip.Addr, error)
     InterfaceAddresses returns the addresses of every interface of this machine.
@@ -505,7 +506,7 @@ type Config struct {
 	// Key returns the signing key for a host's name in SRP.Domain, e.g. from a keystore
 	// (keyrec.ResolveOrCreateKey), so that a restarted bridge keeps its names.
 	Key func(owner string) (*keyrec.LoadedKey, error)
-	// Store, if set, keeps each host's labels across restarts, and whether its names are held
+	// Store, if set, keeps whether each host's names are held, and under which labels
 	// (clientsrp.HostConfig.Store).
 	Store clientsrp.HostStore
 	// Exclude lists host labels never to mirror, compared without regard to case: hosts
@@ -952,9 +953,10 @@ type Config struct {
 	MaxRenames int                // default 5 -- rename-retry attempts before giving up on YXDOMAIN
 
 	// Labels, if set, are the labels to register under instead of the requested ones: what an
-	// earlier Client renamed them to (Client.Labels, OnRenamed), so that a requester keeps its
-	// names across restarts. Each must be the label it stands for, or a rename of it. Entries
-	// for instances not in Instances are kept, for when those instances return.
+	// earlier Client renamed them to (Client.Labels, OnRenamed), so that a Host keeps its
+	// names from one registration to the next, and Release frees the names it holds. Each must
+	// be the label it stands for, or a rename of it. Entries for instances not in Instances are
+	// kept, for when those instances return.
 	Labels *Labels
 	// OnRenamed, if set, is called with the labels in use after every rename, from the
 	// goroutine registering (Run's, or Register's caller's).
@@ -1025,12 +1027,17 @@ type Host struct {
     refreshing on the lease clock), first withdrawing instances that are gone.
     No addresses means no registration: the host is deregistered (RFC 9665
     S3.3.1.3), as it is when the Host stops (the Keeper's Stop and Wait).
-    Labels carry over from one registration to the next, so a renamed host keeps
-    its names.
+    Labels carry over from one registration to the next, so a renamed host
+    keeps its names while it runs; a new Host asks for the requested names again
+    (StartHost).
 
 func StartHost(cfg HostConfig) (*Host, error)
     StartHost starts keeping cfg.Client.HostLabel registered. It registers
-    nothing until the first Set.
+    nothing until the first Set. Every Host asks for the requested names: if
+    cfg.Store says an earlier Host's rename holds names, kept when it stopped,
+    StartHost first frees them (Release), so that they are not held beside the
+    requested ones. If that fails, the Host registers under them, as its key
+    still holds them, and the next start tries again.
 
 func (h *Host) Set(addrs []netip.Addr, instances []InstanceConfig)
     Set replaces what the host should have registered with addrs and instances
@@ -1041,8 +1048,7 @@ type HostConfig struct {
 	// registrar, transport and leases. Key is required: a host keeps one identity. The Host
 	// sets Addresses, Instances, Labels, OnRenamed, OnRegistered and OnError.
 	Client Config
-	// Store, if set, keeps the host's labels, loaded at start and saved after every rename,
-	// and whether its names are held.
+	// Store, if set, keeps whether the host's names are held, and under which labels.
 	Store HostStore
 	// KeeperConfig: KeepNames applies to deregistering the host, on Stop or a Set with no
 	// addresses (Client.Deregister).
@@ -1051,20 +1057,19 @@ type HostConfig struct {
     HostConfig configures StartHost.
 
 type HostStore interface {
-	// Load returns the labels saved for the host whose requested name is host, or nil.
+	// Load returns the labels the names of the host whose requested name is host are held
+	// under, or nil if none are held.
 	Load(host string) *Labels
-	// Save records labels as the host's.
-	Save(host string, labels Labels) error
-	// Hold records whether the host's names are held for its key: true after every
-	// registration that succeeded, false once a deregistration freed them. A store need not
-	// write anything when nothing changes.
-	Hold(host string, held bool) error
+	// Hold records the labels the host's names are held under: after every registration that
+	// succeeded; nil once a deregistration freed them. A store need not write anything when
+	// nothing changes.
+	Hold(host string, labels *Labels) error
 }
-    HostStore keeps what a host needs across restarts: the labels it was renamed
-    to (see Labels), so that a host renamed once does not claim, and lose,
-    its requested names again on every start; and whether its names are held for
-    its key, so that a host no longer wanted can have them freed after a restart
-    (Release).
+    HostStore keeps what a host needs across restarts: whether its names are
+    held for its key, and under which labels (see Labels), so that they can
+    be freed after a restart: those of a host no longer wanted (Release),
+    and those a rename holds, as every start asks for the requested names again
+    (StartHost).
 
 type InstanceConfig struct {
 	Label       string   // single label, e.g. "My Printer" -- not a full instance name; NewClient rejects one containing "." (dnsname.CheckLabel)
@@ -1098,6 +1103,10 @@ type Labels struct {
     key holds the name it makes, to the requested label with "-2" appended,
     then "-3", and so on (see renameHeld); an instance absent from Instances is
     registered under its requested label.
+
+func (l Labels) Renamed(hostLabel string) bool
+    Renamed reports whether l differs from the requested labels: hostLabel for
+    the host, and each instance's own.
 
 ```
 

@@ -75,6 +75,20 @@ func (l Labels) clone() Labels {
 	return out
 }
 
+// Renamed reports whether l differs from the requested labels: hostLabel for the host, and
+// each instance's own.
+func (l Labels) Renamed(hostLabel string) bool {
+	if l.Host != hostLabel {
+		return true
+	}
+	for n, label := range l.Instances {
+		if label != n.Label {
+			return true
+		}
+	}
+	return false
+}
+
 // renameOf reports whether label is requested or a rename of it, as renameHeld makes them.
 func renameOf(requested, label string) bool {
 	if label == requested {
@@ -141,9 +155,10 @@ type Config struct {
 	MaxRenames int                // default 5 -- rename-retry attempts before giving up on YXDOMAIN
 
 	// Labels, if set, are the labels to register under instead of the requested ones: what an
-	// earlier Client renamed them to (Client.Labels, OnRenamed), so that a requester keeps its
-	// names across restarts. Each must be the label it stands for, or a rename of it. Entries
-	// for instances not in Instances are kept, for when those instances return.
+	// earlier Client renamed them to (Client.Labels, OnRenamed), so that a Host keeps its
+	// names from one registration to the next, and Release frees the names it holds. Each must
+	// be the label it stands for, or a rename of it. Entries for instances not in Instances are
+	// kept, for when those instances return.
 	Labels *Labels
 	// OnRenamed, if set, is called with the labels in use after every rename, from the
 	// goroutine registering (Run's, or Register's caller's).

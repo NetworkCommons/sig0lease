@@ -18,16 +18,21 @@ import (
 )
 
 // hostRegistrar records every update a Host's clients send. It answers YXDOMAIN to an update
-// whose host name is in taken, NOERROR to the rest.
+// whose host name is in taken, REFUSED to one whose host name is in refused, NOERROR to the
+// rest. taken and refused are set while no Host runs.
 type hostRegistrar struct {
-	sent  chan *dns.Msg
-	taken []string
+	sent    chan *dns.Msg
+	taken   []string
+	refused []string
 }
 
 func (r *hostRegistrar) Send(ctx context.Context, addr string, network baseclient.Network, msg *dns.Msg) (*dns.Msg, error) {
 	r.sent <- msg
-	if slices.Contains(r.taken, sentUpdate(msg).host) {
+	switch host := sentUpdate(msg).host; {
+	case slices.Contains(r.taken, host):
 		return clienttest.Answer(dns.RcodeYXDomain), nil
+	case slices.Contains(r.refused, host):
+		return clienttest.Answer(dns.RcodeRefused), nil
 	}
 	return clienttest.Granted(30, 1209600), nil
 }
@@ -87,44 +92,41 @@ func sentUpdate(m *dns.Msg) summary {
 	return s
 }
 
-// memStore is a HostStore in memory.
+// memStore is a HostStore in memory: the labels each host's names are held under.
 type memStore struct {
-	mu     sync.Mutex
-	labels map[string]Labels
-	held   map[string]bool
+	mu   sync.Mutex
+	held map[string]Labels
 }
 
 func newMemStore() *memStore {
-	return &memStore{labels: map[string]Labels{}, held: map[string]bool{}}
+	return &memStore{held: map[string]Labels{}}
 }
 
 func (m *memStore) Load(host string) *Labels {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	if l, ok := m.labels[host]; ok {
+	if l, ok := m.held[host]; ok {
 		return &l
 	}
 	return nil
 }
 
-func (m *memStore) Save(host string, labels Labels) error {
+func (m *memStore) Hold(host string, labels *Labels) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	m.labels[host] = labels
-	return nil
-}
-
-func (m *memStore) Hold(host string, held bool) error {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	m.held[host] = held
+	if labels == nil {
+		delete(m.held, host)
+	} else {
+		m.held[host] = *labels
+	}
 	return nil
 }
 
 func (m *memStore) isHeld(host string) bool {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	return m.held[host]
+	_, ok := m.held[host]
+	return ok
 }
 
 func startTestHost(t *testing.T, reg *hostRegistrar, store HostStore, query DNSQuery, logf func(string, ...any), keepNames bool) *Host {
@@ -248,11 +250,14 @@ func TestHost_KeepNames(t *testing.T) {
 	}
 }
 
-// A rename is saved, used by the next registration, and by the next Host on the same store.
-func TestHost_KeepsRenamedLabels(t *testing.T) {
+// A rename is used by the Host's next registrations, and recorded as the labels its names
+// are held under. A new Host on the same store first frees the names the rename holds, kept
+// when the first one stopped, then asks for the requested ones: it is renamed again while
+// another key holds them, and gets them once they are free.
+func TestHost_StartsOverAfterARename(t *testing.T) {
 	reg := &hostRegistrar{sent: make(chan *dns.Msg, 16), taken: []string{"box.srp.test."}}
 	store := newMemStore()
-	h := startTestHost(t, reg, store, heldBy("box.srp.test."), nil, false)
+	h := startTestHost(t, reg, store, heldBy("box.srp.test."), nil, true)
 
 	h.Set(boxAddr, nil)
 	if got := reg.next(t); got.host != "box.srp.test." {
@@ -261,32 +266,80 @@ func TestHost_KeepsRenamedLabels(t *testing.T) {
 	if got := reg.next(t); got.host != "box-2.srp.test." {
 		t.Fatalf("retry = %+v, want box-2", got)
 	}
-	if l := store.Load("box.srp.test."); l == nil || l.Host != "box-2" {
-		t.Fatalf("saved labels = %+v, want host box-2", l)
-	}
+	waitFor(t, "the names recorded as held under box-2", func() bool {
+		l := store.Load("box.srp.test.")
+		return l != nil && l.Host == "box-2"
+	})
 	h.Set(boxAddr, []InstanceConfig{{Label: "Web", ServiceType: "_http._tcp", Port: 80}})
 	if got := reg.next(t); got.host != "box-2.srp.test." {
 		t.Fatalf("next registration = %+v, want box-2 kept", got)
 	}
 	h.Stop()
 	h.Wait()
-	reg.next(t) // the deregistration
+	if got := reg.next(t); got.host != "box-2.srp.test." || len(got.addrs) != 0 || got.keyLease != 1209600 {
+		t.Fatalf("update on stopping = %+v, want box-2 deregistered keeping its names", got)
+	}
 
+	// box is still another key's: the new Host frees box-2, and is renamed box-2 again.
+	again := startTestHost(t, reg, store, heldBy("box.srp.test."), nil, true)
+	if got := reg.next(t); got.host != "box-2.srp.test." || len(got.addrs) != 0 || got.keyLease != 0 {
+		t.Fatalf("first update of a new Host = %+v, want box-2 freed (KEY-LEASE 0)", got)
+	}
+	again.Set(boxAddr, nil)
+	if got := reg.next(t); got.host != "box.srp.test." {
+		t.Fatalf("after freeing box-2, a new Host registered %+v, want box", got)
+	}
+	if got := reg.next(t); got.host != "box-2.srp.test." || len(got.addrs) == 0 {
+		t.Fatalf("retry = %+v, want box-2 registered", got)
+	}
+	again.Stop()
+	again.Wait()
+	reg.next(t) // the deregistration, keeping box-2
+
+	// box is free: the next Host frees box-2 and gets box.
+	reg.taken = nil
 	var logged []string
 	var mu sync.Mutex
-	again := startTestHost(t, reg, store, heldBy("box.srp.test."), func(format string, args ...any) {
+	third := startTestHost(t, reg, store, heldBy(), func(format string, args ...any) {
 		mu.Lock()
 		defer mu.Unlock()
 		logged = append(logged, fmt.Sprintf(format, args...))
-	}, false)
-	again.Set(boxAddr, nil)
-	if got := reg.next(t); got.host != "box-2.srp.test." {
-		t.Fatalf("a new Host on the same store registered %+v, want box-2", got)
+	}, true)
+	if got := reg.next(t); got.host != "box-2.srp.test." || got.keyLease != 0 {
+		t.Fatalf("first update of the third Host = %+v, want box-2 freed", got)
 	}
+	third.Set(boxAddr, nil)
+	if got := reg.next(t); got.host != "box.srp.test." || len(got.addrs) == 0 {
+		t.Fatalf("with box free, the third Host registered %+v, want box", got)
+	}
+	waitFor(t, "the names recorded as held under box", func() bool {
+		l := store.Load("box.srp.test.")
+		return l != nil && l.Host == "box"
+	})
 	mu.Lock()
 	defer mu.Unlock()
-	if !slices.ContainsFunc(logged, func(l string) bool { return strings.HasSuffix(l, "(renamed: host box-2)") }) {
-		t.Errorf("the registration's log line does not show the rename: %q", logged)
+	if want := "box: freeing host box-2, held from an earlier run, to ask for the requested names again"; !slices.Contains(logged, want) {
+		t.Errorf("the third Host did not log %q: %q", want, logged)
+	}
+}
+
+// A Host that cannot free the names an earlier rename holds registers under them, as its key
+// still holds them.
+func TestStartHost_KeepsARenameItCannotFree(t *testing.T) {
+	reg := &hostRegistrar{sent: make(chan *dns.Msg, 16), refused: []string{"box-2.srp.test."}}
+	store := newMemStore()
+	store.held["box.srp.test."] = Labels{Host: "box-2", Instances: map[InstanceName]string{}}
+	h := startTestHost(t, reg, store, heldBy(), nil, true)
+	if got := reg.next(t); got.host != "box-2.srp.test." || got.keyLease != 0 {
+		t.Fatalf("first update = %+v, want box-2 freed", got)
+	}
+	if !store.isHeld("box.srp.test.") {
+		t.Fatal("a refused release recorded the names as freed")
+	}
+	reg.refused = nil
+	h.Set(boxAddr, nil)
+	if got := reg.next(t); got.host != "box-2.srp.test." || len(got.addrs) == 0 {
+		t.Fatalf("registration = %+v, want box-2, which the key still holds", got)
 	}
 }
 
@@ -340,8 +393,7 @@ func TestRelease(t *testing.T) {
 				t.Fatalf("generate key: %v", err)
 			}
 			store := newMemStore()
-			store.labels["box.srp.test."] = Labels{Host: "box-2", Instances: map[InstanceName]string{}}
-			store.held["box.srp.test."] = true
+			store.held["box.srp.test."] = Labels{Host: "box-2", Instances: map[InstanceName]string{}}
 			var sent []summary
 			var logged []string
 			err = Release(HostConfig{

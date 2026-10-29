@@ -19,7 +19,7 @@ D3.
 
 ## Before the day
 
-1. Build, and name the binaries' directory:
+1. Build, and name the binaries' directory (`demo/run.sh` builds them itself):
 
    ```bash
    make build build-client
@@ -37,9 +37,9 @@ D3.
    name's KEY. If another key holds them, change `name: demo` in `demo/demo.yaml` (both
    registrars) and run `watch.sh` with `NAME=<the new label>`.
 
-4. Rehearse once with `demo/run.sh`, with the same `demo/keys` you will use on the day. Those
-   keys then hold the names: the host for 14 days and the name for 30 minutes after the agent stops (the proxy's
-   `config.yaml` caps an RFC 9664 key lease at 1800 s). Keep `demo/keys` until the demo.
+4. Rehearse once with `demo/run.sh`. Stopping frees the names (`on_stop: release` in every
+   registrar of the demo's templates), so someone else may take them before the day: check them
+   again then (step 3).
 
 5. For D3, once: `ipfs init`, then let kubo's gateway listen beyond 127.0.0.1, so the agent's
    probe and the audience on the same network reach it:
@@ -56,9 +56,10 @@ D3.
 
 ## The terminals
 
-For D1, and D2 on a Mac, one terminal is enough: `demo/run.sh` starts the proxy, the site and
-the agents, pauses before each step until Enter, and prints how long `ns1.free2air.org` took to
-show it. The last Enter, or Ctrl-C, stops everything. For the full demo, use these terminals:
+For D1, and D2 on a Mac, one terminal is enough: `demo/run.sh` builds the proxy and the clients,
+starts the proxy, the site and the agents, pauses before each step until Enter, and prints how
+long `ns1.free2air.org` took to show it. The last Enter, or Ctrl-C, stops everything. For the
+full demo, use these terminals:
 
 | | Command | What it is |
 |---|---|---|
@@ -169,10 +170,11 @@ To come: Prosody (XMPP) on the laptop, the agent publishing the name's `_xmpp-cl
 
 ## After the demo
 
-- Ctrl-C the agents, then the site, kubo and the proxy. The records go at once; the names stay
-  with `demo/keys`, the host for 14 days and the name for 30 minutes.
-- To leave the names free for someone else, set `on_stop: release` in both registrars of
-  `demo/demo.yaml` before stopping the agent.
+- Ctrl-C the agents, then the site, kubo and the proxy. The records go at once, and so do the
+  names (`on_stop: release`).
+- To hold the names for their keys after stopping instead, set `on_stop: keep` in the
+  registrars of `demo/demo.yaml` and `demo/mac.yaml`: a host for 14 days and a name for 30
+  minutes (the proxy's `config.yaml` caps an RFC 9664 key lease at 1800 s).
 - Undo D4's search domain.
 
 ## When something fails

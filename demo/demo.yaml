@@ -12,7 +12,7 @@ registrars:
     server: 127.0.0.1:8053              # the proxy on this machine; left empty, discovery would find
                                         # another proxy serving the zone
     lease: 10m
-    on_stop: release                       # stopping keeps the names for these keys; release frees them
+    on_stop: release                    # stopping frees the names; keep would hold them for demo/keys
     hosts:
       - name: demo                      # demo.srp.dev.zenr.io., this machine's addresses
         addresses: [auto]

@@ -539,8 +539,10 @@ func TestRun_FreesHostsRemovedWhileStopped(t *testing.T) {
 	}
 }
 
-// A host renamed because another key holds its name keeps the new name across restarts.
-func TestRun_KeepsRenamedNames(t *testing.T) {
+// A host renamed because another key holds its name keeps the new name while the agent
+// runs. A restart first frees the names the rename held, which on_stop: keep kept, then asks
+// for the host's own: it is renamed again while the other key holds it, and gets it once free.
+func TestRun_RenameLastsUntilARestart(t *testing.T) {
 	h := newHarness(t, srpTemplate("hosts: [{name: box, addresses: [192.0.2.1]}]\n"))
 	h.reg.taken = []string{"box.srp.test."}
 	query := heldBy("box.srp.test.")
@@ -548,15 +550,47 @@ func TestRun_KeepsRenamedNames(t *testing.T) {
 	h.until(t, "registering box-2", func(u update) bool { return u.host == "box-2.srp.test." && len(u.addrs) > 0 })
 	h.logs.waitFor(t, "box: renamed: now host box-2")
 	h.stop(t)
-	state, err := os.ReadFile(filepath.Join(h.dir, "keys", StateFile))
-	if err != nil || !strings.Contains(string(state), `"host": "box-2"`) {
-		t.Fatalf("state file: %v\n%s", err, state)
+	if u := h.until(t, "deregistering box-2", func(u update) bool { return len(u.addrs) == 0 }); u.host != "box-2.srp.test." || u.keyLease != 1209600 {
+		t.Fatalf("update on stopping %+v, want box-2 deregistered keeping its names", u)
 	}
-	h.until(t, "deregistering box-2", func(u update) bool { return u.host == "box-2.srp.test." && len(u.addrs) == 0 })
+	state, err := os.ReadFile(filepath.Join(h.dir, "keys", StateFile))
+	if err != nil || !strings.Contains(string(state), `"host": "box-2"`) || !strings.Contains(string(state), `"held": true`) {
+		t.Fatalf("state file, want box held as box-2: %v\n%s", err, state)
+	}
+	plan, err := Load(h.path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var out strings.Builder
+	if err := Describe(&out, plan, h.options().Interfaces, nil); err != nil {
+		t.Fatal(err)
+	}
+	if want := "renamed:   an earlier run's rename holds host box-2.srp.test.; run frees its names and asks for these again"; !strings.Contains(out.String(), want) {
+		t.Errorf("plan does not say %q:\n%s", want, out.String())
+	}
 
 	h.start(t, func(o *Options) { o.Query = query })
-	if u := h.until(t, "registering", func(u update) bool { return true }); u.host != "box-2.srp.test." {
-		t.Fatalf("after a restart, the first registration is %+v, want box-2", u)
+	if u := h.until(t, "the first update", func(update) bool { return true }); u.host != "box-2.srp.test." || len(u.addrs) != 0 || u.keyLease != 0 {
+		t.Fatalf("first update after a restart %+v, want box-2 freed", u)
+	}
+	if u := h.until(t, "the next update", func(update) bool { return true }); u.host != "box.srp.test." {
+		t.Fatalf("after freeing box-2, the restart registered %+v, want box", u)
+	}
+	h.until(t, "registering box-2 again", func(u update) bool { return u.host == "box-2.srp.test." && len(u.addrs) > 0 })
+	h.logs.waitFor(t, "box: registered")
+	if n := h.logs.count("box: renamed: now host box-2"); n != 2 {
+		t.Errorf("logged %d renames, want 2: one per start", n)
+	}
+	h.stop(t)
+	h.until(t, "deregistering box-2", func(u update) bool { return len(u.addrs) == 0 })
+
+	h.reg.taken = nil
+	h.start(t, func(o *Options) { o.Query = heldBy() })
+	if u := h.until(t, "the first update", func(update) bool { return true }); u.host != "box-2.srp.test." || u.keyLease != 0 {
+		t.Fatalf("first update after the second restart %+v, want box-2 freed", u)
+	}
+	if u := h.until(t, "registering", func(u update) bool { return len(u.addrs) > 0 }); u.host != "box.srp.test." {
+		t.Fatalf("with box free, the restart registered %+v, want box", u)
 	}
 }
 

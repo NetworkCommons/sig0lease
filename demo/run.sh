@@ -5,7 +5,7 @@
 # The last Enter, or Ctrl-C, stops the agents first, so they deregister what they published, then
 # the site and the proxy. The logs, and the agent's copy of the template that step 3 edits, go to
 # a temporary directory, printed at the start. On a Mac it writes demo/mac.yaml, D2's template,
-# when there is none. Run it after make build build-client.
+# when there is none. It builds the proxy and the clients first (make build build-client).
 #
 # NS, DOMAIN, ZONE and NAME change what it asks, as for watch.sh.
 
@@ -18,12 +18,8 @@ name="${NAME:-demo}"
 instance="$name\\032http"         # "demo http", as browsing lists it
 renamed="$name\\032http-2"        # the second key's
 
-for bin in sig0lease sig0lease-agent; do
-    if [ ! -x "$B/$bin" ]; then
-        echo "no $B/$bin: run make build build-client first" >&2
-        exit 1
-    fi
-done
+echo "Building the proxy and the clients."
+make -s build build-client || exit 1
 
 # D2's template names this Mac, so it is not in the repository.
 machost=
@@ -39,6 +35,7 @@ registrars:
     domain: $domain.
     server: 127.0.0.1:8053
     lease: 10m
+    on_stop: release
     mirrors:
       - type: mdns
         hosts: [$machost.local.]
@@ -197,7 +194,7 @@ if [ -n "$machost" ]; then
     wait_until "it is listed" mirrored _rfb._tcp
 fi
 
-step "Last, stop the agents: they deregister what they published; their keys keep the names."
+step "Last, stop the agents: they deregister what they published and free their names (on_stop: release)."
 stop mirror
 stop agent
 wait_until "\"$name http\" is gone" not listed "$instance"

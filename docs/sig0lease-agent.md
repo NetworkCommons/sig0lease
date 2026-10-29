@@ -26,7 +26,7 @@ test-agent` (`tests/test_agent.sh`, against the proxy and a local BIND 9).
 | Command | Does |
 |---|---|
 | `sig0lease-agent validate <template>` | Checks the template and lists every problem at once; exit 1 if there is any. |
-| `sig0lease-agent plan <template>` | Validates, then shows what `run` would register, registrar by registrar: hosts with their addresses (`auto` resolved now) and services with their TXT, subtypes and probes; names with their addresses and records; which keys exist, hosts renamed earlier, and the hosts and names holding names from an earlier run that `run` frees. Writes nothing. |
+| `sig0lease-agent plan <template>` | Validates, then shows what `run` would register, registrar by registrar: hosts with their addresses (`auto` resolved now) and services with their TXT, subtypes and probes; names with their addresses and records; which keys exist, and the names from an earlier run that `run` frees: those an earlier rename holds, and those of hosts and names the template no longer registers. Writes nothing. |
 | `sig0lease-agent run [-poll-interval=10s] [-probe-interval=30s] <template>` | Validates (and refuses to start on any problem), then registers and keeps registered until Ctrl-C or SIGTERM, which deregister everything. |
 | `sig0lease-agent types` | Lists the presets, with their fields, and the complex types. |
 | `sig0lease-agent mdns-list <template>` | Shows what the mDNS daemon sees, `*` marking what the template's `mdns` mirror would register. Registers nothing. |
@@ -256,8 +256,18 @@ key holds: `myhost` becomes `myhost-2`, then `myhost-3`; an instance likewise. I
 under the new names and logs `renamed: now host myhost-2`. If no name turns out to be held, it
 logs an error and tries again later; it does not guess.
 
-Renames are kept in the state file (below) and used from the next start on, so a renamed host
-does not ask for, and lose, its first name every time. `plan` shows them.
+A rename lasts while the agent runs: every start asks for the template's names again, as
+mDNSResponder's SRP client does, whose rename count lives in memory only. Hosts and services are
+found by browsing, not by name, so a name that changes from one start to the next costs little,
+while a rename kept for good would outlive its cause: a passing conflict, such as an old key of
+the agent's own whose lease has not ended yet, would rename the host for good. While another
+key still holds the name, each start is renamed again, to the same `myhost-2` if that is free.
+
+With `on_stop: keep`, a renamed host's stop keeps the names it had, `myhost-2`. The state file
+records them, and the next start frees them before asking for `myhost` (it logs `freeing host
+myhost-2, held from an earlier run, to ask for the requested names again`; `plan` says so
+beforehand). If freeing them fails, that start registers under them again, as the key still
+holds them, and the next one tries again.
 
 An RFC 9664 name is not renamed: RFC 9665 §3.2.5.2's other choice, giving up, applies. Hosts
 and services are found by browsing, so a renamed one is still found; a name is typed or
@@ -271,10 +281,10 @@ from it, and stopping deregisters nothing (the agent logs `another key holds the
 ## The state file
 
 `sig0lease-agent-state.json`, in the keystore, records each host the agent registered, the
-mirror's included, while its names may be held for its key or it was renamed, and each name
-while it may be held or has records registered: where it was registered (domain or zone,
-registrar, transport, resolvers), what registers it (`hosts:`, a mirror, or `names:`), whether
-its names are held, the names a host was renamed to, and a name's records. It is written
+mirror's included, while its names may be held for its key, and each name while it may be held
+or has records registered: where it was registered (domain or zone, registrar, transport,
+resolvers), what registers it (`hosts:`, a mirror, or `names:`), whether its names are held and,
+if a rename changed them, which ones, and a name's records. It is written
 atomically and checksummed, with the same code as the proxy's lease snapshots
 (`pkg/sealedfile`): a file edited by hand stops the agent at start.
 
@@ -294,20 +304,19 @@ tried again at the next start or template change; until then the names stay held
 key lease ends. A mirrored host that only stopped being advertised keeps its names, as
 `on_stop` says.
 
-To ask for the template's names again, stop the agent and delete the file. The agent then no
-longer knows the hosts and names it registered before: the names of those the template no
-longer has stay held until their key lease ends.
+Deleting the file is never needed to get the template's names back: every start asks for them.
+It only makes the agent forget the hosts and names it registered before, whose names then stay
+held until their key lease ends.
 
 A keystore changed while the agent was stopped is not seen either. The state file is in the
 keystore, and a start reads only the one in the keystore the template names now, so the hosts
 and names recorded in the old one are never freed: their names stay held until their key lease
 ends (14 days by default). The hosts the template still registers get new keys in the new
-keystore, while the old keys still hold their names, so they are renamed (`myhost-2`); the new
-state file keeps the rename, also once the old keys' lease has ended, until the file is deleted.
-The names the template still registers are tried again until the old keys' lease ends. To
-change keystores, change `keystore:` while the agent runs, which frees the hosts and names with
-the old keys before registering with the new ones, or move the directory itself, keys and state
-file together.
+keystore, while the old keys still hold their names, so they are renamed (`myhost-2`) until a
+start after the old keys' lease has ended. The names the template still registers are tried
+again until the old keys' lease ends. To change keystores, change `keystore:` while the agent
+runs, which frees the hosts and names with the old keys before registering with the new ones,
+or move the directory itself, keys and state file together.
 
 Run one agent per keystore.
 

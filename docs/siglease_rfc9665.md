@@ -596,7 +596,8 @@ off of.
   `pkg/srp/fcfs_test.go` the prerequisite for each state and policy and both prerequisites'
   wire encoding.
 - `make test-agent` runs `sig0lease-agent` against the same registrar and BIND 9: probes, template
-  reloads, a rename kept across restarts, and deregistration on stop (`tests/test_agent.sh`).
+  reloads, a rename lasting until a restart, which frees it and asks for the name again, and
+  deregistration on stop (`tests/test_agent.sh`).
 - `make test-mdnsresponder-interop` runs the same registrar, plus `client/srp`, against the
   real, unmodified Apple `mDNSResponder/ServiceRegistration` binaries (a sibling checkout, not
   vendored — see `tests/README.md` for setup and the exact pinned commit). It covers plain
@@ -689,8 +690,10 @@ Capabilities:
   `pkg/srp.KeysAllMatch`): each from its own requested label, to `<label>-2`, then `-3`, and so
   on. A conflict with no name held (the registrar and the resolvers disagree) is an error, and
   `Run` retries with backoff rather than guess. `Config.Labels` starts a client from earlier
-  renames and `Config.OnRenamed` reports each, so a caller can keep its names across restarts:
-  `sig0lease-agent` saves them (`docs/sig0lease-agent.md`).
+  renames and `Config.OnRenamed` reports each. `Host` keeps a rename while it runs, and records
+  the names it holds (`HostStore`), so that the next start frees a rename's before asking for
+  the requested names again: every start asks for them, as mDNSResponder's `srp-client` does
+  (`docs/sig0lease-agent.md`).
 - **Identity/keystore** — `-keystore=<dir>` with a `CLIENT_KEYSTORE_DIR` environment-variable
   fallback (the same convention as `cmd/sig0lease-client`); a missing key is an error unless
   `-k=13` (ECDSAP256SHA256) or `-k=15` (ED25519) is given, in which case one is generated for

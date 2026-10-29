@@ -10,8 +10,8 @@ import (
 	clientsrp "github.com/NetworkCommons/sig0lease/client/srp"
 )
 
-// The state file keeps a host while its names are held or it was renamed, and is read back
-// as written.
+// The state file keeps a host while its names are held, with the labels they are held under
+// if a rename changed any, and is read back as written.
 func TestHostStore(t *testing.T) {
 	dir := t.TempDir()
 	s, err := openHostStore(dir)
@@ -19,13 +19,13 @@ func TestHostStore(t *testing.T) {
 		t.Fatal(err)
 	}
 	v := s.view(sourceHosts, savedRegistrar{Domain: "srp.test.", Transport: baseclient.NetworkTLS})
-	if err := v.Hold("a.srp.test.", true); err != nil {
+	if err := v.Hold("a.srp.test.", &clientsrp.Labels{Host: "a"}); err != nil {
 		t.Fatal(err)
 	}
-	if err := v.Save("b.srp.test.", clientsrp.Labels{Host: "b-2"}); err != nil {
+	if err := v.Hold("b.srp.test.", &clientsrp.Labels{Host: "b-2"}); err != nil {
 		t.Fatal(err)
 	}
-	if err := v.Hold("c.srp.test.", false); err != nil {
+	if err := v.Hold("c.srp.test.", nil); err != nil {
 		t.Fatal(err)
 	}
 
@@ -34,8 +34,11 @@ func TestHostStore(t *testing.T) {
 		t.Fatal(err)
 	}
 	got := again.entries()
-	if e := got["a.srp.test."]; !e.Held || e.Source != sourceHosts || e.Registrar.Transport != baseclient.NetworkTLS {
-		t.Errorf("a = %+v, want held, from hosts, over tls", e)
+	if e := got["a.srp.test."]; !e.Held || e.Labels != nil || e.Source != sourceHosts || e.Registrar.Transport != baseclient.NetworkTLS {
+		t.Errorf("a = %+v, want held, no labels written, from hosts, over tls", e)
+	}
+	if l := again.labels("a.srp.test."); l == nil || l.Host != "a" {
+		t.Errorf("a's labels = %+v, want host a", l)
 	}
 	if l := again.labels("b.srp.test."); l == nil || l.Host != "b-2" {
 		t.Errorf("b's labels = %+v, want host b-2", l)
@@ -44,12 +47,12 @@ func TestHostStore(t *testing.T) {
 		t.Errorf("entries = %v, want a and b only", got)
 	}
 
-	// Freed, a holds nothing and was not renamed: it goes. Freed, b keeps its labels.
+	// Freed, a and b hold nothing: they go, b's rename with it.
 	v = again.view(sourceHosts, savedRegistrar{Domain: "srp.test.", Transport: baseclient.NetworkTLS})
-	if err := v.Hold("a.srp.test.", false); err != nil {
+	if err := v.Hold("a.srp.test.", nil); err != nil {
 		t.Fatal(err)
 	}
-	if err := v.Hold("b.srp.test.", false); err != nil {
+	if err := v.Hold("b.srp.test.", nil); err != nil {
 		t.Fatal(err)
 	}
 	if err := again.forget("x.srp.test."); err != nil {
@@ -59,8 +62,11 @@ func TestHostStore(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got := third.entries(); len(got) != 1 || got["b.srp.test."].Labels == nil || got["b.srp.test."].Held {
-		t.Errorf("entries = %v, want b alone, renamed and not held", got)
+	if got := third.entries(); len(got) != 0 {
+		t.Errorf("entries = %v, want none", got)
+	}
+	if l := third.labels("b.srp.test."); l != nil {
+		t.Errorf("b's labels after it was freed = %+v, want none", l)
 	}
 }
 
@@ -165,7 +171,7 @@ registrars:
 	s.hosts = map[string]savedHost{
 		"box.srp.test.":  {Source: sourceHosts, Registrar: here, Held: true},
 		"gone.srp.test.": {Source: sourceHosts, Registrar: here, Held: true},
-		"old.srp.test.":  {Source: sourceHosts, Registrar: here, Labels: &savedLabels{Host: "old-2"}},
+		"old.srp.test.":  {Source: sourceHosts, Registrar: here, Held: true, Labels: &savedLabels{Host: "old-2"}},
 	}
 	if got := s.unwanted(plan); !slices.Equal(got, []string{"gone.srp.test.", "old.srp.test."}) {
 		t.Errorf("unwanted = %v, want gone and old", got)

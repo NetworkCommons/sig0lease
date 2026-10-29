@@ -16,8 +16,9 @@ import (
 
 // Describe writes what Run would register for plan. It reads, and changes nothing: this
 // machine's addresses for auto (interfaces, InterfaceAddresses if nil), the keys the
-// keystore holds, and in StateFile the names hosts were renamed to, and the hosts and names
-// holding names that Run frees (agent.release).
+// keystore holds, and in StateFile the names that Run frees: those an earlier run's renames
+// hold (clientsrp.StartHost), and those of hosts and names the template no longer registers
+// (agent.release).
 func Describe(w io.Writer, plan *Plan, interfaces func() ([]netip.Addr, error), logger *logging.Logger) error {
 	if interfaces == nil {
 		interfaces = InterfaceAddresses
@@ -83,12 +84,13 @@ func Describe(w io.Writer, plan *Plan, interfaces func() ([]netip.Addr, error), 
 		for _, h := range r.Hosts {
 			owner := r.Owner(h.Name)
 			p("")
-			head := "host " + owner
-			saved := store.labels(owner)
-			if saved != nil && saved.Host != h.Name {
-				head += fmt.Sprintf(", registered as %s (renamed: the name was held)", r.Owner(saved.Host))
+			p("host %s", owner)
+			held := store.labels(owner)
+			if held != nil && held.Renamed(h.Name) {
+				p("  renamed:   an earlier run's rename holds host %s; run frees its names and asks for these again", r.Owner(held.Host))
+			} else {
+				held = nil
 			}
-			p("%s", head)
 			if err := key(owner); err != nil {
 				return err
 			}
@@ -102,9 +104,9 @@ func Describe(w io.Writer, plan *Plan, interfaces func() ([]netip.Addr, error), 
 			for _, s := range h.Services {
 				in := s.Instance
 				line := fmt.Sprintf("  service %q %s port %d, type %s, probe %s", in.Label, in.ServiceType, in.Port, s.Type, s.Probe)
-				if saved != nil {
-					if as, ok := saved.Instances[clientsrp.InstanceName{Label: in.Label, ServiceType: in.ServiceType}]; ok && as != in.Label {
-						line += fmt.Sprintf(", registered as %q (renamed)", as)
+				if held != nil {
+					if as, ok := held.Instances[clientsrp.InstanceName{Label: in.Label, ServiceType: in.ServiceType}]; ok && as != in.Label {
+						line += fmt.Sprintf(", held as %q from that rename", as)
 					}
 				}
 				p("%s", line)

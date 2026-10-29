@@ -20,11 +20,12 @@ import (
 )
 
 // StateFile is the agent's state, in the keystore: every host it registered, mirrored ones
-// included, by requested host name, while its names may be held for its key or it was
-// renamed, and every name, while it may be held or has records registered. With it the agent
-// frees the names of hosts and names the template no longer registers, even after a restart
-// (agent.release), a renamed host keeps its new names, and a name's records the template no
-// longer has are withdrawn.
+// included, by requested host name, while its names may be held for its key, and under which
+// labels if a rename changed any, and every name, while it may be held or has records
+// registered. With it the agent frees the names of hosts and names the template no longer
+// registers, even after a restart (agent.release), a host restarted frees the names a rename
+// held before asking for its own again (clientsrp.StartHost), and a name's records the
+// template no longer has are withdrawn.
 const StateFile = "sig0lease-agent-state.json"
 
 // sourceHosts is the source (savedHost.Source) of the template's own SRP hosts, and
@@ -47,8 +48,8 @@ type stateDoc struct {
 	Hosts map[string]savedHost `json:"hosts"`
 }
 
-// savedHost is one host's or name's entry, kept while its names are held, it was renamed, or
-// it has records registered.
+// savedHost is one host's or name's entry, kept while its names are held or it has records
+// registered.
 type savedHost struct {
 	// Source is what registers it: sourceHosts or sourceNames, or the type of the mirror that
 	// does. sourceNames is an RFC 9664 name, the others SRP hosts.
@@ -56,7 +57,8 @@ type savedHost struct {
 	// Registrar is where it was last registered: what freeing its names needs.
 	Registrar savedRegistrar `json:"registrar"`
 	// Held: a registration succeeded, and no deregistration has freed the names since.
-	Held   bool         `json:"held"`
+	Held bool `json:"held"`
+	// Labels are the labels a held host's names are held under, if a rename changed any.
 	Labels *savedLabels `json:"labels,omitempty"`
 	// Records are a name's records registered, in presentation format.
 	Records []string `json:"records,omitempty"`
@@ -152,23 +154,28 @@ func (s *hostStore) entry(host string) (savedHost, bool) {
 	return e, ok
 }
 
+// labels returns the labels host's names are held under, or nil if none are held.
 func (s *hostStore) labels(host string) *clientsrp.Labels {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	saved := s.hosts[host].Labels
-	if saved == nil {
+	e := s.hosts[host]
+	if !e.Held {
 		return nil
 	}
-	l := clientsrp.Labels{Host: saved.Host, Instances: map[clientsrp.InstanceName]string{}}
-	for _, i := range saved.Instances {
+	if e.Labels == nil {
+		label, _, _ := dnsname.CutFirstLabel(host)
+		return &clientsrp.Labels{Host: label, Instances: map[clientsrp.InstanceName]string{}}
+	}
+	l := clientsrp.Labels{Host: e.Labels.Host, Instances: map[clientsrp.InstanceName]string{}}
+	for _, i := range e.Labels.Instances {
 		l.Instances[clientsrp.InstanceName{Label: i.Label, ServiceType: i.ServiceType}] = i.As
 	}
 	return &l
 }
 
 // update applies change to host's entry, recording it as registered by source through
-// registrar, and writes the file if that changed anything. An entry left neither held,
-// renamed, nor with records is dropped.
+// registrar, and writes the file if that changed anything. An entry left neither held nor
+// with records is dropped.
 func (s *hostStore) update(host, source string, registrar savedRegistrar, change func(*savedHost)) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -176,7 +183,7 @@ func (s *hostStore) update(host, source string, registrar savedRegistrar, change
 	e := old
 	e.Source, e.Registrar = source, registrar
 	change(&e)
-	empty := !e.Held && e.Labels == nil && e.Records == nil
+	empty := !e.Held && e.Records == nil
 	switch {
 	case empty && !had:
 		return nil
@@ -211,19 +218,22 @@ type hostView struct {
 
 func (v hostView) Load(host string) *clientsrp.Labels { return v.s.labels(host) }
 
-func (v hostView) Save(host string, l clientsrp.Labels) error {
-	saved := &savedLabels{Host: l.Host}
-	for n, as := range l.Instances {
-		saved.Instances = append(saved.Instances, savedInstance{Label: n.Label, ServiceType: n.ServiceType, As: as})
+// Hold records l as the labels host's names are held under, written only if a rename
+// changed any; nil: none are held.
+func (v hostView) Hold(host string, l *clientsrp.Labels) error {
+	var saved *savedLabels
+	if label, _, _ := dnsname.CutFirstLabel(host); l != nil && l.Renamed(label) {
+		saved = &savedLabels{Host: l.Host}
+		for n, as := range l.Instances {
+			if as != n.Label {
+				saved.Instances = append(saved.Instances, savedInstance{Label: n.Label, ServiceType: n.ServiceType, As: as})
+			}
+		}
+		slices.SortFunc(saved.Instances, func(a, b savedInstance) int {
+			return strings.Compare(a.ServiceType+"\x00"+a.Label, b.ServiceType+"\x00"+b.Label)
+		})
 	}
-	slices.SortFunc(saved.Instances, func(a, b savedInstance) int {
-		return strings.Compare(a.ServiceType+"\x00"+a.Label, b.ServiceType+"\x00"+b.Label)
-	})
-	return v.s.update(host, v.source, v.registrar, func(e *savedHost) { e.Labels = saved })
-}
-
-func (v hostView) Hold(host string, held bool) error {
-	return v.s.update(host, v.source, v.registrar, func(e *savedHost) { e.Held = held })
+	return v.s.update(host, v.source, v.registrar, func(e *savedHost) { e.Held, e.Labels = l != nil, saved })
 }
 
 // nameView is the rfc9664.NameStore of the names registered through one registrar.

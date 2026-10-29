@@ -229,6 +229,7 @@ registrars:
   - protocol: srp
     domain: srp.dev.zenr.io.
     server: 127.0.0.1:8053
+    on_stop: release
     mirrors:
       - type: mdns
         hosts: [$(scutil --get LocalHostName).local.]
