@@ -14,7 +14,7 @@ KEYLEASE=${KEYLEASE:-"2500"}
 LEASE=${LEASE:-"1300"}
 
 # set srp registration domain
-DOMAIN=${DOMAIN:-"srp.dev.zenr.io"}
+DOMAIN=${DOMAIN:-"dev.zenr.io"}
 
 # set wg Service Host description defaults
 SERVER_HOSTNAME=${SERVER_HOSTNAME:-"vpn"}
