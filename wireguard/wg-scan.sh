@@ -55,7 +55,7 @@ echo "=== Browse Domains"
 
  HOSTNAME="myclient"
  SD_TYPE="_VPNServer._sub._wg._udp"
- SD_INSTANCE="myclient"
+ SD_INSTANCE="myclientservice"
  echo
  echo "*** HOST ${HOSTNAME}.${DOMAIN}"
  dig ${DIG_OPTIONS} @ns1.free2air.org ${HOSTNAME}.${DOMAIN}. any | grep -v RRSIG | grep -v NSEC

@@ -1,4 +1,7 @@
-#!/bin/bash
+#!/usr/bin/bash
+
+#!/bin/pkexec /usr/bin/bash
+
 # - bring up proxy manually with ./proxy.sh
 # - run this script
 DIR=$(uname | tr '[:upper:]' '[:lower:]')
@@ -7,8 +10,8 @@ GITDIR="$(git rev-parse --show-toplevel)"
 DIG_OPTIONS=${DIG_OPTIONS:-"+noall +answer @ns1.free2air.org"}
 
 # set DNS RFC9664 lease test defaults
-KEYLEASE=${KEYLEASE:-"250"}
-LEASE=${LEASE:-"130"}
+KEYLEASE=${KEYLEASE:-"2500"}
+LEASE=${LEASE:-"1300"}
 
 # set srp registration domain
 DOMAIN=${DOMAIN:-"srp.dev.zenr.io"}
@@ -18,7 +21,7 @@ SERVER_HOSTNAME=${SERVER_HOSTNAME:-"vpn"}
 SERVER_HOST_IP=${SERVER_HOST_IP:-"128.140.34.230"}
 
 # server wg Service Description defaults
-SERVER_SERVICE_NAME="myserver"
+SERVER_SERVICE_NAME=${SERVER_SERVICE_NAME:-"myservice"}
 SERVER_SD_TYPE="_wg._udp"
 
 # Set SRP Service Advertisement Details
@@ -66,7 +69,7 @@ echo
 CLIENT_HOSTNAME="myclient"
 CLIENT_HOST_IP="10.10.10.10"
 CLIENT_SD_TYPE="_wgpeer._udp"
-CLIENT_SERVICE_NAME="myclient"
+CLIENT_SERVICE_NAME=${CLIENT_SERVICE_NAME:-"myclientservice"}
 CLIENT_SUBTYPE=${SERVER_SERVICE_NAME}
 CLIENT_PUBKEY="mul5zgBo+f14SCYvsj6F1CJgZlO/LFm3dWJrRnCHZzQ="
 #
@@ -151,7 +154,7 @@ echo
 
 
 echo "****"
-echo "**** Step 4: CONFIGURE: CLIENT  watches ${CLIENT_SERVICE_NAME}._sub.${CONFIG_SD_TYPE}. It looks for entry where SRV target host is ${SERVER_HOSTNAME} and whose TXT peer= is its own key. It the sets: address addr peer key pk of WG server, endpoint= SRV target and port, AllowedIPs to allowed="
+echo "**** Step 4: CONFIGURE: CLIENT  watches ${SERVER_SERVICE_NAME}-${CLIENT_SERVICE_NAME}._sub.${CONFIG_SD_TYPE}. It looks for entry where SRV target host is ${SERVER_HOSTNAME} and whose TXT peer= is its own key. It the sets: address addr peer key pk of WG server, endpoint= SRV target and port, AllowedIPs to allowed="
 echo "****"
 
 
