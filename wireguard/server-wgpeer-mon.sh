@@ -9,8 +9,12 @@
 
 # set defaults of any required ENV var that isn't set
 
+# BROWSE dig options
+BROWSE_DIG_OPTIONS=${BROWSE_DIG_OPTIONS:-"+noall +answer @ns1.free2air.org"}
 # dig util options
 DIG_OPTIONS=${DIG_OPTIONS:-"+noall +answer +short @ns1.free2air.org"}
+
+
 
 source ./env
 
@@ -54,8 +58,22 @@ echo
 
 while true
 do
+
+    echo "=== Browse Domains"
+    dig ${BROWSE_DIG_OPTIONS} b._dns-sd._udp.${DOMAIN}. PTR
+    dig ${BROWSE_DIG_OPTIONS} db._dns-sd._udp.${DOMAIN}. PTR
+    dig ${BROWSE_DIG_OPTIONS} lb._dns-sd._udp.${DOMAIN}. PTR
+    dig ${BROWSE_DIG_OPTIONS} r._dns-sd._udp.${DOMAIN}. PTR
+    dig ${BROWSE_DIG_OPTIONS} dr._dns-sd._udp.${DOMAIN}. PTR
+
+    echo
+    echo "=== ACTIVE SERVICE TYPES IN ${DOMAIN}"
+    dig ${DIG_OPTIONS} +short @ns1.free2air.org _services._dns-sd._udp.${DOMAIN}. PTR | grep -v RRSIG | grep -v NSEC
+    echo
+
+
     CLIENT_REQUESTS=`dig ${DIG_OPTIONS} ${REQ_SERVICE_TYPE}.${DOMAIN} PTR | grep -v RRSIG | grep -v NSEC`
-    echo "*ALL* SERVICE CLIENT_REQUESTS WITHIN DOMAIN ${DOMAIN}:"
+    echo "*ALL* WIREGUARD SERVICE CLIENT_REQUESTS WITHIN DOMAIN ${DOMAIN}:"
     echo "${CLIENT_REQUESTS}"
     echo
     # 
