@@ -8,33 +8,47 @@ import (
 	"net/http"
 	"net/netip"
 	"strings"
+	"sync"
 	"time"
 )
 
-// probe checks that the service answers at one of addrs, port port: it passes at the first
-// address that does, each tried for at most timeout.
+// probe checks that the service answers at one of addrs, port port: it tries them all at once,
+// each for at most timeout, and passes as soon as one answers.
 func probe(ctx context.Context, p Probe, addrs []netip.Addr, port uint16, timeout time.Duration) error {
 	if len(addrs) == 0 {
 		return errors.New("the host has no address to probe")
 	}
-	var errs []string
-	for _, a := range addrs {
-		target := netip.AddrPortFrom(a, port).String()
-		var err error
-		switch p.Kind {
-		case ProbeTCP:
-			err = probeTCP(ctx, target, timeout)
-		case ProbeHTTP:
-			err = probeHTTP(ctx, target, p.Path, timeout)
-		default:
-			panic(fmt.Sprintf("agent: probe of kind %d", p.Kind))
-		}
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	errs := make([]error, len(addrs))
+	var wg sync.WaitGroup
+	for i, a := range addrs {
+		wg.Go(func() {
+			if errs[i] = probeAt(ctx, p, netip.AddrPortFrom(a, port).String(), timeout); errs[i] == nil {
+				cancel() // the others need not finish
+			}
+		})
+	}
+	wg.Wait()
+	msgs := make([]string, len(errs))
+	for i, err := range errs {
 		if err == nil {
 			return nil
 		}
-		errs = append(errs, err.Error())
+		msgs[i] = err.Error()
 	}
-	return errors.New(strings.Join(errs, "; "))
+	return errors.New(strings.Join(msgs, "; "))
+}
+
+func probeAt(ctx context.Context, p Probe, target string, timeout time.Duration) error {
+	switch p.Kind {
+	case ProbeTCP:
+		return probeTCP(ctx, target, timeout)
+	case ProbeHTTP:
+		return probeHTTP(ctx, target, p.Path, timeout)
+	default:
+		panic(fmt.Sprintf("agent: probe of kind %d", p.Kind))
+	}
 }
 
 func probeTCP(ctx context.Context, target string, timeout time.Duration) error {

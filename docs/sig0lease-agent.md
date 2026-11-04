@@ -110,7 +110,7 @@ services, sent in one registration.
 | Field | Meaning |
 |---|---|
 | `name` | The host label: letters, digits and hyphens, not starting or ending with a hyphen (RFC 952, RFC 1123; BIND refuses other host names by default). Unique in its registrar, ignoring case. |
-| `addresses` | At least one: `auto`, IP addresses, or both. `auto` is this machine's addresses, without loopback and link-local ones, read again at every poll: a change is registered. A literal address may be any but unspecified, multicast or zoned (loopback is allowed, for tests). |
+| `addresses` | At least one: `auto`, IP addresses, or both. `auto` is this machine's addresses, read again at every poll: a change is registered. It leaves out loopback and link-local addresses, and, on Linux and macOS, IPv6 addresses that are temporary (privacy addresses, RFC 8981), not usable yet or at all (tentative, duplicate, detached) or anycast, as mDNSResponder's SRP client does on macOS; elsewhere temporary addresses are published too. A literal address may be any but unspecified, multicast or zoned (loopback is allowed, for tests). |
 | `services` | The host's services. None: the host is registered alone, with its addresses. |
 | `lease`, `key_lease`, `on_stop` | As in the registrar, for this host only. Left out: the registrar's. |
 
@@ -162,8 +162,8 @@ one, `mdns`.
 | `{tcp: true}` | A TCP connection to the port succeeds. |
 | `{http: /path}` | A plain HTTP `GET` of the path answers 2xx or 3xx. A redirect is not followed. |
 
-A probe tries the host's addresses in turn and passes at the first that answers, each attempt
-taking at most 5 seconds. A probed service is registered only once a probe passes. It is probed
+A probe tries all the host's addresses at once and passes as soon as one answers; it takes at
+most 5 seconds. A probed service is registered only once a probe passes. It is probed
 every 30 seconds (`run -probe-interval`); after 3 failures in a row it is withdrawn, and at the
 next pass registered again. The agent logs the first failure, each failure that counts towards
 a withdrawal, the withdrawal and the return.

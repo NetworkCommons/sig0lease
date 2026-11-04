@@ -279,7 +279,12 @@ func Describe(w io.Writer, plan *Plan, interfaces func() ([]netip.Addr, error), 
     of hosts and names the template no longer registers (agent.release).
 
 func InterfaceAddresses() ([]netip.Addr, error)
-    InterfaceAddresses returns the addresses of every interface of this machine.
+    InterfaceAddresses returns the addresses of every interface of this machine,
+    but for the IPv6 ones not to publish, as mDNSResponder's SRP client
+    leaves them out on macOS: temporary addresses (RFC 8981), there so that
+    the machine's connections cannot be linked to it, and those not usable,
+    yet or at all (tentative, duplicate, detached), or anycast. Linux and macOS
+    tell them apart (unpublishedIPv6); elsewhere every address is returned.
 
 func Run(ctx context.Context, path string, opts Options) error
     Run keeps what the template at path describes registered until ctx ends,
@@ -339,17 +344,17 @@ type Options struct {
 	// PollInterval is how often the template and this machine's addresses are read again;
 	// default 10s.
 	PollInterval time.Duration
-	// A probed service is probed every ProbeInterval (default 30s), each attempt taking at
-	// most ProbeTimeout (5s) per address, and withdrawn after ProbeFailures (3) failures in a
-	// row. It is registered once a probe passes.
+	// A probed service is probed every ProbeInterval (default 30s), each attempt trying all
+	// its addresses at once for at most ProbeTimeout (5s), and withdrawn after ProbeFailures
+	// (3) failures in a row. It is registered once a probe passes.
 	ProbeInterval time.Duration
 	ProbeTimeout  time.Duration
 	ProbeFailures int
 	// Settle and StopTimeout are each host's and name's (client.KeeperConfig).
 	Settle      time.Duration
 	StopTimeout time.Duration
-	// Interfaces returns this machine's addresses, for addresses: [auto]; default those of
-	// every interface. Only publishable ones are used (clientsrp.PublishableAddresses).
+	// Interfaces returns this machine's addresses, for addresses: [auto]; default
+	// InterfaceAddresses. Only publishable ones are used (clientsrp.PublishableAddresses).
 	Interfaces func() ([]netip.Addr, error)
 	// Send, Query and Sleep are every SRP client's (clientsrp.Config), Send and Sleep every
 	// RFC 9664 client's too (rfc9664.Config); nil: the clients' own.

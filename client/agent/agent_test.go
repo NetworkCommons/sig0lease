@@ -14,6 +14,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -863,5 +864,44 @@ func TestProbe(t *testing.T) {
 	}
 	if err := probe(ctx, Probe{Kind: ProbeTCP}, nil, ap.Port(), time.Second); err == nil {
 		t.Error("probe with no address passed")
+	}
+}
+
+// TestProbe_TriesAddressesAtOnce: a probe takes at most its timeout however many addresses do
+// not answer (a Mac in stealth mode lets connections to a stopped service time out), and passes
+// as soon as one answers. The same address stands for several, one connection each.
+func TestProbe_TriesAddressesAtOnce(t *testing.T) {
+	var requests atomic.Int32
+	var hangFirst atomic.Bool
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if n := requests.Add(1); !hangFirst.Load() || n == 1 {
+			<-r.Context().Done() // never answers; done once the probe gives up
+		}
+	}))
+	defer srv.Close()
+	ap := netip.MustParseAddrPort(srv.Listener.Addr().String())
+	ctx := context.Background()
+	get := Probe{Kind: ProbeHTTP, Path: "/"}
+
+	start := time.Now()
+	err := probe(ctx, get, []netip.Addr{ap.Addr(), ap.Addr(), ap.Addr()}, ap.Port(), time.Second)
+	if err == nil {
+		t.Fatal("probe of addresses that never answer passed")
+	}
+	if took := time.Since(start); took >= 2*time.Second {
+		t.Errorf("probe of 3 addresses that never answer took %v, want about its 1s timeout", took)
+	}
+	if n := strings.Count(err.Error(), "Client.Timeout exceeded"); n != 3 {
+		t.Errorf("probe error has %d timeouts, want one per address: %v", n, err)
+	}
+
+	hangFirst.Store(true)
+	requests.Store(0)
+	start = time.Now()
+	if err := probe(ctx, get, []netip.Addr{ap.Addr(), ap.Addr()}, ap.Port(), 5*time.Second); err != nil {
+		t.Fatalf("probe with one address that answers: %v", err)
+	}
+	if took := time.Since(start); took >= 2*time.Second {
+		t.Errorf("probe with one address that answers took %v; it waited for the one that does not", took)
 	}
 }

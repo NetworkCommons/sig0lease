@@ -91,7 +91,9 @@ gives the current answer.
    `watch.sh` shows the instance `demo http` under `_http._tcp`, and the name's addresses and
    TXT. `demo ipfs-gateway` waits for D3: its probe fails until kubo's gateway answers.
 2. Stop the site (Ctrl-C in terminal 2). After three failed probes, about 15 s, `demo http`
-   leaves the browse results. Start it again: it is back within about 10 s.
+   leaves the browse results; about 30 s on a Mac whose firewall is in stealth mode, where a
+   stopped site's port does not refuse connections, so each probe waits its 5 s out. Start it
+   again: it is back within about 10 s.
 3. In `demo/demo.yaml`, uncomment the `hello` record and save. Within 15 s (the agent reads the
    template every 10 s):
 

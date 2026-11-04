@@ -32,17 +32,17 @@ type Options struct {
 	// PollInterval is how often the template and this machine's addresses are read again;
 	// default 10s.
 	PollInterval time.Duration
-	// A probed service is probed every ProbeInterval (default 30s), each attempt taking at
-	// most ProbeTimeout (5s) per address, and withdrawn after ProbeFailures (3) failures in a
-	// row. It is registered once a probe passes.
+	// A probed service is probed every ProbeInterval (default 30s), each attempt trying all
+	// its addresses at once for at most ProbeTimeout (5s), and withdrawn after ProbeFailures
+	// (3) failures in a row. It is registered once a probe passes.
 	ProbeInterval time.Duration
 	ProbeTimeout  time.Duration
 	ProbeFailures int
 	// Settle and StopTimeout are each host's and name's (client.KeeperConfig).
 	Settle      time.Duration
 	StopTimeout time.Duration
-	// Interfaces returns this machine's addresses, for addresses: [auto]; default those of
-	// every interface. Only publishable ones are used (clientsrp.PublishableAddresses).
+	// Interfaces returns this machine's addresses, for addresses: [auto]; default
+	// InterfaceAddresses. Only publishable ones are used (clientsrp.PublishableAddresses).
 	Interfaces func() ([]netip.Addr, error)
 	// Send, Query and Sleep are every SRP client's (clientsrp.Config), Send and Sleep every
 	// RFC 9664 client's too (rfc9664.Config); nil: the clients' own.
@@ -81,18 +81,46 @@ func (o *Options) defaults() {
 	}
 }
 
-// InterfaceAddresses returns the addresses of every interface of this machine.
+// InterfaceAddresses returns the addresses of every interface of this machine, but for the IPv6
+// ones not to publish, as mDNSResponder's SRP client leaves them out on macOS: temporary
+// addresses (RFC 8981), there so that the machine's connections cannot be linked to it, and
+// those not usable, yet or at all (tentative, duplicate, detached), or anycast. Linux and macOS
+// tell them apart (unpublishedIPv6); elsewhere every address is returned.
 func InterfaceAddresses() ([]netip.Addr, error) {
-	ifAddrs, err := net.InterfaceAddrs()
+	ifis, err := net.Interfaces()
 	if err != nil {
 		return nil, err
 	}
+	unpublished, done, err := unpublishedIPv6()
+	if err != nil {
+		return nil, fmt.Errorf("reading the IPv6 addresses' flags: %w", err)
+	}
+	defer done()
 	var out []netip.Addr
-	for _, a := range ifAddrs {
-		if n, ok := a.(*net.IPNet); ok {
-			if ip, ok := netip.AddrFromSlice(n.IP); ok {
-				out = append(out, ip.Unmap())
+	for _, ifi := range ifis {
+		ifAddrs, err := ifi.Addrs()
+		if err != nil {
+			return nil, fmt.Errorf("%s: %w", ifi.Name, err)
+		}
+		for _, a := range ifAddrs {
+			n, ok := a.(*net.IPNet)
+			if !ok {
+				continue
 			}
+			ip, ok := netip.AddrFromSlice(n.IP)
+			if !ok {
+				continue
+			}
+			if ip = ip.Unmap(); ip.Is6() && ip.IsGlobalUnicast() {
+				skip, err := unpublished(ifi, ip)
+				if err != nil {
+					return nil, fmt.Errorf("%s on %s: %w", ip, ifi.Name, err)
+				}
+				if skip {
+					continue
+				}
+			}
+			out = append(out, ip)
 		}
 	}
 	return out, nil
