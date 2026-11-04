@@ -8,7 +8,8 @@ a template, a YAML file listing registrars and what each registers, and register
 - names and their records through this project's proxy with `update_handler` (RFC 9664 with
   `fcfs_naming`): names people type or link, such as a web address, a DNSLink path or a Matrix
   ID, and the services found at a name by SRV records, such as an XMPP server, with a TLSA
-  record for its certificate (DANE).
+  record for its certificate (DANE), or an IPFS node's addresses and a folder it keeps, or
+  follows (DNSLink).
 
 It then keeps the registrations alive, follows the template as it changes, and deregisters
 everything when it stops. Services are described by type: a template names a built-in preset
@@ -19,8 +20,9 @@ the same libraries, as their flags say; the agent keeps a template's worth, and 
 
 Code: `client/agent` (template, run loop, probes, state), `cmd/sig0lease-agent`; each host is
 a `client/srp` `Host`, each name a `client/rfc9664` `Name` (both on `client.Keeper`), the
-`mdns` mirror is `client/mdnsbridge`. Tests: `go test -race ./client/agent` and `make
-test-agent` (`tests/test_agent.sh`, against the proxy and a local BIND 9).
+`mdns` mirror is `client/mdnsbridge`, a name's IPFS node is asked through `client/kubo`.
+Tests: `go test -race ./client/agent` and `make test-agent` (`tests/test_agent.sh`, against the
+proxy and a local BIND 9).
 
 ## Commands
 
@@ -215,10 +217,11 @@ KEY and the records, on the registrar's leases (the handler's Case A).
 | `addresses` | `auto`, IP addresses, or both, as a host's: registered as A and AAAA records at the name. Optional. |
 | `records` | `"<owner> <type> <data>"`, the owner `@` for the name itself or relative to it (`_dnslink`, `www`), the data in zone-file format. At or below the name, class IN, no KEY or SIG, no A or AAAA at the name (`addresses:` has those). Each once. |
 | `services` | Services found at the name by SRV records (below). They need `addresses:`, which the SRV records point at. |
+| `ipfs` | An IPFS node whose addresses, and a folder it keeps or follows, the name publishes (see "A name's IPFS node"). |
 | `lease`, `key_lease`, `on_stop` | As in the registrar, for this name only. Left out: the registrar's. |
 
-A name needs an address or a record. With only `auto` and no address to publish, the agent
-registers nothing for it until the machine has one. A name's records the template or the
+A name needs an address, a record or `ipfs:`. With only `auto` and no address to publish, the
+agent registers nothing for it until the machine has one. A name's records the template or the
 machine no longer has are withdrawn (Case D: LEASE 0 with them listed, the KEY refreshed) before
 the rest is registered again; a record's TTL is the client's 300 seconds, which the proxy may
 override (`record_ttl_sec`).
@@ -265,6 +268,53 @@ cannot yet, as `tlsa` takes one certificate. It is seldom needed: the record mat
 the certificate, whose dates and serial number change at every renewal, so a certificate renewed
 with the same key (certbot's `--reuse-key`, say) keeps it; only a new key, planned or after the
 old one leaked, changes it.
+
+### A name's IPFS node: `ipfs`
+
+```yaml
+    names:
+      - name: a                       # a member: its folder, as the site of a.dev.zenr.io
+        ipfs:
+          api: http://127.0.0.1:5001  # the node's RPC API: the default, IPFS Desktop's too
+          publish: {mfs: /community}  # _dnslink.a TXT "dnslink=/ipfs/<the folder's CID>"
+      - name: site                    # a community node: a's site, once its node holds it all
+        ipfs: {follow: a.dev.zenr.io}
+```
+
+`ipfs` is a complex type: code, run against a kubo node (IPFS Desktop runs one) through its RPC
+API. The name publishes the node's addresses as `_dnsaddr` TXT records, one
+`dnsaddr=<multiaddr>` each, which a node given `/dnsaddr/<name>/p2p/<ID>`, in its peer list say
+(`ipfs bootstrap add`), connects to: those over IPv4 or IPv6 at an address that means something
+off the link, ending in the node's ID, relayed ones left out. With `publish` or `follow`, it also
+publishes a site, as its `_dnslink` TXT record `dnslink=/ipfs/<CID>` (DNSLink), which gateways
+and nodes open as `/ipns/<name>`:
+
+| Field | Meaning |
+|---|---|
+| `api` | The node's RPC API, `http://host:port`. Default `http://127.0.0.1:5001`. |
+| `publish: {mfs: <path>}` | A path in the node's files (MFS, IPFS Desktop's Files): the site is its CID, which changes with anything in it. |
+| `follow: <name>` | Another name's site, its `_dnslink` record, asked of the registrar: the node pins each new one, fetching what it lacks, and the name gives it once the node holds it all; the node's earlier pins of it are then removed. Only a site given as `/ipfs/<CID>` can be followed. |
+
+With neither, the name publishes the node's addresses alone; not both. Nothing else at the name
+may be at `_dnslink` or `_dnsaddr`.
+
+The node is asked again at every poll, each request lasting at most the probe timeout; a pin
+lasts as long as it takes, in the background, and a newer site replaces a pin still running.
+While the node does not answer, the name withdraws its addresses and keeps its site, which other
+nodes may hold; a path that cannot be read keeps the site too, and each failure is logged once.
+A name with `ipfs:` registers nothing until its node has been asked once.
+
+A follower's pins are named `sig0lease-agent <name>` (`ipfs pin ls --type=recursive --names`).
+At the start, until a pin completes, the name gives what its node pinned under that name
+before: the followed name may give nothing then. The pins stay when the agent stops or the name
+leaves the template; `ipfs pin rm` removes them.
+
+The followed name's site is asked of the registrar. This project's proxy, with the `opcode: 0`
+rule of `config.yaml`, answers it from the zone's authoritative server, so a follower sees a
+change as soon as the zone has it; without that rule the proxy asks its upstream resolvers,
+which may answer from their cache for up to the record's TTL. That TTL, the proxy's
+`record_ttl_sec` (30 s in `config.yaml`), is also how long gateways and resolvers may keep a site
+that changed. [demo.md](demo.md), D3, is a member and a community node in a private swarm.
 
 ## Running
 
@@ -386,7 +436,8 @@ Run one agent per keystore.
 
 - RFC 9664 names need this project's proxy: the lease is RFC 9664's, but a name held by its key
   (`fcfs_naming`) is the proxy's.
-- A code handler for IPFS DNSLink from a running node is a later step.
+- `ipfs`: a site given as `/ipns/...`, or as a path below a CID, cannot be followed; a follow
+  removed from the template leaves its pins.
 - Probes are plain TCP and HTTP.
 - A key change announced ahead (RFC 7671 §8.1): `tlsa` takes one certificate, so a name's TLSA
   record follows a new key instead of coming before it (see "names").

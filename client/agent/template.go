@@ -10,7 +10,9 @@
 // an srp registrar's mirrors:, mirrors what a running mDNSResponder sees (client/mdnsbridge).
 // An rfc9664 one holds names, each with its own key, its addresses, its records and its
 // services, which SRV records find at the name (RFC 2782), with a TLSA record for a TLS one
-// (DANE) (client/rfc9664). See docs/sig0lease-agent.md.
+// (DANE) (client/rfc9664); "ipfs", a name's ipfs:, publishes an IPFS node at the name: its
+// addresses, and a folder of its files or the one another name publishes (client/kubo). See
+// docs/sig0lease-agent.md.
 package agent
 
 import (
@@ -32,6 +34,7 @@ import (
 	"codeberg.org/miekg/dns"
 	"codeberg.org/miekg/dns/rdata"
 	baseclient "github.com/NetworkCommons/sig0lease/client"
+	"github.com/NetworkCommons/sig0lease/client/kubo"
 	"github.com/NetworkCommons/sig0lease/client/mdnsresponder"
 	"github.com/NetworkCommons/sig0lease/client/rfc9664"
 	clientsrp "github.com/NetworkCommons/sig0lease/client/srp"
@@ -49,9 +52,24 @@ var presetsYAML []byte
 // out: an hour, RFC 9665 S3.4's "typically 14 days" for the key, and the names kept.
 var defaultLifetime = Lifetime{Lease: 3600, KeyLease: 14 * 24 * 3600, KeepNames: true}
 
-// complexTypes are the types implemented in code, with what each does.
-var complexTypes = map[string]string{
-	"mdns": "mirrors the services a running mDNSResponder sees, one SRP host per mDNS host; under an srp registrar's mirrors:",
+// complexType is a type implemented in code: what it does, and where a template uses it.
+type complexType struct {
+	does   string
+	where  string
+	mirror bool // under an srp registrar's mirrors:
+}
+
+// complexTypes are the types implemented in code, by name.
+var complexTypes = map[string]complexType{
+	"mdns": {
+		does:   "mirrors the services a running mDNSResponder sees, one SRP host per mDNS host",
+		where:  "under an srp registrar's mirrors:",
+		mirror: true,
+	},
+	"ipfs": {
+		does:  "publishes a kubo node's addresses at the name (_dnsaddr), and a folder of its files, or the one another name publishes once the node has pinned it, as the name's site (_dnslink)",
+		where: "as an rfc9664 registrar's name's ipfs:",
+	},
 }
 
 // Plan is a valid template: everything the agent registers.
@@ -215,9 +233,26 @@ type Name struct {
 	Auto      bool         // this machine's addresses too, as they change
 	Addresses []netip.Addr // literal addresses
 	Records   []dns.RR     // at or below the name, fully qualified; no address of the name
-	Services  []Service    // none registers what Records or another service registers
+	Services  []Service    // none registers what Records, another service or IPFS registers
+	IPFS      *IPFS        // nil: none
 	Lifetime               // the registrar's, with what the name overrides
 }
+
+// IPFS is the kubo node a name publishes (client/kubo): its addresses, as the name's _dnsaddr
+// TXT records, which a node given /dnsaddr/<name> connects to, and a site, as its _dnslink TXT
+// record (DNSLink), which IPFS gateways and nodes open by the name: a path in the node's files
+// (Publish), or the site another name publishes, once the node holds all of it (Follow).
+// With neither, the name publishes the node's addresses alone.
+type IPFS struct {
+	API     string // the node's RPC API, "http://host:port"
+	Publish string // a path in the node's files (MFS), such as /community
+	Follow  string // a name, fully qualified, whose site the node pins and the name publishes
+}
+
+// dnsaddrOwner and dnslinkOwner return where a name publishes its node's addresses and its
+// site, name being fully qualified.
+func dnsaddrOwner(name string) string { return "_dnsaddr." + name }
+func dnslinkOwner(name string) string { return "_dnslink." + name }
 
 // Mirror is a complex type that makes its own hosts.
 type Mirror struct {
@@ -307,9 +342,18 @@ type nameDoc struct {
 	Addresses []string     `yaml:"addresses"`
 	Records   []string     `yaml:"records"`
 	Services  []serviceDoc `yaml:"services"`
+	IPFS      *ipfsDoc     `yaml:"ipfs"`
 	Lease     string       `yaml:"lease"`
 	KeyLease  string       `yaml:"key_lease"`
 	OnStop    string       `yaml:"on_stop"`
+}
+
+type ipfsDoc struct {
+	API     string `yaml:"api"`
+	Publish *struct {
+		MFS string `yaml:"mfs"`
+	} `yaml:"publish"`
+	Follow string `yaml:"follow"`
 }
 
 type mirrorDoc struct {
@@ -404,7 +448,7 @@ func parseTypes(docs map[string]typeDoc, builtin map[string]typeDef, problems *[
 		case !typeNameRE.MatchString(name):
 			*problems = append(*problems, fmt.Sprintf("%s: a type name is lower-case letters, digits and hyphens", where))
 			continue
-		case complexTypes[name] != "":
+		case complexTypes[name].does != "":
 			*problems = append(*problems, fmt.Sprintf("%s: %s is a built-in complex type; pick another name", where, name))
 			continue
 		}
@@ -675,8 +719,8 @@ func parseName(d nameDoc, r Registrar, types map[string]typeDef, dir, where stri
 	n.Records = rfc9664.ParseRecords(owner, d.Records, func(j int, err error) {
 		*problems = append(*problems, fmt.Sprintf("%s: records[%d]: %v", where, j, err))
 	})
-	if !n.Auto && len(n.Addresses) == 0 && len(d.Records) == 0 {
-		*problems = append(*problems, where+": nothing to register: give addresses:, records: or both")
+	if !n.Auto && len(n.Addresses) == 0 && len(d.Records) == 0 && d.IPFS == nil {
+		*problems = append(*problems, where+": nothing to register: give addresses:, records:, ipfs: or several")
 	}
 	if len(d.Services) > 0 && !n.Auto && len(n.Addresses) == 0 {
 		*problems = append(*problems, where+": services: their SRV records point at the name, which needs addresses:")
@@ -687,6 +731,19 @@ func parseName(d nameDoc, r Registrar, types map[string]typeDef, dir, where stri
 	slot := func(name string, t uint16) string { return dnsname.Fold(name) + " " + dns.TypeToString[t] }
 	for j, rr := range n.Records {
 		by[slot(rr.Header().Name, dns.RRToType(rr))] = fmt.Sprintf("records[%d]", j)
+	}
+	if d.IPFS != nil {
+		n.IPFS = parseIPFS(*d.IPFS, owner, where+": ipfs", problems)
+		owners := []string{dnsaddrOwner(owner)}
+		if n.IPFS.Publish != "" || n.IPFS.Follow != "" {
+			owners = append(owners, dnslinkOwner(owner))
+		}
+		for _, o := range owners {
+			if other, dup := by[slot(o, dns.TypeTXT)]; dup {
+				*problems = append(*problems, fmt.Sprintf("%s: ipfs: registers the TXT records at %s, which %s registers too", where, o, other))
+			}
+			by[slot(o, dns.TypeTXT)] = "ipfs"
+		}
 	}
 	for j, sd := range d.Services {
 		swhere := fmt.Sprintf("%s: services[%d]", where, j)
@@ -717,6 +774,38 @@ func parseName(d nameDoc, r Registrar, types map[string]typeDef, dir, where stri
 	}
 	n.Lifetime = parseLifetime(d.Lease, d.KeyLease, d.OnStop, r.Lifetime, where, problems)
 	return n
+}
+
+// parseIPFS validates d, the ipfs: of the name owner, at where.
+func parseIPFS(d ipfsDoc, owner, where string, problems *[]string) *IPFS {
+	ip := &IPFS{API: d.API}
+	if ip.API == "" {
+		ip.API = kubo.DefaultAPI
+	}
+	if err := kubo.CheckAPI(ip.API); err != nil {
+		*problems = append(*problems, fmt.Sprintf("%s: api: %v", where, err))
+	}
+	if d.Publish != nil {
+		ip.Publish = d.Publish.MFS
+		if !strings.HasPrefix(ip.Publish, "/") {
+			*problems = append(*problems, fmt.Sprintf("%s: publish: mfs: %q: want a path in the node's files, such as /community", where, ip.Publish))
+		}
+	}
+	if d.Follow != "" {
+		ip.Follow = strings.TrimSuffix(d.Follow, ".") + "."
+		labels := dnsname.Labels(ip.Follow)
+		labels = labels[:len(labels)-1] // the root's
+		switch {
+		case len(labels) < 2 || slices.ContainsFunc(labels, func(l string) bool { return !dnsname.IsHostLabel(l) }):
+			*problems = append(*problems, fmt.Sprintf("%s: follow: %q: want the name of another site, such as a.dev.zenr.io", where, d.Follow))
+		case dnsname.EqualFold(ip.Follow, owner):
+			*problems = append(*problems, fmt.Sprintf("%s: follow: %s is this name", where, d.Follow))
+		}
+	}
+	if d.Publish != nil && d.Follow != "" {
+		*problems = append(*problems, where+": publish: and follow: are two sites for one name; give one")
+	}
+	return ip
 }
 
 // checkRegistrars reports what registrars cannot all have: two for the same domain or zone,
@@ -817,8 +906,8 @@ func parseService(d serviceDoc, label string, onName bool, dir string, types map
 		*problems = append(*problems, fmt.Sprintf("%s: type is required", where))
 		return Service{}, false
 	}
-	if complexTypes[d.Type] != "" {
-		*problems = append(*problems, fmt.Sprintf("%s: %s is a complex type that makes its own hosts; use it under an srp registrar's mirrors:", where, d.Type))
+	if ct := complexTypes[d.Type]; ct.does != "" {
+		*problems = append(*problems, fmt.Sprintf("%s: %s is a complex type, not a service's; use it %s", where, d.Type, ct.where))
 		return Service{}, false
 	}
 	def, ok := types[d.Type]
@@ -936,8 +1025,14 @@ func parseMirror(d mirrorDoc, hosts []Host, where string, problems *[]string) (M
 		*problems = append(*problems, fmt.Sprintf("%s: type is required", where))
 		return Mirror{}, false
 	}
-	if complexTypes[d.Type] == "" {
-		*problems = append(*problems, fmt.Sprintf("%s: %q is not a complex type that makes hosts (known: %s); a service type goes in a host's services:", where, d.Type, strings.Join(sortedKeys(complexTypes), ", ")))
+	if !complexTypes[d.Type].mirror {
+		var mirrors []string
+		for _, name := range sortedKeys(complexTypes) {
+			if complexTypes[name].mirror {
+				mirrors = append(mirrors, name)
+			}
+		}
+		*problems = append(*problems, fmt.Sprintf("%s: %q is not a complex type that makes hosts (known: %s); a service type goes in a host's services:", where, d.Type, strings.Join(mirrors, ", ")))
 		return Mirror{}, false
 	}
 	m := Mirror{Type: d.Type, Socket: d.Socket, Hosts: d.Hosts, AllHosts: d.AllHosts, ServiceTypes: d.Services}
@@ -985,7 +1080,8 @@ func Types() []TypeInfo {
 		out = append(out, TypeInfo{Name: name, Summary: strings.Join(parts, ", ")})
 	}
 	for _, name := range sortedKeys(complexTypes) {
-		out = append(out, TypeInfo{Name: name, Complex: true, Summary: complexTypes[name]})
+		ct := complexTypes[name]
+		out = append(out, TypeInfo{Name: name, Complex: true, Summary: ct.does + "; " + ct.where})
 	}
 	return out
 }

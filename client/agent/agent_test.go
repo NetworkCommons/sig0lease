@@ -24,19 +24,46 @@ import (
 	"github.com/NetworkCommons/sig0lease/client/mdnsresponder"
 	"github.com/NetworkCommons/sig0lease/client/rfc9664"
 	clientsrp "github.com/NetworkCommons/sig0lease/client/srp"
+	"github.com/NetworkCommons/sig0lease/pkg/dnsmsg"
 	leasepkg "github.com/NetworkCommons/sig0lease/pkg/lease"
 )
 
 // registrar records every update the agent's clients send. It answers YXDOMAIN to an update
 // whose host name is in taken, REFUSED to one whose host name is in refused, NOERROR to the
-// rest. taken and refused are set while the agent is not running.
+// rest. taken and refused are set while the agent is not running. It answers a query from
+// the TXT records setTXT gives, without recording it.
 type registrar struct {
 	sent    chan *dns.Msg
 	taken   []string
 	refused []string
+	mu      sync.Mutex
+	txt     map[string][]string // the strings of one TXT record each, by owner
+}
+
+// setTXT makes the TXT records at owner those of values, one each; none removes them.
+func (r *registrar) setTXT(owner string, values ...string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.txt == nil {
+		r.txt = map[string][]string{}
+	}
+	r.txt[owner] = values
 }
 
 func (r *registrar) Send(ctx context.Context, addr string, network baseclient.Network, msg *dns.Msg) (*dns.Msg, error) {
+	if msg.Opcode == dns.OpcodeQuery {
+		resp := &dns.Msg{MsgHeader: dns.MsgHeader{ID: msg.ID, Response: true, Rcode: dns.RcodeNameError}, Question: msg.Question}
+		name := msg.Question[0].Header().Name
+		r.mu.Lock()
+		defer r.mu.Unlock()
+		for _, v := range r.txt[name] {
+			txt := &dns.TXT{Hdr: dns.Header{Name: name, Class: dns.ClassINET, TTL: 30}}
+			txt.TXT.Txt = []string{dnsmsg.EscapeTXT(v)}
+			resp.Answer = append(resp.Answer, txt)
+			resp.Rcode = dns.RcodeSuccess
+		}
+		return resp, nil
+	}
 	r.sent <- msg
 	rcode := uint16(dns.RcodeSuccess)
 	switch host := summarize(msg).host; {

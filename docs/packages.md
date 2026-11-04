@@ -264,7 +264,9 @@ a template uses them but cannot define them; "mdns", under an srp registrar's
 mirrors:, mirrors what a running mDNSResponder sees (client/mdnsbridge).
 An rfc9664 one holds names, each with its own key, its addresses, its records
 and its services, which SRV records find at the name (RFC 2782), with a TLSA
-record for a TLS one (DANE) (client/rfc9664). See docs/sig0lease-agent.md.
+record for a TLS one (DANE) (client/rfc9664); "ipfs", a name's ipfs:, publishes
+an IPFS node at the name: its addresses, and a folder of its files or the one
+another name publishes (client/kubo). See docs/sig0lease-agent.md.
 
 CONSTANTS
 
@@ -325,6 +327,18 @@ type Host struct {
 }
     Host is one SRP identity: a name, its addresses and its services.
 
+type IPFS struct {
+	API     string // the node's RPC API, "http://host:port"
+	Publish string // a path in the node's files (MFS), such as /community
+	Follow  string // a name, fully qualified, whose site the node pins and the name publishes
+}
+    IPFS is the kubo node a name publishes (client/kubo): its addresses,
+    as the name's _dnsaddr TXT records, which a node given /dnsaddr/<name>
+    connects to, and a site, as its _dnslink TXT record (DNSLink), which IPFS
+    gateways and nodes open by the name: a path in the node's files (Publish),
+    or the site another name publishes, once the node holds all of it (Follow).
+    With neither, the name publishes the node's addresses alone.
+
 type Lifetime struct {
 	Lease     uint32 // seconds
 	KeyLease  uint32 // seconds
@@ -349,7 +363,8 @@ type Name struct {
 	Auto      bool         // this machine's addresses too, as they change
 	Addresses []netip.Addr // literal addresses
 	Records   []dns.RR     // at or below the name, fully qualified; no address of the name
-	Services  []Service    // none registers what Records or another service registers
+	Services  []Service    // none registers what Records, another service or IPFS registers
+	IPFS      *IPFS        // nil: none
 	Lifetime               // the registrar's, with what the name overrides
 }
     Name is one RFC 9664 name: a label right below its registrar's zone, held by
@@ -558,6 +573,62 @@ func Answer(rcode uint16) *dns.Msg
 func Granted(lease, keyLease uint32) *dns.Msg
     Granted is a registrar's NOERROR answer granting lease and keyLease:
     the 8-byte Update Lease option echoed (RFC 9664 S4).
+
+```
+
+## github.com/NetworkCommons/sig0lease/client/kubo
+```
+package kubo // import "github.com/NetworkCommons/sig0lease/client/kubo"
+
+Package kubo asks a kubo node -- the IPFS daemon, which IPFS Desktop runs
+-- through its RPC API (docs.ipfs.tech/reference/kubo/rpc/): its peer ID and
+addresses, the CID of a path in its files (MFS, IPFS Desktop's Files), and its
+pins.
+
+CONSTANTS
+
+const DefaultAPI = "http://127.0.0.1:5001"
+    DefaultAPI is where kubo's RPC API listens unless configured otherwise
+    (Addresses.API).
+
+
+FUNCTIONS
+
+func CheckAPI(api string) error
+    CheckAPI reports whether api is an RPC API's address: "http://host:port",
+    with no path.
+
+
+TYPES
+
+type Client struct {
+	// Has unexported fields.
+}
+    Client is a kubo node's RPC API.
+
+func New(api string, timeout time.Duration) *Client
+    New returns the Client of the RPC API at api (CheckAPI). Every request but
+    Pin's lasts at most timeout.
+
+func (c *Client) ID(ctx context.Context) (id string, addrs []string, err error)
+    ID returns the node's peer ID and the addresses it can be reached at,
+    each a multiaddr ending in /p2p/<ID>.
+
+func (c *Client) MFSCID(ctx context.Context, path string) (string, error)
+    MFSCID returns the CID of path in the node's files (MFS).
+
+func (c *Client) Pin(ctx context.Context, cid, name string) (string, error)
+    Pin pins cid and everything it links to under name, fetching from other
+    nodes what the node does not hold, which lasts until the node holds it all
+    or ctx ends. It returns the CID as the node writes it.
+
+func (c *Client) PinsNamed(ctx context.Context, name string) ([]string, error)
+    PinsNamed returns the CIDs pinned with everything they link to under name,
+    sorted.
+
+func (c *Client) Unpin(ctx context.Context, cid string) error
+    Unpin removes cid's pin. What it pinned stays in the node until kubo's
+    garbage collector frees it.
 
 ```
 
@@ -966,9 +1037,12 @@ func DiscoveryService(n baseclient.Network) string
     reachable over n: "_dnssd-srp-tls._tcp" for NetworkTLS (RFC 9665 S10.4.2),
     "_dnssd-srp._tcp" otherwise (S10.4.1).
 
+func Publishable(a netip.Addr) bool
+    Publishable reports whether a means something off the link: it is not
+    loopback, link-local, unspecified or multicast.
+
 func PublishableAddresses(addrs []netip.Addr) []netip.Addr
-    PublishableAddresses returns the addresses in addrs that mean something off
-    the link: not loopback, link-local, unspecified or multicast.
+    PublishableAddresses returns the addresses in addrs that are Publishable.
 
 func Release(cfg HostConfig) error
     Release frees the names a host that is not running may still hold from an

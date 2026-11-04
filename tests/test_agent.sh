@@ -15,7 +15,9 @@
 # freed at the next start -> an RFC 9664 name is registered with its records, one another key
 # holds is tried again rather than renamed, stopping keeps the name and removing it frees it ->
 # with Prosody installed, two XMPP servers on ports only their names' SRV records give federate
-# through what the agent publishes, a stopped one's records are withdrawn and come back.
+# through what the agent publishes, a stopped one's records are withdrawn and come back ->
+# with kubo installed, a name publishes a node's folder and addresses, and another follows it,
+# its node pinning each version before the name gives it.
 # The probed service is python3's http.server; the other key is sig0lease-srp-client's, and
 # sig0lease-client's for a name.
 
@@ -52,6 +54,15 @@ XMPP_A_PORT="${XMPP_A_PORT:-15269}"
 XMPP_B_PORT="${XMPP_B_PORT:-25269}"
 PROSODY_PID_a=""
 PROSODY_PID_b=""
+# AGENT-TEST 11's two kubo nodes, a and b, each in IPFS_DIR/<node>, in a private swarm of
+# their own: no other node has its key.
+IPFS_DIR="$SRP_RUN_DIR/ipfs"
+IPFS_A_API_PORT="${IPFS_A_API_PORT:-15001}"
+IPFS_A_SWARM_PORT="${IPFS_A_SWARM_PORT:-14001}"
+IPFS_B_API_PORT="${IPFS_B_API_PORT:-25001}"
+IPFS_B_SWARM_PORT="${IPFS_B_SWARM_PORT:-24001}"
+IPFS_PID_a=""
+IPFS_PID_b=""
 
 PERFORMED_TESTS=""
 
@@ -288,6 +299,75 @@ spki_sha256() {
 # lower-case hex in one piece (dig splits it).
 dig_tlsa() {
     dig_srp "$1" TLSA | awk '{ d = ""; for (i = 4; i <= NF; i++) d = d $i; print $1, $2, $3, tolower(d) }'
+}
+
+# start_kubo <node> <api port> <swarm port> -- runs a kubo node in IPFS_DIR/<node>, made the
+# first time with kubo's test profile (no bootstrap peers, no mDNS, no AutoConf), in the private
+# swarm of IPFS_DIR/swarm.key (LIBP2P_FORCE_PNET: kubo refuses to start without it), its RPC API
+# on 127.0.0.1:<api port>, and listening for other nodes on <swarm port> at every address: the
+# agent publishes only the addresses that mean something off the link.
+start_kubo() {
+    local node="$1" api="$2" swarm="$3" dir="$IPFS_DIR/$1" port
+    for port in "$api" "$swarm"; do
+        if is_listening "$port"; then
+            log_error "Port $port, for kubo $node, is already in use; set IPFS_A_API_PORT, IPFS_A_SWARM_PORT, IPFS_B_API_PORT or IPFS_B_SWARM_PORT"
+            return 1
+        fi
+    done
+    if [ ! -f "$IPFS_DIR/swarm.key" ]; then
+        mkdir -p "$IPFS_DIR"
+        printf '/key/swarm/psk/1.0.0/\n/base16/\n%s\n' "$(openssl rand -hex 32)" > "$IPFS_DIR/swarm.key"
+    fi
+    if [ ! -d "$dir" ]; then
+        IPFS_PATH="$dir" ipfs init --profile test > "$dir.log" 2>&1 || { cat "$dir.log"; return 1; }
+        IPFS_PATH="$dir" ipfs config Addresses.API "/ip4/127.0.0.1/tcp/$api"
+        IPFS_PATH="$dir" ipfs config --json Addresses.Swarm "[\"/ip4/0.0.0.0/tcp/$swarm\"]"
+        cp "$IPFS_DIR/swarm.key" "$dir/swarm.key"
+    fi
+    IPFS_PATH="$dir" LIBP2P_FORCE_PNET=1 ipfs daemon >> "$dir.log" 2>&1 &
+    eval "IPFS_PID_$node=$!"
+    local start pid
+    start=$(date +%s)
+    until ipfs_on "$node" id > /dev/null 2>&1; do
+        pid="$(eval echo "\$IPFS_PID_$node")"
+        if [ $(( $(date +%s) - start )) -ge 20 ] || ! kill -0 "$pid" 2>/dev/null; then
+            log_error "kubo $node did not start:"
+            cat "$dir.log"
+            return 1
+        fi
+        sleep 0.2
+    done
+}
+
+# stop_kubo <node> -- stops the kubo start_kubo runs for <node>.
+stop_kubo() {
+    local pid
+    pid="$(eval echo "\$IPFS_PID_$1")"
+    if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
+        stop_process "$pid" || true
+    fi
+    eval "IPFS_PID_$1=''"
+}
+
+# ipfs_on <node> <ipfs arguments...> -- runs an ipfs command against the running kubo <node>.
+ipfs_on() {
+    local port="$IPFS_A_API_PORT"
+    [ "$1" = a ] || port="$IPFS_B_API_PORT"
+    shift
+    ipfs --api "/ip4/127.0.0.1/tcp/$port" "$@"
+}
+
+# wait_txt <name> <text> -- waits for the TXT records at name to be text, as dig +short prints
+# them.
+wait_txt() {
+    local start got
+    start=$(date +%s)
+    until got="$(dig_srp "$1" TXT)" && [ "$got" = "$2" ]; do
+        if [ $(( $(date +%s) - start )) -ge "$CHANGE_TIMEOUT" ]; then
+            log_error "TXT $1 is \"$got\", want \"$2\"; agent log:"; cat "$AGENT_LOG"; return 1
+        fi
+        sleep 0.5
+    done
 }
 
 ################################
@@ -702,6 +782,81 @@ NAMES
     PERFORMED_TESTS="$PERFORMED_TESTS\n  [OK] $log_msg"
 }
 
+test_ipfs() {
+    local log_msg="AGENT-TEST 11: a name publishes a kubo node's folder and addresses; another follows it, its node pinning each version before the name gives it; a node that stops has its addresses withdrawn, and its folder kept"
+    log_section "$log_msg"
+    if ! command -v ipfs >/dev/null; then
+        log_step "kubo (ipfs) is not installed: AGENT-TEST 11 skipped"
+        PERFORMED_TESTS="$PERFORMED_TESTS\n  [SKIPPED: no ipfs] $log_msg"
+        return 0
+    fi
+    require_command openssl || return 1
+
+    start_kubo a "$IPFS_A_API_PORT" "$IPFS_A_SWARM_PORT" || return 1
+    start_kubo b "$IPFS_B_API_PORT" "$IPFS_B_SWARM_PORT" || return 1
+    echo "first" | ipfs_on a files write --create --parents /community/hello.txt
+    local first
+    first="$(ipfs_on a files stat --hash /community)"
+    local z="${NAME_ZONE}" stay
+    stay="$(cat <<HOSTS
+hosts:
+  - name: stay
+    addresses: [127.0.0.1]
+HOSTS
+)"
+    NAMES_REGISTRAR="$(names_registrar "$(cat <<NAMES
+names:
+  - name: a
+    ipfs: {api: "http://127.0.0.1:${IPFS_A_API_PORT}", publish: {mfs: /community}}
+  - name: site
+    ipfs: {api: "http://127.0.0.1:${IPFS_B_API_PORT}", follow: a.${z}}
+NAMES
+)")"
+    write_template <<< "$stay"
+    wait_txt "_dnslink.a.${z}" "\"dnslink=/ipfs/${first}\"" || return 1
+    wait_state "_dnsaddr.a.${z}" TXT present || return 1
+
+    # b reaches a at an address a's _dnsaddr records give, as /dnsaddr/a.<zone> would have it
+    # do; kubo reads those through the system's resolver, which does not know the local BIND.
+    local ma connected=""
+    for ma in $(dig_srp "_dnsaddr.a.${z}" TXT | tr -d '"' | sed 's/^dnsaddr=//'); do
+        if ipfs_on b swarm connect "$ma" > /dev/null 2>&1; then connected="$ma"; break; fi
+    done
+    [ -n "$connected" ] || { log_error "b reached a at none of _dnsaddr.a's addresses: $(dig_srp "_dnsaddr.a.${z}" TXT)"; return 1; }
+
+    wait_txt "_dnslink.site.${z}" "\"dnslink=/ipfs/${first}\"" || return 1
+    [ "$(ipfs_on b --offline cat "/ipfs/${first}/hello.txt")" = first ] || { log_error "b does not hold a's folder"; return 1; }
+    [ "$(ipfs_on b pin ls --type=recursive --names "/ipfs/${first}")" = "${first} recursive sig0lease-agent site.${z}" ] \
+        || { log_error "b's pin of a's folder: $(ipfs_on b pin ls --type=recursive --names)"; return 1; }
+
+    echo "second" | ipfs_on a files write --create /community/second.txt
+    local second
+    second="$(ipfs_on a files stat --hash /community)"
+    wait_txt "_dnslink.a.${z}" "\"dnslink=/ipfs/${second}\"" || return 1
+    wait_txt "_dnslink.site.${z}" "\"dnslink=/ipfs/${second}\"" || return 1
+    [ "$(ipfs_on b --offline cat "/ipfs/${second}/second.txt")" = second ] || { log_error "b does not hold a's new folder"; return 1; }
+    wait_log "site.${z}: unpinned ${first}, a site before" || return 1
+    if ipfs_on b pin ls --type=recursive "/ipfs/${first}" > /dev/null 2>&1; then
+        log_error "b still pins the first folder"; return 1
+    fi
+
+    stop_kubo a
+    wait_state "_dnsaddr.a.${z}" TXT absent || return 1
+    wait_log "a.${z}: its node does not answer" || return 1
+    [ "$(dig_srp "_dnslink.a.${z}" TXT)" = "\"dnslink=/ipfs/${second}\"" ] || { log_error "a's _dnslink went with its node"; return 1; }
+    [ "$(dig_srp "_dnslink.site.${z}" TXT)" = "\"dnslink=/ipfs/${second}\"" ] || { log_error "site's _dnslink changed when a's node stopped"; return 1; }
+
+    NAMES_REGISTRAR=""
+    write_template <<< "$stay"
+    wait_state "a.${z}" KEY absent || return 1
+    wait_state "site.${z}" KEY absent || return 1
+    [ -z "$(dig_srp "_dnslink.site.${z}" TXT)" ] || { log_error "site's _dnslink stayed after site was removed"; return 1; }
+    stop_kubo b
+
+    log_success "a gave its folder and addresses; b, reaching a at one of them, pinned each version before site gave it, and unpinned the one before; a's node stopped lost its addresses and kept its folder"
+    PERFORMED_TESTS="$PERFORMED_TESTS\n  [OK] $log_msg"
+}
+
 ################################
 # Top level
 ################################
@@ -709,7 +864,8 @@ run_all_tests() {
     log_section "SIG0LEASE-AGENT INTEGRATION TEST SUITE"
     echo "Real components only: real agent (sig0lease-agent), real proxy process (srp_handler and"
     echo "update_handler), real local BIND 9 authoritative for ${SRP_ZONE} and ${NAME_ZONE}, python3's"
-    echo "http.server as the probed service, and Prosody, if installed, as two XMPP servers."
+    echo "http.server as the probed service, Prosody, if installed, as two XMPP servers, and kubo, if"
+    echo "installed, as two IPFS nodes."
     echo ""
 
     trap cleanup EXIT
@@ -737,6 +893,7 @@ run_all_tests() {
     test_freed_after_restart
     test_rfc9664_names
     test_xmpp_federation
+    test_ipfs
 
     bind9_report_rejections || return 1
     BIND9_REJECTIONS_REPORTED=1
@@ -762,6 +919,8 @@ cleanup() {
     stop_http
     stop_prosody a
     stop_prosody b
+    stop_kubo a
+    stop_kubo b
     stop_srp_proxy
     stop_bind9
     set -e

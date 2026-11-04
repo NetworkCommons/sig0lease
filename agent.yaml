@@ -80,3 +80,10 @@ registrars:
             subdomains: [rooms]         # and _xmpp-server._tcp.rooms.chat: its group chat service
             tlsa: certs/chat.crt        # a TLSA record for this certificate's key (DANE); relative
                                         # to this file, read at every poll
+      - name: files                     # an IPFS node's folder, files.dev.zenr.io. (docs/demo.md, D3)
+        ipfs:
+          api: http://127.0.0.1:5001    # the node's RPC API: the default, IPFS Desktop's too
+          publish: {mfs: /community}    # _dnslink.files: the folder's CID as it changes; and
+                                        # _dnsaddr.files: the node's addresses
+          # follow: a.dev.zenr.io       # instead of publish: another name's site, given once the
+                                        # node has pinned all of it

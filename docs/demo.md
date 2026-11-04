@@ -10,13 +10,13 @@ devices, with the DNS tools they already have. Everything runs from `./main`, wi
 |---|---|---|
 | D1: the laptop publishes itself | its site among browse results and under a name; a service leaves when it stops and comes back; a template edit shows within seconds; a second key gets `demo-2`, and is refused the name | the laptop |
 | D2: the Mac's own services | turning on Remote Login or Screen Sharing puts it in the public zone | a Mac |
-| D3: a site by name over IPFS | `dweb.link/ipns/demo.dev.zenr.io/` serves the laptop's site | kubo (`ipfs`) |
+| D3: a community folder over IPFS | phones open a member's folder by name from the community node, which pins each version before publishing it, and keeps serving it once the member leaves; the two nodes find each other by DNS alone, in a private swarm | two machines with IPFS Desktop or kubo; phones |
 | D4: native discovery | an audience Mac lists the laptop's services beside its `local.` ones | a Mac in the audience |
 | D5: two communities meet in one chat room | phones log in as guests of two laptops' XMPP servers and talk in one room; the servers find each other by SRV records and trust each other's self-signed certificates by TLSA records (DANE) | two machines, each with Docker (a Mac) or Prosody 13 (Linux); phones |
 | D6: the zone in a browser | phones watch the services come and go, and claim a name with a message, held by a key their browser makes; `dig` shows it within seconds | the laptop; phones |
 
-The demos use this repository's programs and tools that come with the system, except kubo for
-D3, and Prosody for D5, whose page loads Converse.js from `cdn.jsdelivr.net`.
+The demos use this repository's programs and tools that come with the system, except IPFS
+Desktop or kubo for D3, and Prosody for D5, whose page loads Converse.js from `cdn.jsdelivr.net`.
 
 ## Before the day
 
@@ -42,12 +42,40 @@ D3, and Prosody for D5, whose page loads Converse.js from `cdn.jsdelivr.net`.
    registrar of the demo's templates), so someone else may take them before the day: check them
    again then (step 3).
 
-5. For D3, once: `ipfs init`, then let kubo's gateway listen beyond 127.0.0.1, so the agent's
-   probe and the audience on the same network reach it:
+5. For D3, once, on A (the presenter's laptop, the member) and B (the community node): IPFS
+   Desktop, or kubo (`ipfs init`), and kubo's `ipfs` command, which works on IPFS Desktop's
+   node too (its repository is `~/.ipfs`). Quit IPFS Desktop, or stop `ipfs daemon`, then on
+   each:
 
    ```bash
-   ipfs config Addresses.Gateway /ip4/0.0.0.0/tcp/8080
+   ipfs config profile apply autoconf-off               # no public peers, resolvers or routers
+   ipfs config Routing.Type dht
+   ipfs config --json AutoTLS.Enabled false
+   ipfs config --json Swarm.Transports.Network.Websocket false
+   ipfs config --json Discovery.MDNS.Enabled false      # nodes found by DNS alone
+   ipfs config Addresses.Gateway /ip4/0.0.0.0/tcp/8080  # the gateway reachable on the network
+   ipfs id -f '<id>\n'                                  # the node's ID, for the other's peer list
    ```
+
+   The two nodes are a private swarm: they share a key no other node has, so the folder reaches
+   no other node. Make it on A and copy the file to B's `~/.ipfs/swarm.key`, by hand, never
+   into DNS or the repository:
+
+   ```bash
+   printf '/key/swarm/psk/1.0.0/\n/base16/\n%s\n' "$(openssl rand -hex 32)" > ~/.ipfs/swarm.key
+   ```
+
+   Each node's peer list is the other's name, whose addresses the agents publish:
+   `ipfs bootstrap add /dnsaddr/site.dev.zenr.io/p2p/<B's ID>` on A,
+   `ipfs bootstrap add /dnsaddr/a.dev.zenr.io/p2p/<A's ID>` on B. Start the nodes again:
+   `ipfs daemon` says "Swarm is limited to private network of peers with the swarm key", and,
+   until the agents publish those names, "failed to bootstrap (no peers found)": it tries again
+   by itself. On A, make the folder, `ipfs files mkdir /community` (IPFS Desktop: Files, New
+   folder), and put a first file in it: without an `index.html`, gateways show it as a list of
+   files. Check that `a` and `site` are free: `dig +short KEY a.dev.zenr.io @ns1.free2air.org`
+   answers nothing, and so for `site`. On B, also `qrencode`, which prints the QR code the
+   phones scan: `brew install qrencode` on a Mac, `sudo apt install qrencode` on Linux.
+   Rehearse: `demo/ipfs.sh member` on A, then `demo/ipfs.sh community` on B.
 
 6. For D2, the rehearsal on a Mac writes the Mac's template, `demo/mac.yaml`: it names this Mac,
    so it is not in the repository. On first use macOS asks whether Terminal may find
@@ -56,13 +84,12 @@ D3, and Prosody for D5, whose page loads Converse.js from `cdn.jsdelivr.net`.
 7. For D5, on each of its two machines: on a Mac, Docker Desktop, then
    `docker pull prosodyim/prosody:13.0`; on Linux, Prosody 13 (`apt install prosody` on Debian
    13, which brings luaunbound, then `sudo systemctl disable --now prosody`: the package's own
-   server would hold the ports), or Docker with `PROSODY=docker`. Also `qrencode`, which prints
-   the QR codes the phones scan: `brew install qrencode` on a Mac, `sudo apt install qrencode`
-   on Linux. Check that `chat-a` and `chat-b` are free:
+   server would hold the ports), or Docker with `PROSODY=docker`. Also `qrencode`, as for D3.
+   Check that `chat-a` and `chat-b` are free:
    `dig +short KEY chat-a.dev.zenr.io @ns1.free2air.org` answers nothing. Rehearse on one
    machine with `demo/chat.sh chat-a chat-b`.
 
-8. For D6, on the laptop: `qrencode`, as for D5. Rehearse with `demo/web.sh` and a phone on the
+8. For D6, on the laptop: `qrencode`, as for D3. Rehearse with `demo/web.sh` and a phone on the
    same network: it builds the page (`make web`), and the phone has to reach the laptop's ports
    8090 and 8443.
 
@@ -103,7 +130,8 @@ gives the current answer.
 
 1. Start terminals 1 to 4. The agent logs `registered` for host `demo` and name `demo`, and
    `watch.sh` shows the instance `demo http` under `_http._tcp`, and the name's addresses and
-   TXT. `demo ipfs-gateway` waits for D3: its probe fails until kubo's gateway answers.
+   TXT. `demo ipfs-gateway` waits for the laptop's IPFS node (D3): its probe fails until the
+   node's gateway answers on the network.
 2. Stop the site (Ctrl-C in terminal 2). After three failed probes, about 15 s, `demo http`
    leaves the browse results; about 30 s on a Mac whose firewall is in stealth mode, where a
    stopped site's port does not refuse connections, so each probe waits its 5 s out. Start it
@@ -126,7 +154,7 @@ gives the current answer.
    renaming: a name is typed, not browsed. Ctrl-C it: it frees what it got (`on_stop: release`)
    and leaves your name alone.
 
-Keep the agent running for D2 and D3.
+Keep the agent running for D2.
 
 ## D2: the Mac's own services
 
@@ -135,34 +163,54 @@ Sharing, turn on Remote Login (`_ssh._tcp`) or Screen Sharing (`_rfb._tcp`): a f
 the agent logs `registered`, and `watch.sh` shows the Mac's instance. Turn it off and it goes.
 [srp-live-demo.md §7](srp-live-demo.md) has the details and limits.
 
-## D3: the site by name, over IPFS
+## D3: a community folder over IPFS
 
-1. In another terminal: `ipfs daemon`. Once it runs, `demo ipfs-gateway` appears in the browse
-   results: the agent's probe reaches kubo's gateway on port 8080.
-2. Add the site, and publish its CID under the name:
+A, a member, keeps a folder in its IPFS node; B, the community node (a colleague's laptop here,
+a small always-on machine in real life), keeps every version of it and serves it. Each runs
+`demo/ipfs.sh` (it starts the proxy unless one runs, as terminal 1 does on A), whose agent
+publishes:
 
-   ```bash
-   ipfs add -r -Q demo/site
-   ```
+| Record | Published by | Changes when |
+|---|---|---|
+| `_dnslink.a.dev.zenr.io` | A | A's folder changes: the folder's CID, read from A's node |
+| `_dnsaddr.a.dev.zenr.io` | A | A's node's addresses change; withdrawn while the node is down |
+| `_dnslink.site.dev.zenr.io` | B | B's node has pinned all of a new version of `a`'s folder |
+| `_dnsaddr.site.dev.zenr.io` | B | B's node's addresses change |
+| `b ipfs-gateway` in `srp.dev.zenr.io` | B | B's gateway starts or stops answering |
 
-   In `demo/demo.yaml`, uncomment the `_dnslink` record, put the CID in place of `CID`, and
-   save. Within 10 s `watch.sh` shows `_dnslink TXT "dnslink=/ipfs/<CID>"`.
-3. The audience opens `https://dweb.link/ipns/demo.dev.zenr.io/`: a public gateway reads the
-   `_dnslink` record and fetches the site from the laptop over IPFS. The first fetch can take a
-   minute, while the gateway finds the laptop. Also:
+B's agent reads `a`'s folder through its proxy, which answers from `ns1.free2air.org`: B follows
+each change as soon as the zone has it.
 
-   ```bash
-   ipfs cat /ipns/demo.dev.zenr.io/index.html          # anyone running kubo
-   ```
+1. The projector shows `NAME="a site" demo/watch.sh`, and IPFS Desktop's Peers on A, empty.
+2. On A, `demo/ipfs.sh member`: `_dnslink.a` and `_dnsaddr.a` appear. Then on B,
+   `demo/ipfs.sh community`: B's node reaches A's at `_dnsaddr.a`'s addresses (A's Peers now
+   lists B, its only peer), pins the folder, and `_dnslink.site` appears. B's script then prints
+   the address of B's gateway, with a QR code:
+   `http://b.srp.dev.zenr.io:8080/ipns/site.dev.zenr.io/`.
+3. Phones scan it: the folder's files.
+4. Drag a photo into `/community` on A (IPFS Desktop, Files). Within about 15 s `_dnslink.a`
+   changes; B pins the new version, and `_dnslink.site` follows, again within about 15 s: each
+   agent asks its node, and B's asks for `a`, every 10 s. A phone's reload shows the photo
+   within about a minute: B's gateway asks for `site` again once its TTL, 30 s, is over.
+5. `https://dweb.link/ipns/site.dev.zenr.io/`, a public gateway, reads the name but cannot find
+   the folder: no node outside the private swarm has it.
+6. A leaves: Enter in A's `ipfs.sh`, and quit IPFS Desktop. `a`'s records go; `site` stays, and
+   phones still load the folder from B.
 
-   and, on the laptop's network, `http://demo.srp.dev.zenr.io:8080/ipns/demo.dev.zenr.io/`.
+B's node keeps the last version pinned after the demo, under the name
+`sig0lease-agent site.dev.zenr.io.` (`ipfs pin ls --type=recursive --names`), and the next start
+gives it as `site` until `a` publishes again. The two roles can be rehearsed on one machine with
+a second node: `IPFS_PATH`, `IPFS_API` and `GATEWAY` tell `ipfs.sh` where it is.
 
-   Public gateways (`dweb.link`, `ipfs.io`) limit requests per address and answer HTTP 429
-   past it; a room behind one address can reach that. The laptop's gateway and kubo have no
-   such limit.
-
-A changed site has a new CID, so the record changes too; gateways keep the old one for up to the
-record's TTL, 5 minutes. For now the CID is copied by hand; the agent is to read it from kubo.
+Why a DNS record, and not IPNS, IPFS's own name for content that changes: an IPNS name is the
+hash of a key (`k51…`), and its record, signed by that key, is published in IPFS's distributed
+hash table, on the peers whose IDs are closest to the name, and over pubsub to the peers
+subscribed to it, which kubo leaves off by default. Publishing or resolving it over the hash
+table can take from tens of seconds to minutes: IPFS's documentation calls it slow, and DNSLink
+"currently much faster than IPNS" ([docs.ipfs.tech/concepts/ipns](https://docs.ipfs.tech/concepts/ipns/)).
+A DNSLink record has a name people can read, is DNSSEC-signed in this zone, and is at the zone's
+servers seconds after the agent's update; a resolver that cached the old one keeps it for up to
+its TTL.
 
 ## D4: an audience Mac finds them without being told where
 
@@ -260,9 +308,9 @@ nobody can forge one, but anyone there can read them. It needs a browser from 20
 
 ## After the demo
 
-- Ctrl-C the agents, then the site, kubo and the proxy. The records go at once, and so do the
-  names (`on_stop: release`). For D5, Enter in each `demo/chat.sh`; for D6, in `demo/web.sh`
-  (the names the phones claimed stay theirs for up to 30 minutes).
+- Ctrl-C the agents, then the site and the proxy. The records go at once, and so do the names
+  (`on_stop: release`). For D3, Enter in each `demo/ipfs.sh`; for D5, in each `demo/chat.sh`;
+  for D6, in `demo/web.sh` (the names the phones claimed stay theirs for up to 30 minutes).
 - To hold the names for their keys after stopping instead, set `on_stop: keep` in the
   registrars of `demo/demo.yaml` and `demo/mac.yaml`: a host for 14 days and a name for 30
   minutes (the proxy's `config.yaml` caps an RFC 9664 key lease at 1800 s).
@@ -273,8 +321,14 @@ nobody can forge one, but anyone there can read them. It needs a browser from 20
 - The proxy logs errors reaching `ns1.free2air.org`: the network blocks port 53. Use a phone's
   hotspot, or the recording.
 - The agent logs a name held by another key: change `name: demo` (step 3 of "Before the day").
-- A public gateway answers HTTP 429: it is limiting the venue's address. Use the laptop's
-  gateway on the same network.
+- D3: B's script waits for `site`: B's node does not reach A's. `ipfs swarm peers` on B lists
+  nobody: both `ipfs daemon` logs show the same swarm key fingerprint? B's resolver may have
+  answered "no such name" for `_dnsaddr.a` before A published it, and keeps that answer for up
+  to 6 minutes: connect by hand, `ipfs swarm connect <address>`, with an address from
+  `dig +short TXT _dnsaddr.a.dev.zenr.io @ns1.free2air.org`. The log in the directory B's script
+  printed says what B's agent waits for (`agent.log`).
+- D3: phones get no answer from B's gateway: it listens on 127.0.0.1 only (Before the day, step
+  5), and then `b ipfs-gateway` is not registered either.
 - `watch.sh` shows a record and the audience does not: their resolver answered "no such name"
   before it was published. Ask `@ns1.free2air.org`, or wait up to 6 minutes.
 - `demo http` is never registered: the probe asks the site at the published addresses

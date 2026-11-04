@@ -192,8 +192,10 @@ handlers:
 
     # TTL of every record this handler writes upstream, in place of the one the requester
     # sent, cut to the granted LEASE (KEY-LEASE for KEYs) when that is shorter. Same setting
-    # as handlers.srp_handler's record_ttl_sec. Optional, default 300.
-    record_ttl_sec: 300
+    # as handlers.srp_handler's record_ttl_sec. Optional, default 300. 30 here: a resolver,
+    # or an IPFS gateway reading a name's site (docs/demo.md, D3), sees a change of a name's
+    # records within half a minute.
+    record_ttl_sec: 30
 
     # Whether to accept requests whose Update Lease option is the 4-byte variant (RFC 9664 S4):
     # one LEASE for every record in the update, KEYs included. macOS's mDNSResponder sends it.

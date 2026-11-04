@@ -1,5 +1,6 @@
-# demo/lib.sh -- what the demo's scripts (run.sh, chat.sh, web.sh) share, sourced by them. They
-# set log, the directory for the programs' logs, and ns, the server ask() asks, before using these.
+# demo/lib.sh -- what the demo's scripts (run.sh, chat.sh, web.sh, ipfs.sh) share, sourced by
+# them. They set log, the directory for the programs' logs, and ns, the server ask() asks, before
+# using these.
 
 # start <var> <log> <command...> -- runs the command in the background, its pid in <var>.
 start() {

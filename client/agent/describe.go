@@ -157,6 +157,15 @@ func Describe(w io.Writer, plan *Plan, interfaces func() ([]netip.Addr, error), 
 					p("    record:   %s (from %s now)", rfc9664.Describe(rr), s.TLSA)
 				}
 			}
+			if ip := n.IPFS; ip != nil {
+				p("  ipfs:      the node at %s; its addresses at %s", ip.API, dnsaddrOwner(owner))
+				switch {
+				case ip.Publish != "":
+					p("    site:     %s in its files, at %s", ip.Publish, dnslinkOwner(owner))
+				case ip.Follow != "":
+					p("    site:     %s's, once the node has pinned it, at %s", ip.Follow, dnslinkOwner(owner))
+				}
+			}
 			if n.Lifetime != r.Lifetime {
 				p("  leases:    %s", n.Lifetime)
 			}

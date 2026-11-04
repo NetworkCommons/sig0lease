@@ -160,6 +160,7 @@ func Run(ctx context.Context, path string, opts Options) error {
 		fatal:        make(chan error, 1),
 		probed:       make(chan probeResult),
 		mirrorEnded:  make(chan mirrorEnd),
+		ipfsReports:  make(chan ipfsReport),
 	}
 	defer func() {
 		cancelProbes()
@@ -184,6 +185,8 @@ func Run(ctx context.Context, path string, opts Options) error {
 			a.probeDone(r)
 		case e := <-a.mirrorEnded:
 			a.mirrorStopped(e)
+		case r := <-a.ipfsReports:
+			a.ipfsReported(r)
 		case <-probes.C:
 			for _, hr := range a.hosts {
 				for _, s := range hr.services {
@@ -226,6 +229,7 @@ type agent struct {
 	fatal       chan error
 	probed      chan probeResult
 	mirrorEnded chan mirrorEnd
+	ipfsReports chan ipfsReport
 }
 
 // hostRun is one template host and what was last asked of its clientsrp.Host.
@@ -241,12 +245,14 @@ type hostRun struct {
 
 // nameRun is one template name and what was last asked of its rfc9664.Name.
 type nameRun struct {
-	registrar Registrar // its registrar's connection (Registrar.connection)
-	name      Name
-	worker    *rfc9664.Name
-	services  []*serviceRun
-	set       bool
-	records   []dns.RR
+	registrar   Registrar // its registrar's connection (Registrar.connection)
+	name        Name
+	worker      *rfc9664.Name
+	services    []*serviceRun
+	ipfs        *ipfsWatch // with name.IPFS
+	ipfsRecords []dns.RR   // what its node gives it, as last reported
+	set         bool
+	records     []dns.RR
 }
 
 // holder is what services run on: a host or a name.
@@ -521,6 +527,9 @@ func (a *agent) startName(r Registrar, n Name) error {
 	for _, svc := range n.Services {
 		nr.services = append(nr.services, newService(nr, svc))
 	}
+	if n.IPFS != nil {
+		nr.ipfs = a.watchIPFS(nr)
+	}
 	a.names[owner] = nr
 	a.readCertificates(nr)
 	nr.publish(a)
@@ -579,9 +588,13 @@ func (nr *nameRun) addresses(a *agent) []netip.Addr {
 	return a.addresses(nr.name.Auto, nr.name.Addresses)
 }
 
-// publish hands nr's records to its name, if they changed: its addresses', its own, then
-// those of each service registered now.
+// publish hands nr's records to its name, if they changed: its addresses', its own, those of
+// each service registered now, then those its node gives it. A name with ipfs: waits for its
+// node's first report.
 func (nr *nameRun) publish(a *agent) {
+	if nr.ipfs != nil && !nr.ipfs.reported {
+		return
+	}
 	owner := nr.label()
 	records := slices.Clone(nr.name.Records)
 	for _, s := range nr.services {
@@ -592,6 +605,7 @@ func (nr *nameRun) publish(a *agent) {
 			}
 		}
 	}
+	records = append(records, nr.ipfsRecords...)
 	records = rfc9664.WithAddresses(owner, nr.addresses(a), records)
 	if nr.set && reflect.DeepEqual(records, nr.records) {
 		return
@@ -882,13 +896,26 @@ func (a *agent) updateHost(hr *hostRun, h Host) {
 }
 
 // updateName moves nr to n, the same name with the same lifetime in a new template
-// (moveServices), its certificates read again.
+// (moveServices), its certificates read again. Its node is watched again if its ipfs:
+// changed; until the new watch's first report, the name keeps what it registers.
 func (a *agent) updateName(nr *nameRun, n Name) {
 	if reflect.DeepEqual(nr.name, n) {
 		return
 	}
 	a.logf("template: %s changed", nr.label())
+	ipfsChanged := !reflect.DeepEqual(nr.name.IPFS, n.IPFS)
 	nr.name = n
+	if ipfsChanged {
+		if nr.ipfs != nil {
+			nr.ipfs.stop()
+			nr.ipfs = nil
+		}
+		if n.IPFS != nil {
+			nr.ipfs = a.watchIPFS(nr)
+		} else {
+			nr.ipfsRecords = nil
+		}
+	}
 	var added []*serviceRun
 	nr.services, added = moveServices(nr, nr.services, n.Services)
 	a.readCertificates(nr)
@@ -1087,6 +1114,9 @@ func stop(hosts []*hostRun, names []*nameRun, restart bool) {
 	for _, nr := range names {
 		for _, s := range nr.services {
 			s.gone = true
+		}
+		if nr.ipfs != nil {
+			nr.ipfs.stop()
 		}
 		workers = append(workers, nr.worker)
 	}

@@ -295,15 +295,19 @@ func describeLabels(l Labels) string {
 	return strings.Join(parts, ", ")
 }
 
-// PublishableAddresses returns the addresses in addrs that mean something off the link:
-// not loopback, link-local, unspecified or multicast.
+// Publishable reports whether a means something off the link: it is not loopback,
+// link-local, unspecified or multicast.
+func Publishable(a netip.Addr) bool {
+	return !a.IsLoopback() && !a.IsLinkLocalUnicast() && !a.IsUnspecified() && !a.IsMulticast()
+}
+
+// PublishableAddresses returns the addresses in addrs that are Publishable.
 func PublishableAddresses(addrs []netip.Addr) []netip.Addr {
 	var out []netip.Addr
 	for _, a := range addrs {
-		if a.IsLoopback() || a.IsLinkLocalUnicast() || a.IsUnspecified() || a.IsMulticast() {
-			continue
+		if Publishable(a) {
+			out = append(out, a)
 		}
-		out = append(out, a)
 	}
 	return out
 }

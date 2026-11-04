@@ -59,8 +59,8 @@ func TestLoad_ExampleTemplate(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(p.Registrars) != 2 || len(p.Registrars[0].Hosts) != 2 || len(p.Registrars[0].Mirrors) != 1 || len(p.Registrars[1].Names) != 2 || len(p.Registrars[1].Names[1].Services) != 2 {
-		t.Fatalf("example: %+v, want an srp registrar with 2 hosts and a mirror, and an rfc9664 one with a name and an XMPP server's", p.Registrars)
+	if len(p.Registrars) != 2 || len(p.Registrars[0].Hosts) != 2 || len(p.Registrars[0].Mirrors) != 1 || len(p.Registrars[1].Names) != 3 || len(p.Registrars[1].Names[1].Services) != 2 || p.Registrars[1].Names[2].IPFS == nil {
+		t.Fatalf("example: %+v, want an srp registrar with 2 hosts and a mirror, and an rfc9664 one with a name, an XMPP server's and an IPFS node's", p.Registrars)
 	}
 }
 
@@ -255,6 +255,62 @@ registrars:
 	}
 }
 
+// A name's ipfs: publishes a path in its node's files or follows another name's site, or
+// gives the node's addresses alone; the node's RPC API defaults to kubo's.
+func TestParse_NameIPFS(t *testing.T) {
+	n := mustParse(t, `
+registrars:
+  - protocol: rfc9664
+    zone: dev.test.
+    server: 192.0.2.1:53
+    names:
+      - {name: a, ipfs: {publish: {mfs: /community}}}
+      - {name: site, ipfs: {api: "http://127.0.0.1:5002", follow: a.dev.test}}
+      - {name: b, ipfs: {}}
+`).Registrars[0].Names
+	for i, want := range []IPFS{
+		{API: "http://127.0.0.1:5001", Publish: "/community"},
+		{API: "http://127.0.0.1:5002", Follow: "a.dev.test."},
+		{API: "http://127.0.0.1:5001"},
+	} {
+		if n[i].IPFS == nil || *n[i].IPFS != want {
+			t.Errorf("%s's ipfs = %+v, want %+v", n[i].Name, n[i].IPFS, want)
+		}
+	}
+
+	got := problems(t, `
+keystore: keys
+registrars:
+  - protocol: rfc9664
+    zone: dev.test.
+    server: 192.0.2.1:53
+    names:
+      - {name: both, ipfs: {publish: {mfs: /x}, follow: a.dev.test}}
+      - {name: badapi, ipfs: {api: "https://127.0.0.1:5001/api"}}
+      - {name: badmfs, ipfs: {publish: {mfs: community}}}
+      - {name: self, ipfs: {follow: self.dev.test.}}
+      - {name: badfollow, ipfs: {follow: a}}
+      - {name: twice, records: ['_dnslink TXT "dnslink=/ipfs/x"'], ipfs: {publish: {mfs: /x}}}
+      - {name: addrs, records: ['_dnsaddr TXT "dnsaddr=/ip4/192.0.2.1/tcp/4001/p2p/x"'], ipfs: {}}
+`)
+	for _, want := range []string{
+		"names[0] (both): ipfs: publish: and follow: are two sites for one name; give one",
+		`names[1] (badapi): ipfs: api: "https://127.0.0.1:5001/api": want http://host:port`,
+		`names[2] (badmfs): ipfs: publish: mfs: "community": want a path in the node's files`,
+		"names[3] (self): ipfs: follow: self.dev.test. is this name",
+		`names[4] (badfollow): ipfs: follow: "a": want the name of another site`,
+		"names[5] (twice): ipfs: registers the TXT records at _dnslink.twice.dev.test., which records[0] registers too",
+		"names[6] (addrs): ipfs: registers the TXT records at _dnsaddr.addrs.dev.test., which records[0] registers too",
+	} {
+		wantProblem(t, got, want)
+	}
+	if len(got) != 7 {
+		t.Errorf("%d problems, want 7:\n%s", len(got), strings.Join(got, "\n"))
+	}
+	wantProblem(t, problems(t, srpYAML("", "    mirrors: [{type: ipfs, all_hosts: true}]\n")), `"ipfs" is not a complex type that makes hosts (known: mdns)`)
+	wantProblem(t, problems(t, srpYAML("", "    hosts: [{name: box, addresses: [auto], services: [{type: ipfs}]}]\n")), "ipfs is a complex type, not a service's; use it as an rfc9664 registrar's name's ipfs:")
+}
+
 // A name's service is the SRV records that find it at the name and its subdomains, pointing
 // at the name; with tlsa, also a TLSA record at the name's port, from a certificate relative to
 // the template.
@@ -440,7 +496,7 @@ registrars:
 		"types: noproto: service:",
 		"hosts[0] (Box): addresses: at least one",
 		`unknown type "sssh"`,
-		"mdns is a complex type that makes its own hosts; use it under an srp registrar's mirrors:",
+		"mdns is a complex type, not a service's; use it under an srp registrar's mirrors:",
 		"a second host named box",
 		"ff02::1 cannot be published",
 		"0.0.0.0 cannot be published",
@@ -559,11 +615,11 @@ func TestTypes_ListsPresetsAndComplexTypes(t *testing.T) {
 	var names []string
 	for _, ti := range Types() {
 		names = append(names, ti.Name)
-		if ti.Name == "mdns" && !ti.Complex {
-			t.Error("mdns is not listed as a complex type")
+		if (ti.Name == "mdns" || ti.Name == "ipfs") && !ti.Complex {
+			t.Errorf("%s is not listed as a complex type", ti.Name)
 		}
 	}
-	for _, want := range []string{"ssh", "sftp-ssh", "http", "https", "ipfs-gateway", "activitypub", "ipp", "xmpp-client", "xmpp-server", "mdns"} {
+	for _, want := range []string{"ssh", "sftp-ssh", "http", "https", "ipfs-gateway", "activitypub", "ipp", "xmpp-client", "xmpp-server", "mdns", "ipfs"} {
 		if !slices.Contains(names, want) {
 			t.Errorf("Types() lacks %s: %v", want, names)
 		}

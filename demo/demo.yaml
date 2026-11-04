@@ -35,7 +35,5 @@ registrars:
         addresses: [auto]
         records:
           - '@ TXT "published by sig0lease-agent"'
-          # D3: the site's CID, from ipfs add -r -Q demo/site
-          # - '_dnslink TXT "dnslink=/ipfs/CID"'
           # D1, during the demo: uncomment and save
           # - 'hello TXT "added while the agent runs"'

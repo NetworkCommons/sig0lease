@@ -251,7 +251,7 @@ Each handler refuses an UPDATE that names anything outside its zone, or inside a
 
 ### Queries for the Zones Served
 
-With a processing rule for opcode 0 (QUERY) listing the handlers, as `config.yaml` has, a query for a name one of them serves (the zone rule above) gets the answer of that zone's authoritative server, the one its UPDATEs go to (`leaseHandler.answerQuery`, through the coordinator's `QueryAuthoritative`, UDP then TCP, the client's ID and RD bit put back). A client reading the zones through the proxy, as the demo's browser page does over DoH, then sees a change as soon as that server has it; through the upstream resolvers it would see what they cached, for up to the records' TTL, and a name looked up before it existed stays missing for up to the zone's negative TTL. A query for any other name is not the handlers', and goes to the upstream resolvers as before. An authoritative server that does not answer gets the client `SERVFAIL` with Extended DNS Error 22 (No Reachable Authority), never the upstream resolvers' answer instead. Without the rule, every query goes upstream.
+With a processing rule for opcode 0 (QUERY) listing the handlers, as `config.yaml` has, a query for a name one of them serves (the zone rule above) gets the answer of that zone's authoritative server, the one its UPDATEs go to (`leaseHandler.answerQuery`, through the coordinator's `QueryAuthoritative`, UDP then TCP, the client's ID and RD bit put back). A client reading the zones through the proxy, as the demo's browser page does over DoH, or `sig0lease-agent` following another name's IPFS site, then sees a change as soon as that server has it; through the upstream resolvers it would see what they cached, for up to the records' TTL, and a name looked up before it existed stays missing for up to the zone's negative TTL. A query for any other name is not the handlers', and goes to the upstream resolvers as before. An authoritative server that does not answer gets the client `SERVFAIL` with Extended DNS Error 22 (No Reachable Authority), never the upstream resolvers' answer instead. Without the rule, every query goes upstream.
 
 ### The Zone Section
 
@@ -540,8 +540,9 @@ as that server has it.
 - `cmd/internal/cli/` - the flags, key lookup and reply printing both client commands share
 - `client/` - what the RFC 9664 and SRP requesters share (granted leases, transports, refresh
   clock, `Keeper`); `client/rfc9664` is the RFC 9664 library requester, `client/srp` the SRP
-  one, `client/agent` the template agent on both, `client/browse` reads a DNS-SD domain with
-  plain queries, and `client/web` is the demo's browser page
+  one, `client/agent` the template agent on both, `client/kubo` asks an IPFS node for the
+  agent's `ipfs` names, `client/browse` reads a DNS-SD domain with plain queries, and
+  `client/web` is the demo's browser page
 - `config/` - YAML config loading and validation
 - `forward/` - upstream forwarding logic
 - `handlers/` - opcode handlers and result types, including `srp_handler.go` (the RFC 9665

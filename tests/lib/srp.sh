@@ -99,6 +99,10 @@ authoritative:
 processing_rules:
   - opcode: 5
     modules: [${modules}]
+  # As in config.yaml: queries for the handlers' zones answered from BIND, as test_agent.sh's
+  # IPFS follower reads the site it follows through the proxy.
+  - opcode: 0
+    modules: [${modules}]
 EOF
 }
 
