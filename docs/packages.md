@@ -262,8 +262,9 @@ type the template defines with the same fields. A service whose probe fails is
 withdrawn and registered again once it passes. Complex types are code, not data:
 a template uses them but cannot define them; "mdns", under an srp registrar's
 mirrors:, mirrors what a running mDNSResponder sees (client/mdnsbridge).
-An rfc9664 one holds names, each with its own key, its addresses and its records
-(client/rfc9664). See docs/sig0lease-agent.md.
+An rfc9664 one holds names, each with its own key, its addresses, its records
+and its services, which SRV records find at the name (RFC 2782), with a TLSA
+record for a TLS one (DANE) (client/rfc9664). See docs/sig0lease-agent.md.
 
 CONSTANTS
 
@@ -303,6 +304,15 @@ func Run(ctx context.Context, path string, opts Options) error
     on without: a first template that is invalid, a keystore it cannot use,
     a state file edited by hand, a host or name its client refuses.
 
+func TLSARecord(owner, file string) (*dns.TLSA, error)
+    TLSARecord reads the PEM certificate file, the first certificate in it
+    being the server's own (as in the chain files TLS servers read), and
+    returns the TLSA record at owner matching its public key: usage 3 (DANE-EE:
+    this server's own key, no certificate authority, the certificate's names and
+    dates not checked), selector 1 (the SubjectPublicKeyInfo) and matching type
+    1 (its SHA-256), the form RFC 7671 S5.1 recommends. It still matches when
+    the certificate is renewed with the same key.
+
 
 TYPES
 
@@ -339,10 +349,11 @@ type Name struct {
 	Auto      bool         // this machine's addresses too, as they change
 	Addresses []netip.Addr // literal addresses
 	Records   []dns.RR     // at or below the name, fully qualified; no address of the name
+	Services  []Service    // none registers what Records or another service registers
 	Lifetime               // the registrar's, with what the name overrides
 }
     Name is one RFC 9664 name: a label right below its registrar's zone, held by
-    its own key, with its addresses and records.
+    its own key, with its addresses, records and services.
 
 type Options struct {
 	// Logf receives the agent's log lines; a host's start with its label, a name's with the
@@ -386,9 +397,9 @@ func Load(path string) (*Plan, error)
     Load reads and validates the template at path.
 
 func Parse(data []byte, path string) (*Plan, error)
-    Parse validates data, the template read from path; a relative keystore is
-    relative to path's directory, and with none CLIENT_KEYSTORE_DIR is used
-    (keyrec.KeystoreDir).
+    Parse validates data, the template read from path; a relative
+    keystore or tlsa is relative to path's directory, and with no keystore
+    CLIENT_KEYSTORE_DIR is used (keyrec.KeystoreDir).
 
 func (p *Plan) Mirror(t string) (Registrar, Mirror, bool)
     Mirror returns the template's mirror of type t, and the registrar it
@@ -438,11 +449,32 @@ func (r Registrar) Owner(label string) string
 func (r Registrar) String() string
 
 type Service struct {
-	Type     string // the type's name: a preset or one the template defines
-	Instance clientsrp.InstanceConfig
+	Type     string                   // the type's name: a preset or one the template defines
+	Instance clientsrp.InstanceConfig // a name's: its ServiceType and Port alone
 	Probe    Probe
+	// A name's only. Subdomains are names below the name, relative to it, that the service is
+	// also offered for; TLSA is the certificate file, absolute, whose key a TLSA record at
+	// "_<port>._<proto>.<name>" gives (TLSARecord), or "".
+	Subdomains []string
+	TLSA       string
 }
-    Service is one instance of a service type on a host.
+    Service is one instance of a service type. On a host it is a DNS-SD
+    instance. On a name it is the SRV records that find the service at the name
+    and at its Subdomains, each pointing at the name and the service's port
+    (RFC 2782), and with TLSA the record that lets a client check the service's
+    certificate through DNSSEC (DANE, RFC 6698).
+
+func (s Service) SRV(name string) []dns.RR
+    SRV returns the SRV records that find s, a service of name (fully
+    qualified), at name and at each of its subdomains: pointing at name and s's
+    port, priority and weight 0 (RFC 2782: there is one target).
+
+func (s Service) String() string
+
+func (s Service) TLSAOwner(name string) string
+    TLSAOwner returns where s's TLSA record is, s being a service of name with a
+    TLSA: the SRV records' target and port, "_<port>._<proto>.<name>" (RFC 6698
+    S3, RFC 7673 S3).
 
 type TypeInfo struct {
 	Name    string

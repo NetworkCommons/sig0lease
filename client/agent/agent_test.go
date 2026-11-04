@@ -81,6 +81,8 @@ func summarize(m *dns.Msg) update {
 			if !strings.Contains(r.Hdr.Name, "._") {
 				u.records = append(u.records, rfc9664.Describe(r))
 			}
+		case *dns.TLSA:
+			u.records = append(u.records, rfc9664.Describe(r))
 		}
 	}
 	for _, rr := range m.Ns {
@@ -733,6 +735,93 @@ names:
 	u = h.until(t, "deregistering site", func(update) bool { return true })
 	if !slices.Equal(u.addrs, []string{"192.0.2.11"}) || len(u.records) != 1 || u.lease != 0 || u.keyLease != 1209600 {
 		t.Fatalf("update on stop %+v, want the records deleted and the name kept (on_stop: keep)", u)
+	}
+}
+
+// A name's service is registered as its SRV records, with the TLSA record its certificate
+// gives, once its probe passes, and withdrawn while its certificate cannot be read or after
+// ProbeFailures failed probes in a row. A new key in the certificate replaces the TLSA record.
+func TestRun_NameServices(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+	port := ln.Addr().(*net.TCPAddr).Port
+	closed, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	closedPort := closed.Addr().(*net.TCPAddr).Port
+	closed.Close()
+	h := newHarness(t, nameTemplate(fmt.Sprintf(`
+names:
+  - name: a
+    addresses: [127.0.0.1]
+    services:
+      - {type: xmpp-server, port: %d, subdomains: [rooms], tlsa: a.pem}
+      - {type: xmpp-client, port: %d}
+`, port, closedPort)))
+	cert := filepath.Join(h.dir, "a.pem")
+	spki := writeCert(t, cert)
+	h.start(t, nil)
+
+	srvs := []string{"_xmpp-server._tcp.a.dev.test.", "_xmpp-server._tcp.rooms.a.dev.test."}
+	tlsa := func(spki string) []string {
+		return []string{fmt.Sprintf("_%d._tcp.a.dev.test. TLSA 3 1 1 %s", port, spki)}
+	}
+	u := h.until(t, "registering xmpp-server", func(u update) bool { return u.lease != 0 && len(u.instances) > 0 })
+	if !slices.Equal(u.instances, srvs) || !slices.Equal(u.records, tlsa(spki)) || !slices.Equal(u.addrs, []string{"127.0.0.1"}) {
+		t.Fatalf("registration %+v, want a's address, xmpp-server's SRV records for a and rooms.a and its TLSA record", u)
+	}
+	h.logs.waitFor(t, "a.dev.test.: _xmpp-client._tcp: not registered until its probe passes")
+
+	newSPKI := writeCert(t, cert)
+	if u = h.until(t, "withdrawing the old TLSA record", func(u update) bool { return u.lease == 0 }); !slices.Equal(u.records, tlsa(spki)) || len(u.instances) != 0 {
+		t.Fatalf("withdrawal after the new key %+v, want the old TLSA record alone", u)
+	}
+	if u = h.until(t, "registering the new TLSA record", func(u update) bool { return u.lease != 0 }); !slices.Equal(u.records, tlsa(newSPKI)) || !slices.Equal(u.instances, srvs) {
+		t.Fatalf("registration after the new key %+v, want the SRV records and the new TLSA record", u)
+	}
+	h.logs.waitFor(t, "a.dev.test.: _xmpp-server._tcp: certificate "+cert+" has a new key; its TLSA record follows")
+
+	if err := os.Remove(cert); err != nil {
+		t.Fatal(err)
+	}
+	if u = h.until(t, "withdrawing xmpp-server", func(u update) bool { return u.lease == 0 }); !slices.Equal(u.records, tlsa(newSPKI)) || !slices.Equal(u.instances, srvs) {
+		t.Fatalf("withdrawal without the certificate %+v, want the SRV and TLSA records", u)
+	}
+	h.logs.waitFor(t, "a.dev.test.: _xmpp-server._tcp: certificate: open "+cert+": no such file or directory; not registered until it can be read")
+	spki = writeCert(t, cert)
+	if u = h.until(t, "registering xmpp-server again", func(u update) bool { return u.lease != 0 && len(u.instances) > 0 }); !slices.Equal(u.records, tlsa(spki)) {
+		t.Fatalf("registration with the certificate back %+v, want its TLSA record", u)
+	}
+	h.logs.waitFor(t, "a.dev.test.: _xmpp-server._tcp: certificate "+cert+" read")
+
+	ln.Close()
+	if u = h.until(t, "withdrawing xmpp-server after its probes", func(u update) bool { return u.lease == 0 }); !slices.Equal(u.instances, srvs) || !slices.Equal(u.records, tlsa(spki)) {
+		t.Fatalf("withdrawal after failed probes %+v, want the SRV and TLSA records", u)
+	}
+	h.logs.waitFor(t, "a.dev.test.: _xmpp-server._tcp: probe failed 3 times in a row, withdrawing it")
+}
+
+// A name's service changed in the template is registered as it now is: here offered for a
+// subdomain too, and without its TLSA record.
+func TestRun_NameServiceChanges(t *testing.T) {
+	h := newHarness(t, nameTemplate("names: [{name: a, addresses: [127.0.0.1], services: [{type: xmpp-server, probe: none, tlsa: a.pem}]}]\n"))
+	spki := writeCert(t, filepath.Join(h.dir, "a.pem"))
+	h.start(t, nil)
+	tlsa := []string{"_5269._tcp.a.dev.test. TLSA 3 1 1 " + spki}
+	if u := h.until(t, "registering a", func(u update) bool { return u.lease != 0 }); !slices.Equal(u.instances, []string{"_xmpp-server._tcp.a.dev.test."}) || !slices.Equal(u.records, tlsa) {
+		t.Fatalf("registration %+v, want xmpp-server's SRV and TLSA records", u)
+	}
+
+	h.write(t, nameTemplate("names: [{name: a, addresses: [127.0.0.1], services: [{type: xmpp-server, probe: none, subdomains: [rooms]}]}]\n"))
+	if u := h.until(t, "withdrawing the TLSA record", func(u update) bool { return u.lease == 0 }); !slices.Equal(u.records, tlsa) || len(u.instances) != 0 {
+		t.Fatalf("withdrawal %+v, want the TLSA record alone", u)
+	}
+	if u := h.until(t, "registering a again", func(u update) bool { return u.lease != 0 }); !slices.Equal(u.instances, []string{"_xmpp-server._tcp.a.dev.test.", "_xmpp-server._tcp.rooms.a.dev.test."}) || len(u.records) != 0 {
+		t.Fatalf("registration after the change %+v, want the SRV records for a and rooms.a, no TLSA record", u)
 	}
 }
 

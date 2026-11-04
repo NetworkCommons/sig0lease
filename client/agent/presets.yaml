@@ -32,3 +32,11 @@ ipp:
   port: 631
   txt: {txtvers: "1", rp: ipp/print}
   probe: {tcp: true}
+xmpp-client:
+  service: _xmpp-client._tcp
+  port: 5222
+  probe: {tcp: true}
+xmpp-server:
+  service: _xmpp-server._tcp
+  port: 5269
+  probe: {tcp: true}

@@ -167,8 +167,9 @@ test-srp:
 	./tests/test_srp.sh run
 
 # Run the sig0lease-agent end-to-end suite (template -> registrations, probes withdrawing and
-# re-adding a service, template reloads, renames kept across restarts) against the real proxy
-# and a real, disposable local BIND 9; the probed service is python3's http.server.
+# re-adding a service, template reloads, renames kept across restarts, and with Prosody installed
+# two XMPP servers federating through the names' SRV records) against the real proxy and a real,
+# disposable local BIND 9; the probed service is python3's http.server.
 test-agent:
 	./tests/test_agent.sh run
 

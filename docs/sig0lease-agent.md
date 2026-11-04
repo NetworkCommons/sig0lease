@@ -7,7 +7,8 @@ a template, a YAML file listing registrars and what each registers, and register
   with `srp_handler`: names people find by browsing (DNS-SD);
 - names and their records through this project's proxy with `update_handler` (RFC 9664 with
   `fcfs_naming`): names people type or link, such as a web address, a DNSLink path or a Matrix
-  ID.
+  ID, and the services found at a name by SRV records, such as an XMPP server, with a TLSA
+  record for its certificate (DANE).
 
 It then keeps the registrations alive, follows the template as it changes, and deregisters
 everything when it stops. Services are described by type: a template names a built-in preset
@@ -120,11 +121,16 @@ registered it, so while a host is registered its key holds its name.
 
 ### services
 
+A host's services are DNS-SD instances; a name's are SRV records (see "names"). Both are
+instances of a type:
+
 | Field | Meaning |
 |---|---|
 | `type` | Required: a preset or one of the template's `types:`. |
-| `instance` | The instance name. Default `"<host> <type>"`, e.g. `myhost ssh`. Free text, without `.`. |
-| `port`, `txt`, `subtypes`, `probe` | Override the type's. |
+| `instance` | A host's: the instance name. Default `"<host> <type>"`, e.g. `myhost ssh`. Free text, without `.`. |
+| `port`, `probe` | Override the type's. |
+| `txt`, `subtypes` | A host's: override the type's. |
+| `subdomains`, `tlsa` | A name's (see "names"). |
 
 A service takes every field of its type and overrides what it gives. `txt` merges key by key
 over the type's, and `key: null` sends the key alone, as a boolean attribute (RFC 6763 §6.4);
@@ -144,6 +150,8 @@ The presets (`sig0lease-agent types` lists them; they are `client/agent/presets.
 | `ipfs-gateway` | `_http._tcp` | 8080 | `path=/ipfs/`, subtype `_ipfs` | TCP |
 | `activitypub` | `_activitypub._tcp` | 443 | | TCP |
 | `ipp` | `_ipp._tcp` | 631 | `txtvers=1`, `rp=ipp/print` | TCP |
+| `xmpp-client` | `_xmpp-client._tcp` | 5222 | | TCP |
+| `xmpp-server` | `_xmpp-server._tcp` | 5269 | | TCP |
 
 A template's own `types:` take the same fields: `service` (required, `_<name>._tcp` or
 `_<name>._udp`), `port`, `txt`, `subtypes` and `probe`. A type without a port needs each of its
@@ -162,8 +170,8 @@ one, `mdns`.
 | `{tcp: true}` | A TCP connection to the port succeeds. |
 | `{http: /path}` | A plain HTTP `GET` of the path answers 2xx or 3xx. A redirect is not followed. |
 
-A probe tries all the host's addresses at once and passes as soon as one answers; it takes at
-most 5 seconds. A probed service is registered only once a probe passes. It is probed
+A probe tries all the host's or name's addresses at once and passes as soon as one answers; it
+takes at most 5 seconds. A probed service is registered only once a probe passes. It is probed
 every 30 seconds (`run -probe-interval`); after 3 failures in a row it is withdrawn, and at the
 next pass registered again. The agent logs the first failure, each failure that counts towards
 a withdrawal, the withdrawal and the return.
@@ -206,6 +214,7 @@ KEY and the records, on the registrar's leases (the handler's Case A).
 | `name` | The label: letters, digits and hyphens, as a host's. The proxy's `fcfs_naming` lets a key register itself only one label below the zone. Unique in its registrar, ignoring case. |
 | `addresses` | `auto`, IP addresses, or both, as a host's: registered as A and AAAA records at the name. Optional. |
 | `records` | `"<owner> <type> <data>"`, the owner `@` for the name itself or relative to it (`_dnslink`, `www`), the data in zone-file format. At or below the name, class IN, no KEY or SIG, no A or AAAA at the name (`addresses:` has those). Each once. |
+| `services` | Services found at the name by SRV records (below). They need `addresses:`, which the SRV records point at. |
 | `lease`, `key_lease`, `on_stop` | As in the registrar, for this name only. Left out: the registrar's. |
 
 A name needs an address or a record. With only `auto` and no address to publish, the agent
@@ -213,6 +222,49 @@ registers nothing for it until the machine has one. A name's records the templat
 machine no longer has are withdrawn (Case D: LEASE 0 with them listed, the KEY refreshed) before
 the rest is registered again; a record's TTL is the client's 300 seconds, which the proxy may
 override (`record_ttl_sec`).
+
+A name's service is the SRV records that find it at the name (RFC 2782), as an XMPP server's
+domain is found:
+
+```yaml
+    names:
+      - name: chat                    # chat.dev.zenr.io., the XMPP server's domain
+        addresses: [auto]
+        services:
+          - type: xmpp-client         # _xmpp-client._tcp.chat SRV 0 0 5222 chat.dev.zenr.io.
+          - type: xmpp-server         # _xmpp-server._tcp.chat and _xmpp-server._tcp.rooms.chat,
+            subdomains: [rooms]       #   both SRV 0 0 5269 chat.dev.zenr.io.
+            tlsa: /etc/prosody/certs/chat.dev.zenr.io.crt   # _5269._tcp.chat TLSA 3 1 1 ...
+```
+
+| Field | Meaning |
+|---|---|
+| `type`, `port`, `probe` | As a host's service's. The type may have no TXT keys or subtypes, which SRV records cannot carry. |
+| `subdomains` | Names below the name, relative to it, that the service is also offered for, each with an SRV record pointing at the name: an XMPP server's group chat service `rooms.chat`, say. |
+| `tlsa` | A PEM certificate file, relative to the template: the service's own, whose public key a TLSA record at `_<port>._<proto>.<name>` gives (RFC 6698), for clients to check it through DNSSEC (DANE) instead of a certificate authority. |
+
+Each SRV record has priority and weight 0 and points at the name and the service's port. A
+name's service type is registered once per name, and nothing a service registers may also be in
+`records:` or come from another service.
+
+The TLSA record is `3 1 1`: the service's own key (DANE-EE, no certificate authority, the
+certificate's names and dates not checked), matched by the SHA-256 of its public key, the form
+RFC 7671 §5.1 recommends. Prosody 13 checks the certificate's names all the same, though RFC 7671
+§10.2 says they are not checked with DANE-EE: give the certificate the name and every subdomain,
+as `demo/chat.sh` does. The first certificate in the file is used, as in the chain files TLS
+servers read. The file is read again at every poll: a new key replaces the record. A file that
+cannot be read withdraws the service, SRV records included, until it can, and the agent logs it
+once: the old record would make DANE clients refuse the service, and the SRV records alone would
+let others reach it unchecked. A TLSA record means something only in a DNSSEC-signed zone.
+
+The record follows a new key; it does not come before it. A DANE client holding the old record,
+which it may cache for the record's TTL, refuses the new key, so the service may be refused for
+up to a poll interval and the TTL after the key changes. RFC 7671 §8.1 avoids that by publishing
+a record for the next key beside the current one at least two TTLs before the change; the agent
+cannot yet, as `tlsa` takes one certificate. It is seldom needed: the record matches the key, not
+the certificate, whose dates and serial number change at every renewal, so a certificate renewed
+with the same key (certbot's `--reuse-key`, say) keeps it; only a new key, planned or after the
+old one leaked, changes it.
 
 ## Running
 
@@ -225,7 +277,7 @@ override (`record_ttl_sec`).
 - a host changed is registered again with its new addresses and services, withdrawing the
   services it no longer has; a service whose port and probe are unchanged keeps its probe
   state, any other is registered once a probe passes. A name changed withdraws the records it
-  no longer has, then registers the others;
+  no longer has, then registers the others; its services are kept as a host's are;
 - a registrar whose `server`, `transport`, `resolvers`, `lease`, `key_lease` or `on_stop`
   changed deregisters what it registers, keeping the names, then registers it again; a new
   `server` or `transport` also frees the names held through the old one. Another registrar's
@@ -334,6 +386,7 @@ Run one agent per keystore.
 
 - RFC 9664 names need this project's proxy: the lease is RFC 9664's, but a name held by its key
   (`fcfs_naming`) is the proxy's.
-- Code handlers for types needing more than data (IPFS DNSLink from a running node, Matrix and
-  XMPP SRV) are later steps.
-- Probes are plain TCP and HTTP; names have none.
+- A code handler for IPFS DNSLink from a running node is a later step.
+- Probes are plain TCP and HTTP.
+- A key change announced ahead (RFC 7671 §8.1): `tlsa` takes one certificate, so a name's TLSA
+  record follows a new key instead of coming before it (see "names").

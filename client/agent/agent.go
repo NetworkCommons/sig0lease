@@ -190,6 +190,11 @@ func Run(ctx context.Context, path string, opts Options) error {
 					a.probe(s)
 				}
 			}
+			for _, nr := range a.names {
+				for _, s := range nr.services {
+					a.probe(s)
+				}
+			}
 		case <-poll.C:
 			if err := a.poll(); err != nil {
 				return err
@@ -239,19 +244,36 @@ type nameRun struct {
 	registrar Registrar // its registrar's connection (Registrar.connection)
 	name      Name
 	worker    *rfc9664.Name
+	services  []*serviceRun
 	set       bool
 	records   []dns.RR
 }
 
+// holder is what services run on: a host or a name.
+type holder interface {
+	label() string                   // what its log lines start with
+	addresses(a *agent) []netip.Addr // now: its services are probed there
+	publish(a *agent)                // hands what is registered now to its worker, if it changed
+}
+
 // serviceRun is one service and its probes.
 type serviceRun struct {
-	host     *hostRun
+	on       holder
 	svc      Service
-	up       bool // registered: no probe, or the last one passed and not ProbeFailures failed since
+	up       bool // no probe, or the last one passed and not ProbeFailures failed since
 	failures int  // in a row
 	probing  bool
 	gone     bool // no longer in the template; a probe still running is ignored
+	// A name's service with a TLSA: the record its certificate gives, nil while the certificate
+	// cannot be read (readCertificate), and the last such error, logged once.
+	tlsa    *dns.TLSA
+	tlsaErr string
 }
+
+// registered reports whether s is registered: up, and with a TLSA, its certificate read.
+func (s *serviceRun) registered() bool { return s.up && (s.svc.TLSA == "" || s.tlsa != nil) }
+
+func (s *serviceRun) String() string { return s.on.label() + ": " + s.svc.String() }
 
 type probeResult struct {
 	s   *serviceRun
@@ -471,7 +493,7 @@ func (a *agent) startHost(r Registrar, h Host) error {
 		hr.services = append(hr.services, newService(hr, svc))
 	}
 	a.hosts[owner] = hr
-	a.publish(hr)
+	hr.publish(a)
 	for _, s := range hr.services {
 		a.probe(s)
 	}
@@ -496,13 +518,20 @@ func (a *agent) startName(r Registrar, n Name) error {
 		return err
 	}
 	nr := &nameRun{registrar: r.connection(), name: n, worker: w}
+	for _, svc := range n.Services {
+		nr.services = append(nr.services, newService(nr, svc))
+	}
 	a.names[owner] = nr
-	a.publishName(nr)
+	a.readCertificates(nr)
+	nr.publish(a)
+	for _, s := range nr.services {
+		a.probe(s)
+	}
 	return nil
 }
 
-func newService(hr *hostRun, svc Service) *serviceRun {
-	return &serviceRun{host: hr, svc: svc, up: svc.Probe.Kind == ProbeNone}
+func newService(on holder, svc Service) *serviceRun {
+	return &serviceRun{on: on, svc: svc, up: svc.Probe.Kind == ProbeNone}
 }
 
 // addresses returns a host's or name's addresses now: its literal ones, then this machine's
@@ -519,12 +548,18 @@ func (a *agent) addresses(auto bool, literal []netip.Addr) []netip.Addr {
 	return addrs
 }
 
-// publish hands hr's addresses and the services that are up to its host, if they changed.
-func (a *agent) publish(hr *hostRun) {
-	addrs := a.addresses(hr.host.Auto, hr.host.Addresses)
+func (hr *hostRun) label() string { return hr.host.Name }
+
+func (hr *hostRun) addresses(a *agent) []netip.Addr {
+	return a.addresses(hr.host.Auto, hr.host.Addresses)
+}
+
+// publish hands hr's addresses and the services registered now to its host, if they changed.
+func (hr *hostRun) publish(a *agent) {
+	addrs := hr.addresses(a)
 	var insts []clientsrp.InstanceConfig
 	for _, s := range hr.services {
-		if s.up {
+		if s.registered() {
 			insts = append(insts, s.svc.Instance)
 		}
 	}
@@ -538,10 +573,26 @@ func (a *agent) publish(hr *hostRun) {
 	hr.worker.Set(addrs, insts)
 }
 
-// publishName hands nr's records to its name, its addresses' first, if they changed.
-func (a *agent) publishName(nr *nameRun) {
-	owner := nr.registrar.Owner(nr.name.Name)
-	records := rfc9664.WithAddresses(owner, a.addresses(nr.name.Auto, nr.name.Addresses), nr.name.Records)
+func (nr *nameRun) label() string { return nr.registrar.Owner(nr.name.Name) }
+
+func (nr *nameRun) addresses(a *agent) []netip.Addr {
+	return a.addresses(nr.name.Auto, nr.name.Addresses)
+}
+
+// publish hands nr's records to its name, if they changed: its addresses', its own, then
+// those of each service registered now.
+func (nr *nameRun) publish(a *agent) {
+	owner := nr.label()
+	records := slices.Clone(nr.name.Records)
+	for _, s := range nr.services {
+		if s.registered() {
+			records = append(records, s.svc.SRV(owner)...)
+			if s.tlsa != nil {
+				records = append(records, s.tlsa)
+			}
+		}
+	}
+	records = rfc9664.WithAddresses(owner, nr.addresses(a), records)
 	if nr.set && reflect.DeepEqual(records, nr.records) {
 		return
 	}
@@ -558,7 +609,7 @@ func (a *agent) probe(s *serviceRun) {
 		return
 	}
 	s.probing = true
-	p, addrs, port, timeout := s.svc.Probe, a.addresses(s.host.host.Auto, s.host.host.Addresses), s.svc.Instance.Port, a.opts.ProbeTimeout
+	p, addrs, port, timeout := s.svc.Probe, s.on.addresses(a), s.svc.Instance.Port, a.opts.ProbeTimeout
 	a.probes.Add(1)
 	go func() {
 		defer a.probes.Done()
@@ -576,27 +627,57 @@ func (a *agent) probeDone(r probeResult) {
 	if s.gone {
 		return
 	}
-	name := fmt.Sprintf("%s: %q %s", s.host.host.Name, s.svc.Instance.Label, s.svc.Instance.ServiceType)
 	if r.err == nil {
 		s.failures = 0
 		if !s.up {
 			s.up = true
-			a.logf("%s: probe %s passes", name, s.svc.Probe)
-			a.publish(s.host)
+			a.logf("%s: probe %s passes", s, s.svc.Probe)
+			s.on.publish(a)
 		}
 		return
 	}
 	s.failures++
 	switch {
 	case s.up && s.failures < a.opts.ProbeFailures:
-		a.logf("%s: probe failed (%d of %d before it is withdrawn): %v", name, s.failures, a.opts.ProbeFailures, r.err)
+		a.logf("%s: probe failed (%d of %d before it is withdrawn): %v", s, s.failures, a.opts.ProbeFailures, r.err)
 	case s.up:
 		s.up = false
-		a.logf("%s: probe failed %d times in a row, withdrawing it: %v", name, s.failures, r.err)
-		a.publish(s.host)
+		a.logf("%s: probe failed %d times in a row, withdrawing it: %v", s, s.failures, r.err)
+		s.on.publish(a)
 	case s.failures == 1:
-		a.logf("%s: not registered until its probe passes: %v", name, r.err)
+		a.logf("%s: not registered until its probe passes: %v", s, r.err)
 	}
+}
+
+// readCertificates reads again the certificate of each of nr's services with a TLSA, and
+// reports whether any service's TLSA record changed. A certificate that cannot be read leaves
+// its service unregistered until it can: a client checking the service through DANE would
+// refuse it, the TLSA record left behind matching the key the service no longer has, and the
+// SRV records alone would let others reach it without the check asked for.
+func (a *agent) readCertificates(nr *nameRun) (changed bool) {
+	for _, s := range nr.services {
+		var rr *dns.TLSA
+		var err error
+		if s.svc.TLSA != "" {
+			rr, err = TLSARecord(s.svc.TLSAOwner(nr.label()), s.svc.TLSA)
+		}
+		switch {
+		case err != nil:
+			if msg := err.Error(); msg != s.tlsaErr {
+				s.tlsaErr = msg
+				a.logf("%s: %v; not registered until it can be read", s, err)
+			}
+		case s.tlsaErr != "":
+			s.tlsaErr = ""
+			a.logf("%s: certificate %s read", s, s.svc.TLSA)
+		case s.tlsa != nil && rr != nil && s.tlsa.Certificate != rr.Certificate:
+			a.logf("%s: certificate %s has a new key; its TLSA record follows", s, s.svc.TLSA)
+		}
+		if !reflect.DeepEqual(rr, s.tlsa) {
+			s.tlsa, changed = rr, true
+		}
+	}
+	return changed
 }
 
 // poll reads this machine's addresses and the template again, and restarts failed mirrors.
@@ -613,14 +694,19 @@ func (a *agent) poll() error {
 			a.machine = addrs
 			for _, hr := range a.hosts {
 				if hr.host.Auto {
-					a.publish(hr)
+					hr.publish(a)
 				}
 			}
 			for _, nr := range a.names {
 				if nr.name.Auto {
-					a.publishName(nr)
+					nr.publish(a)
 				}
 			}
+		}
+	}
+	for _, nr := range a.names {
+		if a.readCertificates(nr) {
+			nr.publish(a)
 		}
 	}
 
@@ -735,11 +821,7 @@ func (a *agent) updateRegistrar(r Registrar) error {
 		case nr == nil:
 			a.logf("template: %s added", owner)
 		case nr.name.Lifetime == n.Lifetime:
-			if !reflect.DeepEqual(nr.name, n) {
-				a.logf("template: %s changed", owner)
-				nr.name = n
-				a.publishName(nr)
-			}
+			a.updateName(nr, n)
 			continue
 		default:
 			a.logf("template: %s's lease, key_lease or on_stop changed; deregistering it, keeping it, then registering it again", owner)
@@ -784,24 +866,51 @@ func (a *agent) stopRemoved(plan *Plan) {
 	stop(hosts, names, false)
 }
 
-// updateHost moves hr to h, the same host in a new template. A service whose port and probe
-// are unchanged keeps its probes' state; any other starts over, registered once a probe
-// passes.
+// updateHost moves hr to h, the same host in a new template (moveServices).
 func (a *agent) updateHost(hr *hostRun, h Host) {
 	if reflect.DeepEqual(hr.host, h) {
 		return
 	}
 	a.logf("template: %s changed", hr.registrar.Owner(h.Name))
+	hr.host = h
+	var added []*serviceRun
+	hr.services, added = moveServices(hr, hr.services, h.Services)
+	hr.publish(a)
+	for _, s := range added {
+		a.probe(s)
+	}
+}
+
+// updateName moves nr to n, the same name with the same lifetime in a new template
+// (moveServices), its certificates read again.
+func (a *agent) updateName(nr *nameRun, n Name) {
+	if reflect.DeepEqual(nr.name, n) {
+		return
+	}
+	a.logf("template: %s changed", nr.label())
+	nr.name = n
+	var added []*serviceRun
+	nr.services, added = moveServices(nr, nr.services, n.Services)
+	a.readCertificates(nr)
+	nr.publish(a)
+	for _, s := range added {
+		a.probe(s)
+	}
+}
+
+// moveServices returns the services svcs of on, a host or name in a new template, from those
+// running, and those of them added, to be probed. One whose instance name, service type, port
+// and probe are unchanged keeps its probes' state; any other starts over, registered once a
+// probe passes. The others are gone.
+func moveServices(on holder, running []*serviceRun, svcs []Service) (services, added []*serviceRun) {
 	key := func(s Service) string {
 		return dnsname.Fold(s.Instance.Label) + "\x00" + dnsname.Fold(s.Instance.ServiceType)
 	}
 	old := map[string]*serviceRun{}
-	for _, s := range hr.services {
+	for _, s := range running {
 		old[key(s.svc)] = s
 	}
-	hr.host = h
-	var services, added []*serviceRun
-	for _, svc := range h.Services {
+	for _, svc := range svcs {
 		s := old[key(svc)]
 		delete(old, key(svc))
 		if s != nil && s.svc.Instance.Port == svc.Instance.Port && s.svc.Probe == svc.Probe {
@@ -810,7 +919,7 @@ func (a *agent) updateHost(hr *hostRun, h Host) {
 			if s != nil {
 				s.gone = true
 			}
-			s = newService(hr, svc)
+			s = newService(on, svc)
 			added = append(added, s)
 		}
 		services = append(services, s)
@@ -818,11 +927,7 @@ func (a *agent) updateHost(hr *hostRun, h Host) {
 	for _, s := range old {
 		s.gone = true
 	}
-	hr.services = services
-	a.publish(hr)
-	for _, s := range added {
-		a.probe(s)
-	}
+	return services, added
 }
 
 // hostNames returns the labels of r's hosts.
@@ -980,6 +1085,9 @@ func stop(hosts []*hostRun, names []*nameRun, restart bool) {
 		workers = append(workers, hr.worker)
 	}
 	for _, nr := range names {
+		for _, s := range nr.services {
+			s.gone = true
+		}
 		workers = append(workers, nr.worker)
 	}
 	for _, w := range workers {

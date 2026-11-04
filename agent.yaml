@@ -72,3 +72,11 @@ registrars:
         records:                        # "<owner> <type> <data>", the owner @ or relative to the name
           - '_dnslink TXT "dnslink=/ipns/k51qzi5uqu5dlvj2baxnqndepeb86cbk3ng7n3i46uzyxzyqj2xjonzllnv0v8"'
           - "www CNAME mysite.dev.zenr.io."
+      - name: chat                      # an XMPP server's domain, chat.dev.zenr.io.
+        addresses: [auto]
+        services:                       # found by SRV records at the name, pointing at it
+          - type: xmpp-client           # _xmpp-client._tcp.chat, port 5222, probed over TCP
+          - type: xmpp-server           # _xmpp-server._tcp.chat, port 5269
+            subdomains: [rooms]         # and _xmpp-server._tcp.rooms.chat: its group chat service
+            tlsa: certs/chat.crt        # a TLSA record for this certificate's key (DANE); relative
+                                        # to this file, read at every poll

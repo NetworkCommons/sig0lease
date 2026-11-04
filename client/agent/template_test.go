@@ -59,8 +59,8 @@ func TestLoad_ExampleTemplate(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(p.Registrars) != 2 || len(p.Registrars[0].Hosts) != 2 || len(p.Registrars[0].Mirrors) != 1 || len(p.Registrars[1].Names) != 1 {
-		t.Fatalf("example: %+v, want an srp registrar with 2 hosts and a mirror, and an rfc9664 one with a name", p.Registrars)
+	if len(p.Registrars) != 2 || len(p.Registrars[0].Hosts) != 2 || len(p.Registrars[0].Mirrors) != 1 || len(p.Registrars[1].Names) != 2 || len(p.Registrars[1].Names[1].Services) != 2 {
+		t.Fatalf("example: %+v, want an srp registrar with 2 hosts and a mirror, and an rfc9664 one with a name and an XMPP server's", p.Registrars)
 	}
 }
 
@@ -252,6 +252,97 @@ registrars:
 	}
 	if n[1].Auto || n[1].Addresses != nil || len(n[1].Records) != 1 {
 		t.Fatalf("other = %+v", n[1])
+	}
+}
+
+// A name's service is the SRV records that find it at the name and its subdomains, pointing
+// at the name; with tlsa, also a TLSA record at the name's port, from a certificate relative to
+// the template.
+func TestParse_NameServices(t *testing.T) {
+	n := mustParse(t, `
+registrars:
+  - protocol: rfc9664
+    zone: dev.test.
+    server: 192.0.2.1:53
+    names:
+      - name: a
+        addresses: [auto]
+        services:
+          - type: xmpp-client
+          - type: xmpp-server
+            port: 15269
+            subdomains: [rooms]
+            tlsa: certs/a.crt
+            probe: none
+`).Registrars[0].Names[0]
+	if len(n.Services) != 2 {
+		t.Fatalf("services = %+v, want 2", n.Services)
+	}
+	c, s := n.Services[0], n.Services[1]
+	if c.Instance.ServiceType != "_xmpp-client._tcp" || c.Instance.Port != 5222 || c.Probe.Kind != ProbeTCP || c.TLSA != "" || c.Instance.Label != "" {
+		t.Errorf("xmpp-client = %+v, want the preset's service, port and probe", c)
+	}
+	if s.Instance.Port != 15269 || s.Probe.Kind != ProbeNone || s.TLSA != "/etc/agent/certs/a.crt" {
+		t.Errorf("xmpp-server = %+v, want port 15269, no probe, tlsa relative to the template", s)
+	}
+	var got []string
+	for _, rr := range s.SRV("a.dev.test.") {
+		got = append(got, rfc9664.Describe(rr))
+	}
+	want := []string{"_xmpp-server._tcp.a.dev.test. SRV 0 0 15269 a.dev.test.", "_xmpp-server._tcp.rooms.a.dev.test. SRV 0 0 15269 a.dev.test."}
+	if !slices.Equal(got, want) {
+		t.Errorf("SRV = %q, want %q", got, want)
+	}
+	if o := s.TLSAOwner("a.dev.test."); o != "_15269._tcp.a.dev.test." {
+		t.Errorf("TLSAOwner = %s, want _15269._tcp.a.dev.test.", o)
+	}
+
+	got = problems(t, `
+keystore: keys
+registrars:
+  - protocol: srp
+    domain: srp.test.
+    hosts:
+      - name: box
+        addresses: [auto]
+        services: [{type: ssh, subdomains: [x], tlsa: c.pem}]
+  - protocol: rfc9664
+    zone: dev.test.
+    server: 192.0.2.1:53
+    names:
+      - name: bare
+        records: ['@ TXT x']
+        services: [{type: xmpp-client}]
+      - name: hostish
+        addresses: [auto]
+        services:
+          - {type: xmpp-client, instance: Chat, txt: {a: b}, subtypes: [_x]}
+          - {type: ipp}
+          - {type: xmpp-server, subdomains: [rooms, Rooms, -bad]}
+      - name: twice
+        addresses: [auto]
+        records: ['_xmpp-client._tcp SRV 0 0 5222 twice.dev.test.']
+        services:
+          - {type: xmpp-client}
+          - {type: xmpp-server, tlsa: a.pem}
+          - {type: xmpp-server, subdomains: [rooms], tlsa: b.pem}
+          - {type: https, port: 5269, tlsa: c.pem}
+`)
+	for _, want := range []string{
+		"hosts[0] (box): services[0]: subdomains: a name's service has it, not a host's",
+		"hosts[0] (box): services[0]: tlsa: a name's service has it, not a host's",
+		"names[0] (bare): services: their SRV records point at the name, which needs addresses:",
+		"names[1] (hostish): services[0]: instance: a host's service has it, not a name's",
+		"names[1] (hostish): services[0]: txt: a host's service has it",
+		"names[1] (hostish): services[0]: subtypes: a host's service has it",
+		"names[1] (hostish): services[1]: type ipp has TXT keys or subtypes, which a name's service cannot carry",
+		"names[1] (hostish): services[2]: subdomains: Rooms twice",
+		`names[1] (hostish): services[2]: subdomains: "-bad": want a name relative to the name`,
+		"names[2] (twice): services[0]: registers the SRV records at _xmpp-client._tcp.twice.dev.test., which records[0] registers too",
+		"names[2] (twice): services[2]: registers the SRV records at _xmpp-server._tcp.twice.dev.test., which services[1] registers too",
+		"names[2] (twice): services[3]: registers the TLSA records at _5269._tcp.twice.dev.test., which services[1] registers too",
+	} {
+		wantProblem(t, got, want)
 	}
 }
 
@@ -472,7 +563,7 @@ func TestTypes_ListsPresetsAndComplexTypes(t *testing.T) {
 			t.Error("mdns is not listed as a complex type")
 		}
 	}
-	for _, want := range []string{"ssh", "sftp-ssh", "http", "https", "ipfs-gateway", "activitypub", "ipp", "mdns"} {
+	for _, want := range []string{"ssh", "sftp-ssh", "http", "https", "ipfs-gateway", "activitypub", "ipp", "xmpp-client", "xmpp-server", "mdns"} {
 		if !slices.Contains(names, want) {
 			t.Errorf("Types() lacks %s: %v", want, names)
 		}

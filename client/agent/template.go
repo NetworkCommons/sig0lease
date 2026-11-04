@@ -8,8 +8,9 @@
 // fields. A service whose probe fails is withdrawn and registered again once it passes.
 // Complex types are code, not data: a template uses them but cannot define them; "mdns", under
 // an srp registrar's mirrors:, mirrors what a running mDNSResponder sees (client/mdnsbridge).
-// An rfc9664 one holds names, each with its own key, its addresses and its records
-// (client/rfc9664). See docs/sig0lease-agent.md.
+// An rfc9664 one holds names, each with its own key, its addresses, its records and its
+// services, which SRV records find at the name (RFC 2782), with a TLSA record for a TLS one
+// (DANE) (client/rfc9664). See docs/sig0lease-agent.md.
 package agent
 
 import (
@@ -29,6 +30,7 @@ import (
 	"time"
 
 	"codeberg.org/miekg/dns"
+	"codeberg.org/miekg/dns/rdata"
 	baseclient "github.com/NetworkCommons/sig0lease/client"
 	"github.com/NetworkCommons/sig0lease/client/mdnsresponder"
 	"github.com/NetworkCommons/sig0lease/client/rfc9664"
@@ -132,11 +134,51 @@ type Host struct {
 	Lifetime  // the registrar's, with what the host overrides
 }
 
-// Service is one instance of a service type on a host.
+// Service is one instance of a service type. On a host it is a DNS-SD instance. On a name it
+// is the SRV records that find the service at the name and at its Subdomains, each pointing at
+// the name and the service's port (RFC 2782), and with TLSA the record that lets a client check
+// the service's certificate through DNSSEC (DANE, RFC 6698).
 type Service struct {
-	Type     string // the type's name: a preset or one the template defines
-	Instance clientsrp.InstanceConfig
+	Type     string                   // the type's name: a preset or one the template defines
+	Instance clientsrp.InstanceConfig // a name's: its ServiceType and Port alone
 	Probe    Probe
+	// A name's only. Subdomains are names below the name, relative to it, that the service is
+	// also offered for; TLSA is the certificate file, absolute, whose key a TLSA record at
+	// "_<port>._<proto>.<name>" gives (TLSARecord), or "".
+	Subdomains []string
+	TLSA       string
+}
+
+func (s Service) String() string {
+	if s.Instance.Label == "" {
+		return s.Instance.ServiceType
+	}
+	return fmt.Sprintf("%q %s", s.Instance.Label, s.Instance.ServiceType)
+}
+
+// SRV returns the SRV records that find s, a service of name (fully qualified), at name and
+// at each of its subdomains: pointing at name and s's port, priority and weight 0 (RFC 2782:
+// there is one target).
+func (s Service) SRV(name string) []dns.RR {
+	owners := []string{name}
+	for _, sub := range s.Subdomains {
+		owners = append(owners, sub+"."+name)
+	}
+	out := make([]dns.RR, len(owners))
+	for i, o := range owners {
+		out[i] = &dns.SRV{
+			Hdr: dns.Header{Name: s.Instance.ServiceType + "." + o, Class: dns.ClassINET},
+			SRV: rdata.SRV{Port: s.Instance.Port, Target: name},
+		}
+	}
+	return out
+}
+
+// TLSAOwner returns where s's TLSA record is, s being a service of name with a TLSA: the SRV
+// records' target and port, "_<port>._<proto>.<name>" (RFC 6698 S3, RFC 7673 S3).
+func (s Service) TLSAOwner(name string) string {
+	_, proto, _ := strings.Cut(s.Instance.ServiceType, ".")
+	return fmt.Sprintf("_%d.%s.%s", s.Instance.Port, proto, name)
 }
 
 // ProbeKind is how a service is checked.
@@ -166,12 +208,13 @@ func (p Probe) String() string {
 }
 
 // Name is one RFC 9664 name: a label right below its registrar's zone, held by its own key,
-// with its addresses and records.
+// with its addresses, records and services.
 type Name struct {
 	Name      string       // the label
 	Auto      bool         // this machine's addresses too, as they change
 	Addresses []netip.Addr // literal addresses
 	Records   []dns.RR     // at or below the name, fully qualified; no address of the name
+	Services  []Service    // none registers what Records or another service registers
 	Lifetime               // the registrar's, with what the name overrides
 }
 
@@ -236,13 +279,17 @@ type typeDoc struct {
 	Probe    *probeDoc          `yaml:"probe"`
 }
 
+// serviceDoc is a host's or a name's service: instance, txt and subtypes are a host's,
+// subdomains and tlsa a name's.
 type serviceDoc struct {
-	Type     string             `yaml:"type"`
-	Instance string             `yaml:"instance"`
-	Port     *int               `yaml:"port"`
-	TXT      map[string]*string `yaml:"txt"`
-	Subtypes []string           `yaml:"subtypes"`
-	Probe    *probeDoc          `yaml:"probe"`
+	Type       string             `yaml:"type"`
+	Instance   string             `yaml:"instance"`
+	Port       *int               `yaml:"port"`
+	TXT        map[string]*string `yaml:"txt"`
+	Subtypes   []string           `yaml:"subtypes"`
+	Probe      *probeDoc          `yaml:"probe"`
+	Subdomains []string           `yaml:"subdomains"`
+	TLSA       string             `yaml:"tlsa"`
 }
 
 type hostDoc struct {
@@ -255,12 +302,13 @@ type hostDoc struct {
 }
 
 type nameDoc struct {
-	Name      string   `yaml:"name"`
-	Addresses []string `yaml:"addresses"`
-	Records   []string `yaml:"records"`
-	Lease     string   `yaml:"lease"`
-	KeyLease  string   `yaml:"key_lease"`
-	OnStop    string   `yaml:"on_stop"`
+	Name      string       `yaml:"name"`
+	Addresses []string     `yaml:"addresses"`
+	Records   []string     `yaml:"records"`
+	Services  []serviceDoc `yaml:"services"`
+	Lease     string       `yaml:"lease"`
+	KeyLease  string       `yaml:"key_lease"`
+	OnStop    string       `yaml:"on_stop"`
 }
 
 type mirrorDoc struct {
@@ -438,15 +486,16 @@ func Load(path string) (*Plan, error) {
 	return Parse(data, path)
 }
 
-// Parse validates data, the template read from path; a relative keystore is relative to
-// path's directory, and with none CLIENT_KEYSTORE_DIR is used (keyrec.KeystoreDir).
+// Parse validates data, the template read from path; a relative keystore or tlsa is relative
+// to path's directory, and with no keystore CLIENT_KEYSTORE_DIR is used (keyrec.KeystoreDir).
 func Parse(data []byte, path string) (*Plan, error) {
 	var doc templateDoc
 	if err := decodeStrict(data, &doc); err != nil {
 		return nil, &ValidationError{Path: path, Problems: []string{err.Error()}}
 	}
 	var problems []string
-	plan := &Plan{Keystore: parseKeystore(doc.Keystore, filepath.Dir(path), &problems)}
+	dir := filepath.Dir(path)
+	plan := &Plan{Keystore: parseKeystore(doc.Keystore, dir, &problems)}
 
 	types := parseTypes(doc.Types, presets, &problems)
 	for name, def := range presets {
@@ -457,7 +506,7 @@ func Parse(data []byte, path string) (*Plan, error) {
 		problems = append(problems, "registrars: at least one, with protocol: srp or rfc9664")
 	}
 	for i, rd := range doc.Registrars {
-		if r, ok := parseRegistrar(rd, types, fmt.Sprintf("registrars[%d]", i), &problems); ok {
+		if r, ok := parseRegistrar(rd, types, dir, fmt.Sprintf("registrars[%d]", i), &problems); ok {
 			plan.Registrars = append(plan.Registrars, r)
 		}
 	}
@@ -485,9 +534,9 @@ func parseKeystore(given, dir string, problems *[]string) string {
 	return abs
 }
 
-// parseRegistrar validates d, the registrar at where, with what it registers; ok is false
-// for a protocol it does not know, whose fields cannot be told apart.
-func parseRegistrar(d registrarDoc, types map[string]typeDef, where string, problems *[]string) (r Registrar, ok bool) {
+// parseRegistrar validates d, the registrar at where, with what it registers, in the template
+// in dir; ok is false for a protocol it does not know, whose fields cannot be told apart.
+func parseRegistrar(d registrarDoc, types map[string]typeDef, dir, where string, problems *[]string) (r Registrar, ok bool) {
 	r = Registrar{Protocol: Protocol(d.Protocol), Server: d.Server, Resolvers: d.Resolvers}
 	misplaced := func(field string, given bool, theirs Protocol) {
 		if given {
@@ -557,7 +606,7 @@ func parseRegistrar(d registrarDoc, types map[string]typeDef, where string, prob
 				*problems = append(*problems, fmt.Sprintf("%s: a second name %s", nwhere, nd.Name))
 			}
 			labels[dnsname.Fold(nd.Name)] = true
-			r.Names = append(r.Names, parseName(nd, r, nwhere, problems))
+			r.Names = append(r.Names, parseName(nd, r, types, dir, nwhere, problems))
 		}
 	}
 	return r, true
@@ -602,7 +651,7 @@ func parseHosts(r *Registrar, docs []hostDoc, types map[string]typeDef, where st
 		h.Auto, h.Addresses = parseAddresses(hd.Addresses, hwhere, problems)
 		h.Lifetime = parseLifetime(hd.Lease, hd.KeyLease, hd.OnStop, r.Lifetime, hwhere, problems)
 		for j, sd := range hd.Services {
-			s, ok := parseService(sd, hd.Name, types, fmt.Sprintf("%s: services[%d]", hwhere, j), problems)
+			s, ok := parseService(sd, hd.Name, false, "", types, fmt.Sprintf("%s: services[%d]", hwhere, j), problems)
 			if !ok {
 				continue
 			}
@@ -618,18 +667,57 @@ func parseHosts(r *Registrar, docs []hostDoc, types map[string]typeDef, where st
 	}
 }
 
-// parseName validates an rfc9664 registrar's name d, registered through r.
-func parseName(d nameDoc, r Registrar, where string, problems *[]string) Name {
+// parseName validates an rfc9664 registrar's name d, registered through r, in the template in
+// dir.
+func parseName(d nameDoc, r Registrar, types map[string]typeDef, dir, where string, problems *[]string) Name {
 	n := Name{Name: d.Name}
+	owner := r.Owner(d.Name)
 	if !hostNameRE.MatchString(d.Name) {
 		*problems = append(*problems, fmt.Sprintf("%s: name %q: one label of letters, digits and hyphens, not starting or ending with a hyphen, at most 63, right below the zone", where, d.Name))
 	}
 	n.Auto, n.Addresses = parseAddresses(d.Addresses, where, problems)
-	n.Records = rfc9664.ParseRecords(r.Owner(d.Name), d.Records, func(j int, err error) {
+	n.Records = rfc9664.ParseRecords(owner, d.Records, func(j int, err error) {
 		*problems = append(*problems, fmt.Sprintf("%s: records[%d]: %v", where, j, err))
 	})
 	if !n.Auto && len(n.Addresses) == 0 && len(d.Records) == 0 {
 		*problems = append(*problems, where+": nothing to register: give addresses:, records: or both")
+	}
+	if len(d.Services) > 0 && !n.Auto && len(n.Addresses) == 0 {
+		*problems = append(*problems, where+": services: their SRV records point at the name, which needs addresses:")
+	}
+
+	// Each record has one source: a record, or one service.
+	by := map[string]string{} // owner and type, folded -> what registers them
+	slot := func(name string, t uint16) string { return dnsname.Fold(name) + " " + dns.TypeToString[t] }
+	for j, rr := range n.Records {
+		by[slot(rr.Header().Name, dns.RRToType(rr))] = fmt.Sprintf("records[%d]", j)
+	}
+	for j, sd := range d.Services {
+		swhere := fmt.Sprintf("%s: services[%d]", where, j)
+		s, ok := parseService(sd, d.Name, true, dir, types, swhere, problems)
+		if !ok {
+			continue
+		}
+		slots := map[string]uint16{}
+		for _, rr := range s.SRV(owner) {
+			slots[rr.Header().Name] = dns.TypeSRV
+		}
+		if s.TLSA != "" {
+			slots[s.TLSAOwner(owner)] = dns.TypeTLSA
+		}
+		for _, name := range sortedKeys(slots) {
+			if other, dup := by[slot(name, slots[name])]; dup {
+				*problems = append(*problems, fmt.Sprintf("%s: registers the %s records at %s, which %s registers too", swhere, dns.TypeToString[slots[name]], name, other))
+				ok = false
+			}
+		}
+		if !ok {
+			continue
+		}
+		for name, t := range slots {
+			by[slot(name, t)] = fmt.Sprintf("services[%d]", j)
+		}
+		n.Services = append(n.Services, s)
 	}
 	n.Lifetime = parseLifetime(d.Lease, d.KeyLease, d.OnStop, r.Lifetime, where, problems)
 	return n
@@ -725,7 +813,10 @@ func parseAddresses(addrs []string, where string, problems *[]string) (auto bool
 	return auto, out
 }
 
-func parseService(d serviceDoc, hostName string, types map[string]typeDef, where string, problems *[]string) (Service, bool) {
+// parseService validates d, a service of the host or name labelled label (onName): a DNS-SD
+// instance on a host, the SRV records that find it on a name (Service). A relative tlsa is
+// relative to dir, the template's directory.
+func parseService(d serviceDoc, label string, onName bool, dir string, types map[string]typeDef, where string, problems *[]string) (Service, bool) {
 	if d.Type == "" {
 		*problems = append(*problems, fmt.Sprintf("%s: type is required", where))
 		return Service{}, false
@@ -746,6 +837,30 @@ func parseService(d serviceDoc, hostName string, types map[string]typeDef, where
 	} else if port == 0 {
 		*problems = append(*problems, fmt.Sprintf("%s: type %s has no port, so the service needs one", where, d.Type))
 	}
+	probe := def.probe
+	d.Probe.check(where, problems)
+	if d.Probe != nil {
+		probe = d.Probe.probe
+	}
+	// The fields of the other kind of service.
+	type field struct {
+		name  string
+		given bool
+	}
+	theirs := []field{{"subdomains", d.Subdomains != nil}, {"tlsa", d.TLSA != ""}}
+	why := "a name's service has it, not a host's: SRP registers a host's services in the domain's service types"
+	if onName {
+		theirs = []field{{"instance", d.Instance != ""}, {"txt", d.TXT != nil}, {"subtypes", d.Subtypes != nil}}
+		why = "a host's service has it, not a name's, which SRV records alone find"
+	}
+	for _, f := range theirs {
+		if f.given {
+			*problems = append(*problems, fmt.Sprintf("%s: %s: %s", where, f.name, why))
+		}
+	}
+	if onName {
+		return parseNameService(d, def, uint16(port), probe, dir, where, problems, n)
+	}
 	txt := map[string]*string{}
 	for k, v := range def.txt {
 		txt[k] = v
@@ -759,17 +874,12 @@ func parseService(d serviceDoc, hostName string, types map[string]typeDef, where
 		subtypes = d.Subtypes
 		checkSubtypes(subtypes, where, problems)
 	}
-	probe := def.probe
-	d.Probe.check(where, problems)
-	if d.Probe != nil {
-		probe = d.Probe.probe
+	instance := d.Instance
+	if instance == "" {
+		instance = label + " " + d.Type
 	}
-	label := d.Instance
-	if label == "" {
-		label = hostName + " " + d.Type
-	}
-	if err := dnsname.CheckLabel(label); err != nil {
-		*problems = append(*problems, fmt.Sprintf("%s: instance %q: %v", where, label, err))
+	if err := dnsname.CheckLabel(instance); err != nil {
+		*problems = append(*problems, fmt.Sprintf("%s: instance %q: %v", where, instance, err))
 	}
 	if len(*problems) > n {
 		return Service{}, false
@@ -781,13 +891,47 @@ func parseService(d serviceDoc, hostName string, types map[string]typeDef, where
 	return Service{
 		Type: d.Type,
 		Instance: clientsrp.InstanceConfig{
-			Label:       label,
+			Label:       instance,
 			ServiceType: def.service,
 			Subtypes:    slices.Clone(subtypes),
 			Port:        uint16(port),
 			TXT:         strs,
 		},
 		Probe: probe,
+	}, true
+}
+
+// parseNameService finishes parseService for a name's service d, of type def, on port with
+// probe; n is the count of problems before parseService began. A name's service is SRV records
+// alone: it has no TXT or subtypes, nor may its type.
+func parseNameService(d serviceDoc, def typeDef, port uint16, probe Probe, dir, where string, problems *[]string, n int) (Service, bool) {
+	if len(def.txt) > 0 || len(def.subtypes) > 0 {
+		*problems = append(*problems, fmt.Sprintf("%s: type %s has TXT keys or subtypes, which a name's service cannot carry: SRV records alone find it", where, d.Type))
+	}
+	seen := map[string]bool{}
+	for _, sub := range d.Subdomains {
+		labels := strings.Split(sub, ".")
+		switch {
+		case slices.ContainsFunc(labels, func(l string) bool { return !hostNameRE.MatchString(l) }):
+			*problems = append(*problems, fmt.Sprintf("%s: subdomains: %q: want a name relative to the name, of labels of letters, digits and hyphens, such as rooms", where, sub))
+		case seen[dnsname.Fold(sub)]:
+			*problems = append(*problems, fmt.Sprintf("%s: subdomains: %s twice", where, sub))
+		}
+		seen[dnsname.Fold(sub)] = true
+	}
+	tlsa := d.TLSA
+	if tlsa != "" && !filepath.IsAbs(tlsa) {
+		tlsa = filepath.Join(dir, tlsa)
+	}
+	if len(*problems) > n {
+		return Service{}, false
+	}
+	return Service{
+		Type:       d.Type,
+		Instance:   clientsrp.InstanceConfig{ServiceType: def.service, Port: port},
+		Probe:      probe,
+		Subdomains: slices.Clone(d.Subdomains),
+		TLSA:       tlsa,
 	}, true
 }
 

@@ -143,6 +143,20 @@ func Describe(w io.Writer, plan *Plan, interfaces func() ([]netip.Addr, error), 
 			for _, rr := range n.Records {
 				p("  record:    %s", rfc9664.Describe(rr))
 			}
+			for _, s := range n.Services {
+				p("  service %s port %d, type %s, probe %s", s.Instance.ServiceType, s.Instance.Port, s.Type, s.Probe)
+				for _, rr := range s.SRV(owner) {
+					p("    record:   %s", rfc9664.Describe(rr))
+				}
+				if s.TLSA == "" {
+					continue
+				}
+				if rr, err := TLSARecord(s.TLSAOwner(owner), s.TLSA); err != nil {
+					p("    tlsa:     %v; not registered until it can be read", err)
+				} else {
+					p("    record:   %s (from %s now)", rfc9664.Describe(rr), s.TLSA)
+				}
+			}
 			if n.Lifetime != r.Lifetime {
 				p("  leases:    %s", n.Lifetime)
 			}

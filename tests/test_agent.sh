@@ -13,7 +13,9 @@
 # names for the agent's keys (on_stop: keep) -> a host removed from the template frees its names, and with
 # on_stop: release so does stopping -> a host removed while the agent was stopped has its names
 # freed at the next start -> an RFC 9664 name is registered with its records, one another key
-# holds is tried again rather than renamed, stopping keeps the name and removing it frees it.
+# holds is tried again rather than renamed, stopping keeps the name and removing it frees it ->
+# with Prosody installed, two XMPP servers on ports only their names' SRV records give federate
+# through what the agent publishes, a stopped one's records are withdrawn and come back.
 # The probed service is python3's http.server; the other key is sig0lease-srp-client's, and
 # sig0lease-client's for a name.
 
@@ -43,6 +45,13 @@ NAME_ZONE="$BIND9_UPDATE_ZONE"         # the RFC 9664 handler's zone
 # The template's rfc9664 registrar, as write_template appends it: none until AGENT-TEST 9.
 NAMES_REGISTRAR=""
 CHANGE_TIMEOUT=20 # seconds for a change to reach BIND: probes, settle time, the client's 0-3s delay
+# AGENT-TEST 10's two Prosody servers, a and b in NAME_ZONE, each in XMPP_DIR/<server> and
+# federating on its own port: not XMPP's 5269, so that only their SRV records tell where.
+XMPP_DIR="$SRP_RUN_DIR/xmpp"
+XMPP_A_PORT="${XMPP_A_PORT:-15269}"
+XMPP_B_PORT="${XMPP_B_PORT:-25269}"
+PROSODY_PID_a=""
+PROSODY_PID_b=""
 
 PERFORMED_TESTS=""
 
@@ -193,6 +202,92 @@ claim_name_as_holder() {
 # the agent's log when it times out.
 wait_state() {
     wait_for_srp_state "$1" "$2" "$3" "$CHANGE_TIMEOUT" || { echo "agent log:"; cat "$AGENT_LOG"; return 1; }
+}
+
+# start_prosody <server> <port> -- runs Prosody for <server>.NAME_ZONE in XMPP_DIR/<server>,
+# federating on 127.0.0.1:<port> alone, with a throwaway certificate (make_tls_cert, kept
+# across restarts), resolving every name through the local BIND, and for a the group chat
+# service rooms.a. Server-to-server connections are encrypted and authenticated by dialback,
+# Prosody's defaults with a certificate no authority signed; DANE needs DNSSEC, which the local
+# BIND does not sign.
+start_prosody() {
+    local server="$1" port="$2" dir="$XMPP_DIR/$1" host="$1.${NAME_ZONE%.}" rooms=""
+    if is_listening "$port"; then
+        log_error "Port $port, for Prosody $host, is already in use; set XMPP_A_PORT or XMPP_B_PORT"
+        return 1
+    fi
+    mkdir -p "$dir/data"
+    [ -f "$dir/cert.pem" ] || make_tls_cert "$dir" || return 1
+    if [ "$server" = a ]; then
+        rooms="$(printf 'Component "rooms.%s" "muc"\n    modules_enabled = { "ping" }' "$host")"
+    fi
+    cat > "$dir/prosody.cfg.lua" <<CFG
+-- AGENT-TEST 10's Prosody for $host (tests/test_agent.sh).
+pidfile = "$dir/prosody.pid"
+data_path = "$dir/data"
+admin_socket = "$dir/prosody.sock"
+log = { debug = "$dir/prosody.log" }
+run_as_root = true -- the suite may run as root, as in a container
+interfaces = { "127.0.0.1" }
+c2s_ports = { }
+s2s_ports = { $port }
+modules_enabled = { "disco", "tls", "dialback", "ping", "admin_shell" }
+certificates = "$dir" -- where Prosody looks for certificates by host name; ssl gives the one to use
+ssl = { certificate = "$dir/cert.pem", key = "$dir/key.pem" }
+-- libunbound answers every name in test. NXDOMAIN itself (RFC 6761 S6.2) unless told otherwise.
+unbound = {
+    resolvconf = false, hoststxt = false, forward = { "${BIND9_ADDR}@${BIND9_PORT}" },
+    options = { ["local-zone"] = "test. transparent" },
+}
+VirtualHost "$host"
+$rooms
+CFG
+    prosody --config "$dir/prosody.cfg.lua" -F >> "$dir/prosody.out" 2>&1 &
+    eval "PROSODY_PID_$server=$!"
+    local start pid
+    start=$(date +%s)
+    until is_listening "$port"; do
+        pid="$(eval echo "\$PROSODY_PID_$server")"
+        if [ $(( $(date +%s) - start )) -ge 10 ] || ! kill -0 "$pid" 2>/dev/null; then
+            log_error "Prosody $host did not start:"
+            cat "$dir/prosody.out"
+            tail -20 "$dir/prosody.log" 2>/dev/null
+            return 1
+        fi
+        sleep 0.2
+    done
+}
+
+# stop_prosody <server> -- stops the Prosody start_prosody runs for <server>.
+stop_prosody() {
+    local pid
+    pid="$(eval echo "\$PROSODY_PID_$1")"
+    if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
+        stop_process "$pid" || true
+    fi
+    eval "PROSODY_PID_$1=''"
+}
+
+# xmpp_ping <from server> <to host> -- has the Prosody of <from server> ping <to host>
+# (XEP-0199) over a server-to-server connection, printing the answer; exits non-zero unless a
+# pong comes back.
+xmpp_ping() {
+    local out
+    out="$(prosodyctl --config "$XMPP_DIR/$1/prosody.cfg.lua" shell "xmpp:ping('$1.${NAME_ZONE%.}', '$2', 15)" 2>&1)"
+    echo "$out"
+    grep -q "^OK: pong from $2 " <<< "$out"
+}
+
+# spki_sha256 <certificate file> -- the SHA-256 of the certificate's public key, in lower-case
+# hex: the data of a TLSA 3 1 1 record for it.
+spki_sha256() {
+    openssl x509 -in "$1" -noout -pubkey | openssl pkey -pubin -outform DER | openssl dgst -sha256 | awk '{print $NF}'
+}
+
+# dig_tlsa <name> -- the TLSA record at name as "<usage> <selector> <type> <data>", the data in
+# lower-case hex in one piece (dig splits it).
+dig_tlsa() {
+    dig_srp "$1" TLSA | awk '{ d = ""; for (i = 4; i <= NF; i++) d = d $i; print $1, $2, $3, tolower(d) }'
 }
 
 ################################
@@ -536,6 +631,77 @@ EOF
     PERFORMED_TESTS="$PERFORMED_TESTS\n  [OK] $log_msg"
 }
 
+test_xmpp_federation() {
+    local log_msg="AGENT-TEST 10: two XMPP servers (Prosody) federate through the SRV records the agent publishes for their names, with a TLSA record each; a server that stops has them withdrawn, and they come back when it starts"
+    log_section "$log_msg"
+    if ! command -v prosody >/dev/null || ! command -v prosodyctl >/dev/null; then
+        log_step "Prosody is not installed: AGENT-TEST 10 skipped"
+        PERFORMED_TESTS="$PERFORMED_TESTS\n  [SKIPPED: no prosody] $log_msg"
+        return 0
+    fi
+    require_command openssl || return 1
+
+    start_prosody a "$XMPP_A_PORT" || return 1
+    start_prosody b "$XMPP_B_PORT" || return 1
+    local z="${NAME_ZONE}" stay
+    stay="$(cat <<HOSTS
+hosts:
+  - name: stay
+    addresses: [127.0.0.1]
+HOSTS
+)"
+    NAMES_REGISTRAR="$(names_registrar "$(cat <<NAMES
+names:
+  - name: a
+    addresses: [127.0.0.1]
+    services:
+      - {type: xmpp-server, port: ${XMPP_A_PORT}, subdomains: [rooms], tlsa: ${XMPP_DIR}/a/cert.pem}
+  - name: b
+    addresses: [127.0.0.1]
+    services:
+      - {type: xmpp-server, port: ${XMPP_B_PORT}, tlsa: ${XMPP_DIR}/b/cert.pem}
+NAMES
+)")"
+    write_template <<< "$stay"
+    wait_state "_xmpp-server._tcp.a.${z}" SRV present || return 1
+    wait_state "_xmpp-server._tcp.b.${z}" SRV present || return 1
+    local want got
+    for want in "_xmpp-server._tcp.a.${z}|0 0 ${XMPP_A_PORT} a.${z}" "_xmpp-server._tcp.rooms.a.${z}|0 0 ${XMPP_A_PORT} a.${z}" \
+        "_xmpp-server._tcp.b.${z}|0 0 ${XMPP_B_PORT} b.${z}"; do
+        got="$(dig_srp "${want%%|*}" SRV)"
+        [ "$got" = "${want#*|}" ] || { log_error "SRV ${want%%|*} is \"$got\", want \"${want#*|}\""; return 1; }
+    done
+    for want in "a|${XMPP_A_PORT}" "b|${XMPP_B_PORT}"; do
+        got="$(dig_tlsa "_${want#*|}._tcp.${want%%|*}.${z}")"
+        [ "$got" = "3 1 1 $(spki_sha256 "$XMPP_DIR/${want%%|*}/cert.pem")" ] \
+            || { log_error "TLSA _${want#*|}._tcp.${want%%|*}.${z} is \"$got\", want 3 1 1 and ${want%%|*}'s certificate's key"; return 1; }
+    done
+
+    xmpp_ping a "b.${z%.}" || { log_error "a could not reach b"; return 1; }
+    xmpp_ping b "rooms.a.${z%.}" || { log_error "b could not reach rooms.a"; return 1; }
+
+    stop_prosody b
+    wait_state "_xmpp-server._tcp.b.${z}" SRV absent || return 1
+    wait_state "_${XMPP_B_PORT}._tcp.b.${z}" TLSA absent || return 1
+    [ "$(dig_srp "b.${z}" A)" = "127.0.0.1" ] || { log_error "b's address went with its service"; return 1; }
+    wait_log "b.${z}: _xmpp-server._tcp: probe failed 3 times in a row, withdrawing it" || return 1
+    [ -n "$(dig_srp "_xmpp-server._tcp.a.${z}" SRV)" ] || { log_error "a's SRV went with b's"; return 1; }
+
+    start_prosody b "$XMPP_B_PORT" || return 1
+    wait_state "_xmpp-server._tcp.b.${z}" SRV present || return 1
+    wait_state "_${XMPP_B_PORT}._tcp.b.${z}" TLSA present || return 1
+    xmpp_ping b "a.${z%.}" || { log_error "b, started again, could not reach a"; return 1; }
+
+    NAMES_REGISTRAR=""
+    write_template <<< "$stay"
+    wait_state "a.${z}" KEY absent || return 1
+    wait_state "b.${z}" KEY absent || return 1
+    [ -z "$(dig_srp "_xmpp-server._tcp.a.${z}" SRV)" ] || { log_error "a's SRV stayed after a was removed"; return 1; }
+
+    log_success "a and b federated on ports only their SRV records gave (a to b, b to rooms.a), with TLSA records for their certificates; b stopped lost its SRV and TLSA records, kept its address, and got them back started again"
+    PERFORMED_TESTS="$PERFORMED_TESTS\n  [OK] $log_msg"
+}
+
 ################################
 # Top level
 ################################
@@ -543,7 +709,7 @@ run_all_tests() {
     log_section "SIG0LEASE-AGENT INTEGRATION TEST SUITE"
     echo "Real components only: real agent (sig0lease-agent), real proxy process (srp_handler and"
     echo "update_handler), real local BIND 9 authoritative for ${SRP_ZONE} and ${NAME_ZONE}, python3's"
-    echo "http.server as the probed service."
+    echo "http.server as the probed service, and Prosody, if installed, as two XMPP servers."
     echo ""
 
     trap cleanup EXIT
@@ -570,6 +736,7 @@ run_all_tests() {
     test_names_freed
     test_freed_after_restart
     test_rfc9664_names
+    test_xmpp_federation
 
     bind9_report_rejections || return 1
     BIND9_REJECTIONS_REPORTED=1
@@ -593,6 +760,8 @@ cleanup() {
     [ -z "${BIND9_REJECTIONS_REPORTED:-}" ] && bind9_report_rejections
     stop_agent
     stop_http
+    stop_prosody a
+    stop_prosody b
     stop_srp_proxy
     stop_bind9
     set -e
