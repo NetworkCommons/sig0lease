@@ -581,6 +581,20 @@ func TestDiscover_UDPLooksUpPlainService(t *testing.T) {
 	}
 }
 
+// TestDiscover_DoHIsNeverDiscovered: RFC 9665 names no DoH service, so a DoH requester gets
+// an error before any lookup, rather than a plain-DNS registrar's "host:port", which is not
+// an address it can use.
+func TestDiscover_DoHIsNeverDiscovered(t *testing.T) {
+	f := tlsAndPlainDNS()
+	_, err := Discover(context.Background(), f.query, "example.com.", DiscoveryClosest, baseclient.NetworkDoH)
+	if err == nil || !strings.Contains(err.Error(), "no registrar is discovered over doh") {
+		t.Fatalf("Discover = %v, want it refused for doh", err)
+	}
+	if len(f.queries) != 0 {
+		t.Fatalf("Discover asked %q for doh, want nothing asked", f.queries)
+	}
+}
+
 // TestDiscover_TLSDoesNotFallBackToPlainService: a zone that publishes only
 // "_dnssd-srp._tcp" has no registrar for a TLS requester. RFC 9665 S7: a requester able to
 // use TLS SHOULD NOT fall back to TCP, so discovery fails instead of returning the plain one.

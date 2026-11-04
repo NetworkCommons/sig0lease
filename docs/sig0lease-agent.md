@@ -76,8 +76,8 @@ A list, each entry with a `protocol`: `srp` registers hosts, their services and 
 
 | Field | Default | Meaning |
 |---|---|---|
-| `server` | srp: discovery; rfc9664: required | The registrar's `host:port`. srp, empty: found through the `_dnssd-srp._tcp` SRV record (`_dnssd-srp-tls._tcp` with `tls`), closest to `domain` (`docs/siglease_rfc9665.md` §3). RFC 9664 has no discovery. |
-| `transport` | `tcp` | `tcp`, `udp` or `tls` (DNS over TLS, opportunistic: the certificate is not checked). |
+| `server` | srp: discovery; rfc9664: required | The registrar's `host:port`, or its URL with `doh` (`https://host:port`, `http://` for a plain listener). srp, empty: found through the `_dnssd-srp._tcp` SRV record (`_dnssd-srp-tls._tcp` with `tls`), closest to `domain` (`docs/siglease_rfc9665.md` §3); never over `doh`, which needs `server`. RFC 9664 has no discovery. |
+| `transport` | `tcp` | `tcp`, `udp`, `tls` (DNS over TLS) or `doh` (DNS over HTTPS, or plain HTTP), the last two opportunistic: the certificate is not checked. |
 | `lease` | `1h` | How long the records last unless refreshed. A Go duration, in whole seconds. |
 | `key_lease` | `336h` | How long each host's or name's names stay reserved for its key (RFC 9665 §3.4). At least `lease`. |
 | `on_stop` | `keep` | What stopping does to the names. `keep`: the records go, the KEYs stay, so the names remain reserved for the agent's keys for `key_lease` (RFC 9665 §3.2.5.5.1; RFC 9664's Case D). `release`: the KEYs go too, and the names are free at once. |
@@ -325,5 +325,5 @@ Run one agent per keystore.
 - RFC 9664 names need this project's proxy: the lease is RFC 9664's, but a name held by its key
   (`fcfs_naming`) is the proxy's.
 - Code handlers for types needing more than data (IPFS DNSLink from a running node, Matrix and
-  XMPP SRV), and DNS-over-HTTPS, are later steps.
+  XMPP SRV) are later steps.
 - Probes are plain TCP and HTTP; names have none.

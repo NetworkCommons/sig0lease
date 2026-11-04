@@ -36,13 +36,19 @@ type UpstreamConfig struct {
 type ServerConfig struct {
 	// Address is the address to listen on (e.g., ":53")
 	Address string `yaml:"address"`
-	// Networks are the network protocols to enable ("udp", "tcp", "tls")
+	// Networks are the network protocols to enable ("udp", "tcp", "tls", "doh")
 	Networks []string `yaml:"networks"`
 	// TLS configures the "tls" network (DNS-over-TLS, RFC 7858):
 	// opportunistic only, no client-certificate/key-pinning auth -- transport-level, so it
 	// benefits every handler (base RFC 9664, SRP, plain forwarding alike), not just one
 	// protocol. Required when "tls" appears in Networks; ignored otherwise.
 	TLS *TLSConfig `yaml:"tls,omitempty"`
+	// DoH configures the "doh" network (DNS-over-HTTPS, RFC 8484), the one DNS transport a
+	// web browser has. Transport-level, like TLS. Its certificate is optional: without one
+	// it serves plain HTTP, which a page on a plain-HTTP origin (a laptop on the LAN) can
+	// reach, as browsers refuse a self-signed certificate. Required when "doh" appears in
+	// Networks; ignored otherwise.
+	DoH *TLSConfig `yaml:"doh,omitempty"`
 	// RequestTimeout bounds how long the handlers may work on one request, including any
 	// wait for a lease-store node another request holds (docs/siglease_rfc9664.md, "Node
 	// Locks"). Must be positive: without a bound, a waiter could wait forever.
@@ -55,17 +61,37 @@ type ServerConfig struct {
 	Diagnostics bool `yaml:"diagnostics"`
 }
 
-// TLSConfig holds the DNS-over-TLS listener's own address and certificate. A separate
-// Address (rather than reusing ServerConfig.Address) because DoT conventionally listens on
-// its own port (853, RFC 7858) alongside plain DNS on 53 -- binding both to one address
-// would collide, since they're two independent net.Listeners either way.
+// TLSConfig holds a listener's own address and certificate: the DNS-over-TLS listener's,
+// and the DNS-over-HTTPS one's. A separate Address (rather than reusing
+// ServerConfig.Address) because DoT conventionally listens on its own port (853, RFC 7858)
+// alongside plain DNS on 53, and DoH on an HTTP port -- binding both to one address would
+// collide, since they're independent net.Listeners either way.
 type TLSConfig struct {
-	// Address is the DoT listener's own address (e.g., ":853").
+	// Address is the listener's own address (e.g., ":853" for DoT, ":8443" for DoH).
 	Address string `yaml:"address"`
 	// Cert is the path to a PEM-encoded certificate (or certificate chain).
 	Cert string `yaml:"cert"`
 	// Key is the path to the PEM-encoded private key matching Cert.
 	Key string `yaml:"key"`
+}
+
+// validate checks the server.<network> block of a network that is enabled: it must be
+// there, with an address; certRequired says whether it needs a certificate, which comes
+// with its key either way.
+func (t *TLSConfig) validate(network string, certRequired bool) error {
+	if t == nil {
+		return fmt.Errorf(`server.networks includes %q but server.%s is not configured`, network, network)
+	}
+	if t.Address == "" {
+		return fmt.Errorf("server.%s.address cannot be empty", network)
+	}
+	if _, _, err := net.SplitHostPort(t.Address); err != nil {
+		return fmt.Errorf("invalid server.%s.address %q: %w", network, t.Address, err)
+	}
+	if (t.Cert == "") != (t.Key == "") || (certRequired && t.Cert == "") {
+		return fmt.Errorf("server.%s.cert and server.%s.key are both required", network, network)
+	}
+	return nil
 }
 
 // AuthoritativeConfig holds limits on the UPDATEs this proxy sends to authoritative servers.
@@ -142,22 +168,16 @@ func (c *Config) Validate() error {
 	}
 
 	for _, network := range c.Server.Networks {
-		if network != "tls" {
-			continue
+		switch network {
+		case "tls":
+			if err := c.Server.TLS.validate("tls", true); err != nil {
+				return err
+			}
+		case "doh":
+			if err := c.Server.DoH.validate("doh", false); err != nil {
+				return err
+			}
 		}
-		if c.Server.TLS == nil {
-			return fmt.Errorf(`server.networks includes "tls" but server.tls is not configured`)
-		}
-		if c.Server.TLS.Address == "" {
-			return fmt.Errorf("server.tls.address cannot be empty")
-		}
-		if _, _, err := net.SplitHostPort(c.Server.TLS.Address); err != nil {
-			return fmt.Errorf("invalid server.tls.address %q: %w", c.Server.TLS.Address, err)
-		}
-		if c.Server.TLS.Cert == "" || c.Server.TLS.Key == "" {
-			return fmt.Errorf("server.tls.cert and server.tls.key are both required")
-		}
-		break
 	}
 
 	for i, rule := range c.ProcessingRules {

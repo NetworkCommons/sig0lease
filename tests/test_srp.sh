@@ -6,7 +6,8 @@
 # instance authoritative for srp.test. -- register -> dig -> refresh -> conflict (YXDOMAIN)
 # -> remove-one -> remove-all -> expiry -> LEASE-only expiry -> registrar discovery -> registrar
 # discovery and update over DNS-over-TLS -> concurrent claims of one name -> foreign-data
-# takeover. Every update is sent by the real requester,
+# takeover -> release -> register and release over DNS-over-HTTPS (plain HTTP, as a browser on
+# the LAN reaches it). Every update is sent by the real requester,
 # cmd/sig0lease-srp-client (client/srp), in -once mode -- no stubs/mocks.
 
 set -euo pipefail
@@ -379,6 +380,40 @@ test_release() {
     PERFORMED_TESTS="$PERFORMED_TESTS\n  [OK] $log_msg"
 }
 
+test_doh() {
+    # The same requester over DNS-over-HTTPS (RFC 8484), on the proxy's plain-HTTP listener,
+    # as a page served over plain HTTP on the LAN reaches it from a browser: the signed UPDATE
+    # is POSTed as is, its ID and SIG(0) signature intact, and dispatched to srp_handler as
+    # over every other transport. Then the release, over DoH too.
+    local log_msg="TEST 13: Register and release over DNS-over-HTTPS (-transport=doh, plain HTTP)"
+    log_section "$log_msg"
+
+    local out
+    out="$("$SRP_CLIENT_BIN" -transport=doh -server="$SRP_PROXY_DOH_URL" -domain="$SRP_ZONE" \
+        -keystore="${SRP_KEY_DIR}/id10-doh" -k=13 -once \
+        -host=host10 -addr=192.0.2.10 -instance=Doodad:_http._tcp:8080 -txt=Doodad:path=/ \
+        -lease="$SRP_LEASE_SECONDS" -key-lease="$SRP_KEY_LEASE_SECONDS")"
+    echo "$out"
+    echo "$out" | grep -q "Transport: doh" || { log_error "client did not report the doh transport"; return 1; }
+    echo "$out" | grep -q "Status: NOERROR (Rcode=0)" || { log_error "registration over DoH did not return NOERROR"; return 1; }
+    [ "$(dig_srp host10.srp.test. A)" = 192.0.2.10 ] || { log_error "host A record not found at authoritative"; return 1; }
+    [ -n "$(dig_srp Doodad._http._tcp.srp.test. SRV)" ] || { log_error "instance SRV not found at authoritative"; return 1; }
+
+    out="$("$SRP_CLIENT_BIN" -transport=doh -server="$SRP_PROXY_DOH_URL" -domain="$SRP_ZONE" \
+        -keystore="${SRP_KEY_DIR}/id10-doh" -host=host10 -deregister)"
+    echo "$out"
+    echo "$out" | grep -q "Status: NOERROR (Rcode=0)" || { log_error "release over DoH did not return NOERROR"; return 1; }
+    local name rr_type
+    for name in host10.srp.test. Doodad._http._tcp.srp.test.; do
+        for rr_type in KEY A SRV; do
+            [ -z "$(dig_srp "$name" "$rr_type")" ] || { log_error "$name $rr_type still at the authoritative server after the release over DoH"; return 1; }
+        done
+    done
+
+    log_success "Registered and released over DoH: the host's records reached the authoritative server and left it"
+    PERFORMED_TESTS="$PERFORMED_TESTS\n  [OK] $log_msg"
+}
+
 ################################
 # Top level
 ################################
@@ -413,6 +448,7 @@ run_all_tests() {
     test_concurrent_claims
     test_foreign_data_takeover
     test_release
+    test_doh
 
     bind9_report_rejections || return 1
     BIND9_REJECTIONS_REPORTED=1

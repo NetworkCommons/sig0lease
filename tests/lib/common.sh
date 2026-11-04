@@ -47,12 +47,15 @@ PROXY_PORT="${PROXY_PORT:-8053}"
 PROXY_URL="$PROXY_ADDR:$PROXY_PORT"
 # Transport run_client (tests/lib/client.sh) uses to reach the proxy.
 # Defaults to udp; set PROXY_PROTOCOL=tcp to run the whole suite over TCP
-# instead (passes -transport tcp to sig0lease-client), or PROXY_PROTOCOL=tls
+# instead (passes -transport tcp to sig0lease-client), PROXY_PROTOCOL=tls
 # for DNS-over-TLS (-transport tls), sent to PROXY_TLS_URL: the proxy's DoT listener,
-# which prepare_lease_config turns on in the scratch config it writes.
+# or PROXY_PROTOCOL=doh for DNS-over-HTTPS (-transport doh), sent to PROXY_DOH_URL: the
+# proxy's DoH listener. prepare_lease_config turns either on in the scratch config it writes.
 PROXY_PROTOCOL="${PROXY_PROTOCOL:-udp}"
 PROXY_TLS_PORT="${PROXY_TLS_PORT:-8853}"
 PROXY_TLS_URL="$PROXY_ADDR:$PROXY_TLS_PORT"
+PROXY_DOH_PORT="${PROXY_DOH_PORT:-8443}"
+PROXY_DOH_URL="https://$PROXY_ADDR:$PROXY_DOH_PORT"
 
 AUTH_SERVER="${AUTH_SERVER:-ns1.free2air.org}"
 # The zone AUTH_SERVER is authoritative for, which lib/dns.sh's direct nsupdate changes

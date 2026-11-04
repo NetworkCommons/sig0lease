@@ -39,15 +39,32 @@ type Endpoint struct {
 // Define defines Endpoint's flags on fs; server says what -server is for that command.
 func (e *Endpoint) Define(fs *flag.FlagSet, server string) {
 	fs.StringVar(&e.Server, "server", "", server)
-	fs.TextVar(&e.Transport, "transport", client.NetworkTCP, "tcp, udp or tls: DNS over TLS (RFC 7858), opportunistic, so the certificate is not checked")
+	fs.TextVar(&e.Transport, "transport", client.NetworkTCP, "tcp, udp, tls or doh: DNS over TLS (RFC 7858) or over HTTPS (RFC 8484), opportunistic, so the certificate is not checked; with doh, -server is a URL")
 }
 
-// RequireServer reports a missing -server, for the commands that cannot discover one.
-func (e *Endpoint) RequireServer() error {
+// Check reports a -server that cannot be an address over -transport (a URL with doh, else
+// "host:port", client.Network.CheckServer), and a missing one with doh, which nothing
+// discovers.
+func (e *Endpoint) Check() error {
 	if e.Server == "" {
-		return fmt.Errorf(`-server is required: the proxy's "host:port"`)
+		if e.Transport == client.NetworkDoH {
+			return fmt.Errorf("-transport doh needs -server, the proxy's URL: no registrar is discovered over DoH")
+		}
+		return nil
+	}
+	if err := e.Transport.CheckServer(e.Server); err != nil {
+		return fmt.Errorf("-server %w", err)
 	}
 	return nil
+}
+
+// RequireServer reports a missing -server, for the commands that cannot discover one, and
+// what Check reports.
+func (e *Endpoint) RequireServer() error {
+	if e.Server == "" {
+		return fmt.Errorf(`-server is required: the proxy's "host:port", or its URL with -transport doh`)
+	}
+	return e.Check()
 }
 
 // DefineKeystore defines -keystore on fs, read into dir: the directory holding the signing
@@ -83,8 +100,11 @@ func (r *Request) Define(fs *flag.FlagSet, server string) {
 	fs.UintVar(&r.TTL, "ttl", 300, "TTL suggested for the records the command builds, KEYs included, in seconds; independent of the leases, and the registrar may override it")
 }
 
-// Check reports a flag value a request cannot carry.
+// Check reports a flag value a request cannot carry, and what Endpoint.Check reports.
 func (r *Request) Check() error {
+	if err := r.Endpoint.Check(); err != nil {
+		return err
+	}
 	switch {
 	case r.Lease > math.MaxUint32 || r.KeyLease > math.MaxUint32:
 		return fmt.Errorf("-lease and -key-lease must fit 32 bits")

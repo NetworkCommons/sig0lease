@@ -20,8 +20,8 @@ CLIENT_BIN="${TESTS_DIR}/../bin/${OS}/sig0lease-client"
 # spaces/quotes are safe).
 # Transport is controlled by PROXY_PROTOCOL (see lib/common.sh; defaults to udp, same
 # udp-unless-told-otherwise mechanism as PROXY_ADDR/PROXY_PORT) -- every call site gets
-# -transport for it, and the proxy's DoT address (PROXY_TLS_URL) when PROXY_PROTOCOL=tls; no
-# call site needs to pass either itself.
+# -transport for it, and the proxy's DoT address (PROXY_TLS_URL) when PROXY_PROTOCOL=tls, its
+# DoH URL (PROXY_DOH_URL) when PROXY_PROTOCOL=doh; no call site needs to pass either itself.
 run_client() {
     require_client_keystore_dir || return 1
 
@@ -34,8 +34,9 @@ run_client() {
     case "$PROXY_PROTOCOL" in
         udp|tcp) ;;
         tls) server="$PROXY_TLS_URL" ;;
+        doh) server="$PROXY_DOH_URL" ;;
         *)
-            log_error "Unknown PROXY_PROTOCOL=$PROXY_PROTOCOL (want udp, tcp or tls)"
+            log_error "Unknown PROXY_PROTOCOL=$PROXY_PROTOCOL (want udp, tcp, tls or doh)"
             return 1
             ;;
     esac

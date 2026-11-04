@@ -24,7 +24,7 @@ import (
 func main() {
 	var req cli.Request
 	var modes cli.Modes
-	req.Define(flag.CommandLine, `explicit registrar "host:port"; empty: discovered through _dnssd-srp._tcp (_dnssd-srp-tls._tcp with -transport tls)`)
+	req.Define(flag.CommandLine, `explicit registrar "host:port" (a URL with -transport doh); empty: discovered through _dnssd-srp._tcp (_dnssd-srp-tls._tcp with -transport tls)`)
 	modes.Define(flag.CommandLine, "the host and every -instance")
 	domain := flag.String("domain", "", "registration domain (required)")
 	host := flag.String("host", "", "base host label, e.g. \"myhost\" (required)")
@@ -228,8 +228,9 @@ What to register:
   -subtype value          DNS-SD subtype for a declared instance, "Label:subtypelabel" (repeatable)
 
 Where and how:
-  -server string          registrar "host:port"; empty: discovered through _dnssd-srp._tcp
-                          (_dnssd-srp-tls._tcp with -transport tls)
+  -server string          registrar "host:port", or its URL with -transport doh; empty:
+                          discovered through _dnssd-srp._tcp (_dnssd-srp-tls._tcp with
+                          -transport tls)
   -discovery string       where discovery looks for the registrar's SRV: "closest" (default:
                           the domain, then each parent up to its zone apex; the first record
                           wins) or "apex" (the zone apex only, as RFC 9665 S3.1.1 specifies --
@@ -237,10 +238,13 @@ Where and how:
   -resolver value         resolver "host:port" for every discovery lookup: zone apex SOA,
                           registrar SRV, registrar address (repeatable; default 8.8.8.8:53,
                           8.8.4.4:53); ignored with -server
-  -transport string       tcp (default), udp or tls: DNS over TLS (RFC 7858), opportunistic as
-                          RFC 9665 S7 specifies, so the registrar's certificate is not checked.
-                          With tls, discovery looks for _dnssd-srp-tls._tcp and never falls back
-                          to plain TCP; with -server, give the registrar's DoT port
+  -transport string       tcp (default), udp, tls or doh. tls: DNS over TLS (RFC 7858),
+                          opportunistic as RFC 9665 S7 specifies, so the registrar's
+                          certificate is not checked; discovery looks for _dnssd-srp-tls._tcp
+                          and never falls back to plain TCP; with -server, give the
+                          registrar's DoT port. doh: DNS over HTTPS (RFC 8484), or plain HTTP,
+                          opportunistic too; -server is required, as the registrar's URL
+                          (https://host:port), since RFC 9665 names no DoH service to discover
   -lease uint             LEASE to ask for, in seconds (default 3600)
   -key-lease uint         KEY-LEASE to ask for, in seconds (default 1209600)
   -ttl uint               TTL suggested for every registered record, KEYs included, in seconds

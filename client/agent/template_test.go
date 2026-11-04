@@ -255,6 +255,29 @@ registrars:
 	}
 }
 
+// Over DoH a registrar is a URL, and an SRP one must be given: nothing discovers it.
+func TestParse_DoHServer(t *testing.T) {
+	r := mustParse(t, "registrars: [{protocol: srp, domain: srp.test., transport: doh, server: \"http://192.0.2.1:8080\"}]\n").Registrars[0]
+	if r.Transport != baseclient.NetworkDoH || r.Server != "http://192.0.2.1:8080" {
+		t.Fatalf("got transport %s server %q", r.Transport, r.Server)
+	}
+	got := problems(t, `
+registrars:
+  - {protocol: srp, domain: a.test., transport: doh}
+  - {protocol: srp, domain: b.test., transport: doh, server: "192.0.2.1:8080"}
+  - {protocol: rfc9664, zone: c.test., transport: doh, server: "https://proxy.example/dns-query", names: [{name: x, addresses: [192.0.2.1]}]}
+  - {protocol: srp, domain: d.test., server: "https://proxy.example"}
+`)
+	for _, want := range []string{
+		"registrars[0] (srp a.test.): server is required with transport doh",
+		`registrars[1] (srp b.test.): server: "192.0.2.1:8080": want an http or https URL`,
+		`registrars[2] (rfc9664 c.test.): server: "https://proxy.example/dns-query": want an http or https URL`,
+		`registrars[3] (srp d.test.): server: "https://proxy.example": want host:port`,
+	} {
+		wantProblem(t, got, want)
+	}
+}
+
 // Every problem is reported at once.
 func TestParse_ReportsEveryProblem(t *testing.T) {
 	got := problems(t, `

@@ -20,8 +20,8 @@ registrars:
   # An srp registrar registers hosts and their services, found by browsing (DNS-SD).
   - protocol: srp
     domain: srp.dev.zenr.io.
-    server: ""                          # "host:port"; empty: discover the registrar (_dnssd-srp._tcp SRV)
-    transport: tcp                      # tcp, udp or tls
+    server: ""                          # "host:port" (a URL with doh); empty: discover the registrar (_dnssd-srp._tcp SRV)
+    transport: tcp                      # tcp, udp, tls or doh
     resolvers: [8.8.8.8:53, 8.8.4.4:53] # for discovery, and to find who holds a name after a conflict
     lease: 1h                           # how long the records last unless refreshed
     key_lease: 336h                     # how long each host's name stays reserved for its key

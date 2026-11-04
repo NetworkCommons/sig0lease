@@ -6,6 +6,9 @@ Package client provides DNS query functionality for testing and client use.
 
 FUNCTIONS
 
+func CheckHostPort(s string) error
+    CheckHostPort reports whether s is "host:port", with a numeric port.
+
 func DescribeAnswer(resp *dns.Msg, outcome Outcome) string
     DescribeAnswer describes a registrar's answer for an error: its outcome,
     RCODE and EDEs.
@@ -45,8 +48,9 @@ type Client struct {
 
 func New(server string, protocol string, timeout time.Duration) *Client
     New creates a new DNS client. protocol is "udp" (the default), "tcp",
-    or "tls" for DNS-over-TLS (RFC 7858) with the Opportunistic Privacy profile
-    (see opportunisticTLS).
+    "tls" for DNS-over-TLS (RFC 7858) with the Opportunistic Privacy profile
+    (see opportunisticTLS), or "doh" for DNS-over-HTTPS (RFC 8484), where server
+    is a URL (Network.CheckServer).
 
 func (c *Client) Query(msg *dns.Msg) (*dns.Msg, error)
     Query sends a DNS query and returns the response.
@@ -164,9 +168,21 @@ const (
 	// NetworkUDP is for constrained networks (RFC 9665 S3.1.2): a registrar accepts it only
 	// where it allows UDP.
 	NetworkUDP
+	// NetworkDoH is DNS-over-HTTPS (RFC 8484), the one DNS transport a web browser has, or
+	// the same over plain HTTP: the registrar is a URL ("https://host:port"), not
+	// "host:port" (CheckServer). An https registrar's certificate is not checked, as with
+	// NetworkTLS. RFC 9665 names no DoH service, so an SRP registrar reached over DoH is
+	// never discovered: it must be given.
+	NetworkDoH
 )
 func ParseNetwork(s string) (Network, error)
-    ParseNetwork returns the Network whose String is s: "tcp", "udp" or "tls".
+    ParseNetwork returns the Network whose String is s: "tcp", "udp", "tls" or
+    "doh".
+
+func (n Network) CheckServer(s string) error
+    CheckServer reports whether s can be a registrar's address over n:
+    for NetworkDoH an http or https URL with a host and no path (the requests go
+    to its "/dns-query", RFC 8484 S6), for the others "host:port".
 
 func (n Network) MarshalText() ([]byte, error)
     MarshalText and UnmarshalText write and read n as its String, as in a JSON
@@ -391,7 +407,7 @@ const (
 type Registrar struct {
 	Protocol  Protocol
 	Domain    string             // SRP: the domain; RFC 9664: the zone. Fully qualified.
-	Server    string             // "host:port"; SRP only: "" to discover the registrar
+	Server    string             // "host:port", a URL with NetworkDoH; SRP only: "" to discover the registrar
 	Transport baseclient.Network //
 	Resolvers []string           // SRP: for discovery and KEY lookups; nil: client/srp's default
 	Lifetime                     // every host's or name's, unless it gives its own; the mirrors' hosts'
@@ -823,6 +839,7 @@ func Discover(ctx context.Context, query DNSQuery, domain string, mode Discovery
     "_dnssd-srp._tcp" otherwise, the service names RFC 9665 S10.4 registers
     in RFC 6763 S7's "_<service>._tcp" form -- for each name mode selects
     (see DiscoveryMode), in order, and stops at the first name that has one.
+    NetworkDoH has no service, so it is never discovered (an error).
     A NetworkTLS search never falls back to "_dnssd-srp._tcp": S7 says a
     requester able to use TLS SHOULD NOT fall back to TCP. It never looks
     above the apex: a zone cut separates authority, so a registrar named in
@@ -1159,13 +1176,18 @@ type Endpoint struct {
     Endpoint holds the flags saying where a command sends: -server and
     -transport.
 
+func (e *Endpoint) Check() error
+    Check reports a -server that cannot be an address over -transport (a URL
+    with doh, else "host:port", client.Network.CheckServer), and a missing one
+    with doh, which nothing discovers.
+
 func (e *Endpoint) Define(fs *flag.FlagSet, server string)
     Define defines Endpoint's flags on fs; server says what -server is for that
     command.
 
 func (e *Endpoint) RequireServer() error
     RequireServer reports a missing -server, for the commands that cannot
-    discover one.
+    discover one, and what Check reports.
 
 type Modes struct {
 	Once       bool
@@ -1206,7 +1228,8 @@ type Request struct {
     -keystore, -k, -lease, -key-lease and -ttl.
 
 func (r *Request) Check() error
-    Check reports a flag value a request cannot carry.
+    Check reports a flag value a request cannot carry, and what Endpoint.Check
+    reports.
 
 func (r *Request) Define(fs *flag.FlagSet, server string)
     Define defines Request's flags on fs; server says what -server is for that
@@ -1331,13 +1354,19 @@ type ProcessingConfig struct {
 type ServerConfig struct {
 	// Address is the address to listen on (e.g., ":53")
 	Address string `yaml:"address"`
-	// Networks are the network protocols to enable ("udp", "tcp", "tls")
+	// Networks are the network protocols to enable ("udp", "tcp", "tls", "doh")
 	Networks []string `yaml:"networks"`
 	// TLS configures the "tls" network (DNS-over-TLS, RFC 7858):
 	// opportunistic only, no client-certificate/key-pinning auth -- transport-level, so it
 	// benefits every handler (base RFC 9664, SRP, plain forwarding alike), not just one
 	// protocol. Required when "tls" appears in Networks; ignored otherwise.
 	TLS *TLSConfig `yaml:"tls,omitempty"`
+	// DoH configures the "doh" network (DNS-over-HTTPS, RFC 8484), the one DNS transport a
+	// web browser has. Transport-level, like TLS. Its certificate is optional: without one
+	// it serves plain HTTP, which a page on a plain-HTTP origin (a laptop on the LAN) can
+	// reach, as browsers refuse a self-signed certificate. Required when "doh" appears in
+	// Networks; ignored otherwise.
+	DoH *TLSConfig `yaml:"doh,omitempty"`
 	// RequestTimeout bounds how long the handlers may work on one request, including any
 	// wait for a lease-store node another request holds (docs/siglease_rfc9664.md, "Node
 	// Locks"). Must be positive: without a bound, a waiter could wait forever.
@@ -1352,18 +1381,19 @@ type ServerConfig struct {
     ServerConfig holds server listening configuration.
 
 type TLSConfig struct {
-	// Address is the DoT listener's own address (e.g., ":853").
+	// Address is the listener's own address (e.g., ":853" for DoT, ":8443" for DoH).
 	Address string `yaml:"address"`
 	// Cert is the path to a PEM-encoded certificate (or certificate chain).
 	Cert string `yaml:"cert"`
 	// Key is the path to the PEM-encoded private key matching Cert.
 	Key string `yaml:"key"`
 }
-    TLSConfig holds the DNS-over-TLS listener's own address and certificate.
-    A separate Address (rather than reusing ServerConfig.Address) because DoT
-    conventionally listens on its own port (853, RFC 7858) alongside plain
-    DNS on 53 -- binding both to one address would collide, since they're two
-    independent net.Listeners either way.
+    TLSConfig holds a listener's own address and certificate: the DNS-over-TLS
+    listener's, and the DNS-over-HTTPS one's. A separate Address (rather than
+    reusing ServerConfig.Address) because DoT conventionally listens on its own
+    port (853, RFC 7858) alongside plain DNS on 53, and DoH on an HTTP port
+    -- binding both to one address would collide, since they're independent
+    net.Listeners either way.
 
 type UpstreamConfig struct {
 	// Address is the upstream DNS server address (e.g., "8.8.8.8:53")

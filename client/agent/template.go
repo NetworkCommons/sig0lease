@@ -19,14 +19,12 @@ import (
 	"fmt"
 	"io"
 	"math"
-	"net"
 	"net/netip"
 	"os"
 	"path/filepath"
 	"regexp"
 	"slices"
 	"sort"
-	"strconv"
 	"strings"
 	"time"
 
@@ -83,7 +81,7 @@ const (
 type Registrar struct {
 	Protocol  Protocol
 	Domain    string             // SRP: the domain; RFC 9664: the zone. Fully qualified.
-	Server    string             // "host:port"; SRP only: "" to discover the registrar
+	Server    string             // "host:port", a URL with NetworkDoH; SRP only: "" to discover the registrar
 	Transport baseclient.Network //
 	Resolvers []string           // SRP: for discovery and KEY lookups; nil: client/srp's default
 	Lifetime                     // every host's or name's, unless it gives its own; the mirrors' hosts'
@@ -527,11 +525,18 @@ func parseRegistrar(d registrarDoc, types map[string]typeDef, where string, prob
 			*problems = append(*problems, where+": transport "+err.Error())
 		}
 	}
-	if d.Server != "" {
-		checkHostPort(d.Server, where+": server", problems)
+	switch {
+	case d.Server != "":
+		if err := r.Transport.CheckServer(d.Server); err != nil {
+			*problems = append(*problems, where+": server: "+err.Error())
+		}
+	case d.Server == "" && r.Protocol == SRP && r.Transport == baseclient.NetworkDoH:
+		*problems = append(*problems, where+": server is required with transport doh: no registrar is discovered over DoH")
 	}
 	for _, res := range d.Resolvers {
-		checkHostPort(res, where+": resolvers", problems)
+		if err := baseclient.CheckHostPort(res); err != nil {
+			*problems = append(*problems, where+": resolvers: "+err.Error())
+		}
 	}
 	r.Lifetime = parseLifetime(d.Lease, d.KeyLease, d.OnStop, defaultLifetime, where, problems)
 	if r.Protocol == SRP {
@@ -677,16 +682,6 @@ func parseLifetime(lease, keyLease, onStop string, def Lifetime, where string, p
 		*problems = append(*problems, fmt.Sprintf("%s: on_stop %q: want keep or release", where, onStop))
 	}
 	return l
-}
-
-func checkHostPort(s, where string, problems *[]string) {
-	_, port, err := net.SplitHostPort(s)
-	if err == nil {
-		_, err = strconv.ParseUint(port, 10, 16)
-	}
-	if err != nil {
-		*problems = append(*problems, fmt.Sprintf("%s: %q: want host:port", where, s))
-	}
 }
 
 // parseLease reads a Go duration ("1h", "336h") in whole seconds; def, in seconds, if s is empty.

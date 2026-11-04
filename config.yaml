@@ -30,6 +30,7 @@ server:
     - udp
     - tcp
     # - tls   # DNS-over-TLS (RFC 7858); requires the "tls:" block below
+    # - doh   # DNS-over-HTTPS (RFC 8484); requires the "doh:" block below
 
   # DNS-over-TLS listener config -- only read if "tls" appears in networks above.
   # Its own address (conventionally 853, separate from plain DNS on the address above);
@@ -39,6 +40,17 @@ server:
   # (docs/siglease_rfc9664.md, "DNS-over-TLS", shows how to make one).
   # tls:
   #   address: ":853"
+  #   cert: "/path/to/cert.pem"
+  #   key: "/path/to/key.pem"
+
+  # DNS-over-HTTPS listener config -- only read if "doh" appears in networks above.
+  # Serves RFC 8484's "/dns-query", the one DNS transport a web browser has, on its own
+  # address; transport-level, like DoT. With cert and key it serves HTTPS; without both, plain
+  # HTTP, which a page served over plain HTTP on the LAN can reach (a browser refuses a
+  # self-signed certificate). Every answer allows any origin (CORS), so a page served from
+  # elsewhere can use it. See docs/siglease_rfc9664.md, "DNS-over-HTTPS".
+  # doh:
+  #   address: ":8443"
   #   cert: "/path/to/cert.pem"
   #   key: "/path/to/key.pem"
 

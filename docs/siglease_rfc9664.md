@@ -9,7 +9,7 @@ flow.
 
 The proxy also implements [RFC 9665](https://datatracker.ietf.org/doc/rfc9665/) (DNS-SD Service
 Registration Protocol, SRP) as a **sibling** request path, sharing this document's SIG(0)
-signing, lease store, upstream forward/re-sign, and DNS-over-TLS transport, but with its own,
+signing, lease store, upstream forward/re-sign, and DNS-over-TLS and DNS-over-HTTPS transports, but with its own,
 more constrained message shape and authorization model — see `docs/siglease_rfc9665.md` for
 that protocol. Everywhere below, a callout marks the parts genuinely shared between the two.
 
@@ -462,6 +462,62 @@ The transport is tested at three levels. `server/transport_tls_test.go` sends a 
 config with a throwaway certificate. `tests/test_srp.sh`'s TEST 9 discovers the registrar
 through `_dnssd-srp-tls._tcp` and registers over DoT.
 
+## DNS-over-HTTPS
+
+The server can also offer DNS-over-HTTPS ([RFC 8484](https://datatracker.ietf.org/doc/rfc8484/)),
+the one DNS transport a web browser has: a page running a client compiled to WebAssembly
+reaches the handlers through it. Transport-level like DoT, so every handler is reached through
+it alike, with the same accept policy (`acceptMsg`: FORMERR for a message without exactly one
+question, NOTIMP for an unknown opcode) and the same dispatch.
+
+Add `"doh"` to `server.networks` and a `server.doh` block:
+
+```yaml
+server:
+  networks: [udp, tcp, doh]
+  doh:
+    address: ":8443"
+    cert: /path/to/cert.pem   # optional, with key: without both, plain HTTP
+    key: /path/to/key.pem
+```
+
+It serves `/dns-query`, POST and GET (RFC 8484 §4.1). With a certificate it serves HTTPS
+(HTTP/2 or HTTP/1.1); without one, plain HTTP. Plain HTTP is for a browser on the LAN: a page
+served over plain HTTP from a laptop may fetch a plain-HTTP URL, while every browser refuses a
+self-signed certificate, so an HTTPS listener needs a certificate a browser trusts. Plain HTTP
+gives an UPDATE the protection plain DNS gives it, its SIG(0) signature.
+
+What the listener does beyond the RFC:
+
+- Every answer carries `Access-Control-Allow-Origin: *`, and a browser's preflight request
+  (`OPTIONS`, sent first for the `application/dns-message` Content-Type) gets 204 allowing GET
+  and POST, so a page served from another origin (another port of the laptop, as in the demos)
+  can use it. Any page a visitor opens can then reach the proxy through the visitor's browser,
+  as anything on the network reaches its UDP and TCP listeners.
+- A message's DNS ID may be any. RFC 8484 §4.1 says a client SHOULD use ID 0, for HTTP caching,
+  and `codeberg.org/miekg/dns/dnshttp` refuses any other ID by default; but a SIG(0) signature
+  covers the ID, so a signed UPDATE keeps the ID it was signed with. The server turns the
+  library's check off (`dnshttp.MsgAcceptFunc`) and applies `acceptMsg` instead.
+- A request that is not a DNS message (wrong Content-Type, a body that does not unpack), or a
+  message `acceptMsg` ignores (a response), gets HTTP 400: there is no DNS reply to send, as UDP
+  and TCP send none.
+- Every answer carries the library's `Cache-Control: max-age=600`. RFC 8484 §5.1 asks for no
+  longer than the smallest TTL, so a GET answer may be cached by a browser longer than its
+  records live. The clients here POST, which browsers do not cache.
+
+The clients send over DoH with `-transport doh` (template `transport: doh`), `-server` then
+being the URL (`https://host:port`, or `http://` for a plain listener) instead of
+`host:port` (`client.Network.CheckServer`). They POST the message as packed, its ID included.
+An https server's certificate is not checked, the Opportunistic Privacy profile DoT has; in a
+browser, `net/http` sends through `fetch`, which checks it itself. RFC 9665 names no DoH
+service, so an SRP registrar reached over DoH is never discovered: `-server` is required.
+
+Tested like DoT: `server/transport_equivalence_test.go` drives the same accept-policy cases
+through UDP, TCP and DoH, and `server/transport_doh_test.go` covers HTTPS, GET, CORS and
+shutdown. `PROXY_PROTOCOL=doh` runs the whole `tests/test_update.sh` suite over DoH (HTTPS, a
+throwaway certificate), and `tests/test_srp.sh`'s TEST 13 registers and releases a host over
+the plain-HTTP listener.
+
 ## Project Layout
 
 - `cmd/sig0lease/` - proxy entrypoint
@@ -484,7 +540,8 @@ through `_dnssd-srp-tls._tcp` and registers over DoT.
 - `pkg/updatecore/` - upstream forward/re-sign plumbing shared by both the RFC 9664 and
   RFC 9665 (SRP) handlers (SOA-based discovery, static `upstream` override, TTL
   consistency checks)
-- `server/` - UDP/TCP/TLS (DNS-over-TLS, RFC 7858) listener and request dispatch
+- `server/` - UDP/TCP/TLS (DNS-over-TLS, RFC 7858)/DoH (DNS-over-HTTPS, RFC 8484) listeners
+  and request dispatch
 
 See `docs/siglease_rfc9665.md` for the full RFC 9665 SRP design (package layout, client
 library/CLI, config, and known limitations) — it's the source of truth for anything SRP that
@@ -614,7 +671,7 @@ Every package of ours imports the library, so none of them builds for WebAssembl
 ### Proposed handling
 
 - [miekg-dns-wasm-build.patch](miekg-dns-wasm-build.patch) is a proposed upstream fix, against v0.6.117; it also applies to v0.6.82. It is not applied here. It changes the build tag of `server_no_recvmmsg.go` from `windows` to `!unix`: that file reads one message at a time through `net.PacketConn` and needs nothing from Windows. Builds for unix do not change.
-- With it, `pkg/...`, `client` and `client/srp` build for `js/wasm` and `wasip1/wasm`. A small program that registers through `client/srp` is 10.5 MB, 2.6 MB gzipped.
+- With it, `pkg/...`, `client`, `client/srp`, `client/rfc9664` and `client/agent` build for `js/wasm`, and `pkg/...`, `client` and `client/srp` for `wasip1/wasm`. A small program that registers through `client/srp` is 10.5 MB, 2.6 MB gzipped. In a browser it sends over DNS-over-HTTPS (see "DNS-over-HTTPS").
 - Until a release carries it, build for WebAssembly against a patched copy of the library. From `main/`, leaving `go.mod` and `go.sum` as they are:
 
 ```sh

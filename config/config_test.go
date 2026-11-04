@@ -60,6 +60,34 @@ func TestValidate_NoTLSNetwork_ServerTLSIgnoredIfAbsent(t *testing.T) {
 	}
 }
 
+// The "doh" network needs its server.doh block and an address; a certificate is optional
+// (plain HTTP without one) but comes with its key.
+func TestValidate_DoHNetwork(t *testing.T) {
+	cases := []struct {
+		name string
+		doh  *TLSConfig
+		good bool
+	}{
+		{"no server.doh block", nil, false},
+		{"empty address", &TLSConfig{Address: ""}, false},
+		{"invalid address (no port)", &TLSConfig{Address: "127.0.0.1"}, false},
+		{"cert without key", &TLSConfig{Address: ":8443", Cert: "c.pem"}, false},
+		{"key without cert", &TLSConfig{Address: ":8443", Key: "k.pem"}, false},
+		{"plain HTTP", &TLSConfig{Address: ":8080"}, true},
+		{"HTTPS", &TLSConfig{Address: ":8443", Cert: "c.pem", Key: "k.pem"}, true},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			cfg := baseValidConfig()
+			cfg.Server.Networks = append(cfg.Server.Networks, "doh")
+			cfg.Server.DoH = c.doh
+			if err := cfg.Validate(); (err == nil) != c.good {
+				t.Fatalf("Validate() = %v, want good=%v", err, c.good)
+			}
+		})
+	}
+}
+
 func TestAuthoritativeMaxInflightUpdates_DefaultsToOneAndRejectsNegative(t *testing.T) {
 	cfg := NewDefaultConfig()
 	if cfg.Authoritative.MaxInflightUpdates != 1 {

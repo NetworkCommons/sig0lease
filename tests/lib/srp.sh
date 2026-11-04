@@ -27,6 +27,8 @@ SRP_PROXY_URL="${SRP_PROXY_ADDR}:${SRP_PROXY_PORT}"
 BIND9_SRP_REGISTRAR_PORT="$SRP_PROXY_PORT" # the zone's _dnssd-srp._tcp SRV points here
 SRP_PROXY_TLS_PORT="${SRP_PROXY_TLS_PORT:-8160}" # the proxy's DNS-over-TLS listener
 BIND9_SRP_REGISTRAR_TLS_PORT="$SRP_PROXY_TLS_PORT" # the zone's _dnssd-srp-tls._tcp SRV points here
+SRP_PROXY_DOH_PORT="${SRP_PROXY_DOH_PORT:-8161}" # the proxy's DNS-over-HTTPS listener, as plain HTTP
+SRP_PROXY_DOH_URL="http://${SRP_PROXY_ADDR}:${SRP_PROXY_DOH_PORT}"
 SRP_KEYSTORE_DIR="$BIND9_SRP_KEYSTORE_DIR"
 SRP_REFUSE_ON_FOREIGN_DATA=true # the default; test_srp.sh's test_foreign_data_takeover restarts the proxy with false
 # true: the proxy also runs the RFC 9664 handler (update) on update.test., with fcfs_naming as
@@ -68,10 +70,13 @@ server:
     - udp
     - tcp
     - tls
+    - doh
   tls:
     address: ":${SRP_PROXY_TLS_PORT}"
     cert: "${SRP_TLS_DIR}/cert.pem"
     key: "${SRP_TLS_DIR}/key.pem"
+  doh:
+    address: ":${SRP_PROXY_DOH_PORT}"
 upstreams:
   - address: "8.8.8.8:53"
     protocol: "udp"
@@ -109,7 +114,7 @@ start_srp_proxy() {
     # Appended to its log: test_srp.sh's test_foreign_data_takeover restarts the proxy.
     proxy_launch "$SRP_TMP_CONFIG" "$SRP_PROXY_PORT" "$SRP_PROXY_LOG" || return 1
     SRP_PROXY_PID="$LAUNCHED_PROXY_PID"
-    log_success "SRP proxy listening (PID $SRP_PROXY_PID) on $SRP_PROXY_URL, DNS-over-TLS on port $SRP_PROXY_TLS_PORT, config $SRP_TMP_CONFIG"
+    log_success "SRP proxy listening (PID $SRP_PROXY_PID) on $SRP_PROXY_URL, DNS-over-TLS on port $SRP_PROXY_TLS_PORT, DNS-over-HTTPS (plain HTTP) at $SRP_PROXY_DOH_URL, config $SRP_TMP_CONFIG"
 }
 
 stop_srp_proxy() {

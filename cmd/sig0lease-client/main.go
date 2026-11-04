@@ -27,7 +27,7 @@ import (
 	"github.com/NetworkCommons/sig0lease/pkg/sig0"
 )
 
-const proxyUsage = `the proxy's "host:port" (required; its DoT address with -transport tls)`
+const proxyUsage = `the proxy's "host:port" (required; its DoT address with -transport tls, its DoH URL with -transport doh)`
 
 func main() {
 	if len(os.Args) < 2 {
@@ -700,16 +700,18 @@ Commands:
       sig0lease-client register -server 127.0.0.1:8053 -lease 0 -key-lease 3600 -same-key -k 13 \
         test.dev.zenr.io.
 
-  verify [-server host:port] [-transport tcp|udp|tls] <name>
+  verify [-server host:port] [-transport tcp|udp|tls|doh] <name>
       Ask the proxy for the KEY at name.
 
   list-keys [-keystore dir]
       List the keys in the keystore.
 
 Request flags (name, register, refresh, register-tamper):
-  -server string          the proxy's "host:port" (required; its DoT address with -transport tls)
-  -transport string       tcp (default), udp or tls: DNS over TLS (RFC 7858), opportunistic, so
-                          the proxy's certificate is not checked
+  -server string          the proxy's "host:port" (required; its DoT address with -transport
+                          tls, its DoH URL, such as https://host:port, with -transport doh)
+  -transport string       tcp (default), udp, tls or doh: DNS over TLS (RFC 7858) or over HTTPS
+                          (RFC 8484, or plain HTTP), opportunistic, so the proxy's certificate
+                          is not checked
   -keystore string        directory holding the signing keys (default $CLIENT_KEYSTORE_DIR; one
                           of the two is required)
   -k uint                 DNSSEC algorithm (13=ECDSAP256SHA256, 15=ED25519) to generate a key

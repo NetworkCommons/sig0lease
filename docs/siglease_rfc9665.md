@@ -439,6 +439,11 @@ store, so the names stayed held.
   (RFC 7858 §4.1): the client does not check the registrar's certificate, so the connection is
   encrypted but the registrar is not authenticated. RFC 9665 §6.5 mentions out-of-band key
   pinning (RFC 7858 §4.2) and leaves it out of scope; it is not implemented.
+- The server can offer DNS-over-HTTPS (RFC 8484) too, the one DNS transport a browser has, also
+  transport-level (`server.networks` plus `server.doh`; see `docs/siglease_rfc9664.md`,
+  "DNS-over-HTTPS"). `client/srp` can use it (`Config.Network = NetworkDoH`, `-transport doh`),
+  with the registrar's URL as `RegistrarAddr`: RFC 9665 names no DoH service, so `Discover`
+  refuses `NetworkDoH` instead of returning a plain-DNS registrar's `host:port`.
 - Source-address filtering (RFC 9665 §3.1.3's SHOULD) is a wired but dormant stub:
   `srp_handler.allowed_source_prefixes` is parsed and the check point exists, but an empty list
   (the only value currently supported end-to-end) allows every source. See §11 below.

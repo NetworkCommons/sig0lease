@@ -187,8 +187,8 @@ proxy_stop() {
 # error replies and the lease-store dump the suites check) and min_key_lease_sec/
 # min_rr_lease_sec forced down to TEST_MIN_LEASE_SECONDS, so lease-cycle tests don't wait out
 # the real policy minimums. With PROXY_PROTOCOL=tls it also turns on config.yaml's
-# commented-out DoT listener at PROXY_TLS_URL, with a throwaway certificate in
-# PROXY_RUN_DIR/tls. Idempotent: safe to call from multiple entry points (e.g. a caller that
+# commented-out DoT listener at PROXY_TLS_URL, with PROXY_PROTOCOL=doh its DoH listener at
+# PROXY_DOH_URL, either with a throwaway certificate in PROXY_RUN_DIR/tls. Idempotent: safe to call from multiple entry points (e.g. a caller that
 # needs lease values before start_proxy runs, and start_proxy itself).
 prepare_lease_config() {
     if [ "$LEASE_CONFIG_PREPARED" = true ]; then
@@ -219,25 +219,40 @@ prepare_lease_config() {
         return 1
     fi
 
-    if [ "$PROXY_PROTOCOL" = "tls" ]; then
-        local tls_dir="$PROXY_RUN_DIR/tls"
-        mkdir "$tls_dir"
-        make_tls_cert "$tls_dir" || return 1
-        sed -i.bak \
-            -e "s|^    # - tls .*$|    - tls|" \
-            -e "s|^  # tls:$|  tls:|" \
-            -e "s|^  #   address:.*$|    address: \"$PROXY_TLS_URL\"|" \
-            -e "s|^  #   cert:.*$|    cert: \"$tls_dir/cert.pem\"|" \
-            -e "s|^  #   key:.*$|    key: \"$tls_dir/key.pem\"|" \
-            "$PROXY_CONFIG_FILE"
-        rm -f "$PROXY_CONFIG_FILE.bak"
-        if ! grep -q '^    - tls$' "$PROXY_CONFIG_FILE" || ! grep -q '^  tls:$' "$PROXY_CONFIG_FILE" \
-            || ! grep -qF "address: \"$PROXY_TLS_URL\"" "$PROXY_CONFIG_FILE" \
-            || ! grep -qF "$tls_dir/cert.pem" "$PROXY_CONFIG_FILE" \
-            || ! grep -qF "$tls_dir/key.pem" "$PROXY_CONFIG_FILE"; then
-            log_error "Could not turn on the DoT listener in $PROXY_CONFIG_FILE: $CONFIG_FILE no longer has the commented-out \"- tls\" and \"tls:\" lines this edits"
-            return 1
-        fi
+    case "$PROXY_PROTOCOL" in
+        tls) enable_tls_listener tls "$PROXY_TLS_URL" || return 1 ;;
+        doh) enable_tls_listener doh "${PROXY_DOH_URL#https://}" || return 1 ;;
+    esac
+}
+
+# enable_tls_listener <network> <address> -- turns on config.yaml's commented-out listener
+# for network (tls or doh) in PROXY_CONFIG_FILE: its "- <network>" line under networks, and
+# its "<network>:" block, with address and a throwaway certificate in PROXY_RUN_DIR/tls. Only
+# the lines of that block are edited, as each block has its own address, cert and key.
+enable_tls_listener() {
+    local network="$1" address="$2" tls_dir="$PROXY_RUN_DIR/tls"
+    if [ -z "$PROXY_RUN_DIR" ] || [ -z "$PROXY_CONFIG_FILE" ]; then
+        log_error "enable_tls_listener needs PROXY_RUN_DIR and PROXY_CONFIG_FILE (prepare_lease_config sets them)"
+        return 1
+    fi
+    mkdir "$tls_dir"
+    make_tls_cert "$tls_dir" || return 1
+    sed -i.bak \
+        -e "s|^    # - $network .*$|    - $network|" \
+        -e "/^  # $network:$/,/^  #   key:/{
+s|^  # $network:$|  $network:|
+s|^  #   address:.*$|    address: \"$address\"|
+s|^  #   cert:.*$|    cert: \"$tls_dir/cert.pem\"|
+s|^  #   key:.*$|    key: \"$tls_dir/key.pem\"|
+}" \
+        "$PROXY_CONFIG_FILE"
+    rm -f "$PROXY_CONFIG_FILE.bak"
+    if ! grep -q "^    - $network\$" "$PROXY_CONFIG_FILE" || ! grep -q "^  $network:\$" "$PROXY_CONFIG_FILE" \
+        || ! grep -qF "address: \"$address\"" "$PROXY_CONFIG_FILE" \
+        || ! grep -qF "$tls_dir/cert.pem" "$PROXY_CONFIG_FILE" \
+        || ! grep -qF "$tls_dir/key.pem" "$PROXY_CONFIG_FILE"; then
+        log_error "Could not turn on the $network listener in $PROXY_CONFIG_FILE: $CONFIG_FILE no longer has the commented-out \"- $network\" and \"$network:\" lines this edits"
+        return 1
     fi
 }
 

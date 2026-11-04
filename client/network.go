@@ -3,6 +3,9 @@ package client
 import (
 	"context"
 	"fmt"
+	"net"
+	"net/url"
+	"strconv"
 	"time"
 
 	"codeberg.org/miekg/dns"
@@ -25,16 +28,25 @@ const (
 	// NetworkUDP is for constrained networks (RFC 9665 S3.1.2): a registrar accepts it only
 	// where it allows UDP.
 	NetworkUDP
+	// NetworkDoH is DNS-over-HTTPS (RFC 8484), the one DNS transport a web browser has, or
+	// the same over plain HTTP: the registrar is a URL ("https://host:port"), not
+	// "host:port" (CheckServer). An https registrar's certificate is not checked, as with
+	// NetworkTLS. RFC 9665 names no DoH service, so an SRP registrar reached over DoH is
+	// never discovered: it must be given.
+	NetworkDoH
 )
 
-// ParseNetwork returns the Network whose String is s: "tcp", "udp" or "tls".
+// networks lists every Network, in the order ParseNetwork's error names them.
+var networks = []Network{NetworkTCP, NetworkUDP, NetworkTLS, NetworkDoH}
+
+// ParseNetwork returns the Network whose String is s: "tcp", "udp", "tls" or "doh".
 func ParseNetwork(s string) (Network, error) {
-	for _, n := range []Network{NetworkTCP, NetworkUDP, NetworkTLS} {
+	for _, n := range networks {
 		if s == n.String() {
 			return n, nil
 		}
 	}
-	return 0, fmt.Errorf("%q: want tcp, udp or tls", s)
+	return 0, fmt.Errorf("%q: want tcp, udp, tls or doh", s)
 }
 
 // MarshalText and UnmarshalText write and read n as its String, as in a JSON document.
@@ -54,6 +66,8 @@ func (n Network) String() string {
 		return "tls"
 	case NetworkUDP:
 		return "udp"
+	case NetworkDoH:
+		return "doh"
 	default:
 		return fmt.Sprintf("Network(%d)", int(n))
 	}
@@ -62,10 +76,37 @@ func (n Network) String() string {
 // Validate reports whether n is one of the Networks above.
 func (n Network) Validate() error {
 	switch n {
-	case NetworkTCP, NetworkTLS, NetworkUDP:
+	case NetworkTCP, NetworkTLS, NetworkUDP, NetworkDoH:
 		return nil
 	}
 	return fmt.Errorf("unknown Network %d", n)
+}
+
+// CheckServer reports whether s can be a registrar's address over n: for NetworkDoH an http
+// or https URL with a host and no path (the requests go to its "/dns-query", RFC 8484 S6),
+// for the others "host:port".
+func (n Network) CheckServer(s string) error {
+	if n != NetworkDoH {
+		return CheckHostPort(s)
+	}
+	u, err := url.Parse(s)
+	if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" ||
+		(u.Path != "" && u.Path != "/") || u.RawQuery != "" || u.Fragment != "" || u.User != nil {
+		return fmt.Errorf("%q: want an http or https URL with no path, such as https://host:port", s)
+	}
+	return nil
+}
+
+// CheckHostPort reports whether s is "host:port", with a numeric port.
+func CheckHostPort(s string) error {
+	_, port, err := net.SplitHostPort(s)
+	if err == nil {
+		_, err = strconv.ParseUint(port, 10, 16)
+	}
+	if err != nil {
+		return fmt.Errorf("%q: want host:port", s)
+	}
+	return nil
 }
 
 // Transport sends a signed UPDATE to addr over network and returns the response. Requesters

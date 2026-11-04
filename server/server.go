@@ -105,6 +105,8 @@ func (s *Server) Serve() error {
 				return s.serveTCP(ctx, router)
 			case "tls":
 				return s.serveDoT(ctx, router)
+			case "doh":
+				return s.serveDoH(ctx, router)
 			default:
 				return fmt.Errorf("unsupported network: %s", net)
 			}

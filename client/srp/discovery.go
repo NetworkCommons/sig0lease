@@ -90,7 +90,8 @@ func (m DiscoveryMode) validate() error {
 // "<service>.<name>.", where service is network's DiscoveryService -- "_dnssd-srp-tls._tcp"
 // for NetworkTLS, "_dnssd-srp._tcp" otherwise, the service names RFC 9665 S10.4 registers in
 // RFC 6763 S7's "_<service>._tcp" form -- for each name mode selects (see DiscoveryMode), in
-// order, and stops at the first name that has one. A NetworkTLS search never falls back to
+// order, and stops at the first name that has one. NetworkDoH has no service, so it is never
+// discovered (an error). A NetworkTLS search never falls back to
 // "_dnssd-srp._tcp": S7 says a requester able to use TLS SHOULD NOT fall back to TCP. It
 // never looks above the apex: a zone cut separates authority, so a registrar named in the
 // parent zone speaks for nothing in the child. A failed query ends the search with its error
@@ -110,6 +111,9 @@ func Discover(ctx context.Context, query DNSQuery, domain string, mode Discovery
 	}
 	if err := network.Validate(); err != nil {
 		return "", fmt.Errorf("srp/client: %w", err)
+	}
+	if network == baseclient.NetworkDoH {
+		return "", fmt.Errorf("srp/client: no registrar is discovered over doh: RFC 9665 names no DoH service, so give the registrar's URL")
 	}
 	domain = dnsutil.Fqdn(domain)
 	zone, err := zoneApex(ctx, query, domain)

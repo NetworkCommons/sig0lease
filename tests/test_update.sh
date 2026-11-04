@@ -56,7 +56,7 @@ fi
 
 # localize_lease_config -- local mode: turns this run's copy of config.yaml
 # (prepare_lease_config, which already set the listen address, diagnostics, the minimum leases
-# and, with PROXY_PROTOCOL=tls, the DoT listener) into a config for the local BIND 9
+# and, with PROXY_PROTOCOL=tls or doh, the DoT or DoH listener) into a config for the local BIND 9
 # deployment, by replacing only what names a server, zone, key or file: the upstream resolvers
 # become the local BIND 9, and each handler gets its own zone on it (srp_handler BIND9_ZONE,
 # the update handler BIND9_UPDATE_ZONE), reached through its static "upstream", with that
@@ -1091,11 +1091,11 @@ run_all_tests() {
     echo "Summary of what was tested:"
     echo -e "$PERFORMED_TESTS"
     echo ""
-    if [ "$PROXY_PROTOCOL" = "tls" ]; then
-        echo "Proxy process was exercised at $PROXY_TLS_URL over tls"
-    else
-        echo "Proxy process was exercised at $PROXY_URL over $PROXY_PROTOCOL"
-    fi
+    case "$PROXY_PROTOCOL" in
+        tls) echo "Proxy process was exercised at $PROXY_TLS_URL over tls" ;;
+        doh) echo "Proxy process was exercised at $PROXY_DOH_URL over doh" ;;
+        *) echo "Proxy process was exercised at $PROXY_URL over $PROXY_PROTOCOL" ;;
+    esac
     if [ "$PROXY_LAUNCH" = auto ]; then
         echo "Proxy log: $PROXY_LOG_FILE"
     fi
