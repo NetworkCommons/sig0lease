@@ -26,7 +26,7 @@ type ProcessingConfig struct {
 type UpstreamConfig struct {
 	// Address is the upstream DNS server address (e.g., "8.8.8.8:53")
 	Address string `yaml:"address"`
-	// Protocol is the protocol to use ("udp", "tcp", "tls", "https")
+	// Protocol is the protocol to use ("udp" or "tcp")
 	Protocol string `yaml:"protocol"`
 	// Timeout for upstream queries
 	Timeout time.Duration `yaml:"timeout"`
@@ -121,30 +121,18 @@ type Config struct {
 	Authoritative AuthoritativeConfig `yaml:"authoritative"`
 }
 
-// NewDefaultConfig returns a configuration with sensible defaults.
+// NewDefaultConfig returns the defaults of the optional settings, which LoadConfig reads the
+// config file over. The rest -- the server's address and networks, and the upstreams -- the
+// file gives.
 func NewDefaultConfig() *Config {
 	return &Config{
 		Server: ServerConfig{
-			Address:  ":8053", // Use non-privileged port by default
-			Networks: []string{"udp", "tcp"},
 			// Above the worst case of one authoritative UPDATE: a UDP attempt, then a TCP
 			// fallback, at the dns library's default timeouts (about 11s).
 			RequestTimeout: 15 * time.Second,
 		},
 		ProcessingRules: []ProcessingConfig{},
-		Upstreams: []UpstreamConfig{
-			{
-				Address:  "8.8.8.8:53",
-				Protocol: "udp",
-				Timeout:  5 * time.Second,
-			},
-			{
-				Address:  "1.1.1.1:53",
-				Protocol: "udp",
-				Timeout:  5 * time.Second,
-			},
-		},
-		Handlers: make(map[string]map[string]interface{}),
+		Handlers:        make(map[string]map[string]interface{}),
 		// BIND 9.20's default sig0checks-quota.
 		Authoritative: AuthoritativeConfig{MaxInflightUpdates: 1},
 	}
@@ -157,6 +145,10 @@ func (c *Config) Validate() error {
 	}
 	if _, _, err := net.SplitHostPort(c.Server.Address); err != nil {
 		return fmt.Errorf("invalid server address %q: %w", c.Server.Address, err)
+	}
+
+	if len(c.Server.Networks) == 0 {
+		return fmt.Errorf("server.networks must list at least one network")
 	}
 
 	if len(c.Upstreams) == 0 {
@@ -195,11 +187,14 @@ func (c *Config) Validate() error {
 	}
 
 	for i, upstream := range c.Upstreams {
-		if upstream.Address == "" {
-			return fmt.Errorf("upstream %d: address cannot be empty", i)
+		if _, _, err := net.SplitHostPort(upstream.Address); err != nil {
+			return fmt.Errorf("upstream %d: invalid address %q: %w", i, upstream.Address, err)
+		}
+		if upstream.Protocol != "udp" && upstream.Protocol != "tcp" {
+			return fmt.Errorf("upstream %d: protocol must be udp or tcp, got %q", i, upstream.Protocol)
 		}
 		if upstream.Timeout <= 0 {
-			c.Upstreams[i].Timeout = 5 * time.Second
+			return fmt.Errorf("upstream %d: timeout must be positive, got %s", i, upstream.Timeout)
 		}
 	}
 
@@ -210,17 +205,10 @@ func (c *Config) Validate() error {
 	return nil
 }
 
-// LoadConfig reads configuration from a file.
+// LoadConfig reads the configuration from the file at path, which must exist.
 func LoadConfig(path string) (*Config, error) {
 	cfg := NewDefaultConfig()
 
-	// Check if config file exists
-	if _, err := os.Stat(path); err != nil {
-		// File doesn't exist - use defaults
-		return cfg, cfg.Validate()
-	}
-
-	// Read and parse the YAML config file
 	data, err := os.ReadFile(path)
 	if err != nil {
 		return nil, fmt.Errorf("read config: %w", err)

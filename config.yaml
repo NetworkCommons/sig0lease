@@ -1,6 +1,8 @@
 # DNS Proxy Configuration Example
 #
-# This file demonstrates the configuration options for the DNS proxy.
+# This file demonstrates the configuration options for the DNS proxy. The proxy needs a
+# config file (sig0lease [config file], default config.yaml): it has no built-in server
+# address, networks or upstreams. Settings marked optional have defaults.
 # The proxy routes DNS queries based on their opcode to processing modules,
 # and forwards all other opcodes to upstream resolvers.
 #
@@ -10,8 +12,8 @@
 # - Other opcodes are routed according to the configured processing rules or forwarded upstream
 
 server:
-  # Address to listen on (port 8053 by default - non-privileged)
-  # For standard DNS, use :53 but requires root privileges
+  # Address to listen on; required. Port 8053 is non-privileged;
+  # for standard DNS, use :53, which requires root privileges
   address: ":8053"
 
   # How long the handlers may work on one request, including waiting for a lease-store
@@ -55,6 +57,7 @@ server:
   #   key: "/path/to/key.pem"
 
 upstreams:
+  # Required: at least one, each with its address, protocol (udp or tcp) and timeout.
   # Generic upstream resolvers used for non-processed opcodes.
   # Forwarding for opcodes not listed in processing_rules uses the upstreams list.
   # UPDATE handlers primarily resolves authoritative server from handlers.<handler>.upstream_zone.
@@ -62,7 +65,8 @@ upstreams:
     protocol: "udp"
     timeout: "5s"
 
-  # Secondary upstream resolver (used as fallback)
+  # A second upstream resolver: a forwarded query goes to all of them at once, and the first
+  # answer is used
   - address: "8.8.4.4:53"
     protocol: "udp"
     timeout: "5s"

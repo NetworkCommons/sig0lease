@@ -41,25 +41,15 @@ type StaticUpstream struct {
 	Addr string // "host:port"
 }
 
-// defaultBootstrapResolvers is used only when no bootstrap resolver list was configured
-// at all -- the same pair config.NewDefaultConfig uses for generic upstreams, so
-// out-of-the-box behavior for a caller that sets nothing is unchanged from before this
-// extraction.
-var defaultBootstrapResolvers = []string{"8.8.8.8:53", "8.8.4.4:53"}
-
-// NewCoordinator creates a Coordinator. bootstrapResolvers falls back to
-// defaultBootstrapResolvers when empty. static may be nil (discovery for every name).
+// NewCoordinator creates a Coordinator. static may be nil (discovery for every name). With
+// no bootstrapResolvers, discovery fails: only names at or below static's zone can be served.
 func NewCoordinator(logger *logging.Logger, bootstrapResolvers []string, static *StaticUpstream) *Coordinator {
-	resolvers := bootstrapResolvers
-	if len(resolvers) == 0 {
-		resolvers = defaultBootstrapResolvers
-	}
 	if static != nil && !strings.HasSuffix(static.Zone, ".") {
 		static = &StaticUpstream{Zone: static.Zone + ".", Addr: static.Addr}
 	}
 	return &Coordinator{
 		logger:             logger,
-		bootstrapResolvers: resolvers,
+		bootstrapResolvers: bootstrapResolvers,
 		static:             static,
 	}
 }

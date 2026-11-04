@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"slices"
 	"strconv"
+	"strings"
 
 	"codeberg.org/miekg/dns"
 	"github.com/NetworkCommons/sig0lease/config"
@@ -64,11 +65,9 @@ func applyUpdateHandlerEnvOverrides(cfg map[string]any) map[string]any {
 
 // withBootstrapResolvers fills in "bootstrap_resolvers" for the update
 // handler from the top-level "upstreams" config, unless the handler config
-// already sets its own. Without this, the handler's own SOA-based zone-
-// authority resolution (used to find where to forward signed UPDATEs, and
-// to check for pre-existing records upstream) has no configured resolver of
-// its own and falls back to a hardcoded default -- silently independent of
-// whatever the operator configured under "upstreams" for generic traffic.
+// already sets its own: the resolvers the handler's SOA-based discovery of a
+// name's zone and primary server asks (to find where to forward signed
+// UPDATEs, and to check for pre-existing records upstream).
 func withBootstrapResolvers(handlerCfg map[string]any, appCfg *config.Config) map[string]any {
 	out := make(map[string]any, len(handlerCfg)+1)
 	for k, v := range handlerCfg {
@@ -79,13 +78,9 @@ func withBootstrapResolvers(handlerCfg map[string]any, appCfg *config.Config) ma
 	}
 	addrs := make([]string, 0, len(appCfg.Upstreams))
 	for _, u := range appCfg.Upstreams {
-		if u.Address != "" {
-			addrs = append(addrs, u.Address)
-		}
+		addrs = append(addrs, u.Address)
 	}
-	if len(addrs) > 0 {
-		out["bootstrap_resolvers"] = addrs
-	}
+	out["bootstrap_resolvers"] = addrs
 	return out
 }
 
@@ -247,6 +242,10 @@ func main() {
 			dumpMode = true
 			dumpLevel = "debug"
 		default:
+			if strings.HasPrefix(os.Args[i], "-") {
+				fmt.Fprintf(os.Stderr, "Usage: %s [--dump | --dump-debug] [config file, default config.yaml]\n", os.Args[0])
+				os.Exit(2)
+			}
 			cfgPath = os.Args[i]
 		}
 	}
