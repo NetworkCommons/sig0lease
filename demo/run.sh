@@ -10,6 +10,7 @@
 # NS, DOMAIN, ZONE and NAME change what it asks, as for watch.sh.
 
 cd "$(dirname "$0")/.." || exit 1
+. demo/lib.sh
 B="./bin/$(uname -s | tr A-Z a-z)"
 ns="${NS:-ns1.free2air.org}"
 domain="${DOMAIN:-srp.dev.zenr.io}"
@@ -50,30 +51,6 @@ set -m
 log="$(mktemp -d "${TMPDIR:-/tmp}/sig0lease-demo.XXXXXX")" || exit 1
 proxy= site= agent= other= mirror=
 
-# start <var> <log> <command...> -- runs the command in the background, its pid in <var>.
-start() {
-    local var="$1" out="$log/$2" pid
-    shift 2
-    "$@" < /dev/null >> "$out" 2>&1 &
-    pid=$!
-    sleep 1
-    if ! kill -0 "$pid" 2> /dev/null; then
-        echo "$1 stopped at once; $out:"
-        tail -n 5 "$out"
-        exit 1
-    fi
-    printf -v "$var" %s "$pid"
-}
-
-# stop <var> -- sends SIGTERM to the program whose pid is in <var>, and waits for it to exit.
-stop() {
-    local pid="${!1}"
-    [ -n "$pid" ] || return 0
-    kill "$pid" 2> /dev/null
-    wait "$pid" 2> /dev/null
-    printf -v "$1" %s ""
-}
-
 finish() {
     trap '' INT
     echo
@@ -88,16 +65,7 @@ finish() {
 trap finish EXIT
 trap 'exit 130' INT TERM
 
-# step <text> -- prints the step and waits for Enter.
-step() {
-    printf '\n%s\n[Enter] ' "$1"
-    read -r _ || echo
-}
-
-ask() { dig +short +time=2 +tries=1 "@$ns" "$@"; }
-answers() { [ -n "$(ask "$@")" ]; }
 listed() { ask PTR "_http._tcp.$domain" | grep -qF "$1._http._tcp.$domain."; }
-not() { ! "$@"; }
 
 # mirrored <type> -- whether an instance of <type> on this Mac's host is listed.
 mirrored() {
@@ -106,24 +74,6 @@ mirrored() {
         ask SRV "$instance" | grep -qiF " $machost.$domain." && return 0
     done
     return 1
-}
-
-# wait_until <what> <command...> -- runs the command every second until it succeeds, and prints
-# how long that took; after 90 s it gives up, showing the agents' last log lines.
-wait_until() {
-    local what="$1" t0
-    shift
-    t0=$(date +%s)
-    printf '  waiting until %s ... ' "$what"
-    until "$@"; do
-        if [ $(( $(date +%s) - t0 )) -ge 90 ]; then
-            echo "not after 90 s; the agents' last log lines:"
-            tail -n 5 "$log"/*agent.log
-            exit 1
-        fi
-        sleep 1
-    done
-    echo "$(( $(date +%s) - t0 )) s"
 }
 
 sed "s|^keystore: keys |keystore: $PWD/demo/keys |" demo/demo.yaml > "$log/demo.yaml"

@@ -11,3 +11,4 @@ data
 .DS_Store
 demo/keys*
 demo/mac.yaml
+demo/chat/servers/

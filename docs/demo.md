@@ -12,10 +12,10 @@ devices, with the DNS tools they already have. Everything runs from `./main`, wi
 | D2: the Mac's own services | turning on Remote Login or Screen Sharing puts it in the public zone | a Mac |
 | D3: a site by name over IPFS | `dweb.link/ipns/demo.dev.zenr.io/` serves the laptop's site | kubo (`ipfs`) |
 | D4: native discovery | an audience Mac lists the laptop's services beside its `local.` ones | a Mac in the audience |
-| D5: a chat server by name | to come: XMPP clients find a Prosody server through the name's SRV records | |
+| D5: two communities meet in one chat room | phones log in as guests of two laptops' XMPP servers and talk in one room; the servers find each other by SRV records and trust each other's self-signed certificates by TLSA records (DANE) | two machines, each with Docker (a Mac) or Prosody 13 (Linux); phones |
 
 The demos use this repository's programs and tools that come with the system, except kubo for
-D3.
+D3, and Prosody for D5, whose page loads Converse.js from `cdn.jsdelivr.net`.
 
 ## Before the day
 
@@ -52,7 +52,16 @@ D3.
    so it is not in the repository. On first use macOS asks whether Terminal may find
    devices on the local network: allow it.
 
-7. Record the rehearsal: if the venue's network blocks port 53, the recording is the demo.
+7. For D5, on each of its two machines: on a Mac, Docker Desktop, then
+   `docker pull prosodyim/prosody:13.0`; on Linux, Prosody 13 (`apt install prosody` on Debian
+   13, which brings luaunbound, then `sudo systemctl disable --now prosody`: the package's own
+   server would hold the ports), or Docker with `PROSODY=docker`. Also `qrencode`, which prints
+   the QR codes the phones scan: `brew install qrencode` on a Mac, `sudo apt install qrencode`
+   on Linux. Check that `chat-a` and `chat-b` are free:
+   `dig +short KEY chat-a.dev.zenr.io @ns1.free2air.org` answers nothing. Rehearse on one
+   machine with `demo/chat.sh chat-a chat-b`.
+
+8. Record the rehearsal: if the venue's network blocks port 53, the recording is the demo.
 
 ## The terminals
 
@@ -165,15 +174,49 @@ srp.dev.zenr.io.`; mDNSResponder looks for that record in each search domain and
 names (RFC 6763 §11). This works with `dns-sd` on macOS 26.7; whether Finder and Screen
 Sharing list the instances too has not been tried.
 
-## D5: a chat server by name
+## D5: two communities meet in one chat room
 
-To come: Prosody (XMPP) on the laptop, the agent publishing the name's `_xmpp-client._tcp` and
-`_xmpp-server._tcp` SRV records, and any XMPP client logging in to `alice@chat.dev.zenr.io`.
+Two machines, A and B, each run an XMPP server (Prosody) for a community: A's guests get
+addresses at `chat-a.dev.zenr.io` and its rooms are at `rooms.chat-a.dev.zenr.io`; B's, at
+`chat-b`. The agent on each publishes its server's addresses, the SRV records that tell other
+servers where it listens (`_xmpp-server._tcp`, for the name and for `rooms`) and clients where to
+log in (`_xmpp-client._tcp`), and a TLSA record with the hash of the server's key. The
+certificates are self-signed: a server accepts another only when its key matches its TLSA
+record, which DNSSEC vouches for (DANE). Nothing is configured between the two servers, and
+nobody makes an account.
+
+1. On A, `demo/chat.sh chat-a`; on B, `ROOM=meet@rooms.chat-a.dev.zenr.io demo/chat.sh chat-b`.
+   Each starts its proxy, its server (in Docker on a Mac, Prosody installed on Linux;
+   `PROSODY=docker` or `native` chooses) and its agent, waits until `ns1.free2air.org` has the
+   records, and prints the address of the page its server serves, and its QR code. On a Mac,
+   allow Docker's incoming connections when asked; on Linux, the firewall has to let in ports
+   5222, 5269 and 5280.
+2. Show what the other server reads:
+
+   ```bash
+   dig +short SRV _xmpp-server._tcp.rooms.chat-a.dev.zenr.io     # 0 0 5269 chat-a.dev.zenr.io.
+   dig +dnssec TLSA _5269._tcp.chat-a.dev.zenr.io @8.8.8.8      # the ad flag: validated
+   ```
+
+3. Half the room scans A's QR code, half B's. The page (Converse.js) logs each phone in as a
+   guest of that server and joins `meet@rooms.chat-a.dev.zenr.io`; the first one in creates the
+   room. B's guests' messages reach A's room over a connection between the servers that each end
+   authenticated by the other's TLSA record.
+4. Enter, or Ctrl-C, in `chat.sh` stops the agent first, which frees the names, then the server
+   and the proxy.
+
+Phones talk to their server over plain HTTP on the venue's network, so the guests' messages are
+not encrypted there; the servers talk to each other over TLS. A phone needs the internet too,
+for Converse.js. Each server keeps its certificate and key in `demo/chat/servers/<name>/`, so
+its TLSA record is the same at every run; delete the directory for a new key. A rehearsal on
+one machine, `demo/chat.sh chat-a chat-b`, gives the second server ports 10 above: 5232, 5279,
+5290. A server whose key its TLSA record does not match is refused ("certificate does not match
+any DANE TLSA records" in the other server's log), as the rehearsal on `dev.zenr.io` checked.
 
 ## After the demo
 
 - Ctrl-C the agents, then the site, kubo and the proxy. The records go at once, and so do the
-  names (`on_stop: release`).
+  names (`on_stop: release`). For D5, Enter in each `demo/chat.sh`.
 - To hold the names for their keys after stopping instead, set `on_stop: keep` in the
   registrars of `demo/demo.yaml` and `demo/mac.yaml`: a host for 14 days and a name for 30
   minutes (the proxy's `config.yaml` caps an RFC 9664 key lease at 1800 s).
@@ -191,3 +234,14 @@ To come: Prosody (XMPP) on the laptop, the agent publishing the name's `_xmpp-cl
 - `demo http` is never registered: the probe asks the site at the published addresses
   (`$B/sig0lease-agent plan demo/demo.yaml` lists them); a firewall may block port 8000. On a Mac,
   allow `python3`'s incoming connections when asked.
+- D5: B's guests cannot join A's room ("remote-server-timeout"). The servers' logs are in the
+  directory `chat.sh` printed (`<name>-prosody.log`). "does not match any DANE TLSA records": the
+  record is not for the key the server uses. Other DNSSEC failures: Prosody resolves from the
+  DNS root itself, which a network blocking outgoing port 53 prevents; add
+  `forward = { "9.9.9.9" }` to `unbound` in `demo/chat/prosody.cfg.lua`, a resolver that passes
+  the signatures on, which Prosody still checks. Without DANE, `s2s_secure_auth = false` there
+  lets the servers fall back to dialback.
+- D5: a phone cannot open the page by name: the venue's resolver hides answers with private
+  addresses. The address line `chat.sh` prints, and its QR code, need no name.
+- D5: the records list a Docker or VPN address that other machines cannot reach: give the
+  venue's with `ADDRESS=<address>`.
