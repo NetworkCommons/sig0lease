@@ -232,14 +232,14 @@ func describeUpdateChange(rr dns.RR) string {
 	}
 }
 
-// queryAuthoritative sends req to zoneHint's authoritative server (ResolveSOAMasterServer,
-// honoring a static override) over UDP, falling back to TCP on a UDP failure or a truncated
-// answer. A truncated UDP answer must not be trusted as-is: its empty (or partial) Answer
+// QueryAuthoritative sends req, with its RD bit cleared, to zoneHint's authoritative server
+// (ResolveSOAMasterServer, honoring a static override) over UDP, falling back to TCP on a UDP
+// failure or a truncated answer. A truncated UDP answer must not be trusted as-is: its empty (or partial) Answer
 // section would otherwise read as "no such records" -- letting FCFS treat an already-owned
 // name as free, say -- even though the name really has more data than fit in the UDP
 // response. This fork's dns.Exchange neither retries nor falls back to TCP on truncation on
 // its own (see its doc comment), so it has to happen here. what names the query in errors.
-func (c *Coordinator) queryAuthoritative(ctx context.Context, zoneHint string, req *dns.Msg, what string) (*dns.Msg, error) {
+func (c *Coordinator) QueryAuthoritative(ctx context.Context, zoneHint string, req *dns.Msg, what string) (*dns.Msg, error) {
 	soaServer, _, err := c.ResolveSOAMasterServer(ctx, zoneHint)
 	if err != nil {
 		return nil, fmt.Errorf("failed to resolve authoritative server for %s: %w", zoneHint, err)
@@ -271,7 +271,7 @@ func (c *Coordinator) QueryKeyAtName(ctx context.Context, zoneHint, name string)
 	if req == nil {
 		return 0, nil, fmt.Errorf("failed to build KEY query for %s", name)
 	}
-	resp, err := c.queryAuthoritative(ctx, zoneHint, req, "KEY query for "+name)
+	resp, err := c.QueryAuthoritative(ctx, zoneHint, req, "KEY query for "+name)
 	if err != nil {
 		return 0, nil, err
 	}
@@ -311,7 +311,7 @@ func (c *Coordinator) QueryPTRExists(ctx context.Context, zoneHint, name string)
 	if req == nil {
 		return false, fmt.Errorf("failed to build PTR query for %s", name)
 	}
-	resp, err := c.queryAuthoritative(ctx, zoneHint, req, "PTR query for "+name)
+	resp, err := c.QueryAuthoritative(ctx, zoneHint, req, "PTR query for "+name)
 	if err != nil {
 		return false, err
 	}
@@ -340,7 +340,7 @@ func (c *Coordinator) QueryRRs(ctx context.Context, zoneHint, name string, rrTyp
 	if req == nil {
 		return nil, fmt.Errorf("failed to build %s", what)
 	}
-	resp, err := c.queryAuthoritative(ctx, zoneHint, req, what)
+	resp, err := c.QueryAuthoritative(ctx, zoneHint, req, what)
 	if err != nil {
 		return nil, err
 	}

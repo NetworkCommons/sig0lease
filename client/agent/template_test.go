@@ -208,7 +208,7 @@ types:
 	}
 }
 
-// A backslash in a TXT value is sent as itself (clientsrp.EscapeTXT).
+// A backslash in a TXT value is sent as itself (dnsmsg.EscapeTXT).
 func TestParse_TXTIsEscaped(t *testing.T) {
 	p := mustParse(t, srpYAML("", `    hosts:
       - name: box

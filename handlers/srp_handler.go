@@ -76,6 +76,8 @@ type srpCoordinator interface {
 	// gone everywhere before removing it from the enumeration record, not just gone from
 	// this process's own local lease-store view.
 	QueryPTRExists(ctx context.Context, zoneHint, name string) (bool, error)
+	// QueryAuthoritative sends a query to zoneHint's authoritative server: answerQuery's.
+	QueryAuthoritative(ctx context.Context, zoneHint string, req *dns.Msg, what string) (*dns.Msg, error)
 }
 
 // NewSRPHandler creates a new handler for opcode 5 (UPDATE), RFC 9665 SRP path.
@@ -164,6 +166,9 @@ func rewriteZoneSuffix(name, realZone string) string {
 func (h *SRPHandler) Handle(ctx context.Context, w dns.ResponseWriter, r *dns.Msg) *HandlerResult {
 	if r == nil {
 		return NewErrorResult(nil, "nil message received", fmt.Errorf("nil message"))
+	}
+	if r.Opcode == dns.OpcodeQuery {
+		return h.answerQuery(ctx, r)
 	}
 
 	// Step 1: classify. NotRelevant (not an error) if the message isn't SRP-shaped at

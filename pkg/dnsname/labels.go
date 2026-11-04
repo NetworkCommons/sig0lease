@@ -2,6 +2,7 @@ package dnsname
 
 import (
 	"fmt"
+	"regexp"
 	"strings"
 )
 
@@ -60,3 +61,11 @@ func CheckLabel(label string) error {
 	}
 	return nil
 }
+
+var hostLabelRE = regexp.MustCompile(`^[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?$`)
+
+// IsHostLabel reports whether label is a host name label (RFC 952, RFC 1123 S2.1): letters,
+// digits and hyphens, not starting or ending with a hyphen, at most 63 octets. A name that has
+// an address record, or is typed or linked, needs one: BIND refuses an address record with any
+// other owner name by default (check-names).
+func IsHostLabel(label string) bool { return hostLabelRE.MatchString(label) }

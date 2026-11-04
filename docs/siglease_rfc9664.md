@@ -249,6 +249,10 @@ A proxy can run both handlers, each with its own zone (`upstream_zone`). The zon
 
 Each handler refuses an UPDATE that names anything outside its zone, or inside a zone another handler serves, with `REFUSED` and Extended DNS Error 18 (`leaseHandler.refuseNamesNotServed`). This handler checks before the case dispatch and its node locks; SRP checks after its `default.service.arpa` rewrite has made the names final. Before this check only the authoritative server's update-policy kept the handlers apart. This handler could add a second KEY at a name SRP holds First-Come First-Served, or records SRP's lease store knows nothing about, whenever its signing key was allowed to write below its zone.
 
+### Queries for the Zones Served
+
+With a processing rule for opcode 0 (QUERY) listing the handlers, as `config.yaml` has, a query for a name one of them serves (the zone rule above) gets the answer of that zone's authoritative server, the one its UPDATEs go to (`leaseHandler.answerQuery`, through the coordinator's `QueryAuthoritative`, UDP then TCP, the client's ID and RD bit put back). A client reading the zones through the proxy, as the demo's browser page does over DoH, then sees a change as soon as that server has it; through the upstream resolvers it would see what they cached, for up to the records' TTL, and a name looked up before it existed stays missing for up to the zone's negative TTL. A query for any other name is not the handlers', and goes to the upstream resolvers as before. An authoritative server that does not answer gets the client `SERVFAIL` with Extended DNS Error 22 (No Reachable Authority), never the upstream resolvers' answer instead. Without the rule, every query goes upstream.
+
 ### The Zone Section
 
 Both handlers read the Zone Section the same way (`handlers.refuseOutsideZoneSection`): it must enclose every name in the Update section, as RFC 2136 §3.4.1.3 requires, or the answer is `NOTZONE`; anything but one entry is `FORMERR`. Nothing else reads it. Which handler takes an UPDATE, and what it may change, go by the names: this handler's zone check (above), the signer's name and the SIG(0) checks; SRP takes an update by its host name (`docs/siglease_rfc9665.md` §3). The UPDATE sent upstream names the handler's own zone, and its lookups ask that zone's server.
@@ -392,7 +396,7 @@ Two backends are selectable via `handlers.update.storage` in `config.yaml` (see 
 - `pkg/lease/lease.go` — `LeaseOption` encode/decode and the shared `FindOption`/`DecodeOption`/`FindAndDecode` helpers.
 - `client/lease_response.go` — client-side decoding of the server's granted LEASE/KEY-LEASE.
 - `client/rfc9664/client.go` — the library requester: `Register` (Case A), `Withdraw` (Case D with the records listed), `Deregister` (Case D keeping the name, Case C freeing it) and `Run`, which keeps the name registered on the lease clock (`client/lifecycle.go`). A `YXDOMAIN` (`fcfs_naming`: another key holds the name) is an error `Run` tries again with backoff; it never renames.
-- `client/rfc9664/name.go` — `Name`, one name kept registered as its records change, on `client.Keeper` (`client/keeper.go`, which `client/srp`'s `Host` uses too): it withdraws the records it no longer has, those an earlier run's `NameStore` kept included, before registering the rest. `Release` frees a name that is not running. `sig0lease-agent` registers its `names:` with it (`docs/sig0lease-agent.md`).
+- `client/rfc9664/name.go` — `Name`, one name kept registered as its records change, on `client.Keeper` (`client/keeper.go`, which `client/srp`'s `Host` uses too): it withdraws the records it no longer has, those an earlier run's `NameStore` kept included, before registering the rest. `Release` frees a name that is not running. `sig0lease-agent` registers its `names:` with it (`docs/sig0lease-agent.md`), and so does the demo's browser page (`client/web`, "DNS-over-HTTPS").
 
 ## Configuration
 
@@ -406,7 +410,8 @@ Two backends are selectable via `handlers.update.storage` in `config.yaml` (see 
 - opcode-to-module routing (an ordered list per opcode — see `docs/siglease_rfc9665.md` §3 for
   how SRP's handler fits into the same list). Each handler serves its own zone, and the deepest
   zone wins where they nest; two handlers on one zone stop the proxy at startup (see "Zones
-  Served");
+  Served"). Listing the handlers for opcode 0 too answers queries for their zones from the
+  zones' authoritative servers (see "Queries for the Zones Served");
 - `authoritative.max_inflight_updates` (default 1, `0` for no limit): how many UPDATEs the proxy
   has in flight to one authoritative server at a time, across all handlers. Every forwarded
   UPDATE is SIG(0)-signed, and BIND 9.20 refuses SIG(0) requests beyond its `sig0checks-quota`
@@ -518,15 +523,25 @@ shutdown. `PROXY_PROTOCOL=doh` runs the whole `tests/test_update.sh` suite over 
 throwaway certificate), and `tests/test_srp.sh`'s TEST 13 registers and releases a host over
 the plain-HTTP listener.
 
+The demo's browser page is such a client ([demo.md](demo.md), D6): `cmd/sig0lease-web`, built
+for `js/wasm` by `make web` (see "The library does not build for WebAssembly"), gives the page
+`client/web`, which reads a DNS-SD domain with plain queries (`client/browse`) and claims a name
+with a message through `client/rfc9664`'s `Name`, the name's key and records kept in the
+browser's `localStorage`. Its queries go to the proxy too, which answers them for its zones from
+their authoritative server ("Queries for the Zones Served"), so the page sees a change as soon
+as that server has it.
+
 ## Project Layout
 
 - `cmd/sig0lease/` - proxy entrypoint
 - `cmd/sig0lease-client/` - client entrypoint (RFC 9664: raw updates for the tests, and `name`
   over `client/rfc9664`)
+- `cmd/sig0lease-web/` - the demo's browser page's program, `js/wasm` only (`make web`)
 - `cmd/internal/cli/` - the flags, key lookup and reply printing both client commands share
 - `client/` - what the RFC 9664 and SRP requesters share (granted leases, transports, refresh
   clock, `Keeper`); `client/rfc9664` is the RFC 9664 library requester, `client/srp` the SRP
-  one, `client/agent` the template agent on both
+  one, `client/agent` the template agent on both, `client/browse` reads a DNS-SD domain with
+  plain queries, and `client/web` is the demo's browser page
 - `config/` - YAML config loading and validation
 - `forward/` - upstream forwarding logic
 - `handlers/` - opcode handlers and result types, including `srp_handler.go` (the RFC 9665
@@ -672,7 +687,7 @@ Every package of ours imports the library, so none of them builds for WebAssembl
 
 - [miekg-dns-wasm-build.patch](miekg-dns-wasm-build.patch) is a proposed upstream fix, against v0.6.117; it also applies to v0.6.82. It is not applied here. It changes the build tag of `server_no_recvmmsg.go` from `windows` to `!unix`: that file reads one message at a time through `net.PacketConn` and needs nothing from Windows. Builds for unix do not change.
 - With it, `pkg/...`, `client`, `client/srp`, `client/rfc9664` and `client/agent` build for `js/wasm`, and `pkg/...`, `client` and `client/srp` for `wasip1/wasm`. A small program that registers through `client/srp` is 10.5 MB, 2.6 MB gzipped. In a browser it sends over DNS-over-HTTPS (see "DNS-over-HTTPS").
-- Until a release carries it, build for WebAssembly against a patched copy of the library. From `main/`, leaving `go.mod` and `go.sum` as they are:
+- Until a release carries it, build for WebAssembly against a patched copy of the library. From `main/`, leaving `go.mod` and `go.sum` as they are (`make web` builds the demo page's program this way, 14.8 MB, 3.5 MB gzipped):
 
 ```sh
 V=$(go list -m -f '{{.Version}}' codeberg.org/miekg/dns)

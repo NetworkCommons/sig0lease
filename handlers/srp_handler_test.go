@@ -6,6 +6,7 @@ import (
 	"crypto/elliptic"
 	"crypto/rand"
 	"encoding/base64"
+	"fmt"
 	"net"
 	"strconv"
 	"strings"
@@ -52,6 +53,9 @@ type fakeSRPCoordinator struct {
 	// before, without any test needing to configure this explicitly.
 	ptrExists    bool
 	ptrExistsErr error
+
+	// authoritative, if set, answers QueryAuthoritative: the query route's upstream.
+	authoritative func(zoneHint string, req *dns.Msg) (*dns.Msg, error)
 }
 
 func (f *fakeSRPCoordinator) QueryKeyAtName(ctx context.Context, zoneHint, name string) (srp.AuthoritativeKeyState, []*dns.KEY, error) {
@@ -72,6 +76,14 @@ func (f *fakeSRPCoordinator) ResolveAuthoritativeZone(ctx context.Context, zone 
 
 func (f *fakeSRPCoordinator) QueryPTRExists(ctx context.Context, zoneHint, name string) (bool, error) {
 	return f.ptrExists, f.ptrExistsErr
+}
+
+// QueryAuthoritative answers with authoritative, or fails if the test gave the fake none.
+func (f *fakeSRPCoordinator) QueryAuthoritative(ctx context.Context, zoneHint string, req *dns.Msg, what string) (*dns.Msg, error) {
+	if f.authoritative == nil {
+		return nil, fmt.Errorf("fakeSRPCoordinator: no authoritative server for %s", what)
+	}
+	return f.authoritative(zoneHint, req)
 }
 
 // stubTCPResponseWriter presents as a TCP peer -- the default test harness's response

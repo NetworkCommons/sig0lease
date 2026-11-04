@@ -13,6 +13,7 @@ devices, with the DNS tools they already have. Everything runs from `./main`, wi
 | D3: a site by name over IPFS | `dweb.link/ipns/demo.dev.zenr.io/` serves the laptop's site | kubo (`ipfs`) |
 | D4: native discovery | an audience Mac lists the laptop's services beside its `local.` ones | a Mac in the audience |
 | D5: two communities meet in one chat room | phones log in as guests of two laptops' XMPP servers and talk in one room; the servers find each other by SRV records and trust each other's self-signed certificates by TLSA records (DANE) | two machines, each with Docker (a Mac) or Prosody 13 (Linux); phones |
+| D6: the zone in a browser | phones watch the services come and go, and claim a name with a message, held by a key their browser makes; `dig` shows it within seconds | the laptop; phones |
 
 The demos use this repository's programs and tools that come with the system, except kubo for
 D3, and Prosody for D5, whose page loads Converse.js from `cdn.jsdelivr.net`.
@@ -61,7 +62,11 @@ D3, and Prosody for D5, whose page loads Converse.js from `cdn.jsdelivr.net`.
    `dig +short KEY chat-a.dev.zenr.io @ns1.free2air.org` answers nothing. Rehearse on one
    machine with `demo/chat.sh chat-a chat-b`.
 
-8. Record the rehearsal: if the venue's network blocks port 53, the recording is the demo.
+8. For D6, on the laptop: `qrencode`, as for D5. Rehearse with `demo/web.sh` and a phone on the
+   same network: it builds the page (`make web`), and the phone has to reach the laptop's ports
+   8090 and 8443.
+
+9. Record the rehearsal: if the venue's network blocks port 53, the recording is the demo.
 
 ## The terminals
 
@@ -213,10 +218,51 @@ one machine, `demo/chat.sh chat-a chat-b`, gives the second server ports 10 abov
 5290. A server whose key its TLSA record does not match is refused ("certificate does not match
 any DANE TLSA records" in the other server's log), as the rehearsal on `dev.zenr.io` checked.
 
+## D6: the zone in a browser
+
+The page has a DNS client in it: this repository's client code, built for WebAssembly
+(`make web`). It sends every question and every update to the laptop's proxy over
+DNS-over-HTTPS, the one DNS transport a browser has, and the proxy answers the questions about
+its zones from the zone's own server: the page sees a change as soon as `ns1.free2air.org` has
+it, not what a resolver cached.
+
+1. `demo/web.sh` builds the proxy and the page, starts the proxy with its DNS-over-HTTPS
+   listener on (port 8443, plain HTTP), serves the page on port 8090, and prints its address
+   and its QR code.
+
+   During the full demo, the proxy is already running in terminal 1, without that listener. Stop
+   it there (Ctrl-C) and run `demo/web.sh` in its place. The agent in terminal 3 needs no
+   restart: `web.sh` starts the same proxy program on the same port, 8053, where the agent sends
+   its updates, and the proxy reads the leases it granted back from `data/`. The site and the
+   name stay published meanwhile.
+2. Phones scan the code. The page lists the services in `srp.dev.zenr.io`, read every 3
+   seconds: stop and start the site (D1, step 2), and the phones show `demo http` leave, struck
+   through, and come back, lit up.
+3. Someone picks a name and writes a message. The browser makes a key and keeps it, and the page
+   claims `<name>.dev.zenr.io` with the message as its TXT record. The badge turns `published`
+   once the zone's server has it, within a few seconds, and anyone can check:
+
+   ```bash
+   dig +short TXT <name>.dev.zenr.io @ns1.free2air.org
+   ```
+
+   A second phone that claims the same name stays `waiting`, and shows the first one's message:
+   another key holds the name.
+4. "Release the name" deletes the message and frees the name. Enter, or Ctrl-C, in `web.sh`
+   stops the page and the proxy.
+
+A name stays its phone's while the page is open: the message for 10 minutes after the page
+closes (its lease), the name for 30 (its key's, the most the zone grants). Opened again within
+that time, from the same browser, the page claims it again. Clearing the browser's data for the
+site loses the key, and the name with it until those 30 minutes are over. The page reaches the
+proxy over plain HTTP on the venue's network: every update is signed with the phone's key, so
+nobody can forge one, but anyone there can read them. It needs a browser from 2023 or later.
+
 ## After the demo
 
 - Ctrl-C the agents, then the site, kubo and the proxy. The records go at once, and so do the
-  names (`on_stop: release`). For D5, Enter in each `demo/chat.sh`.
+  names (`on_stop: release`). For D5, Enter in each `demo/chat.sh`; for D6, in `demo/web.sh`
+  (the names the phones claimed stay theirs for up to 30 minutes).
 - To hold the names for their keys after stopping instead, set `on_stop: keep` in the
   registrars of `demo/demo.yaml` and `demo/mac.yaml`: a host for 14 days and a name for 30
   minutes (the proxy's `config.yaml` caps an RFC 9664 key lease at 1800 s).
@@ -245,3 +291,7 @@ any DANE TLSA records" in the other server's log), as the rehearsal on `dev.zenr
   addresses. The address line `chat.sh` prints, and its QR code, need no name.
 - D5: the records list a Docker or VPN address that other machines cannot reach: give the
   venue's with `ADDRESS=<address>`.
+- D6: the page says the DNS client did not start, or cannot read the services: the phone does
+  not reach port 8443. On a Mac, allow `sig0lease`'s incoming connections when asked. If
+  `web.sh` printed a Docker or VPN address, give the venue's with `ADDRESS=<address>`.
+- D6: a claim stays `waiting` with no other message shown: the log under the page says why.

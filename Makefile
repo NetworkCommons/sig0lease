@@ -13,7 +13,7 @@ BUILD_DIR := ./bin/$(OS)
 RELEASE_DIR := ./bin/release
 CLIENT_KEYSTORE_DIR ?=
 
-.PHONY: all build build-all build-client build-client-all clean clean-binary deps docs fmt lint release run-server test-unit test-register test-update test-update-local test-srp test-agent test-mdnsresponder-interop vet
+.PHONY: all build build-all build-client build-client-all clean clean-binary deps docs fmt lint release run-server test-unit test-register test-update test-update-local test-srp test-agent test-mdnsresponder-interop vet web
 
 all: build build-client test
 
@@ -26,6 +26,24 @@ build-client:
 	go build -o $(BUILD_DIR)/$(CLIENT_9664) ./cmd/$(CLIENT_9664)
 	go build -o $(BUILD_DIR)/$(CLIENT_9665) ./cmd/$(CLIENT_9665)
 	go build -o $(BUILD_DIR)/$(AGENT) ./cmd/$(AGENT)
+
+# Build the demo's browser page (docs/demo.md, E3) into ./bin/web: cmd/sig0lease-web for
+# WebAssembly, gzipped (a quarter of the size; the page unzips it), and beside it the page and
+# Go's loader for it. The DNS library does not build for
+# WebAssembly as released, so the program is built against a copy of it patched with
+# docs/miekg-dns-wasm-build.patch, in a temporary directory, with go.mod and go.sum left as
+# they are (docs/siglease_rfc9664.md, "The library does not build for WebAssembly").
+web:
+	@set -e; W=$$(mktemp -d); trap 'rm -rf "$$W"' EXIT; \
+	go mod download codeberg.org/miekg/dns; \
+	cp -R "$$(go list -m -f '{{.Dir}}' codeberg.org/miekg/dns)" "$$W/dns"; chmod -R u+w "$$W/dns"; \
+	git -C "$$W/dns" apply "$(CURDIR)/docs/miekg-dns-wasm-build.patch"; \
+	cp go.mod go.sum "$$W/"; \
+	go mod edit -modfile="$$W/go.mod" -replace codeberg.org/miekg/dns="$$W/dns"; \
+	GOOS=js GOARCH=wasm go build -modfile="$$W/go.mod" -ldflags="-s -w" -o "$$W/sig0lease-web.wasm" ./cmd/sig0lease-web; \
+	mkdir -p ./bin/web; \
+	gzip -9 -c "$$W/sig0lease-web.wasm" > ./bin/web/sig0lease-web.wasm.gz; \
+	cp "$$(go env GOROOT)/lib/wasm/wasm_exec.js" demo/web/index.html ./bin/web/
 
 # Cross-compile server for multiple platforms. The macOS builds need cgo for syslog
 # (logging/syslog_darwin.go), and cgo can only target macOS from a Mac -- for both Mac

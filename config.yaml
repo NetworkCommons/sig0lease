@@ -94,6 +94,13 @@ processing_rules:
   - opcode: 5
     # modules: ["update_handler"]
     modules: ["srp_handler", "update_handler"]
+  # Opcode 0 (QUERY): a query for a name a handler serves gets the answer of that zone's
+  # authoritative server, where the handler's UPDATEs go, so that a client reading the zones
+  # through the proxy -- the demo's browser page, over DoH -- sees a change as soon as the
+  # server has it, rather than what a recursive resolver cached. Queries for other names go
+  # to the upstreams above. Without this rule, every query goes to the upstreams.
+  - opcode: 0
+    modules: ["srp_handler", "update_handler"]
 
 
 # Handler Configuration for SIG(0) Registration Requests

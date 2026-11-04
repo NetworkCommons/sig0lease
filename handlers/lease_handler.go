@@ -17,7 +17,7 @@ import (
 // embeds one, built by newLeaseHandler. C is the handler's own coordinator interface
 // (UpstreamCoordinator, srpCoordinator): the part of *updatecore.Coordinator that handler
 // uses, so that a test stub implements only that part.
-type leaseHandler[C upstreamClient] struct {
+type leaseHandler[C zoneCoordinator] struct {
 	BaseHandler
 	*leaseRuntime
 
@@ -45,12 +45,35 @@ var (
 // newLeaseHandler returns the shared part of the UPDATE handler named name, whose node lock ids
 // are lockIDs, whose lease events run leaseEvent and whose reconciliation pass ends with
 // passExtra, if not nil (newLeaseRuntime).
-func newLeaseHandler[C upstreamClient](name string, lockIDs func(nodeKey string) []string, leaseEvent func(ctx context.Context, nodeKey string), passExtra func(ctx context.Context)) leaseHandler[C] {
+func newLeaseHandler[C zoneCoordinator](name string, lockIDs func(nodeKey string) []string, leaseEvent func(ctx context.Context, nodeKey string), passExtra func(ctx context.Context)) leaseHandler[C] {
 	return leaseHandler[C]{
-		BaseHandler:  BaseHandler{name: name, opcodes: []uint8{dns.OpcodeUpdate}},
+		BaseHandler:  BaseHandler{name: name, opcodes: []uint8{dns.OpcodeUpdate, dns.OpcodeQuery}},
 		leaseRuntime: newLeaseRuntime(lockIDs, leaseEvent, passExtra),
 		recordTTL:    defaultRecordTTL,
 	}
+}
+
+// answerQuery answers r, a query routed to the handler (processing_rules, opcode 0), when its
+// name is the handler's (notServed): with the answer of the zone's authoritative server, the
+// one the handler's UPDATEs go to, so that a client reading the zone through the proxy, as the
+// browser page does over DoH, sees each change as soon as that server has it, and not what a
+// recursive resolver cached for up to its TTL. A name that is not the handler's is NotRelevant,
+// for the next handler or the router's upstream forwarding.
+func (b *leaseHandler[C]) answerQuery(ctx context.Context, r *dns.Msg) *HandlerResult {
+	name := r.Question[0].Header().Name // the server accepts a message with exactly one question
+	if err := b.notServed(name); err != nil {
+		return NewNotRelevantResult(err.Error())
+	}
+	requireUpstream(b.Name(), any(b.upstreamCoordinator) != nil, b.upstreamKeyRecord != nil)
+	resp, err := b.upstreamCoordinator.QueryAuthoritative(ctx, b.upstreamZone, r.Copy(), "query for "+name)
+	if err != nil {
+		reply := makeErrorResponse(r, dns.RcodeServerFailure, dns.ExtendedErrorNoReachableAuthority, err.Error())
+		reply.Question = r.Question // a query's reply repeats its question (RFC 1035 S4.1.2)
+		return NewErrorResult(reply, "the authoritative server did not answer", err)
+	}
+	resp.ID = r.ID
+	resp.RecursionDesired = r.RecursionDesired // RFC 1035 S4.1.1: copied into the response
+	return NewProcessedResult(resp)
 }
 
 // servedZone is a zone and the name of the handler serving it.

@@ -35,6 +35,7 @@ import (
 	"github.com/NetworkCommons/sig0lease/client/mdnsresponder"
 	"github.com/NetworkCommons/sig0lease/client/rfc9664"
 	clientsrp "github.com/NetworkCommons/sig0lease/client/srp"
+	"github.com/NetworkCommons/sig0lease/pkg/dnsmsg"
 	"github.com/NetworkCommons/sig0lease/pkg/dnsname"
 	"github.com/NetworkCommons/sig0lease/pkg/dnssd"
 	"github.com/NetworkCommons/sig0lease/pkg/keyrec"
@@ -393,11 +394,6 @@ func decodeStrict(data []byte, v any) error {
 
 var typeNameRE = regexp.MustCompile(`^[a-z0-9]([a-z0-9-]*[a-z0-9])?$`)
 
-// hostNameRE is a host name label (RFC 952, RFC 1123 S2.1): letters, digits and hyphens, not
-// starting or ending with a hyphen. BIND refuses an address record with any other owner name
-// by default (check-names), so a host label is checked here, not only as a DNS label.
-var hostNameRE = regexp.MustCompile(`^[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?$`)
-
 // parseTypes validates docs, data service types. builtin are names a type may not take.
 func parseTypes(docs map[string]typeDoc, builtin map[string]typeDef, problems *[]string) map[string]typeDef {
 	defs := map[string]typeDef{}
@@ -622,7 +618,7 @@ func parseDomain(given, field, where string, problems *[]string) string {
 	domain := strings.TrimSuffix(given, ".") + "."
 	labels := dnsname.Labels(domain)
 	labels = labels[:len(labels)-1] // the root's
-	if len(labels) == 0 || slices.ContainsFunc(labels, func(l string) bool { return !hostNameRE.MatchString(l) }) {
+	if len(labels) == 0 || slices.ContainsFunc(labels, func(l string) bool { return !dnsname.IsHostLabel(l) }) {
 		*problems = append(*problems, fmt.Sprintf("%s: %s %q: want labels of letters, digits and hyphens, as in a host name", where, field, given))
 	}
 	return domain
@@ -639,7 +635,7 @@ func parseHosts(r *Registrar, docs []hostDoc, types map[string]typeDef, where st
 		}
 		h := Host{Name: hd.Name}
 		switch {
-		case !hostNameRE.MatchString(hd.Name):
+		case !dnsname.IsHostLabel(hd.Name):
 			*problems = append(*problems, fmt.Sprintf("%s: name %q: a host name is letters, digits and hyphens, not starting or ending with a hyphen, at most 63", hwhere, hd.Name))
 		case hostNames[dnsname.Fold(hd.Name)]:
 			*problems = append(*problems, fmt.Sprintf("%s: a second host named %s", hwhere, hd.Name))
@@ -672,7 +668,7 @@ func parseHosts(r *Registrar, docs []hostDoc, types map[string]typeDef, where st
 func parseName(d nameDoc, r Registrar, types map[string]typeDef, dir, where string, problems *[]string) Name {
 	n := Name{Name: d.Name}
 	owner := r.Owner(d.Name)
-	if !hostNameRE.MatchString(d.Name) {
+	if !dnsname.IsHostLabel(d.Name) {
 		*problems = append(*problems, fmt.Sprintf("%s: name %q: one label of letters, digits and hyphens, not starting or ending with a hyphen, at most 63, right below the zone", where, d.Name))
 	}
 	n.Auto, n.Addresses = parseAddresses(d.Addresses, where, problems)
@@ -886,7 +882,7 @@ func parseService(d serviceDoc, label string, onName bool, dir string, types map
 	}
 	strs := make([]string, 0, len(txt))
 	for _, k := range sortedKeys(txt) {
-		strs = append(strs, clientsrp.EscapeTXT(txtString(k, txt[k])))
+		strs = append(strs, dnsmsg.EscapeTXT(txtString(k, txt[k])))
 	}
 	return Service{
 		Type: d.Type,
@@ -912,7 +908,7 @@ func parseNameService(d serviceDoc, def typeDef, port uint16, probe Probe, dir, 
 	for _, sub := range d.Subdomains {
 		labels := strings.Split(sub, ".")
 		switch {
-		case slices.ContainsFunc(labels, func(l string) bool { return !hostNameRE.MatchString(l) }):
+		case slices.ContainsFunc(labels, func(l string) bool { return !dnsname.IsHostLabel(l) }):
 			*problems = append(*problems, fmt.Sprintf("%s: subdomains: %q: want a name relative to the name, of labels of letters, digits and hyphens, such as rooms", where, sub))
 		case seen[dnsname.Fold(sub)]:
 			*problems = append(*problems, fmt.Sprintf("%s: subdomains: %s twice", where, sub))
@@ -955,7 +951,7 @@ func parseMirror(d mirrorDoc, hosts []Host, where string, problems *[]string) (M
 	for _, mh := range d.Hosts {
 		label := strings.TrimSuffix(strings.TrimSuffix(mh, "."), ".local")
 		switch {
-		case !hostNameRE.MatchString(label):
+		case !dnsname.IsHostLabel(label):
 			*problems = append(*problems, fmt.Sprintf("%s: hosts: %q: want an mDNS host name, such as mymac.local.", where, mh))
 		case slices.ContainsFunc(hosts, func(h Host) bool { return dnsname.EqualFold(h.Name, label) }):
 			*problems = append(*problems, fmt.Sprintf("%s: hosts: %s would be registered as %s, which hosts: already registers", where, mh, label))

@@ -25,6 +25,8 @@ type stubUpstreamCoordinator struct {
 	resolveErr error
 	// query, if set, answers QueryRRs -- the authoritative data a test needs the handler to see.
 	query func(ctx context.Context, zoneHint, name string, rrType uint16) ([]dns.RR, error)
+	// authoritative, if set, answers QueryAuthoritative: the query route's upstream.
+	authoritative func(zoneHint string, req *dns.Msg) (*dns.Msg, error)
 	sentUpdates
 	// onSend, if set, runs at the start of every SendUpdate: a concurrency test blocks in it
 	// to hold a request inside its upstream round trip.
@@ -59,6 +61,14 @@ func (s *stubUpstreamCoordinator) QueryRRs(ctx context.Context, zoneHint, name s
 		return nil, fmt.Errorf("stubUpstreamCoordinator: no authoritative data for %s", name)
 	}
 	return s.query(ctx, zoneHint, name, rrType)
+}
+
+// QueryAuthoritative answers with authoritative, or fails if the test gave the stub none.
+func (s *stubUpstreamCoordinator) QueryAuthoritative(ctx context.Context, zoneHint string, req *dns.Msg, what string) (*dns.Msg, error) {
+	if s.authoritative == nil {
+		return nil, fmt.Errorf("stubUpstreamCoordinator: no authoritative server for %s", what)
+	}
+	return s.authoritative(zoneHint, req)
 }
 
 // QueryKeyAtName answers from query's KEY records: a name without any reports no KEY, which

@@ -36,18 +36,11 @@ type InstanceConfig struct {
 	ServiceType string   // e.g. "_ipps._tcp" -- not a full service-type name; NewClient rejects any other shape (dnssd.ValidateServiceType)
 	Subtypes    []string // additional bare subtype labels, e.g. "_universal"; checked like Label
 	Port        uint16
-	TXT         []string // presentation text, where a backslash starts an escape: see EscapeTXT
+	TXT         []string // presentation text, where a backslash starts an escape: see dnsmsg.EscapeTXT
 	// Remove withdraws this instance instead of registering it (RFC 9665 S3.2.5.5.2, first
 	// method): the update carries a bare Delete All RRsets for its name, and Port, TXT and
 	// Subtypes are ignored. The host and every other instance are registered as usual.
 	Remove bool
-}
-
-// EscapeTXT turns raw, one TXT string's octets, into the form InstanceConfig.TXT takes. It is
-// presentation text, as codeberg.org/miekg/dns packs it, where a backslash starts an escape,
-// so only backslashes need escaping for every other octet to go out as it is.
-func EscapeTXT(raw string) string {
-	return strings.ReplaceAll(raw, `\`, `\\`)
 }
 
 // InstanceName identifies a requested instance: its label as configured

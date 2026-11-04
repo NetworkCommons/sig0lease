@@ -15,6 +15,7 @@ import (
 	baseclient "github.com/NetworkCommons/sig0lease/client"
 	"github.com/NetworkCommons/sig0lease/client/mdnsbridge"
 	clientsrp "github.com/NetworkCommons/sig0lease/client/srp"
+	"github.com/NetworkCommons/sig0lease/pkg/dnsmsg"
 	"github.com/NetworkCommons/sig0lease/pkg/dnsname"
 	"github.com/NetworkCommons/sig0lease/pkg/sealedfile"
 )
@@ -106,7 +107,7 @@ func openHostStore(keystore string) (*hostStore, error) {
 		return nil, fmt.Errorf("agent state %s: %w (the agent's state must not be edited by hand)", s.path, err)
 	default:
 		for host, e := range doc.Hosts {
-			if _, err := parseRecords(e.Records); err != nil {
+			if _, err := dnsmsg.ParseRecords(e.Records); err != nil {
 				return nil, fmt.Errorf("agent state %s: %s: %w", s.path, host, err)
 			}
 		}
@@ -115,19 +116,6 @@ func openHostStore(keystore string) (*hostStore, error) {
 		}
 	}
 	return s, nil
-}
-
-// parseRecords reads records saved in presentation format.
-func parseRecords(saved []string) ([]dns.RR, error) {
-	var out []dns.RR
-	for _, r := range saved {
-		rr, err := dns.New(r)
-		if err != nil {
-			return nil, fmt.Errorf("record %q: %w", r, err)
-		}
-		out = append(out, rr)
-	}
-	return out, nil
 }
 
 // view is the clientsrp.HostStore of the hosts source registers through r.
@@ -244,7 +232,7 @@ type nameView struct {
 
 func (v nameView) Load(name string) []dns.RR {
 	e, _ := v.s.entry(name)
-	records, err := parseRecords(e.Records)
+	records, err := dnsmsg.ParseRecords(e.Records)
 	if err != nil {
 		// openHostStore parsed every entry's, and Save writes only what the library prints.
 		panic(fmt.Sprintf("agent state: %s: %v", name, err))
@@ -253,10 +241,7 @@ func (v nameView) Load(name string) []dns.RR {
 }
 
 func (v nameView) Save(name string, held bool, records []dns.RR) error {
-	var saved []string
-	for _, rr := range records {
-		saved = append(saved, rr.String())
-	}
+	saved := dnsmsg.RecordStrings(records)
 	return v.s.update(name, sourceNames, v.registrar, func(e *savedHost) { e.Held, e.Records = held, saved })
 }
 

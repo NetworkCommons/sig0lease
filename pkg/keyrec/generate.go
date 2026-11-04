@@ -108,12 +108,13 @@ func ResolveOrCreateKey(dir, owner string, createAlgorithm uint8, logger *loggin
 // SaveToFile writes lk to <dir>/<lk.Name>.key and <dir>/<lk.Name>.private, in the same
 // format LoadKeyFromFile reads. dir must already exist.
 func (lk *LoadedKey) SaveToFile(dir string) error {
+	pubText, privText := lk.KeyText()
 	keyPath := filepath.Join(dir, lk.Name+".key")
-	if err := os.WriteFile(keyPath, []byte(lk.PublicKey.String()+"\n"), 0o644); err != nil {
+	if err := os.WriteFile(keyPath, []byte(pubText), 0o644); err != nil {
 		return fmt.Errorf("keyrec: write %s: %w", keyPath, err)
 	}
 	privPath := filepath.Join(dir, lk.Name+".private")
-	if err := os.WriteFile(privPath, []byte(lk.PublicKey.PrivateKeyString(lk.PrivateKey)), 0o600); err != nil {
+	if err := os.WriteFile(privPath, []byte(privText), 0o600); err != nil {
 		return fmt.Errorf("keyrec: write %s: %w", privPath, err)
 	}
 	return nil

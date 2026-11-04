@@ -498,6 +498,52 @@ func (e *ValidationError) Error() string
 
 ```
 
+## github.com/NetworkCommons/sig0lease/client/browse
+```
+package browse // import "github.com/NetworkCommons/sig0lease/client/browse"
+
+Package browse reads a DNS-SD domain (RFC 6763) with plain queries, as a client
+that can only ask questions does, such as a browser page over DNS-over-HTTPS:
+the service types the domain lists (S9), each type's instances (S4), and each
+instance's SRV and TXT records (S6) and its target's addresses.
+
+TYPES
+
+type Domain struct {
+	Domain    string     `json:"domain"`
+	Types     []string   `json:"types"`     // sorted
+	Instances []Instance `json:"instances"` // sorted by type, then name
+}
+    Domain is what Browse found in a domain.
+
+func Browse(ctx context.Context, q Query, domain string) (*Domain, error)
+    Browse lists domain's service types (the PTR records at
+    _services._dns-sd._udp.<domain>), then each type's instances (the PTR
+    records at <type>.<domain>), then each instance's SRV and TXT records and
+    the addresses of the SRV record's target. An instance whose SRV record
+    is gone by the time it is asked for, as when it is withdrawn meanwhile,
+    is listed without a target. Any failed question fails the whole.
+
+type Instance struct {
+	Name      string   `json:"name"`      // its Instance label, "demo http"
+	Type      string   `json:"type"`      // its service type, "_http._tcp"
+	Target    string   `json:"target"`    // its SRV record's target; "" when it has none
+	Port      uint16   `json:"port"`      // its SRV record's port
+	TXT       []string `json:"txt"`       // its TXT record's strings, as their octets
+	Addresses []string `json:"addresses"` // the target's A and AAAA addresses, sorted
+}
+    Instance is one service instance found in the domain.
+
+type Query func(ctx context.Context, name string, qtype uint16) ([]dns.RR, error)
+    Query asks one question and returns the answer's records of type qtype at
+    name: none for NXDOMAIN or NODATA, an error for any other failure.
+
+func Querier(send client.Transport, server string, network client.Network) Query
+    Querier returns the Query that sends each question to server over network
+    with send.
+
+```
+
 ## github.com/NetworkCommons/sig0lease/client/clienttest
 ```
 package clienttest // import "github.com/NetworkCommons/sig0lease/client/clienttest"
@@ -920,12 +966,6 @@ func DiscoveryService(n baseclient.Network) string
     reachable over n: "_dnssd-srp-tls._tcp" for NetworkTLS (RFC 9665 S10.4.2),
     "_dnssd-srp._tcp" otherwise (S10.4.1).
 
-func EscapeTXT(raw string) string
-    EscapeTXT turns raw, one TXT string's octets, into the form
-    InstanceConfig.TXT takes. It is presentation text, as codeberg.org/miekg/dns
-    packs it, where a backslash starts an escape, so only backslashes need
-    escaping for every other octet to go out as it is.
-
 func PublishableAddresses(addrs []netip.Addr) []netip.Addr
     PublishableAddresses returns the addresses in addrs that mean something off
     the link: not loopback, link-local, unspecified or multicast.
@@ -1155,7 +1195,7 @@ type InstanceConfig struct {
 	ServiceType string   // e.g. "_ipps._tcp" -- not a full service-type name; NewClient rejects any other shape (dnssd.ValidateServiceType)
 	Subtypes    []string // additional bare subtype labels, e.g. "_universal"; checked like Label
 	Port        uint16
-	TXT         []string // presentation text, where a backslash starts an escape: see EscapeTXT
+	TXT         []string // presentation text, where a backslash starts an escape: see dnsmsg.EscapeTXT
 	// Remove withdraws this instance instead of registering it (RFC 9665 S3.2.5.5.2, first
 	// method): the update carries a bare Delete All RRsets for its name, and Port, TXT and
 	// Subtypes are ignored. The host and every other instance are registered as usual.
@@ -1186,6 +1226,83 @@ type Labels struct {
 func (l Labels) Renamed(hostLabel string) bool
     Renamed reports whether l differs from the requested labels: hostLabel for
     the host, and each instance's own.
+
+```
+
+## github.com/NetworkCommons/sig0lease/client/web
+```
+package web // import "github.com/NetworkCommons/sig0lease/client/web"
+
+Package web is what the demo's browser page does (docs/demo.md, E3),
+apart from showing it: it browses a DNS-SD domain (client/browse), and lets the
+visitor claim a name in a zone with a short message, a TXT record at the name
+that client/rfc9664's Name keeps registered while the page is open. Everything
+goes to the proxy over DNS-over-HTTPS, the one DNS transport a browser has;
+the proxy answers queries for its zones from their authoritative server,
+so the page sees a change as soon as the server has it. The name's key, what the
+name holds and the claim are kept in the browser's storage, so that a visitor
+who comes back within the name's KEY-LEASE gets the name back. cmd/sig0lease-web
+makes a Page the page's JavaScript API.
+
+TYPES
+
+type Claim struct {
+	Label   string `json:"label"`
+	Message string `json:"message"`
+}
+    Claim is what the visitor claimed: a name, by its label, and the message
+    there.
+
+type Config struct {
+	DoH     string  // the proxy's DNS-over-HTTPS server, "http://host:port"
+	Zone    string  // the zone names are claimed in: the proxy's RFC 9664 handler's
+	Domain  string  // the DNS-SD domain Browse reads
+	Storage Storage // required
+	// Logf receives the claimed name's log lines. Default: none.
+	Logf    func(format string, args ...any)
+	Timeout time.Duration    // per exchange; default 10s
+	Send    client.Transport // default client.LiveTransport(Timeout)
+}
+    Config configures New.
+
+type Page struct {
+	// Has unexported fields.
+}
+    Page is the page's requester: what it shows, and the name it claims.
+
+func New(cfg Config) (*Page, error)
+    New validates cfg and applies its defaults.
+
+func (p *Page) Browse(ctx context.Context) (*browse.Domain, error)
+    Browse reads the domain (browse.Browse).
+
+func (p *Page) Claim(label, message string) error
+    Claim claims label's name with message: the name, held by a key kept in the
+    browser (made the first time), gets a TXT record of message, kept registered
+    until Release. A claim of another name first frees the one claimed before.
+    The name is registered in the background: the log lines say how it went,
+    and Message what the zone has.
+
+func (p *Page) Claimed() (c Claim, ok bool, err error)
+    Claimed returns the claim the browser keeps, which the page resumes when it
+    opens.
+
+func (p *Page) Message(ctx context.Context, label string) ([]string, error)
+    Message returns the strings of the TXT records at label's name, as their
+    octets: none when it has none.
+
+func (p *Page) Release() error
+    Release frees the name claimed, deleting its message and its key's hold on
+    it, and forgets the claim. A claim the page has not resumed is freed too
+    (rfc9664.Release).
+
+type Storage interface {
+	Get(key string) (value string, ok bool)
+	Set(key, value string) error
+	Remove(key string)
+}
+    Storage keeps strings by key: the browser's localStorage, or what stands in
+    for it.
 
 ```
 
@@ -1867,6 +1984,8 @@ type UpstreamCoordinator interface {
 	// QueryKeyAtName reports the KEYs at name, telling NXDOMAIN from a name without one:
 	// fcfs_naming's live check (srp.Evaluate), as for the SRP handler.
 	QueryKeyAtName(ctx context.Context, zoneHint, name string) (srp.AuthoritativeKeyState, []*dns.KEY, error)
+	// QueryAuthoritative sends a query to zoneHint's authoritative server: answerQuery's.
+	QueryAuthoritative(ctx context.Context, zoneHint string, req *dns.Msg, what string) (*dns.Msg, error)
 	// Has unexported methods.
 }
     UpstreamCoordinator handles communication with the upstream
@@ -1990,6 +2109,15 @@ func AddressRR(owner string, addr netip.Addr, ttl uint32) dns.RR
 func EDEs(m *dns.Msg) []*dns.EDE
     EDEs returns the Extended DNS Errors in m, in order.
 
+func EscapeTXT(raw string) string
+    EscapeTXT turns raw, one TXT string's octets, into the form a TXT record's
+    strings take in codeberg.org/miekg/dns: presentation text, where a backslash
+    starts an escape, which the library decodes when it packs the record.
+    It is the form the library unpacks a TXT string into -- a quote or a
+    backslash escaped with a backslash, an octet outside printable ASCII as \DDD
+    -- so a record made with it is the same record as one read from the wire,
+    and compares equal to it (pkg/lease.RecordKey).
+
 func FormatEDE(e *dns.EDE) string
     FormatEDE renders e for people: its INFO-CODE, the code's name in the IANA
     "Extended DNS Error Codes" registry, and its EXTRA-TEXT, if any.
@@ -2005,9 +2133,23 @@ func ParseAdditionalRRSpec(spec string) (dns.RR, error)
 
         owner ttl class type rdata...
 
+func ParseRecords(saved []string) ([]dns.RR, error)
+    ParseRecords reads records kept in presentation format, one string each
+    (RecordStrings).
+
+func RecordStrings(records []dns.RR) []string
+    RecordStrings returns records in presentation format, one string each,
+    as ParseRecords reads them back: how a requester keeps the records it
+    registered.
+
 func StripEDEText(m *dns.Msg)
     StripEDEText empties the EXTRA-TEXT of every Extended DNS Error in m and
     keeps its INFO-CODE.
+
+func UnescapeTXT(s string) string
+    UnescapeTXT returns the octets of s, a TXT string in the library's form
+    (EscapeTXT), as the library packs them: \DDD is the octet DDD, a backslash
+    before any other character that character, and a backslash ending s nothing.
 
 ```
 
@@ -2083,6 +2225,13 @@ func IsAtOrBelow(name, zone string) bool
     comparing whole labels under Fold: "test.srp.test." is below "srp.test.",
     "evilsrp.test." is not. Trailing dots are optional on both. Every name is at
     or below the root zone ("." or "").
+
+func IsHostLabel(label string) bool
+    IsHostLabel reports whether label is a host name label (RFC 952, RFC 1123
+    S2.1): letters, digits and hyphens, not starting or ending with a hyphen,
+    at most 63 octets. A name that has an address record, or is typed or linked,
+    needs one: BIND refuses an address record with any other owner name by
+    default (check-names).
 
 func Labels(name string) []string
     Labels splits name into its labels. A fully-qualified name's last
@@ -2310,6 +2459,12 @@ func LoadKeyFromFile(keystoreDir, keyName string) (*LoadedKey, error)
     <keystoreDir>/<keyName>.key and <keystoreDir>/<keyName>.private Uses
     codeberg.org/miekg/dns v0.6.82 API
 
+func ParseKey(name, pubText, privText string) (*LoadedKey, error)
+    ParseKey reads the key named name from the texts of its .key file (the
+    KEY RR) and its .private file (the private key, in the DNSSEC format):
+    what LoadKeyFromFile reads from a keystore directory, and KeyText returns,
+    for a key kept elsewhere, such as a browser's storage.
+
 func ResolveOrCreateKey(dir, owner string, createAlgorithm uint8, logger *logging.Logger) (key *LoadedKey, created bool, err error)
     ResolveOrCreateKey finds an existing key for owner (a fully-qualified
     DNS name) in dir, or -- only when createAlgorithm is non-zero --
@@ -2345,6 +2500,10 @@ func (lk *LoadedKey) KeyName() string
 
 func (lk *LoadedKey) KeyTag() uint16
     KeyTag returns the key tag from the public key
+
+func (lk *LoadedKey) KeyText() (pubText, privText string)
+    KeyText returns lk's .key and .private file texts, which ParseKey reads
+    back.
 
 func (lk *LoadedKey) Print()
     Print key info
@@ -3415,6 +3574,17 @@ func NewCoordinator(logger *logging.Logger, bootstrapResolvers []string, static 
     NewCoordinator creates a Coordinator. bootstrapResolvers falls back to
     defaultBootstrapResolvers when empty. static may be nil (discovery for every
     name).
+
+func (c *Coordinator) QueryAuthoritative(ctx context.Context, zoneHint string, req *dns.Msg, what string) (*dns.Msg, error)
+    QueryAuthoritative sends req, with its RD bit cleared, to zoneHint's
+    authoritative server (ResolveSOAMasterServer, honoring a static override)
+    over UDP, falling back to TCP on a UDP failure or a truncated answer.
+    A truncated UDP answer must not be trusted as-is: its empty (or partial)
+    Answer section would otherwise read as "no such records" -- letting FCFS
+    treat an already-owned name as free, say -- even though the name really
+    has more data than fit in the UDP response. This fork's dns.Exchange
+    neither retries nor falls back to TCP on truncation on its own (see its doc
+    comment), so it has to happen here. what names the query in errors.
 
 func (c *Coordinator) QueryKeyAtName(ctx context.Context, zoneHint, name string) (AuthoritativeKeyState, []*dns.KEY, error)
     QueryKeyAtName is the real implementation of AuthoritativeKeyQuery (S3.3.3

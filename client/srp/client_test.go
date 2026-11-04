@@ -1,7 +1,6 @@
 package srp
 
 import (
-	"bytes"
 	"context"
 	"errors"
 	"math/rand"
@@ -620,19 +619,5 @@ func TestNetwork_String(t *testing.T) {
 		if got := n.String(); got != want {
 			t.Errorf("%d.String() = %q, want %q", int(n), got, want)
 		}
-	}
-}
-
-func TestEscapeTXT_PacksToTheRawBytes(t *testing.T) {
-	raw := "a\\b\x00\xff\"q"
-	m := &dns.Msg{}
-	txt := &dns.TXT{Hdr: dns.Header{Name: "x.", Class: dns.ClassINET}}
-	txt.TXT.Txt = []string{EscapeTXT(raw)}
-	m.Answer = []dns.RR{txt}
-	if err := m.Pack(); err != nil {
-		t.Fatal(err)
-	}
-	if want := append([]byte{byte(len(raw))}, raw...); !bytes.HasSuffix(m.Data, want) {
-		t.Errorf("packed TXT ends % x, want % x", m.Data[len(m.Data)-len(want):], want)
 	}
 }

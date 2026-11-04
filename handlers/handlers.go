@@ -214,6 +214,13 @@ type upstreamClient interface {
 	ResolveAuthoritativeZone(ctx context.Context, zone string) (string, error)
 }
 
+// zoneCoordinator is what leaseHandler needs of a handler's coordinator: upstreamTarget's part,
+// and the queries answerQuery passes to the zone's authoritative server.
+type zoneCoordinator interface {
+	upstreamClient
+	QueryAuthoritative(ctx context.Context, zoneHint string, req *dns.Msg, what string) (*dns.Msg, error)
+}
+
 // upstreamTarget is where one handler's UPDATEs go and what signs them: its coordinator, the
 // proxy's signing key that Setup loaded once (a rotated key on disk needs a restart), and the
 // handler's configured upstream zone. leaseHandler.upstream builds one from the handler's fields.

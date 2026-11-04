@@ -36,43 +36,44 @@ func LoadKeyFromFile(keystoreDir, keyName string) (*LoadedKey, error) {
 	pubKeyPath := filepath.Join(keystoreDir, keyName+".key")
 	privKeyPath := filepath.Join(keystoreDir, keyName+".private")
 
-	// Read public key file (contains KEY RR in text format)
-	pubKeyFile, err := os.Open(pubKeyPath)
+	pubText, err := os.ReadFile(pubKeyPath)
 	if err != nil {
 		return nil, fmt.Errorf("failed to open public key file %q: %w", pubKeyPath, err)
 	}
-	defer pubKeyFile.Close()
-
-	// Parse KEY RR using dns.Read from codeberg/miekg/dns
-	// This reads wire format or text format DNS records
-	rr, err := dns.Read(pubKeyFile)
-	if err != nil {
-		return nil, fmt.Errorf("failed to parse KEY RR from %q: %w", pubKeyPath, err)
-	}
-
-	dnsKey, ok := rr.(*dns.KEY)
-	if !ok {
-		return nil, fmt.Errorf("expected dns.KEY from %q, got %T", pubKeyPath, rr)
-	}
-
-	// Read private key file as text
-	privKeyBytes, err := os.ReadFile(privKeyPath)
+	privText, err := os.ReadFile(privKeyPath)
 	if err != nil {
 		return nil, fmt.Errorf("failed to read private key file %q: %w", privKeyPath, err)
 	}
-
-	// Parse private key material using NewPrivate from codeberg/miekg/dns
-	// This expects DNSSEC format private key text
-	privKey, err := dnsKey.NewPrivate(string(privKeyBytes))
+	lk, err := ParseKey(keyName, string(pubText), string(privText))
 	if err != nil {
-		return nil, fmt.Errorf("failed to parse private key from %q: %w", privKeyPath, err)
+		return nil, fmt.Errorf("key %s in %s: %w", keyName, keystoreDir, err)
 	}
+	return lk, nil
+}
 
-	return &LoadedKey{
-		Name:       keyName,
-		PublicKey:  dnsKey,
-		PrivateKey: privKey,
-	}, nil
+// ParseKey reads the key named name from the texts of its .key file (the KEY RR) and its
+// .private file (the private key, in the DNSSEC format): what LoadKeyFromFile reads from a
+// keystore directory, and KeyText returns, for a key kept elsewhere, such as a browser's
+// storage.
+func ParseKey(name, pubText, privText string) (*LoadedKey, error) {
+	rr, err := dns.Read(strings.NewReader(pubText))
+	if err != nil {
+		return nil, fmt.Errorf("failed to parse KEY RR: %w", err)
+	}
+	dnsKey, ok := rr.(*dns.KEY)
+	if !ok {
+		return nil, fmt.Errorf("expected a KEY RR, got %T", rr)
+	}
+	privKey, err := dnsKey.NewPrivate(privText)
+	if err != nil {
+		return nil, fmt.Errorf("failed to parse private key: %w", err)
+	}
+	return &LoadedKey{Name: name, PublicKey: dnsKey, PrivateKey: privKey}, nil
+}
+
+// KeyText returns lk's .key and .private file texts, which ParseKey reads back.
+func (lk *LoadedKey) KeyText() (pubText, privText string) {
+	return lk.PublicKey.String() + "\n", lk.PublicKey.PrivateKeyString(lk.PrivateKey)
 }
 
 // ListKeysInDirectory lists all key names in a keystore directory.

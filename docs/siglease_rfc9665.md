@@ -91,6 +91,12 @@ with `rewrite_default_service_arpa` on (`SRPHandler.takes`). The Zone Section pl
 that: both handlers only require it to enclose every name in the update, answering `NOTZONE`
 otherwise (RFC 2136 §3.4.1.3; `docs/siglease_rfc9664.md`, "The Zone Section").
 
+Listed for opcode 0 as well (`config.yaml` does), both handlers answer a query for a name in
+their zone with the answer of the zone's authoritative server, as their shared base does it
+(`leaseHandler.answerQuery`), so that browsing the SRP domain through the proxy sees a
+registration or a removal as soon as that server has it; `docs/siglease_rfc9664.md`, "Queries
+for the Zones Served".
+
 Each handler serves exactly one zone, and the proxy refuses to start when `srp_handler` and
 `update_handler` serve the same one (`handlers.SeparateZones`). The zones may nest; the live
 `config.yaml` has `srp.dev.zenr.io.` inside the RFC 9664 handler's `dev.zenr.io.`. A name then

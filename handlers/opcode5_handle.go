@@ -18,6 +18,9 @@ func (h *UpdateHandler) Handle(ctx context.Context, w dns.ResponseWriter, r *dns
 	if r == nil {
 		return NewErrorResult(nil, "nil message received", fmt.Errorf("nil message"))
 	}
+	if r.Opcode == dns.OpcodeQuery {
+		return h.answerQuery(ctx, r)
+	}
 
 	// CHECK 1: Verify UPDATE-LEASE EDNS option is present
 	// If missing, this is a regular UPDATE not relevant to sig0lease

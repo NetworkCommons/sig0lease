@@ -24,6 +24,7 @@ import (
 	baseclient "github.com/NetworkCommons/sig0lease/client"
 	"github.com/NetworkCommons/sig0lease/client/mdnsresponder"
 	clientsrp "github.com/NetworkCommons/sig0lease/client/srp"
+	"github.com/NetworkCommons/sig0lease/pkg/dnsmsg"
 	"github.com/NetworkCommons/sig0lease/pkg/dnsname"
 	"github.com/NetworkCommons/sig0lease/pkg/dnssd"
 	"github.com/NetworkCommons/sig0lease/pkg/keyrec"
@@ -377,7 +378,7 @@ func (b *bridge) added(ctx context.Context, key instanceKey, inst *instance, res
 	}
 	txt := make([]string, len(res.TXT))
 	for i, s := range res.TXT {
-		txt[i] = clientsrp.EscapeTXT(string(s))
+		txt[i] = dnsmsg.EscapeTXT(string(s))
 	}
 	h := b.hosts[target]
 	if h == nil {

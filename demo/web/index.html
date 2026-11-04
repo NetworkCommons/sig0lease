@@ -1,0 +1,309 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>sig0lease live zone</title>
+<!-- E3 of docs/demo.md: make web builds this page into bin/web, beside sig0lease-web.wasm.gz (cmd/sig0lease-web)
+     and Go's wasm_exec.js; demo/web.sh serves it. Query parameters: doh, the proxy's DNS-over-HTTPS server
+     (default this host, port 8443); zone, where names are claimed (default dev.zenr.io); domain, the DNS-SD
+     domain shown (default srp.dev.zenr.io); ns, a server for the dig commands shown (default none). -->
+<style>
+  :root { --fg: #222; --bg: #fafafa; --muted: #666; --line: #ddd; --code: #eee; --card: #fff;
+          --new: #d7f5dd; --gone: #f9dcdc; --ok: #1a7f37; --wait: #9a6700; --err: #c62828; }
+  @media (prefers-color-scheme: dark) {
+    :root { --fg: #ddd; --bg: #181818; --muted: #999; --line: #333; --code: #2a2a2a; --card: #202020;
+            --new: #1d3b24; --gone: #4a2224; --ok: #4ac26b; --wait: #d4a72c; --err: #ef6b6b; }
+  }
+  * { box-sizing: border-box; }
+  body { font: 17px/1.5 system-ui, sans-serif; max-width: 44rem; margin: 2rem auto; padding: 0 1rem;
+         color: var(--fg); background: var(--bg); }
+  h1 { font-size: 1.6rem; margin-bottom: .2rem; }
+  h2 { font-size: 1.15rem; margin: 0 0 .6rem; }
+  section { background: var(--card); border: 1px solid var(--line); border-radius: 8px; padding: 1rem; margin: 1rem 0; }
+  code { background: var(--code); padding: 0 .3em; border-radius: 3px; overflow-wrap: anywhere; }
+  .muted { color: var(--muted); font-size: .9rem; }
+  form { display: flex; flex-wrap: wrap; gap: .5rem; align-items: center; }
+  input { font: inherit; padding: .4rem .5rem; border: 1px solid var(--line); border-radius: 5px;
+          background: var(--bg); color: var(--fg); min-width: 0; }
+  #label, #lookup-label { width: 10rem; }
+  #message { flex: 1 1 14rem; }
+  button { font: inherit; padding: .4rem .9rem; border: 1px solid var(--line); border-radius: 5px;
+           background: var(--code); color: var(--fg); cursor: pointer; }
+  button:disabled { opacity: .5; cursor: default; }
+  .badge { font-size: .8rem; font-weight: 600; padding: .1rem .5rem; border-radius: 99px; border: 1px solid currentColor; }
+  .ok { color: var(--ok); } .wait { color: var(--wait); } .err { color: var(--err); }
+  ul.types { list-style: none; padding: 0; margin: 0; }
+  ul.types > li { margin: .6rem 0; }
+  ul.instances { list-style: none; padding: 0; margin: .3rem 0 0; }
+  ul.instances > li { padding: .4rem .6rem; border-left: 3px solid var(--line); margin: .3rem 0; border-radius: 3px;
+                      transition: background-color 2s; }
+  li.new { background: var(--new); }
+  li.gone { background: var(--gone); text-decoration: line-through; }
+  .name { font-weight: 600; }
+  .txt { display: inline-block; font-size: .85rem; background: var(--code); border-radius: 3px; padding: 0 .3em; margin: .1rem .2rem 0 0; }
+  pre { white-space: pre-wrap; font-size: .8rem; max-height: 14rem; overflow-y: auto; margin: .5rem 0 0; }
+</style>
+</head>
+<body>
+<h1>The live zone, from your browser</h1>
+<p class="muted" id="status">Loading the DNS client…</p>
+
+<section>
+  <h2>Claim a name</h2>
+  <p class="muted">Pick a name and leave a short message there. Your browser makes a key and keeps it; the
+  key, not an account, holds the name. It stays yours while this page is open, and for half an hour after.</p>
+  <form id="claim-form">
+    <input id="label" required autocomplete="off" autocapitalize="none" spellcheck="false" placeholder="yourname"
+           pattern="[a-z0-9]([a-z0-9\-]{0,61}[a-z0-9])?" title="letters, digits and hyphens">
+    <span>.<span class="zone"></span></span>
+    <input id="message" maxlength="140" placeholder="a short message">
+    <button id="claim" disabled>Claim</button>
+  </form>
+  <p class="err" id="claim-error" hidden></p>
+  <div id="mine" hidden>
+    <p><code id="mine-name"></code> <span class="badge" id="mine-state"></span></p>
+    <p class="muted" id="mine-zone"></p>
+    <p class="muted">Anyone can check: <code id="mine-dig"></code></p>
+    <button id="release">Release the name</button>
+  </div>
+</section>
+
+<section>
+  <h2>Services in <code id="domain"></code></h2>
+  <p class="muted" id="browse-status"></p>
+  <ul class="types" id="types"></ul>
+</section>
+
+<section>
+  <h2>Look up a name</h2>
+  <form id="lookup-form">
+    <input id="lookup-label" required autocomplete="off" autocapitalize="none" spellcheck="false" placeholder="name">
+    <span>.<span class="zone"></span></span>
+    <button id="lookup" disabled>Look up</button>
+  </form>
+  <p id="lookup-result"></p>
+</section>
+
+<details>
+  <summary class="muted">Log</summary>
+  <pre id="log"></pre>
+</details>
+
+<script src="wasm_exec.js"></script>
+<script>
+"use strict";
+const params = new URLSearchParams(location.search);
+const cfg = {
+  doh: params.get("doh") || `${location.protocol}//${location.hostname}:8443`,
+  zone: params.get("zone") || "dev.zenr.io",
+  domain: params.get("domain") || "srp.dev.zenr.io",
+};
+const ns = params.get("ns");
+const every = 3000; // ms between two readings of the zone
+const $ = (id) => document.getElementById(id);
+
+function el(tag, cls, text) {
+  const e = document.createElement(tag);
+  if (cls) e.className = cls;
+  if (text !== undefined) e.textContent = text;
+  return e;
+}
+
+function log(line) {
+  const pre = $("log");
+  pre.textContent += `${new Date().toLocaleTimeString()} ${line}\n`;
+  pre.scrollTop = pre.scrollHeight;
+}
+
+function dig(type, name) { return `dig +short ${type} ${name}` + (ns ? ` @${ns}` : ""); }
+
+for (const z of document.querySelectorAll(".zone")) z.textContent = cfg.zone;
+$("domain").textContent = cfg.domain;
+
+// The services: every reading is drawn against the one before, new instances lit up and those
+// gone struck through until the next reading.
+let shown = new Map(); // "<type> <name>" -> instance, as last drawn
+let drawn = false; // whether a reading was drawn: the first one lights nothing up
+
+function instanceItem(inst, cls) {
+  const li = el("li", cls);
+  li.append(el("span", "name", inst.name));
+  if (inst.target) {
+    li.append(" ", el("span", "muted", `${inst.target.replace(/\.$/, "")}:${inst.port}`));
+    if (inst.addresses.length) li.append(el("div", "muted", inst.addresses.join("  ")));
+  } else {
+    li.append(" ", el("span", "muted", "withdrawn"));
+  }
+  if (inst.txt.length) {
+    const d = el("div");
+    for (const t of inst.txt) d.append(el("span", "txt", t));
+    li.append(d);
+  }
+  return li;
+}
+
+function draw(domain) {
+  const now = new Map(domain.instances.map((i) => [`${i.type} ${i.name}`, i]));
+  const all = new Map([...shown, ...now]);
+  const byType = new Map();
+  for (const [key, inst] of [...all].sort(([a], [b]) => a.localeCompare(b))) {
+    const cls = !now.has(key) ? "gone" : drawn && !shown.has(key) ? "new" : "";
+    if (!byType.has(inst.type)) byType.set(inst.type, []);
+    byType.get(inst.type).push(instanceItem(inst, cls));
+  }
+  const ul = $("types");
+  ul.replaceChildren();
+  for (const [type, items] of byType) {
+    const li = el("li");
+    li.append(el("code", "", type));
+    const inner = el("ul", "instances");
+    inner.append(...items);
+    li.append(inner);
+    ul.append(li);
+  }
+  if (!byType.size) ul.append(el("li", "muted", "No services right now."));
+  // Lit-up instances fade back once drawn.
+  requestAnimationFrame(() => requestAnimationFrame(() => {
+    for (const li of ul.querySelectorAll("li.new")) li.classList.remove("new");
+  }));
+  shown = now;
+  drawn = true;
+}
+
+async function browseLoop() {
+  try {
+    draw(await sig0lease.browse());
+    $("browse-status").textContent = `Read at ${new Date().toLocaleTimeString()}, every ${every / 1000} s.`;
+    $("browse-status").className = "muted";
+  } catch (e) {
+    $("browse-status").textContent = `Could not read ${cfg.domain}: ${e.message}`;
+    $("browse-status").className = "err";
+  }
+  setTimeout(browseLoop, every);
+}
+
+// The claim: what the zone has at the name, read as often as the services.
+let mine = null; // {label, message} while a name is claimed
+
+function showMine() {
+  $("mine").hidden = !mine;
+  if (!mine) return;
+  const name = `${mine.label}.${cfg.zone}`;
+  $("mine-name").textContent = name;
+  $("mine-dig").textContent = dig("TXT", name);
+  $("mine-state").textContent = "waiting";
+  $("mine-state").className = "badge wait";
+  $("mine-zone").textContent = "";
+}
+
+async function mineLoop() {
+  const m = mine;
+  if (m) {
+    try {
+      const got = await sig0lease.message(m.label);
+      if (m === mine) {
+        const up = got.length === 1 && got[0] === m.message;
+        $("mine-state").textContent = up ? "published" : "waiting";
+        $("mine-state").className = up ? "badge ok" : "badge wait";
+        $("mine-zone").textContent = up ? "The zone's server has your message."
+          : got.length ? `The zone has: ${got.join(" ")}` : "The zone has nothing there yet.";
+      }
+    } catch (e) {
+      $("mine-zone").textContent = `Could not read the name: ${e.message}`;
+    }
+  }
+  setTimeout(mineLoop, every);
+}
+
+function claimError(e) {
+  $("claim-error").hidden = !e;
+  $("claim-error").textContent = e ? e.message : "";
+}
+
+$("claim-form").addEventListener("submit", async (ev) => {
+  ev.preventDefault();
+  const label = $("label").value.trim().toLowerCase();
+  const message = $("message").value;
+  if (new TextEncoder().encode(message).length > 255) {
+    claimError(new Error("The message is too long."));
+    return;
+  }
+  $("claim").disabled = true;
+  try {
+    await sig0lease.claim(label, message);
+    claimError(null);
+    mine = { label, message };
+    showMine();
+  } catch (e) {
+    claimError(e);
+  }
+  $("claim").disabled = false;
+});
+
+$("release").addEventListener("click", async () => {
+  $("release").disabled = true;
+  $("release").textContent = "Releasing…";
+  try {
+    await sig0lease.release();
+    mine = null;
+    showMine();
+    claimError(null);
+  } catch (e) {
+    claimError(e);
+  }
+  $("release").disabled = false;
+  $("release").textContent = "Release the name";
+});
+
+$("lookup-form").addEventListener("submit", async (ev) => {
+  ev.preventDefault();
+  const label = $("lookup-label").value.trim().toLowerCase();
+  const out = $("lookup-result");
+  out.className = "";
+  out.textContent = "…";
+  try {
+    const got = await sig0lease.message(label);
+    out.textContent = got.length ? got.join(" ") : `${label}.${cfg.zone} has no message.`;
+    if (!got.length) out.className = "muted";
+  } catch (e) {
+    out.textContent = e.message;
+    out.className = "err";
+  }
+});
+
+(async () => {
+  try {
+    const go = new Go();
+    const resp = await fetch("sig0lease-web.wasm.gz");
+    if (!resp.ok) throw new Error(`sig0lease-web.wasm.gz: ${resp.status} ${resp.statusText}`);
+    const wasm = await new Response(resp.body.pipeThrough(new DecompressionStream("gzip"))).arrayBuffer();
+    const { instance } = await WebAssembly.instantiate(wasm, go.importObject);
+    go.run(instance); // sets the global sig0lease, then waits for calls
+    await sig0lease.start({ ...cfg, log });
+    $("status").textContent = `A DNS client running in this page asks this laptop's proxy, over DNS-over-HTTPS at ${cfg.doh}. The proxy answers from the zone's own server.`;
+    $("claim").disabled = $("lookup").disabled = false;
+  } catch (e) {
+    $("status").textContent = `The DNS client did not start: ${e.message}`;
+    $("status").className = "err";
+    return;
+  }
+  try { // the claim this browser keeps, from an earlier visit
+    const c = await sig0lease.claimed();
+    if (c) {
+      $("label").value = c.label;
+      $("message").value = c.message;
+      await sig0lease.claim(c.label, c.message);
+      mine = c;
+      showMine();
+      log(`resumed the claim of ${c.label}.${cfg.zone}`);
+    }
+  } catch (e) {
+    claimError(e);
+  }
+  browseLoop();
+  mineLoop();
+})();
+</script>
+</body>
+</html>

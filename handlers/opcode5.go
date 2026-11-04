@@ -51,6 +51,8 @@ type UpstreamCoordinator interface {
 	// QueryKeyAtName reports the KEYs at name, telling NXDOMAIN from a name without one:
 	// fcfs_naming's live check (srp.Evaluate), as for the SRP handler.
 	QueryKeyAtName(ctx context.Context, zoneHint, name string) (srp.AuthoritativeKeyState, []*dns.KEY, error)
+	// QueryAuthoritative sends a query to zoneHint's authoritative server: answerQuery's.
+	QueryAuthoritative(ctx context.Context, zoneHint string, req *dns.Msg, what string) (*dns.Msg, error)
 }
 
 // UpdateHandler handles DNS opcode 5 (UPDATE queries).

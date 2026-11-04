@@ -44,7 +44,7 @@ type sharedFields struct {
 	recordTTL    uint32
 }
 
-func sharedFieldsOf[C upstreamClient](b *leaseHandler[C]) sharedFields {
+func sharedFieldsOf[C zoneCoordinator](b *leaseHandler[C]) sharedFields {
 	return sharedFields{
 		leaseRuntime: b.leaseRuntime,
 		upstreamZone: b.upstreamZone,
