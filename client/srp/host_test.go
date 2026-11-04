@@ -185,11 +185,14 @@ func TestHost_RegistersWithdrawsAndDeregisters(t *testing.T) {
 	}
 
 	h.Set(nil, nil)
-	if got := reg.next(t); len(got.addrs) != 0 || !slices.Equal(got.withdrawn, []string{"Web._http._tcp.srp.test."}) {
-		t.Fatalf("update after no addresses = %+v, want the host deregistered", got)
+	if got := reg.next(t); len(got.addrs) != 0 || !slices.Equal(got.withdrawn, []string{"Web._http._tcp.srp.test."}) || got.keyLease != 1209600 {
+		t.Fatalf("update after no addresses = %+v, want the host deregistered keeping its names", got)
 	}
 	h.Stop()
 	h.Wait()
+	if got := reg.next(t); len(got.addrs) != 0 || len(got.withdrawn) != 0 || got.keyLease != 0 {
+		t.Fatalf("update on Stop = %+v, want the host alone deregistered freeing its names", got)
+	}
 	reg.none(t, 50*time.Millisecond)
 }
 
@@ -209,18 +212,23 @@ func TestHost_RegistersTheHostAlone(t *testing.T) {
 	}
 }
 
-// With KeepNames, deregistering on Stop or on a Set with no addresses asks for the KEY-LEASE
-// the host registers with, so its names stay reserved for its key; without it for a
-// KEY-LEASE of 0, which frees them (RFC 9665 S3.2.5.5.1). The store records the names as held
-// from the first registration until they are freed.
+// With KeepNames, Stop's deregistration asks for the KEY-LEASE the host registers with, so
+// its names stay reserved for its key; without it for a KEY-LEASE of 0, which frees them (RFC
+// 9665 S3.2.5.5.1). While the Host runs it keeps them whatever KeepNames says: a Set with no
+// addresses deregisters it keeping them, as StopKeepingNames does; a Stop after such a Set
+// frees them, unless KeepNames. The store records the names as held from the first
+// registration until they are freed.
 func TestHost_KeepNames(t *testing.T) {
+	const kept = 1209600
 	for _, tt := range []struct {
 		name string
 		keep bool
+		stop func(*Host)
 		want uint32
 	}{
-		{"Stop keeping the names", true, 1209600},
-		{"Stop freeing the names", false, 0},
+		{"Stop keeping the names", true, (*Host).Stop, kept},
+		{"Stop freeing the names", false, (*Host).Stop, 0},
+		{"StopKeepingNames without KeepNames", false, (*Host).StopKeepingNames, kept},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			reg := &hostRegistrar{sent: make(chan *dns.Msg, 16)}
@@ -229,24 +237,63 @@ func TestHost_KeepNames(t *testing.T) {
 			h.Set(boxAddr, nil)
 			reg.next(t)
 			waitFor(t, "the names recorded as held", func() bool { return store.isHeld("box.srp.test.") })
-			h.Stop()
+			tt.stop(h)
 			h.Wait()
 			if got := reg.next(t); len(got.addrs) != 0 || got.keyLease != tt.want {
 				t.Fatalf("update on stopping = %+v, want the host deregistered with KEY-LEASE %d", got, tt.want)
 			}
-			if held := store.isHeld("box.srp.test."); held != tt.keep {
-				t.Fatalf("names recorded as held after stopping: %v, want %v", held, tt.keep)
+			if held := store.isHeld("box.srp.test."); held != (tt.want != 0) {
+				t.Fatalf("names recorded as held after stopping: %v, want %v", held, tt.want != 0)
 			}
 		})
 	}
 
-	reg := &hostRegistrar{sent: make(chan *dns.Msg, 16)}
-	h := startTestHost(t, reg, nil, nil, nil, true)
+	for _, keep := range []bool{true, false} {
+		t.Run(fmt.Sprintf("a Set with no addresses, then Stop, KeepNames %v", keep), func(t *testing.T) {
+			reg := &hostRegistrar{sent: make(chan *dns.Msg, 16)}
+			store := newMemStore()
+			h := startTestHost(t, reg, store, nil, nil, keep)
+			h.Set(boxAddr, nil)
+			reg.next(t)
+			h.Set(nil, nil)
+			if got := reg.next(t); len(got.addrs) != 0 || got.keyLease != kept {
+				t.Fatalf("update after no addresses = %+v, want the host deregistered keeping its names", got)
+			}
+			if !store.isHeld("box.srp.test.") {
+				t.Fatal("names recorded as freed after a Set with no addresses")
+			}
+			h.Stop()
+			h.Wait()
+			if keep {
+				reg.none(t, 50*time.Millisecond)
+			} else if got := reg.next(t); got.host != "box.srp.test." || len(got.addrs) != 0 || got.keyLease != 0 {
+				t.Fatalf("update on Stop = %+v, want the host alone deregistered freeing its names", got)
+			}
+			if held := store.isHeld("box.srp.test."); held != keep {
+				t.Fatalf("names recorded as held after stopping: %v, want %v", held, keep)
+			}
+		})
+	}
+}
+
+// A Stop without KeepNames frees the names a Set with no addresses kept, under the labels a
+// rename gave them.
+func TestHost_StopFreesARenameKeptWhileRunning(t *testing.T) {
+	reg := &hostRegistrar{sent: make(chan *dns.Msg, 16), taken: []string{"box.srp.test."}}
+	h := startTestHost(t, reg, newMemStore(), heldBy("box.srp.test."), nil, false)
 	h.Set(boxAddr, nil)
-	reg.next(t)
+	reg.next(t) // box, which another key holds
+	if got := reg.next(t); got.host != "box-2.srp.test." || len(got.addrs) == 0 {
+		t.Fatalf("retry = %+v, want box-2 registered", got)
+	}
 	h.Set(nil, nil)
-	if got := reg.next(t); len(got.addrs) != 0 || got.keyLease != 1209600 {
-		t.Fatalf("update after no addresses = %+v, want the host deregistered keeping its names", got)
+	if got := reg.next(t); got.host != "box-2.srp.test." || len(got.addrs) != 0 || got.keyLease != 1209600 {
+		t.Fatalf("update after no addresses = %+v, want box-2 deregistered keeping its names", got)
+	}
+	h.Stop()
+	h.Wait()
+	if got := reg.next(t); got.host != "box-2.srp.test." || len(got.addrs) != 0 || got.keyLease != 0 {
+		t.Fatalf("update on Stop = %+v, want box-2 freed", got)
 	}
 }
 

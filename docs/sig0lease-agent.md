@@ -80,7 +80,7 @@ A list, each entry with a `protocol`: `srp` registers hosts, their services and 
 | `transport` | `tcp` | `tcp`, `udp`, `tls` (DNS over TLS) or `doh` (DNS over HTTPS, or plain HTTP), the last two opportunistic: the certificate is not checked. |
 | `lease` | `1h` | How long the records last unless refreshed. A Go duration, in whole seconds. |
 | `key_lease` | `336h` | How long each host's or name's names stay reserved for its key (RFC 9665 §3.4). At least `lease`. |
-| `on_stop` | `keep` | What stopping does to the names. `keep`: the records go, the KEYs stay, so the names remain reserved for the agent's keys for `key_lease` (RFC 9665 §3.2.5.5.1; RFC 9664's Case D). `release`: the KEYs go too, and the names are free at once. |
+| `on_stop` | `keep` | What stopping does to the names. `keep`: the records go, the KEYs stay, so the names remain reserved for the agent's keys for `key_lease` (RFC 9665 §3.2.5.5.1; RFC 9664's Case D). `release`: the KEYs go too, and the names are free at once. Only stopping: while the agent runs, what it deregisters but still registers keeps its names (see "Running"). |
 
 An `srp` registrar also takes:
 
@@ -183,7 +183,8 @@ Under an `srp` registrar:
 The `mdns` mirror asks a running mDNSResponder, over its client socket, what is advertised on
 the link, and registers each selected mDNS host (`mymac.local.` becomes `mymac.<domain>`) with
 its addresses and instances, each with its own key in the keystore. An instance the daemon
-reports gone is withdrawn; a host with none left is deregistered. It does not follow subtypes,
+reports gone is withdrawn; a host with none left is deregistered, keeping its names (see
+"Running"). It does not follow subtypes,
 nor a host's address or TXT changes after its instances first appear. `hosts:` or
 `all_hosts: true` is required, not both: copying a whole network into a public zone has to be
 asked for. A mirrored host may not be one its registrar's `hosts:` registers: naming one is an
@@ -219,21 +220,28 @@ override (`record_ttl_sec`).
 
 - a host or name added is registered; one removed is deregistered as on stopping, then its
   names are freed, whatever `on_stop` says (see "The state file");
-- a host or name whose `lease`, `key_lease` or `on_stop` changed is deregistered as on
-  stopping, then registered again;
+- a host or name whose `lease`, `key_lease` or `on_stop` changed is deregistered keeping its
+  names, then registered again;
 - a host changed is registered again with its new addresses and services, withdrawing the
   services it no longer has; a service whose port and probe are unchanged keeps its probe
   state, any other is registered once a probe passes. A name changed withdraws the records it
   no longer has, then registers the others;
 - a registrar whose `server`, `transport`, `resolvers`, `lease`, `key_lease` or `on_stop`
-  changed deregisters what it registers, then registers it again; a new `server` or
-  `transport` also frees the names held through the old one. Another registrar's hosts and
-  names are not touched. A registrar with a new `domain` or `zone` is a new registrar: the old
-  one's hosts and names are removed, as above;
+  changed deregisters what it registers, keeping the names, then registers it again; a new
+  `server` or `transport` also frees the names held through the old one. Another registrar's
+  hosts and names are not touched. A registrar with a new `domain` or `zone` is a new
+  registrar: the old one's hosts and names are removed, as above;
 - a changed `keystore` deregisters everything, frees the names held with the old keys, then
   registers everything again with the new ones;
-- a changed mirror is restarted; the hosts it no longer selects, or all of a removed mirror's,
-  have their names freed.
+- a changed mirror is restarted, its hosts keeping their names; the hosts it no longer
+  selects, or all of a removed mirror's, have their names freed.
+
+`on_stop` applies only when the agent stops. While it runs, a host or name it deregisters but
+still registers keeps its names, whatever `on_stop` says, as a withdrawn service keeps its
+instance name: a host left with no address, a name with no address or record (`auto` finding
+none), a mirrored host whose last instance went, the hosts of a mirror that stopped on its own
+(it is started again at the next poll), and the restarts above. What the template no longer
+registers is freed.
 
 An invalid change is logged, once, with every problem, and the agent goes on with the template
 as it was until the file is valid again. Each host's log lines start with its label, each
@@ -246,7 +254,9 @@ can take the names, and the next start gets them back. With `release` it asks fo
 of 0, a permanent removal (for a name, Case C: the KEY alone, which takes its records): the
 names are free, first come, first served. A host name another key takes in the meantime is
 renamed on the next start; a name is tried again (below). The mirror's hosts follow their
-registrar's `on_stop`, also when the daemon stops advertising them.
+registrar's `on_stop`. With `release`, stopping also frees what the state file still records
+as held for hosts and names the template registers: names kept while the agent ran by one not
+registered as it stopped, or held from an earlier run by one this run never registered.
 
 ## Names another key holds
 
@@ -301,8 +311,8 @@ registrar removes the host's service instances with it (RFC 9665 §3.2.5.5.1, "e
 requester doesn't list them"). A name gets its KEY alone with both leases 0 (Case C), which
 deletes every record the key registered. `plan` lists them. A release that fails is logged and
 tried again at the next start or template change; until then the names stay held until their
-key lease ends. A mirrored host that only stopped being advertised keeps its names, as
-`on_stop` says.
+key lease ends. A mirrored host that only stopped being advertised keeps its names until the
+agent stops (see "Running").
 
 Deleting the file is never needed to get the template's names back: every start asks for them.
 It only makes the agent forget the hosts and names it registered before, whose names then stay

@@ -159,7 +159,7 @@ registrars:
 		{"site.dev.test.", savedHost{Source: sourceHosts, Registrar: zone}, keystore, false},
 		{"box.srp.test.", savedHost{Source: sourceNames, Registrar: here}, keystore, false},
 	} {
-		if got := wanted(plan, tt.keystore, tt.host, tt.e); got != tt.want {
+		if _, got := wanted(plan, tt.keystore, tt.host, tt.e); got != tt.want {
 			t.Errorf("wanted(%s, %+v, %s) = %v, want %v", tt.host, tt.e, tt.keystore, got, tt.want)
 		}
 	}

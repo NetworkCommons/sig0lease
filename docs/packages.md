@@ -74,8 +74,14 @@ func (k *Keeper[S]) Set(s S)
 
 func (k *Keeper[S]) Stop()
     Stop starts stopping the Keeper: it stops keeping the registration and
-    leaves (Moves.Leave); Wait waits for it to finish. It may be called more
-    than once.
+    leaves (Moves.Leave), keeping the names if KeepNames; Wait waits for it to
+    finish. Stop and StopKeepingNames may be called more than once: the first
+    call decides.
+
+func (k *Keeper[S]) StopKeepingNames()
+    StopKeepingNames stops the Keeper as Stop does, but keeps the names whatever
+    KeepNames says: for a registration a new Keeper takes over, with the same
+    key and another configuration.
 
 func (k *Keeper[S]) Wait()
     Wait returns once the Keeper has stopped (Stop).
@@ -86,9 +92,11 @@ type KeeperConfig struct {
 	// StopTimeout bounds each withdrawal or deregistration sent outside the refresh clock;
 	// default 10s.
 	StopTimeout time.Duration
-	// KeepNames makes deregistering, on Stop or when nothing is left to register, keep the
-	// names reserved for the key until the KEY-LEASE ends, so that it gets them back when it
-	// returns. Without it the names are freed.
+	// KeepNames makes Stop keep the names reserved for the key until the KEY-LEASE ends, so
+	// that it gets them back when it returns. Without it Stop frees them, also those kept by
+	// a deregistration while the Keeper ran. While it runs, a Keeper keeps them whatever
+	// KeepNames says: deregistering when nothing is left to register keeps them, as does
+	// StopKeepingNames.
 	KeepNames bool
 	// Logf receives the log lines, each starting with the name kept. Default: none.
 	Logf func(format string, args ...any)
@@ -146,8 +154,9 @@ type Moves[S any] struct {
 	// Kept, if set, is called once a registration To returned has stopped, before the next
 	// To or Leave.
 	Kept func()
-	// Leave deregisters what To registered, as the Keeper stops. Its error goes to OnFatal.
-	Leave func() error
+	// Leave deregisters what To registered, as the Keeper stops, keeping the names if
+	// keepNames (Stop, StopKeepingNames). Its error goes to OnFatal.
+	Leave func(keepNames bool) error
 }
     Moves are what a Keeper does, each called from its goroutine alone.
 
@@ -486,17 +495,28 @@ and its instances, through client/srp: one SRP identity, so one signing key,
 per mDNS host.
 
 When the daemon reports an instance gone, the bridge withdraws it; when a host
-has no instance left, or the bridge stops, it deregisters the host. What it does
-not follow: subtypes (a browse does not report them), and a host's later address
-or TXT changes (it resolves an instance and looks up its host's addresses when
-they first appear).
+has no instance left, or the bridge stops, it deregisters the host, keeping its
+names until a stop that frees them (Config.KeepNames). What it does not follow:
+subtypes (a browse does not report them), and a host's later address or TXT
+changes (it resolves an instance and looks up its host's addresses when they
+first appear).
+
+VARIABLES
+
+var ErrRestart = errors.New("mdnsbridge: restarting")
+    ErrRestart is the cause of a ctx ending (context.WithCancelCause) for a
+    Run that is to run again, with another configuration: its hosts keep their
+    names, whatever KeepNames says.
+
 
 FUNCTIONS
 
 func Run(ctx context.Context, cfg Config) error
     Run mirrors until ctx ends, then deregisters every host it registered and
     returns ctx's error. A browse that fails, such as one macOS refuses for lack
-    of Local Network permission, stops it the same way, returning that error.
+    of Local Network permission, stops it the same way, returning that error,
+    but its hosts keep their names: a failure is no request to free them,
+    and Run's caller may run it again.
 
 func Selects(hosts []string, allHosts bool, target string) bool
     Selects reports whether a bridge given Hosts hosts and AllHosts allHosts
@@ -538,8 +558,10 @@ type Config struct {
 	// StopTimeout bounds the deregistrations sent when Run stops.
 	Settle      time.Duration
 	StopTimeout time.Duration
-	// KeepNames keeps a host's names reserved for its key when it is deregistered, because
-	// its last instance went or Run stopped (clientsrp.HostConfig.KeepNames).
+	// KeepNames keeps a host's names reserved for its key when Run stops because ctx ended
+	// (clientsrp.HostConfig.KeepNames); without it they are freed, those kept by an earlier
+	// deregistration included. A host whose last instance went keeps them, as does every host
+	// when Run is to run again: when it fails on its own, or ctx ends with ErrRestart.
 	KeepNames bool
 	Logf      func(format string, args ...any)
 }
@@ -690,13 +712,14 @@ func ParseRecords(name string, specs []string, bad func(i int, err error)) []dns
     order, and calls bad with the index of each spec it could not read and why.
 
 func Release(cfg NameConfig) error
-    Release frees a name that is not running and may still be held from an
-    earlier run: one deregistration of the KEY alone with both leases 0 (Case
-    C), which deletes every record the key registered with it, bounded by
-    cfg.StopTimeout. cfg.Store records the name as freed once the proxy confirms
-    it, or answers that another key holds it now. Release returns an error only
-    for a client configuration NewClient refuses; a deregistration that fails is
-    logged, and the name stays recorded as held.
+    Release frees a name that has nothing registered and may still be held:
+    one not running, from an earlier run, or a Name's that stops after a Set
+    with no records kept it. It sends one deregistration of the KEY alone with
+    both leases 0 (Case C), which deletes every record the key registered
+    with it, bounded by cfg.StopTimeout. cfg.Store records the name as freed
+    once the proxy confirms it, or answers that another key holds it now.
+    Release returns an error only for a client configuration NewClient refuses;
+    a deregistration that fails is logged, and the name stays recorded as held.
 
 func WithAddresses(name string, addrs []netip.Addr, records []dns.RR) []dns.RR
     WithAddresses returns what name registers: an A or AAAA record at name for
@@ -779,9 +802,10 @@ type Name struct {
     the records, and the Name registers them (Client.Run, refreshing on the
     lease clock), first withdrawing those that are gone, those Store kept from
     an earlier run included. No records means no registration: the name is
-    deregistered, as it is when the Name stops (the Keeper's Stop and Wait).
-    While the registrar answers that another key holds the name, nothing at it
-    is this key's: no withdrawal or deregistration is sent.
+    deregistered and kept for its key, as the Name still runs. When the Name
+    stops (the Keeper's Stop and Wait), it is deregistered and kept or freed, as
+    KeepNames says. While the registrar answers that another key holds the name,
+    nothing at it is this key's: no withdrawal or deregistration is sent.
 
 func StartName(cfg NameConfig) (*Name, error)
     StartName starts keeping cfg.Client's name registered. It registers nothing
@@ -798,8 +822,8 @@ type NameConfig struct {
 	// Store, if set, keeps the records registered at the name, loaded at start and saved
 	// after every registration and deregistration, and whether the name is held.
 	Store NameStore
-	// KeeperConfig: KeepNames applies to deregistering the name, on Stop or a Set with no
-	// records (Client.Deregister).
+	// KeeperConfig: KeepNames applies to deregistering the name on Stop (Client.Deregister).
+	// A Set with no records deregisters it keeping it, as the Name still runs.
 	baseclient.KeeperConfig
 }
     NameConfig configures StartName.
@@ -1048,10 +1072,11 @@ type Host struct {
     its addresses and instances, and the Host registers them (Client.Run,
     refreshing on the lease clock), first withdrawing instances that are gone.
     No addresses means no registration: the host is deregistered (RFC 9665
-    S3.3.1.3), as it is when the Host stops (the Keeper's Stop and Wait).
-    Labels carry over from one registration to the next, so a renamed host
-    keeps its names while it runs; a new Host asks for the requested names again
-    (StartHost).
+    S3.3.1.3) keeping its names, as the Host still runs. When the Host stops
+    (the Keeper's Stop and Wait), the host is deregistered keeping or freeing
+    them, as KeepNames says. Labels carry over from one registration to the
+    next, so a renamed host keeps its names while it runs; a new Host asks for
+    the requested names again (StartHost).
 
 func StartHost(cfg HostConfig) (*Host, error)
     StartHost starts keeping cfg.Client.HostLabel registered. It registers
@@ -1072,8 +1097,8 @@ type HostConfig struct {
 	Client Config
 	// Store, if set, keeps whether the host's names are held, and under which labels.
 	Store HostStore
-	// KeeperConfig: KeepNames applies to deregistering the host, on Stop or a Set with no
-	// addresses (Client.Deregister).
+	// KeeperConfig: KeepNames applies to deregistering the host on Stop (Client.Deregister).
+	// A Set with no addresses deregisters it keeping its names, as the Host still runs.
 	baseclient.KeeperConfig
 }
     HostConfig configures StartHost.

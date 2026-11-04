@@ -414,7 +414,7 @@ hosts:
 // on_stop decides whether a host's names outlive the agent: keep, the default, deregisters
 // asking for the host's key lease, release for 0. A host removed from the template is
 // deregistered as its on_stop says, then has its names freed; one whose lifetime changes is
-// registered again with it.
+// deregistered keeping its names, whatever its on_stop says, and registered again with it.
 func TestRun_OnStop(t *testing.T) {
 	kept := "  - {name: kept, addresses: [192.0.2.1]}\n"
 	freed := "  - {name: freed, addresses: [192.0.2.2], lease: 2m, key_lease: 10m, on_stop: release}\n"
@@ -435,12 +435,20 @@ func TestRun_OnStop(t *testing.T) {
 	}
 
 	kept = "  - {name: kept, addresses: [192.0.2.1], lease: 30m}\n"
+	freed = "  - {name: freed, addresses: [192.0.2.2], lease: 3m, key_lease: 10m, on_stop: release}\n"
 	h.write(t, srpTemplate("hosts:\n"+kept+freed))
-	if u := h.until(t, "deregistering kept", func(u update) bool { return u.host == "kept.srp.test." }); len(u.addrs) != 0 || u.keyLease != 1209600 {
-		t.Errorf("kept's update on its lease changing %+v, want it deregistered keeping its names", u)
-	}
-	if u := h.until(t, "registering kept again", func(u update) bool { return u.host == "kept.srp.test." }); len(u.addrs) == 0 || u.lease != 1800 {
-		t.Errorf("kept's next update %+v, want it registered with lease 1800", u)
+	restarted := map[string][]update{}
+	h.until(t, "deregistering kept and freed, then registering them again", func(u update) bool {
+		restarted[u.host] = append(restarted[u.host], u)
+		return len(restarted["kept.srp.test."]) == 2 && len(restarted["freed.srp.test."]) == 2
+	})
+	for host, want := range map[string]struct{ keyLease, lease uint32 }{"kept.srp.test.": {1209600, 1800}, "freed.srp.test.": {600, 180}} {
+		if u := restarted[host][0]; len(u.addrs) != 0 || u.keyLease != want.keyLease {
+			t.Errorf("%s's update on its lease changing %+v, want it deregistered keeping its names (KEY-LEASE %d)", host, u, want.keyLease)
+		}
+		if u := restarted[host][1]; len(u.addrs) == 0 || u.lease != want.lease {
+			t.Errorf("%s's next update %+v, want it registered with lease %d", host, u, want.lease)
+		}
 	}
 
 	if err := h.stop(t); !errors.Is(err, context.Canceled) {
@@ -762,6 +770,115 @@ func TestRun_NameRemoved(t *testing.T) {
 	h.waitState(t, "site and not gone", func(state string) bool {
 		return !strings.Contains(state, `"gone.dev.test."`) && strings.Contains(state, `"site.dev.test."`)
 	})
+}
+
+// While the agent runs, a host or name it still registers keeps its names when it is
+// deregistered, whatever its on_stop says: here a host and a name left with no address.
+// Stopping with on_stop: release then frees them.
+func TestRun_KeepsNamesWhileRunning(t *testing.T) {
+	h := newHarness(t, srpTemplate("on_stop: release\nhosts: [{name: box, addresses: [auto]}]\n")+`  - protocol: rfc9664
+    zone: dev.test.
+    server: 127.0.0.1:8159
+    on_stop: release
+    names: [{name: site, addresses: [auto]}]
+`)
+	h.start(t, nil)
+	byHost := func(what string) map[string]update {
+		got := map[string]update{}
+		h.until(t, what, func(u update) bool { got[u.host] = u; return len(got) == 2 })
+		return got
+	}
+	byHost("registering box and site")
+
+	h.setMachine()
+	got := byHost("deregistering box and site")
+	if u := got["box.srp.test."]; len(u.addrs) != 0 || u.keyLease != 1209600 {
+		t.Errorf("box's update with no address %+v, want it deregistered keeping its names", u)
+	}
+	if u := got["site.dev.test."]; !slices.Equal(u.addrs, []string{"192.0.2.10"}) || u.lease != 0 || u.keyLease != 1209600 {
+		t.Errorf("site's update with no address %+v, want its address deleted and the name kept", u)
+	}
+
+	h.stop(t)
+	got = byHost("freeing box and site")
+	if u := got["box.srp.test."]; len(u.addrs) != 0 || len(u.withdrawn) != 0 || u.keyLease != 0 {
+		t.Errorf("box's update on stopping %+v, want the host alone freed", u)
+	}
+	if u := got["site.dev.test."]; len(u.addrs) != 0 || u.lease != 0 || u.keyLease != 0 {
+		t.Errorf("site's update on stopping %+v, want its KEY alone, both leases 0", u)
+	}
+	h.none(t, 100*time.Millisecond)
+}
+
+// Names held from an earlier run by a host this run never registers are freed when the agent
+// stops, if its on_stop is release.
+func TestRun_StopFreesNamesHeldFromAnEarlierRun(t *testing.T) {
+	h := newHarness(t, srpTemplate("hosts: [{name: box, addresses: [auto]}]\n"))
+	h.start(t, nil)
+	h.logs.waitFor(t, "box: registered")
+	h.stop(t)
+	h.until(t, "deregistering box, keeping its names", func(u update) bool { return u.host == "box.srp.test." && len(u.addrs) == 0 })
+
+	h.write(t, srpTemplate("on_stop: release\nhosts: [{name: box, addresses: [auto]}]\n"))
+	h.setMachine()
+	h.start(t, nil)
+	h.logs.waitFor(t, "box: no address to register it with")
+	h.stop(t)
+	if u := h.until(t, "freeing box", func(u update) bool { return u.host == "box.srp.test." }); len(u.addrs) != 0 || u.keyLease != 0 {
+		t.Errorf("box's update on stopping %+v, want the host alone freed", u)
+	}
+	h.logs.waitFor(t, "state: box.srp.test. still holds names; freeing them (on_stop: release)")
+}
+
+// goneDaemon is an mDNS daemon that reports one instance on mac.local. for every service type
+// browsed, until it goes away (gone closed): then every browse fails.
+type goneDaemon struct{ gone chan struct{} }
+
+func (d *goneDaemon) Browse(ctx context.Context, serviceType, domain string, events chan<- mdnsresponder.BrowseEvent) error {
+	select {
+	case <-d.gone:
+		return errors.New("daemon gone")
+	case events <- mdnsresponder.BrowseEvent{Add: true, InterfaceIndex: 2, Name: "Shell", Type: serviceType + ".", Domain: "local."}:
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+	select {
+	case <-d.gone:
+		return errors.New("daemon gone")
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+func (d *goneDaemon) Resolve(context.Context, uint32, string, string, string) (mdnsresponder.ResolveResult, error) {
+	return mdnsresponder.ResolveResult{Target: "mac.local.", Port: 22}, nil
+}
+
+func (d *goneDaemon) Addresses(context.Context, string) ([]netip.Addr, error) {
+	return []netip.Addr{netip.MustParseAddr("192.0.2.20")}, nil
+}
+
+// A mirror that stops on its own deregisters its hosts keeping their names, whatever on_stop
+// says: it is started again at the next poll. The agent stopping with on_stop: release frees
+// them, also while the mirror is down.
+func TestRun_MirrorFailureKeepsNames(t *testing.T) {
+	h := newHarness(t, srpTemplate("on_stop: release\nmirrors: [{type: mdns, all_hosts: true, services: [_ssh._tcp], socket: /nowhere}]\n"))
+	d := &goneDaemon{gone: make(chan struct{})}
+	h.start(t, func(o *Options) { o.MirrorSource = func(string) mdnsbridge.Source { return d } })
+	h.until(t, "registering mac", func(u update) bool { return u.host == "mac.srp.test." && len(u.addrs) > 0 })
+	h.logs.waitFor(t, "mac: registered")
+
+	close(d.gone)
+	if u := h.until(t, "deregistering mac", func(u update) bool { return u.host == "mac.srp.test." }); len(u.addrs) != 0 || u.keyLease != 1209600 {
+		t.Errorf("mac's update as its mirror stopped %+v, want it deregistered keeping its names", u)
+	}
+	h.logs.waitFor(t, "mdns mirror: stopped: ")
+
+	h.stop(t)
+	if u := h.until(t, "freeing mac", func(u update) bool { return u.host == "mac.srp.test." }); len(u.addrs) != 0 || len(u.withdrawn) != 0 || u.keyLease != 0 {
+		t.Errorf("mac's update as the agent stopped %+v, want the host alone freed", u)
+	}
+	h.logs.waitFor(t, "state: mac.srp.test. still holds names; freeing them (on_stop: release)")
 }
 
 // noDaemon is an mDNS daemon that is not there.

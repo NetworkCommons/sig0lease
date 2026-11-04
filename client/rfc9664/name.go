@@ -31,17 +31,18 @@ type NameConfig struct {
 	// Store, if set, keeps the records registered at the name, loaded at start and saved
 	// after every registration and deregistration, and whether the name is held.
 	Store NameStore
-	// KeeperConfig: KeepNames applies to deregistering the name, on Stop or a Set with no
-	// records (Client.Deregister).
+	// KeeperConfig: KeepNames applies to deregistering the name on Stop (Client.Deregister).
+	// A Set with no records deregisters it keeping it, as the Name still runs.
 	baseclient.KeeperConfig
 }
 
 // Name keeps one name registered as its records change: each Set restates the records, and
 // the Name registers them (Client.Run, refreshing on the lease clock), first withdrawing those
 // that are gone, those Store kept from an earlier run included. No records means no
-// registration: the name is deregistered, as it is when the Name stops (the Keeper's Stop
-// and Wait). While the registrar answers that another key holds the name, nothing at it is
-// this key's: no withdrawal or deregistration is sent.
+// registration: the name is deregistered and kept for its key, as the Name still runs. When
+// the Name stops (the Keeper's Stop and Wait), it is deregistered and kept or freed, as
+// KeepNames says. While the registrar answers that another key holds the name, nothing at it
+// is this key's: no withdrawal or deregistration is sent.
 type Name struct {
 	*baseclient.Keeper[[]dns.RR]
 	cfg     NameConfig
@@ -51,6 +52,7 @@ type Name struct {
 	// deregister. The running client's callbacks write it; to and leave read it once the
 	// Keeper has stopped that client.
 	heldByOther bool
+	holding     bool // a Set with no records deregistered the name, keeping it
 }
 
 // StartName starts keeping cfg.Client's name registered. It registers nothing until the
@@ -69,9 +71,10 @@ func StartName(cfg NameConfig) (*Name, error) {
 	return n, nil
 }
 
-// Release frees a name that is not running and may still be held from an earlier run: one
-// deregistration of the KEY alone with both leases 0 (Case C), which deletes every record the
-// key registered with it, bounded by cfg.StopTimeout. cfg.Store records the name as freed
+// Release frees a name that has nothing registered and may still be held: one not running,
+// from an earlier run, or a Name's that stops after a Set with no records kept it. It sends
+// one deregistration of the KEY alone with both leases 0 (Case C), which deletes every record
+// the key registered with it, bounded by cfg.StopTimeout. cfg.Store records the name as freed
 // once the proxy confirms it, or answers that another key holds it now. Release returns an
 // error only for a client configuration NewClient refuses; a deregistration that fails is
 // logged, and the name stays recorded as held.
@@ -121,12 +124,14 @@ func (n *Name) client(records []dns.RR) (*Client, error) {
 	return NewClient(c)
 }
 
-// to moves the name to next (Moves.To): it deregisters the name if next has no records, and
-// otherwise withdraws the records next lacks, unless another key holds the name, then keeps
-// next registered.
+// to moves the name to next (Moves.To): it deregisters the name, keeping it, if next has no
+// records, and otherwise withdraws the records next lacks, unless another key holds the name,
+// then keeps next registered.
 func (n *Name) to(next []dns.RR) (func(context.Context), error) {
 	if len(next) == 0 {
-		err := n.leave()
+		registered := len(n.applied) > 0 && !n.heldByOther
+		err := n.leave(true)
+		n.holding = n.holding || registered
 		n.applied = nil
 		return nil, err
 	}
@@ -141,16 +146,21 @@ func (n *Name) to(next []dns.RR) (func(context.Context), error) {
 		baseclient.Report(n.cfg.logf, "withdrawing "+describe(gone), "withdrew "+describe(gone), outcome, err)
 	}
 	n.cfg.logf("registering %s", describe(next))
-	n.applied = next
+	n.applied, n.holding = next, false
 	return func(ctx context.Context) {
 		_ = c.Run(ctx) // returns only once ctx ends; OnRegistered/OnError report each cycle
 	}, nil
 }
 
-// leave deregisters what was last registered, if anything (Moves.Leave): nothing when
-// another key holds the name.
-func (n *Name) leave() error {
+// leave deregisters what was last registered, keeping the name if keepName (Moves.Leave):
+// nothing when another key holds the name. With nothing registered, it frees the name a Set
+// with no records kept, unless keepName.
+func (n *Name) leave(keepName bool) error {
 	if len(n.applied) == 0 {
+		if n.holding && !keepName {
+			n.holding = false
+			return Release(n.cfg)
+		}
 		return nil
 	}
 	if n.heldByOther {
@@ -162,7 +172,7 @@ func (n *Name) leave() error {
 	if err != nil {
 		return err
 	}
-	deregister(n.cfg, c, n.cfg.KeepNames)
+	deregister(n.cfg, c, keepName)
 	return nil
 }
 

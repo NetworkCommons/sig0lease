@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"maps"
 	"net"
 	"net/netip"
 	"os"
@@ -162,7 +163,7 @@ func Run(ctx context.Context, path string, opts Options) error {
 	}
 	defer func() {
 		cancelProbes()
-		a.stopAll()
+		a.end()
 		a.probes.Wait()
 	}()
 	if err := a.start(plan); err != nil {
@@ -262,7 +263,7 @@ type mirrorRun struct {
 	mirror    Mirror
 	exclude   []string
 	started   time.Time
-	cancel    func()
+	cancel    context.CancelCauseFunc // mdnsbridge.ErrRestart: its hosts keep their names
 	done      chan struct{}
 }
 
@@ -392,10 +393,7 @@ func (a *agent) release(plan *Plan) error {
 		e, _ := a.store.entry(owner)
 		if e.Held {
 			a.logf("state: %s holds names the template no longer registers; freeing them", owner)
-			key, _, err := keyrec.ResolveOrCreateKey(a.store.keystore, owner, 0, a.opts.Logger)
-			if err != nil {
-				a.logf("state: %s: %v; its names stay held until their key lease ends", owner, err)
-			} else {
+			if key := a.heldKey(owner); key != nil {
 				if err := a.releaseHeld(owner, e, key); err != nil {
 					return err
 				}
@@ -410,6 +408,16 @@ func (a *agent) release(plan *Plan) error {
 		}
 	}
 	return nil
+}
+
+// heldKey returns owner's key, to free the names it holds; nil, logged, if it cannot be loaded.
+func (a *agent) heldKey(owner string) *keyrec.LoadedKey {
+	key, _, err := keyrec.ResolveOrCreateKey(a.store.keystore, owner, 0, a.opts.Logger)
+	if err != nil {
+		a.logf("state: %s: %v; its names stay held until their key lease ends", owner, err)
+		return nil
+	}
+	return key
 }
 
 // releaseHeld frees the names of owner, whose entry e is, with its key: an SRP host's
@@ -667,8 +675,8 @@ func (a *agent) apply(plan *Plan) error {
 		case i < 0:
 			a.logf("template: the %s added", r)
 		case !reflect.DeepEqual(a.plan.Registrars[i].connection(), r.connection()):
-			a.logf("template: the %s changed; deregistering what it registers, then registering it again", r)
-			a.stopWhere(r.same)
+			a.logf("template: the %s changed; deregistering what it registers, keeping the names, then registering it again", r)
+			a.stopWhere(r.same, true)
 		default:
 			continue
 		}
@@ -687,7 +695,7 @@ func (a *agent) apply(plan *Plan) error {
 		r, m, ok := plan.Mirror(t)
 		if !ok || !r.same(mr.registrar) || !reflect.DeepEqual(m, mr.mirror) || !slices.Equal(hostNames(r), mr.exclude) {
 			a.logf("template: the %s mirror changed; restarting it", t)
-			a.stopMirror(t)
+			a.stopMirror(t, mdnsbridge.ErrRestart)
 		}
 	}
 	if err := a.release(plan); err != nil {
@@ -713,8 +721,8 @@ func (a *agent) updateRegistrar(r Registrar) error {
 			continue
 		default:
 			// Its client and Host take the lifetime when they start.
-			a.logf("template: %s's lease, key_lease or on_stop changed; deregistering it, then registering it again", owner)
-			stop([]*hostRun{hr}, nil)
+			a.logf("template: %s's lease, key_lease or on_stop changed; deregistering it, keeping its names, then registering it again", owner)
+			stop([]*hostRun{hr}, nil, true)
 			delete(a.hosts, owner)
 		}
 		if err := a.startHost(r, h); err != nil {
@@ -734,8 +742,8 @@ func (a *agent) updateRegistrar(r Registrar) error {
 			}
 			continue
 		default:
-			a.logf("template: %s's lease, key_lease or on_stop changed; deregistering it, then registering it again", owner)
-			stop(nil, []*nameRun{nr})
+			a.logf("template: %s's lease, key_lease or on_stop changed; deregistering it, keeping it, then registering it again", owner)
+			stop(nil, []*nameRun{nr}, true)
 			delete(a.names, owner)
 		}
 		if err := a.startName(r, n); err != nil {
@@ -773,7 +781,7 @@ func (a *agent) stopRemoved(plan *Plan) {
 			delete(a.names, owner)
 		}
 	}
-	stop(hosts, names)
+	stop(hosts, names, false)
 }
 
 // updateHost moves hr to h, the same host in a new template. A service whose port and probe
@@ -832,7 +840,7 @@ func (a *agent) startMirror(r Registrar, m Mirror) {
 		panic(fmt.Sprintf("agent: a mirror of type %q passed validation", m.Type))
 	}
 	keystore := a.plan.Keystore
-	ctx, cancel := context.WithCancel(context.Background())
+	ctx, cancel := context.WithCancelCause(context.Background())
 	mr := &mirrorRun{registrar: r.connection(), mirror: m, exclude: hostNames(r), started: time.Now(), cancel: cancel, done: make(chan struct{})}
 	srp := a.srpConfig(savedRegistrarOf(r))
 	srp.RequestedLease, srp.RequestedKeyLease = r.Lease, r.KeyLease
@@ -883,25 +891,57 @@ func (a *agent) mirrorStopped(e mirrorEnd) {
 	a.mirrorFailed[t] = msg
 }
 
-func (a *agent) stopMirror(t string) {
+// stopMirror stops the mirror of type t, ending its ctx with cause (mdnsbridge.ErrRestart, or
+// nil).
+func (a *agent) stopMirror(t string, cause error) {
 	mr := a.mirrors[t]
-	mr.cancel()
+	mr.cancel(cause)
 	<-mr.done
 	delete(a.mirrors, t)
 	delete(a.mirrorFailed, t)
 }
 
+// end stops everything as the agent stops, keeping the names each host's and name's on_stop
+// keeps (stopAll). Then it frees the names the state file still records as held for a host
+// or name the template registers whose on_stop is release: kept while the agent ran by one
+// not registered as it stopped, such as the hosts of a mirror that stopped on its own
+// (mdnsbridge.Run), or held from an earlier run by one this run never registered.
+func (a *agent) end() {
+	if a.store == nil {
+		return // start failed before anything ran
+	}
+	a.stopAll()
+	entries := a.store.entries()
+	for _, owner := range slices.Sorted(maps.Keys(entries)) {
+		e := entries[owner]
+		if l, ok := wanted(a.plan, a.store.keystore, owner, e); !ok || l.KeepNames || !e.Held {
+			continue
+		}
+		a.logf("state: %s still holds names; freeing them (on_stop: release)", owner)
+		if key := a.heldKey(owner); key != nil {
+			if err := a.releaseHeld(owner, e, key); err != nil {
+				a.logf("state: %s: %v; its names stay held until their key lease ends", owner, err)
+			}
+		}
+	}
+}
+
 // stopAll deregisters everything, keeping the names each host's and name's on_stop keeps:
 // every host, every name, and every mirror's hosts.
-func (a *agent) stopAll() { a.stopWhere(func(Registrar) bool { return true }) }
+func (a *agent) stopAll() { a.stopWhere(func(Registrar) bool { return true }, false) }
 
-// stopWhere deregisters what registers through the registrars in selects, keeping the names
-// each host's and name's on_stop keeps: hosts, names and mirrors' hosts.
-func (a *agent) stopWhere(in func(Registrar) bool) {
+// stopWhere deregisters what registers through the registrars in selects: hosts, names and
+// mirrors' hosts. They keep their names if restart, as they are to be registered again, and
+// otherwise as each one's on_stop says.
+func (a *agent) stopWhere(in func(Registrar) bool, restart bool) {
+	var cause error
+	if restart {
+		cause = mdnsbridge.ErrRestart
+	}
 	var mirrors []string
 	for t, mr := range a.mirrors {
 		if in(mr.registrar) {
-			mr.cancel()
+			mr.cancel(cause)
 			mirrors = append(mirrors, t)
 		}
 	}
@@ -919,16 +959,18 @@ func (a *agent) stopWhere(in func(Registrar) bool) {
 			delete(a.names, owner)
 		}
 	}
-	stop(hosts, names)
+	stop(hosts, names, restart)
 	for _, t := range mirrors {
-		a.stopMirror(t)
+		a.stopMirror(t, cause)
 	}
 }
 
-// stop deregisters hosts and names, all at once, keeping the names each one's on_stop keeps.
-func stop(hosts []*hostRun, names []*nameRun) {
+// stop deregisters hosts and names, all at once, keeping their names if restart, as they are
+// to be registered again, and otherwise as each one's on_stop says.
+func stop(hosts []*hostRun, names []*nameRun, restart bool) {
 	var workers []interface {
 		Stop()
+		StopKeepingNames()
 		Wait()
 	}
 	for _, hr := range hosts {
@@ -941,7 +983,11 @@ func stop(hosts []*hostRun, names []*nameRun) {
 		workers = append(workers, nr.worker)
 	}
 	for _, w := range workers {
-		w.Stop()
+		if restart {
+			w.StopKeepingNames()
+		} else {
+			w.Stop()
+		}
 	}
 	for _, w := range workers {
 		w.Wait()

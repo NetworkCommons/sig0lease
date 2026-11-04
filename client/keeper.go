@@ -18,9 +18,11 @@ type KeeperConfig struct {
 	// StopTimeout bounds each withdrawal or deregistration sent outside the refresh clock;
 	// default 10s.
 	StopTimeout time.Duration
-	// KeepNames makes deregistering, on Stop or when nothing is left to register, keep the
-	// names reserved for the key until the KEY-LEASE ends, so that it gets them back when it
-	// returns. Without it the names are freed.
+	// KeepNames makes Stop keep the names reserved for the key until the KEY-LEASE ends, so
+	// that it gets them back when it returns. Without it Stop frees them, also those kept by
+	// a deregistration while the Keeper ran. While it runs, a Keeper keeps them whatever
+	// KeepNames says: deregistering when nothing is left to register keeps them, as does
+	// StopKeepingNames.
 	KeepNames bool
 	// Logf receives the log lines, each starting with the name kept. Default: none.
 	Logf func(format string, args ...any)
@@ -55,8 +57,9 @@ type Moves[S any] struct {
 	// Kept, if set, is called once a registration To returned has stopped, before the next
 	// To or Leave.
 	Kept func()
-	// Leave deregisters what To registered, as the Keeper stops. Its error goes to OnFatal.
-	Leave func() error
+	// Leave deregisters what To registered, as the Keeper stops, keeping the names if
+	// keepNames (Stop, StopKeepingNames). Its error goes to OnFatal.
+	Leave func(keepNames bool) error
 }
 
 // Keeper keeps one registration current as what it should register changes: it takes the
@@ -64,12 +67,13 @@ type Moves[S any] struct {
 // previous registration, and moves to the latest (Moves.To); Stop stops keeping it and leaves
 // (Moves.Leave).
 type Keeper[S any] struct {
-	cfg     KeeperConfig
-	moves   Moves[S]
-	updates chan S
-	quit    chan struct{}
-	done    chan struct{}
-	stop    sync.Once
+	cfg       KeeperConfig
+	moves     Moves[S]
+	updates   chan S
+	quit      chan struct{}
+	done      chan struct{}
+	stop      sync.Once
+	keepNames bool // what leaving keeps, set once before quit closes
 }
 
 // StartKeeper starts a Keeper. cfg must have its defaults (KeeperConfig.Defaults). It does
@@ -97,8 +101,20 @@ func (k *Keeper[S]) Set(s S) {
 }
 
 // Stop starts stopping the Keeper: it stops keeping the registration and leaves
-// (Moves.Leave); Wait waits for it to finish. It may be called more than once.
-func (k *Keeper[S]) Stop() { k.stop.Do(func() { close(k.quit) }) }
+// (Moves.Leave), keeping the names if KeepNames; Wait waits for it to finish. Stop and
+// StopKeepingNames may be called more than once: the first call decides.
+func (k *Keeper[S]) Stop() { k.leaveKeeping(k.cfg.KeepNames) }
+
+// StopKeepingNames stops the Keeper as Stop does, but keeps the names whatever KeepNames says:
+// for a registration a new Keeper takes over, with the same key and another configuration.
+func (k *Keeper[S]) StopKeepingNames() { k.leaveKeeping(true) }
+
+func (k *Keeper[S]) leaveKeeping(keepNames bool) {
+	k.stop.Do(func() {
+		k.keepNames = keepNames
+		close(k.quit)
+	})
+}
 
 // Wait returns once the Keeper has stopped (Stop).
 func (k *Keeper[S]) Wait() { <-k.done }
@@ -120,7 +136,7 @@ func (k *Keeper[S]) run() {
 	}
 	leave := func() {
 		stopKeeping()
-		if err := k.moves.Leave(); err != nil {
+		if err := k.moves.Leave(k.keepNames); err != nil {
 			k.cfg.OnFatal(err)
 		}
 	}

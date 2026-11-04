@@ -35,17 +35,18 @@ type HostConfig struct {
 	Client Config
 	// Store, if set, keeps whether the host's names are held, and under which labels.
 	Store HostStore
-	// KeeperConfig: KeepNames applies to deregistering the host, on Stop or a Set with no
-	// addresses (Client.Deregister).
+	// KeeperConfig: KeepNames applies to deregistering the host on Stop (Client.Deregister).
+	// A Set with no addresses deregisters it keeping its names, as the Host still runs.
 	baseclient.KeeperConfig
 }
 
 // Host keeps one host registered as what it offers changes: each Set restates its addresses
 // and instances, and the Host registers them (Client.Run, refreshing on the lease clock),
 // first withdrawing instances that are gone. No addresses means no registration: the host is
-// deregistered (RFC 9665 S3.3.1.3), as it is when the Host stops (the Keeper's Stop and Wait).
-// Labels carry over from one registration to the next, so a renamed host keeps its names
-// while it runs; a new Host asks for the requested names again (StartHost).
+// deregistered (RFC 9665 S3.3.1.3) keeping its names, as the Host still runs. When the Host
+// stops (the Keeper's Stop and Wait), the host is deregistered keeping or freeing them, as
+// KeepNames says. Labels carry over from one registration to the next, so a renamed host
+// keeps its names while it runs; a new Host asks for the requested names again (StartHost).
 type Host struct {
 	*baseclient.Keeper[hostState]
 	cfg     HostConfig
@@ -53,6 +54,7 @@ type Host struct {
 	labels  *Labels
 	applied hostState // what was last registered; no addresses: nothing
 	running *Client   // the client the Keeper keeps running, if any
+	holding bool      // a Set with no addresses deregistered the host, keeping its names
 }
 
 // hostState is what a host should have registered.
@@ -101,11 +103,18 @@ func (cfg *HostConfig) owner() string {
 // refuses; a deregistration that fails is logged, and the names stay recorded as held.
 func Release(cfg HostConfig) error {
 	cfg.Defaults()
+	var labels *Labels
+	if cfg.Store != nil {
+		labels = cfg.Store.Load(cfg.owner())
+	}
+	return release(cfg, labels)
+}
+
+// release frees the names a host with nothing registered holds under labels (Release).
+func release(cfg HostConfig, labels *Labels) error {
 	c := cfg.Client
 	c.Instances = nil
-	if cfg.Store != nil {
-		c.Labels = cfg.Store.Load(cfg.owner())
-	}
+	c.Labels = labels
 	client, err := NewClient(c)
 	if err != nil {
 		return fmt.Errorf("srp/host %s: %w", c.HostLabel, err)
@@ -156,11 +165,14 @@ func (h *Host) client(s hostState) (*Client, error) {
 	return client, nil
 }
 
-// to moves the host to next (Moves.To): it deregisters the host if next has no addresses,
-// and otherwise withdraws the instances next lacks, then keeps next registered.
+// to moves the host to next (Moves.To): it deregisters the host, keeping its names, if next
+// has no addresses, and otherwise withdraws the instances next lacks, then keeps next
+// registered.
 func (h *Host) to(next hostState) (func(context.Context), error) {
 	if len(next.addrs) == 0 {
-		err := h.leave()
+		registered := len(h.applied.addrs) > 0
+		err := h.leave(true)
+		h.holding = h.holding || registered
 		h.applied = hostState{}
 		return nil, err
 	}
@@ -179,7 +191,7 @@ func (h *Host) to(next hostState) (func(context.Context), error) {
 		return nil, err
 	}
 	h.cfg.logf("registering %s at %v%s", describe(next.instances), next.addrs, h.renamed())
-	h.running, h.applied = c, next
+	h.running, h.applied, h.holding = c, next, false
 	return func(ctx context.Context) {
 		_ = c.Run(ctx) // returns only once ctx ends; OnRegistered/OnError report each cycle
 	}, nil
@@ -193,16 +205,21 @@ func (h *Host) kept() {
 	h.running = nil
 }
 
-// leave deregisters what was last registered, if anything (Moves.Leave).
-func (h *Host) leave() error {
+// leave deregisters what was last registered, keeping the names if keepNames (Moves.Leave).
+// With nothing registered, it frees the names a Set with no addresses kept, unless keepNames.
+func (h *Host) leave(keepNames bool) error {
 	if len(h.applied.addrs) == 0 {
+		if h.holding && !keepNames {
+			h.holding = false
+			return release(h.cfg, h.labels)
+		}
 		return nil
 	}
 	c, err := h.client(h.applied)
 	if err != nil {
 		return err
 	}
-	deregister(h.cfg, c, h.applied.instances, h.cfg.KeepNames)
+	deregister(h.cfg, c, h.applied.instances, keepNames)
 	return nil
 }
 

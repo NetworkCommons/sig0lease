@@ -263,10 +263,11 @@ func (v nameView) Save(name string, held bool, records []dns.RR) error {
 // wanted reports whether plan registers the host or name e records, owner, as it was
 // registered: from keystore, through the same registration (sameRegistration), and as one of
 // the registrar's names, one of its hosts or, if a mirror registered it, a host a mirror of
-// that type selects.
-func wanted(plan *Plan, keystore, owner string, e savedHost) bool {
+// that type selects. It returns the Lifetime plan registers it with: the name's, the host's,
+// or the mirror's registrar's.
+func wanted(plan *Plan, keystore, owner string, e savedHost) (Lifetime, bool) {
 	if keystore != plan.Keystore {
-		return false
+		return Lifetime{}, false
 	}
 	label, _, _ := dnsname.CutFirstLabel(owner)
 	for _, r := range plan.Registrars {
@@ -275,26 +276,32 @@ func wanted(plan *Plan, keystore, owner string, e savedHost) bool {
 		}
 		switch {
 		case e.Source == sourceNames:
-			if r.Protocol == RFC9664 && slices.ContainsFunc(r.Names, func(n Name) bool { return dnsname.EqualFold(n.Name, label) }) {
-				return true
+			if r.Protocol != RFC9664 {
+				continue
+			}
+			if i := slices.IndexFunc(r.Names, func(n Name) bool { return dnsname.EqualFold(n.Name, label) }); i >= 0 {
+				return r.Names[i].Lifetime, true
 			}
 		case r.Protocol != SRP:
-		case slices.ContainsFunc(r.Hosts, func(h Host) bool { return dnsname.EqualFold(h.Name, label) }):
-			return true
-		case e.Source != sourceHosts && slices.ContainsFunc(r.Mirrors, func(m Mirror) bool {
-			return m.Type == e.Source && mdnsbridge.Selects(m.Hosts, m.AllHosts, label)
-		}):
-			return true
+		default:
+			if i := slices.IndexFunc(r.Hosts, func(h Host) bool { return dnsname.EqualFold(h.Name, label) }); i >= 0 {
+				return r.Hosts[i].Lifetime, true
+			}
+			if e.Source != sourceHosts && slices.ContainsFunc(r.Mirrors, func(m Mirror) bool {
+				return m.Type == e.Source && mdnsbridge.Selects(m.Hosts, m.AllHosts, label)
+			}) {
+				return r.Lifetime, true
+			}
 		}
 	}
-	return false
+	return Lifetime{}, false
 }
 
 // unwanted returns, sorted, the hosts and names s records that plan does not register (wanted).
 func (s *hostStore) unwanted(plan *Plan) []string {
 	var out []string
 	for host, e := range s.entries() {
-		if !wanted(plan, s.keystore, host, e) {
+		if _, ok := wanted(plan, s.keystore, host, e); !ok {
 			out = append(out, host)
 		}
 	}

@@ -16,6 +16,7 @@ import (
 	baseclient "github.com/NetworkCommons/sig0lease/client"
 	"github.com/NetworkCommons/sig0lease/client/mdnsresponder"
 	"github.com/NetworkCommons/sig0lease/pkg/keyrec"
+	leasepkg "github.com/NetworkCommons/sig0lease/pkg/lease"
 )
 
 // fakeSource stands in for the daemon: the test drives each browse through browser(), and
@@ -174,7 +175,7 @@ type harness struct {
 	src    *fakeSource
 	reg    *registrar
 	logs   *logs
-	cancel context.CancelFunc
+	cancel context.CancelCauseFunc
 	done   chan error
 	owners chan string
 }
@@ -210,11 +211,11 @@ func start(t *testing.T, cfg Config) *harness {
 	}
 	cfg.Settle = 20 * time.Millisecond
 	cfg.Logf = h.logs.logf
-	ctx, cancel := context.WithCancel(context.Background())
+	ctx, cancel := context.WithCancelCause(context.Background())
 	h.cancel = cancel
 	go func() { h.done <- Run(ctx, cfg) }()
 	t.Cleanup(func() {
-		cancel()
+		cancel(nil)
 		select {
 		case <-h.done:
 		case <-time.After(10 * time.Second):
@@ -226,7 +227,13 @@ func start(t *testing.T, cfg Config) *harness {
 
 func (h *harness) stop(t *testing.T) error {
 	t.Helper()
-	h.cancel()
+	return h.stopWith(t, nil)
+}
+
+// stopWith ends Run's ctx with cause.
+func (h *harness) stopWith(t *testing.T, cause error) error {
+	t.Helper()
+	h.cancel(cause)
 	select {
 	case err := <-h.done:
 		h.done <- err // for Cleanup
@@ -237,17 +244,21 @@ func (h *harness) stop(t *testing.T) error {
 	}
 }
 
-// update summarizes an update: host addresses, live instances (SRV owner -> port) and
-// instances deleted without an SRV.
+// update summarizes an update: host addresses, live instances (SRV owner -> port), instances
+// deleted without an SRV, and the KEY-LEASE asked for.
 type update struct {
-	addrs   []string
-	srv     map[string]uint16
-	txt     map[string][]string
-	deleted []string
+	addrs    []string
+	srv      map[string]uint16
+	txt      map[string][]string
+	deleted  []string
+	keyLease uint32
 }
 
 func summarize(m *dns.Msg) update {
 	u := update{srv: map[string]uint16{}, txt: map[string][]string{}}
+	if lo, err := leasepkg.FindAndDecode(m); err == nil && lo.KeyLease != nil {
+		u.keyLease = *lo.KeyLease
+	}
 	for _, rr := range m.Ns {
 		switch r := rr.(type) {
 		case *dns.A:
@@ -311,17 +322,21 @@ func TestRun_MirrorsSelectedHostAndFollowsItsInstances(t *testing.T) {
 		t.Errorf("after the withdrawal: %+v, want Widget alone", u)
 	}
 
-	// Widget goes too: the host is deregistered, addresses and all.
+	// Widget goes too: the host is deregistered, addresses and all, keeping its names while
+	// the bridge runs; stopping frees them (KeepNames is false).
 	h.src.send(t, "_http._tcp", false, "Widget")
 	u = summarize(h.reg.next(t))
-	if len(u.addrs) != 0 || len(u.srv) != 0 || !slices.Equal(u.deleted, []string{"Widget._http._tcp.srp.test."}) {
-		t.Errorf("deregistration = %+v, want no addresses and Widget deleted", u)
+	if len(u.addrs) != 0 || len(u.srv) != 0 || !slices.Equal(u.deleted, []string{"Widget._http._tcp.srp.test."}) || u.keyLease == 0 {
+		t.Errorf("deregistration = %+v, want no addresses, Widget deleted and the names kept", u)
 	}
 
 	if err := h.stop(t); !errors.Is(err, context.Canceled) {
 		t.Errorf("Run = %v, want context.Canceled", err)
 	}
-	h.reg.none(t, 50*time.Millisecond) // nothing left to deregister
+	if u := summarize(h.reg.next(t)); len(u.addrs) != 0 || len(u.deleted) != 0 || u.keyLease != 0 {
+		t.Errorf("update at stop = %+v, want the host alone deregistered freeing its names", u)
+	}
+	h.reg.none(t, 50*time.Millisecond)
 }
 
 func TestRun_StopDeregistersEveryHost(t *testing.T) {
@@ -340,8 +355,8 @@ func TestRun_StopDeregistersEveryHost(t *testing.T) {
 	got := map[string]bool{}
 	for range 2 {
 		u := summarize(h.reg.next(t))
-		if len(u.addrs) != 0 || len(u.deleted) != 1 {
-			t.Errorf("update at stop = %+v, want a deregistration", u)
+		if len(u.addrs) != 0 || len(u.deleted) != 1 || u.keyLease != 0 {
+			t.Errorf("update at stop = %+v, want a deregistration freeing the names", u)
 		}
 		got[strings.Join(u.deleted, ",")] = true
 	}
@@ -375,6 +390,8 @@ func TestRun_ListRegistersNothing(t *testing.T) {
 	h.reg.none(t, 100*time.Millisecond)
 }
 
+// A browse that fails stops Run, which deregisters its hosts keeping their names: a failure
+// is no request to free them.
 func TestRun_BrowseFailureStopsAndDeregisters(t *testing.T) {
 	h := start(t, Config{ServiceTypes: []string{"_http._tcp"}, Hosts: []string{"box"}})
 	h.src.instance("Widget", "box.local.", 8080)
@@ -395,9 +412,26 @@ func TestRun_BrowseFailureStopsAndDeregisters(t *testing.T) {
 	case <-time.After(5 * time.Second):
 		t.Fatal("Run kept going after its browse failed")
 	}
-	if u := summarize(h.reg.next(t)); len(u.addrs) != 0 {
-		t.Errorf("update after the failure = %+v, want the deregistration", u)
+	if u := summarize(h.reg.next(t)); len(u.addrs) != 0 || u.keyLease == 0 {
+		t.Errorf("update after the failure = %+v, want the deregistration keeping the names", u)
 	}
+}
+
+// A Run whose ctx ends with ErrRestart is to run again: its hosts keep their names, whatever
+// KeepNames says.
+func TestRun_RestartKeepsTheNames(t *testing.T) {
+	h := start(t, Config{ServiceTypes: []string{"_ssh._tcp"}, AllHosts: true})
+	h.src.instance("a", "one.local.", 22)
+	h.src.addrs["one.local."] = []netip.Addr{netip.MustParseAddr("192.0.2.1")}
+	h.src.waitBrowse(t, "_ssh._tcp")
+	h.src.send(t, "_ssh._tcp", true, "a")
+	h.reg.next(t)
+
+	h.stopWith(t, ErrRestart)
+	if u := summarize(h.reg.next(t)); len(u.addrs) != 0 || len(u.deleted) != 1 || u.keyLease == 0 {
+		t.Errorf("update at a restart = %+v, want a deregistration keeping the names", u)
+	}
+	h.reg.none(t, 50*time.Millisecond)
 }
 
 func TestRun_SkipsWhatSRPCannotCarry(t *testing.T) {

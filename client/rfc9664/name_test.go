@@ -142,22 +142,65 @@ func TestName_RegistersWithdrawsAndDeregisters(t *testing.T) {
 	expect(t, "registration after it", reg.next(t), []string{siteA}, 30, 600)
 
 	n.Set(nil)
-	expect(t, "update after no records", reg.next(t), nil, 0, 0)
+	expect(t, "update after no records, keeping the name", reg.next(t), []string{siteA}, 0, 600)
 	n.Stop()
 	n.Wait()
+	expect(t, "update on Stop, freeing the name", reg.next(t), nil, 0, 0)
 	reg.none(t, 50*time.Millisecond)
 }
 
-// With KeepNames, Stop deletes the records and keeps the KEY (Case D).
+// With KeepNames, Stop deletes the records and keeps the KEY (Case D); without it, it frees
+// the name (Case C). While the Name runs it keeps the name whatever KeepNames says: a Set with
+// no records deletes them keeping the KEY, as StopKeepingNames does; a Stop after such a Set
+// frees the name, unless KeepNames. The store records the name as held until it is freed.
 func TestName_KeepNames(t *testing.T) {
-	reg := newNameRegistrar()
-	n := startTestName(t, reg, nil, true)
+	for _, tt := range []struct {
+		name     string
+		keep     bool
+		stop     func(*Name)
+		records  []string // the update on stopping: Case D lists the records it deletes
+		keyLease uint32
+	}{
+		{"Stop keeping the name", true, (*Name).Stop, []string{siteA}, 600},
+		{"Stop freeing the name", false, (*Name).Stop, nil, 0},
+		{"StopKeepingNames without KeepNames", false, (*Name).StopKeepingNames, []string{siteA}, 600},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			reg := newNameRegistrar()
+			store := newMemNames()
+			n := startTestName(t, reg, store, tt.keep)
+			n.Set(records(t, siteA))
+			expect(t, "registration", reg.next(t), []string{siteA}, 30, 600)
+			tt.stop(n)
+			n.Wait()
+			expect(t, "update on stopping", reg.next(t), tt.records, 0, tt.keyLease)
+			if held, _ := store.state("site.example."); held != (tt.keyLease != 0) {
+				t.Fatalf("name recorded as held after stopping: %v, want %v", held, tt.keyLease != 0)
+			}
+		})
+	}
 
-	n.Set(records(t, siteA))
-	expect(t, "registration", reg.next(t), []string{siteA}, 30, 600)
-	n.Stop()
-	n.Wait()
-	expect(t, "update on Stop", reg.next(t), []string{siteA}, 0, 600)
+	for _, keep := range []bool{true, false} {
+		t.Run(fmt.Sprintf("a Set with no records, then Stop, KeepNames %v", keep), func(t *testing.T) {
+			reg := newNameRegistrar()
+			store := newMemNames()
+			n := startTestName(t, reg, store, keep)
+			n.Set(records(t, siteA))
+			expect(t, "registration", reg.next(t), []string{siteA}, 30, 600)
+			n.Set(nil)
+			expect(t, "update after no records", reg.next(t), []string{siteA}, 0, 600)
+			n.Stop()
+			n.Wait()
+			if keep {
+				reg.none(t, 50*time.Millisecond)
+			} else {
+				expect(t, "update on Stop", reg.next(t), nil, 0, 0)
+			}
+			if held, _ := store.state("site.example."); held != keep {
+				t.Fatalf("name recorded as held after stopping: %v, want %v", held, keep)
+			}
+		})
+	}
 }
 
 // While the registrar answers that another key holds the name, nothing at it is the Name's:

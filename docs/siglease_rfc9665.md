@@ -673,7 +673,9 @@ Capabilities:
 - **Deregister** — withdraws the host and every configured instance in one message, requesting
   `LEASE=0`, with the configured `KEY-LEASE` to keep the names for the key or `KEY-LEASE=0` to
   free them (§3.2.5.5.1); `client/srp`'s `Host` keeps them on `Stop` when told to
-  (`HostConfig.KeepNames`, the agent's `on_stop`); `Release` frees them for a host that is not
+  (`HostConfig.KeepNames`, the agent's `on_stop`), and always while it runs: on a `Set` with no
+  addresses, and on `StopKeepingNames`, for a restart; a `Stop` freeing them after such a
+  `Set` frees them as `Release` does; `Release` frees them for a host that is not
   running, deregistering the host alone, as the registrar removes its instances with it
   (§3.2.5.5.1: "even if the SRP requester doesn't list them"); `sig0lease-srp-client
   -deregister` frees them, or keeps them with `-keep-names`. §3.2.5.5.1's removal is a `LEASE`

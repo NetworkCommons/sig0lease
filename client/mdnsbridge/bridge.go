@@ -5,7 +5,8 @@
 // one SRP identity, so one signing key, per mDNS host.
 //
 // When the daemon reports an instance gone, the bridge withdraws it; when a host has no
-// instance left, or the bridge stops, it deregisters the host. What it does not follow:
+// instance left, or the bridge stops, it deregisters the host, keeping its names until a stop
+// that frees them (Config.KeepNames). What it does not follow:
 // subtypes (a browse does not report them), and a host's later address or TXT changes (it
 // resolves an instance and looks up its host's addresses when they first appear).
 package mdnsbridge
@@ -88,8 +89,10 @@ type Config struct {
 	// StopTimeout bounds the deregistrations sent when Run stops.
 	Settle      time.Duration
 	StopTimeout time.Duration
-	// KeepNames keeps a host's names reserved for its key when it is deregistered, because
-	// its last instance went or Run stopped (clientsrp.HostConfig.KeepNames).
+	// KeepNames keeps a host's names reserved for its key when Run stops because ctx ended
+	// (clientsrp.HostConfig.KeepNames); without it they are freed, those kept by an earlier
+	// deregistration included. A host whose last instance went keeps them, as does every host
+	// when Run is to run again: when it fails on its own, or ctx ends with ErrRestart.
 	KeepNames bool
 	Logf      func(format string, args ...any)
 }
@@ -97,9 +100,14 @@ type Config struct {
 // lookupTimeout bounds one resolve or address lookup.
 const lookupTimeout = 5 * time.Second
 
+// ErrRestart is the cause of a ctx ending (context.WithCancelCause) for a Run that is to run
+// again, with another configuration: its hosts keep their names, whatever KeepNames says.
+var ErrRestart = errors.New("mdnsbridge: restarting")
+
 // Run mirrors until ctx ends, then deregisters every host it registered and returns
 // ctx's error. A browse that fails, such as one macOS refuses for lack of Local Network
-// permission, stops it the same way, returning that error.
+// permission, stops it the same way, returning that error, but its hosts keep their names:
+// a failure is no request to free them, and Run's caller may run it again.
 func Run(ctx context.Context, cfg Config) error {
 	if cfg.Source == nil {
 		return errors.New("mdnsbridge: Source is required")
@@ -176,6 +184,7 @@ func (b *bridge) run(ctx context.Context) error {
 	}
 
 	var err error
+	var again bool // Run is to run again: its hosts keep their names
 loop:
 	for {
 		select {
@@ -184,9 +193,11 @@ loop:
 		case apply := <-b.results:
 			apply()
 		case err = <-b.failed:
+			again = true
 			break loop
 		case <-ctx.Done():
 			err = ctx.Err()
+			again = errors.Is(context.Cause(ctx), ErrRestart)
 			break loop
 		}
 	}
@@ -204,7 +215,11 @@ loop:
 		}
 	}
 	for _, h := range b.hosts {
-		if h.worker != nil {
+		switch {
+		case h.worker == nil:
+		case again:
+			h.worker.StopKeepingNames()
+		default:
 			h.worker.Stop()
 		}
 	}
