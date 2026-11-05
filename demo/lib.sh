@@ -35,6 +35,20 @@ step() {
 # in_use <port> -- whether something on this machine accepts connections on the port.
 in_use() { (exec 3<> "/dev/tcp/127.0.0.1/$1") 2> /dev/null; }
 
+# check_proxy_ports [port...] -- exits unless port 8053, where the demo's proxy listens, and the
+# other ports given are free on this machine. Each demo starts its own proxy, with the config it
+# needs, so it does not run beside another proxy: another demo's, or one whose config it cannot
+# know.
+check_proxy_ports() {
+    local port
+    for port in 8053 "$@"; do
+        if in_use "$port"; then
+            echo "Port $port, for this demo's proxy, is in use: another demo, or another proxy, runs on this machine. Stop it first: each demo starts its own proxy (docs/demo.md)." >&2
+            exit 1
+        fi
+    done
+}
+
 ask() { dig +short +time=2 +tries=1 "@$ns" "$@"; }
 answers() { [ -n "$(ask "$@")" ]; }
 not() { ! "$@"; }
@@ -56,3 +70,10 @@ wait_until() {
     done
     echo "$(( $(date +%s) - t0 )) s"
 }
+
+# D1's site, which D6 (web.sh) starts too: demo/demo.yaml's host registers it as "<name> http",
+# in the SRP domain, while it answers. listed uses domain, which the script sets.
+start_site() { start site site.log python3 -m http.server 8000 -d demo/site; }
+
+# listed <instance> -- whether browsing the domain's HTTP services lists the instance.
+listed() { ask PTR "_http._tcp.$domain" | grep -qF "$1._http._tcp.$domain."; }

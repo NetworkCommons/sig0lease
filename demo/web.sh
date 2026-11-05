@@ -3,16 +3,19 @@
 # DNS client in it that sends everything to this machine's proxy over DNS-over-HTTPS. Phones on
 # the network open it, watch the SRP domain's services come and go, and claim names with a
 # message, each with a key the phone's browser makes and keeps.
-# It builds the proxy and the page, starts the proxy with a copy of config.yaml that turns on its
-# DoH listener, in plain HTTP (a page served over plain HTTP may reach it, and a browser refuses
-# a self-signed certificate), serves the page, prints its address and a QR code of it, and
-# waits: Enter, or Ctrl-C, stops the page and the proxy. The logs and the copy of the config
-# go to a temporary directory, printed at the start.
+# It builds the proxy, the agent and the page, starts the proxy with a copy of config.yaml that
+# turns on its DoH listener, in plain HTTP (a page served over plain HTTP may reach it, and a
+# browser refuses a self-signed certificate), D1's site and agent (demo/demo.yaml), whose
+# "<name> http" the page shows, and serves the page, and prints its address and a QR code of it.
+# The next Enters stop the site and start it again, for the phones to see "<name> http" leave
+# and come back. The last Enter, or Ctrl-C, stops the agent first, so it frees its names, then
+# the page, the site and the proxy. The logs and the copy of the config go to a temporary
+# directory, printed at the start.
 #   ADDRESS   the address phones reach this machine at; default, the one it reaches the internet
 #             from
 #   PORT      the page's port; default 8090 (D3's gateway has 8080)
 #   DOH_PORT  the proxy's DoH port; default 8443
-#   NS, ZONE, DOMAIN as for watch.sh.
+#   NS, ZONE, DOMAIN, NAME as for watch.sh.
 # A name a page claims stays the phone's while the page is open, and for half an hour after:
 # stopping the proxy does not free it.
 
@@ -22,6 +25,8 @@ B="./bin/$(uname -s | tr A-Z a-z)"
 ns="${NS:-ns1.free2air.org}"
 zone="${ZONE:-dev.zenr.io}"
 domain="${DOMAIN:-srp.dev.zenr.io}"
+name="${NAME:-demo}"
+instance="$name\\032http"         # "demo http", as browsing lists it
 port="${PORT:-8090}"
 doh_port="${DOH_PORT:-8443}"
 
@@ -43,18 +48,22 @@ if [ -z "$address" ]; then
     exit 1
 fi
 
-echo "Building the proxy and the page."
-make -s build web || exit 1
+check_proxy_ports "$doh_port"
+
+echo "Building the proxy, the agent and the page."
+make -s build build-client web || exit 1
 
 set -m
 log="$(mktemp -d "${TMPDIR:-/tmp}/sig0lease-web.XXXXXX")" || exit 1
-proxy= page=
+proxy= site= agent= page=
 
 finish() {
     trap '' INT
     echo
     echo "Stopping."
+    stop agent
     stop page
+    stop site
     stop proxy
     echo "Logs: $log"
 }
@@ -85,11 +94,14 @@ The page, served by this machine at $address, and its proxy on the live $zone zo
 Logs: $log
 EOF
 
-step "1. Start the proxy and serve the page."
+step "1. Start the proxy, the site and the agent, and serve the page."
 start proxy proxy.log "$B/sig0lease" "$log/config.yaml"
+start_site
+start agent agent.log "$B/sig0lease-agent" run -probe-interval 5s demo/demo.yaml
 start page page.log python3 -m http.server "$port" -d bin/web
 wait_until "the proxy answers over DoH" doh_answers
 wait_until "the page is served" page_served
+wait_until "\"$name http\" is listed" listed "$instance"
 
 echo
 echo "The page: $url"
@@ -102,4 +114,13 @@ and for the services it shows:
   demo/watch.sh
 EOF
 
-step "2. Stop the page and the proxy."
+step "2. Stop the site: after three failed probes the agent withdraws \"$name http\", and the phones show it leave."
+stop site
+wait_until "\"$name http\" is gone" not listed "$instance"
+step "   Start the site again: once a probe passes, \"$name http\" is back on the phones."
+start_site
+wait_until "\"$name http\" is listed" listed "$instance"
+
+step "Last, stop the agent, which frees its names (on_stop: release), then the page, the site and the proxy."
+stop agent
+wait_until "\"$name http\" is gone" not listed "$instance"

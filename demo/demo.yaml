@@ -21,8 +21,6 @@ registrars:
             port: 8000
             txt: {path: /}
             probe: {http: /}
-          - type: ipfs-gateway          # instance "demo ipfs-gateway": kubo's gateway, once it
-                                        # listens beyond 127.0.0.1 (docs/demo.md, D3)
 
   # Typed or linked: demo.dev.zenr.io. and records under it.
   - protocol: rfc9664

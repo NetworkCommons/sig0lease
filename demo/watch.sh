@@ -1,7 +1,8 @@
 #!/bin/bash
 # demo/watch.sh [seconds|once] -- what anyone can see of the demo (docs/demo.md), asked of the
 # zone's authoritative server every few seconds (default 2), with dig only: the service types and
-# instances browsing finds in the SRP domain, and the demo names' records. Ctrl-C stops it.
+# instances browsing finds in the SRP domain, and the records the demo names have. Ctrl-C stops
+# it.
 #
 # NS, DOMAIN, ZONE and NAME change what it asks; defaults: ns1.free2air.org, srp.dev.zenr.io,
 # dev.zenr.io, demo. NAME may list several names, as D3's "a site".
@@ -14,11 +15,9 @@ every="${1:-2}"
 
 ask() { dig +short +time=2 +tries=1 "@$ns" "$@"; }
 
-# line <label> <answers> -- one record set, "-" when there is none.
+# line <label> <answers> -- one record set, if there is one.
 line() {
-    local answers
-    answers="$(printf '%s' "$2" | tr '\n' ' ')"
-    printf '  %-22s %s\n' "$1" "${answers:--}"
+    [ -z "$2" ] || printf '  %-22s %s\n' "$1" "$(printf '%s' "$2" | tr '\n' ' ')"
 }
 
 show() {
@@ -38,16 +37,19 @@ show() {
         done
     done
     [ -n "$found" ] || echo "  (no instances)"
-    local name
+    local name records
     for name in "${names[@]}"; do
         echo
         echo "Name $name.$zone (RFC 9664):"
-        line "KEY" "$(ask KEY "$name.$zone" | cut -c1-40)"
-        line "A, AAAA" "$(ask A "$name.$zone"; ask AAAA "$name.$zone")"
-        line "TXT" "$(ask TXT "$name.$zone")"
-        line "_dnslink TXT" "$(ask TXT "_dnslink.$name.$zone")"
-        line "_dnsaddr TXT" "$(ask TXT "_dnsaddr.$name.$zone")"
-        line "hello TXT" "$(ask TXT "hello.$name.$zone")"
+        records="$(
+            line "KEY" "$(ask KEY "$name.$zone" | cut -c1-40)"
+            line "A, AAAA" "$(ask A "$name.$zone"; ask AAAA "$name.$zone")"
+            line "TXT" "$(ask TXT "$name.$zone")"
+            line "_dnslink TXT" "$(ask TXT "_dnslink.$name.$zone")"
+            line "_dnsaddr TXT" "$(ask TXT "_dnsaddr.$name.$zone")"
+            line "hello TXT" "$(ask TXT "hello.$name.$zone")"
+        )"
+        echo "${records:-  (no records)}"
     done
 }
 

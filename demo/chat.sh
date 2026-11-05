@@ -50,6 +50,7 @@ for tool in "$need" openssl dig curl qrencode; do
     command -v "$tool" > /dev/null || { echo "$tool is not installed (docs/demo.md, D5)" >&2; exit 1; }
 done
 
+check_proxy_ports
 echo "Building the proxy and the clients."
 make -s build build-client || exit 1
 

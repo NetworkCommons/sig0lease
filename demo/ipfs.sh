@@ -10,11 +10,10 @@
 #              addresses go at <SITE>.<zone>, and its gateway is the SRP instance
 #              "<HOST> ipfs-gateway". Once <SITE>.<zone> has the site, the gateway's address for
 #              phones is printed, with a QR code.
-# It builds the proxy and the agent, starts the proxy unless this machine runs one already (the
-# full demo's terminal 1), checks that the node answers and has a swarm key, starts the agent,
-# waits until the zone's authoritative server has the records, and waits: Enter, or Ctrl-C,
-# stops the agent, which frees the names, then the proxy if it started it. The logs and the
-# agent's template go to a temporary directory, printed at the start.
+# It checks that the node answers and has a swarm key, builds the proxy and the agent, starts
+# them, waits until the zone's authoritative server has the records, and waits: Enter, or
+# Ctrl-C, stops the agent, which frees the names, then the proxy. The logs and the agent's
+# template go to a temporary directory, printed at the start.
 #   MEMBER     the member's label; default a
 #   SITE       the community's site's label; default site
 #   HOST       the community node's host in the SRP domain; default b
@@ -63,6 +62,7 @@ if ! curl -sf -o /dev/null -X POST "$api/api/v0/id"; then
     echo "No IPFS node answers at $api: start IPFS Desktop, or ipfs daemon" >&2
     exit 1
 fi
+check_proxy_ports
 
 echo "Building the proxy and the clients."
 make -s build build-client || exit 1
@@ -81,14 +81,6 @@ finish() {
 }
 trap finish EXIT
 trap 'exit 130' INT TERM
-
-# proxy_answers -- whether a DNS server on this machine's port 8053 answers for the zone: the
-# proxy, run by hand (the full demo's terminal 1), by another of these scripts, or by this one.
-# The answer has the zone's SOA record, or, the zone being no apex (dev.zenr.io is in zenr.io),
-# the SOA of the zone it is in, in the authority section.
-proxy_answers() {
-    dig +noall +answer +authority +tcp +time=2 +tries=1 -p 8053 @127.0.0.1 SOA "$zone" | grep -q '[[:space:]]SOA[[:space:]]'
-}
 
 registrar() {
     cat << EOF
@@ -136,14 +128,8 @@ Logs: $log
 Answers are asked of $ns, the zone's authoritative server.
 EOF
 
-step "1. Start the agent, and the proxy unless it runs."
-if in_use 8053; then
-    proxy_answers || { echo "Port 8053 is in use, by something that does not answer for $zone as the proxy does" >&2; exit 1; }
-    echo "  using the proxy that runs on port 8053"
-else
-    start proxy proxy.log "$B/sig0lease"
-    wait_until "the proxy answers" proxy_answers
-fi
+step "1. Start the proxy and the agent."
+start proxy proxy.log "$B/sig0lease"
 start agent agent.log "$B/sig0lease-agent" run -probe-interval 5s "$log/ipfs.yaml"
 if [ "$role" = member ]; then
     wait_until "$member.$zone has the folder's site" answers TXT "_dnslink.$member.$zone"
@@ -172,4 +158,4 @@ EOF
     qrencode -t ANSIUTF8 "$url"
 fi
 
-step "2. Stop the agent, and the proxy if this script started it."
+step "2. Stop the agent and the proxy."

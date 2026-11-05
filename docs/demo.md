@@ -6,6 +6,9 @@ authoritative server of `zenr.io.` (`ns1.free2air.org`). The audience looks from
 devices, with the DNS tools they already have. Everything runs from `./main`, with the files in
 [`demo/`](../demo).
 
+Each demo's script starts its own proxy, with the config that demo needs, and refuses to start
+while another proxy runs on the machine, another demo's included: run one demo at a time.
+
 | Demo | What the audience sees | Needs |
 |---|---|---|
 | D1: the laptop publishes itself | its site among browse results and under a name; a service leaves when it stops and comes back; a template edit shows within seconds; a second key gets `demo-2`, and is refused the name | the laptop |
@@ -34,8 +37,8 @@ Desktop or kubo for D3, and Prosody for D5, whose page loads Converse.js from `c
    dig +tcp +short SOA zenr.io @ns1.free2air.org
    ```
 
-3. Check that the names are free: `demo/watch.sh once` shows no `demo` instance and a `-` for the
-   name's KEY. If another key holds them, change `name: demo` in `demo/demo.yaml` (both
+3. Check that the names are free: `demo/watch.sh once` shows no `demo` instance, and
+   `(no records)` under the name `demo`. If another key holds them, change `name: demo` in `demo/demo.yaml` (both
    registrars) and run `watch.sh` with `NAME=<the new label>`.
 
 4. Rehearse once with `demo/run.sh`. Stopping frees the names (`on_stop: release` in every
@@ -99,8 +102,8 @@ Desktop or kubo for D3, and Prosody for D5, whose page loads Converse.js from `c
 
 For D1, and D2 on a Mac, one terminal is enough: `demo/run.sh` builds the proxy and the clients,
 starts the proxy, the site and the agents, pauses before each step until Enter, and prints how
-long `ns1.free2air.org` took to show it. The last Enter, or Ctrl-C, stops everything. For the
-full demo, use these terminals:
+long `ns1.free2air.org` took to show it. The last Enter, or Ctrl-C, stops everything. To run D1
+by hand instead, use these terminals:
 
 | | Command | What it is |
 |---|---|---|
@@ -130,8 +133,7 @@ gives the current answer.
 
 1. Start terminals 1 to 4. The agent logs `registered` for host `demo` and name `demo`, and
    `watch.sh` shows the instance `demo http` under `_http._tcp`, and the name's addresses and
-   TXT. `demo ipfs-gateway` waits for the laptop's IPFS node (D3): its probe fails until the
-   node's gateway answers on the network.
+   TXT.
 2. Stop the site (Ctrl-C in terminal 2). After three failed probes, about 15 s, `demo http`
    leaves the browse results; about 30 s on a Mac whose firewall is in stealth mode, where a
    stopped site's port does not refuse connections, so each probe waits its 5 s out. Start it
@@ -154,11 +156,10 @@ gives the current answer.
    renaming: a name is typed, not browsed. Ctrl-C it: it frees what it got (`on_stop: release`)
    and leaves your name alone.
 
-Keep the agent running for D2.
-
 ## D2: the Mac's own services
 
-In another terminal: `$B/sig0lease-agent run demo/mac.yaml`. In System Settings > General >
+`demo/run.sh` does it on a Mac, as its step 5. By hand, beside terminals 1 to 4, in another
+terminal: `$B/sig0lease-agent run demo/mac.yaml`. In System Settings > General >
 Sharing, turn on Remote Login (`_ssh._tcp`) or Screen Sharing (`_rfb._tcp`): a few seconds later
 the agent logs `registered`, and `watch.sh` shows the Mac's instance. Turn it off and it goes.
 [srp-live-demo.md §7](srp-live-demo.md) has the details and limits.
@@ -167,8 +168,7 @@ the agent logs `registered`, and `watch.sh` shows the Mac's instance. Turn it of
 
 A, a member, keeps a folder in its IPFS node; B, the community node (a colleague's laptop here,
 a small always-on machine in real life), keeps every version of it and serves it. Each runs
-`demo/ipfs.sh` (it starts the proxy unless one runs, as terminal 1 does on A), whose agent
-publishes:
+`demo/ipfs.sh`, which starts a proxy and an agent; the agent publishes:
 
 | Record | Published by | Changes when |
 |---|---|---|
@@ -274,18 +274,14 @@ DNS-over-HTTPS, the one DNS transport a browser has, and the proxy answers the q
 its zones from the zone's own server: the page sees a change as soon as `ns1.free2air.org` has
 it, not what a resolver cached.
 
-1. `demo/web.sh` builds the proxy and the page, starts the proxy with its DNS-over-HTTPS
-   listener on (port 8443, plain HTTP), serves the page on port 8090, and prints its address
-   and its QR code.
-
-   During the full demo, the proxy is already running in terminal 1, without that listener. Stop
-   it there (Ctrl-C) and run `demo/web.sh` in its place. The agent in terminal 3 needs no
-   restart: `web.sh` starts the same proxy program on the same port, 8053, where the agent sends
-   its updates, and the proxy reads the leases it granted back from `data/`. The site and the
-   name stay published meanwhile.
+1. `demo/web.sh` builds the proxy, the agent and the page, and starts: the proxy, with its
+   DNS-over-HTTPS listener on (port 8443, plain HTTP); a site and an agent that registers it as
+   the service `demo http`, as in D1 (`demo/demo.yaml`); and the page, on port 8090. It prints
+   the page's address and its QR code.
 2. Phones scan the code. The page lists the services in `srp.dev.zenr.io`, read every 3
-   seconds: stop and start the site (D1, step 2), and the phones show `demo http` leave, struck
-   through, and come back, lit up.
+   seconds. At the next Enter, `web.sh` stops the site, and after three failed probes, about
+   15 s, the phones show `demo http` leave, struck through; at the one after, it starts the site
+   again, and `demo http` comes back, lit up.
 3. Someone picks a name and writes a message. The browser makes a key and keeps it, and the page
    claims `<name>.dev.zenr.io` with the message as its TXT record. The badge turns `published`
    once the zone's server has it, within a few seconds, and anyone can check:
@@ -296,8 +292,8 @@ it, not what a resolver cached.
 
    A second phone that claims the same name stays `waiting`, and shows the first one's message:
    another key holds the name.
-4. "Release the name" deletes the message and frees the name. Enter, or Ctrl-C, in `web.sh`
-   stops the page and the proxy.
+4. "Release the name" deletes the message and frees the name. The last Enter, or Ctrl-C, in
+   `web.sh` stops the agent, which frees `demo`, then the page, the site and the proxy.
 
 A name stays its phone's while the page is open: the message for 10 minutes after the page
 closes (its lease), the name for 30 (its key's, the most the zone grants). Opened again within
@@ -318,6 +314,8 @@ nobody can forge one, but anyone there can read them. It needs a browser from 20
 
 ## When something fails
 
+- A script stops at once: "Port 8053, for this demo's proxy, is in use". Another demo still runs,
+  or the proxy of terminal 1 ("The terminals"): stop it, then start the script again.
 - The proxy logs errors reaching `ns1.free2air.org`: the network blocks port 53. Use a phone's
   hotspot, or the recording.
 - The agent logs a name held by another key: change `name: demo` (step 3 of "Before the day").

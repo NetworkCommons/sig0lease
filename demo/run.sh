@@ -19,6 +19,7 @@ name="${NAME:-demo}"
 instance="$name\\032http"         # "demo http", as browsing lists it
 renamed="$name\\032http-2"        # the second key's
 
+check_proxy_ports
 echo "Building the proxy and the clients."
 make -s build build-client || exit 1
 
@@ -65,8 +66,6 @@ finish() {
 trap finish EXIT
 trap 'exit 130' INT TERM
 
-listed() { ask PTR "_http._tcp.$domain" | grep -qF "$1._http._tcp.$domain."; }
-
 # mirrored <type> -- whether an instance of <type> on this Mac's host is listed.
 mirrored() {
     local instance
@@ -97,7 +96,7 @@ EOF
 
 step "1. Start the proxy, the site and the agent."
 start proxy proxy.log "$B/sig0lease"
-start site site.log python3 -m http.server 8000 -d demo/site
+start_site
 start agent agent.log "$B/sig0lease-agent" run -probe-interval 5s "$log/demo.yaml"
 wait_until "\"$name http\" is listed" listed "$instance"
 wait_until "$name.$zone has its records" answers TXT "$name.$zone"
@@ -108,7 +107,7 @@ step "2. Stop the site: after three failed probes the agent withdraws \"$name ht
 stop site
 wait_until "\"$name http\" is gone" not listed "$instance"
 step "   Start the site again: once a probe passes, \"$name http\" is back."
-start site site.log python3 -m http.server 8000 -d demo/site
+start_site
 wait_until "\"$name http\" is listed" listed "$instance"
 
 step "3. Add a record to the template, hello.$name TXT: the agent reads it every 10 s."
