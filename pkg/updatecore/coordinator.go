@@ -287,43 +287,11 @@ func (c *Coordinator) QueryKeyAtName(ctx context.Context, zoneHint, name string)
 	}
 }
 
-// QueryPTRExists reports whether at least one PTR record currently exists live at name
-// (typically a per-type browsing name "<type>.<zone>", RFC 6763 S4.1) against zoneHint's
-// resolved authoritative server -- same query/fallback shape as QueryKeyAtName, but a
-// simple presence check rather than a tri-state result, since the only question here is
-// "does anything else still provide this type." Used by
-// handlers.SRPHandler.reconcileServiceEnumeration immediately before removing a type from
-// the RFC 6763 S9 enumeration record, to confirm no OTHER registrant this process's own
-// local lease store doesn't know about still provides it -- see that function's doc comment
-// for why a local-only view can't safely decide this alone.
-func (c *Coordinator) QueryPTRExists(ctx context.Context, zoneHint, name string) (bool, error) {
-	req := dns.NewMsg(name, dns.TypePTR)
-	if req == nil {
-		return false, fmt.Errorf("failed to build PTR query for %s", name)
-	}
-	resp, err := c.QueryAuthoritative(ctx, zoneHint, req, "PTR query for "+name)
-	if err != nil {
-		return false, err
-	}
-
-	switch resp.Rcode {
-	case dns.RcodeNameError:
-		return false, nil
-	case dns.RcodeSuccess:
-		for _, rr := range resp.Answer {
-			if _, ok := rr.(*dns.PTR); ok {
-				return true, nil
-			}
-		}
-		return false, nil
-	default:
-		return false, fmt.Errorf("PTR query for %s returned unexpected rcode %d (%s)", name, resp.Rcode, dns.RcodeToString[resp.Rcode])
-	}
-}
-
 // QueryRRs returns the rrType records at name from zoneHint's authoritative server -- none
 // for NXDOMAIN -- with the same query/fallback shape as QueryKeyAtName. Used by the RFC 9664
-// handler's checks of what is already published (signer KEYs, duplicate registrations).
+// handler's checks of what is already published (signer KEYs, duplicate registrations), and by
+// the SRP handler's RFC 6763 S9 and S11 reconciliation (the PTRs at a browsing or
+// domain-enumeration name).
 func (c *Coordinator) QueryRRs(ctx context.Context, zoneHint, name string, rrType uint16) ([]dns.RR, error) {
 	what := fmt.Sprintf("%s query for %s", dns.TypeToString[rrType], name)
 	req := dns.NewMsg(name, rrType)

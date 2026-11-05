@@ -38,27 +38,20 @@ type SRPHandler struct {
 	// read, so a freshly started (or restarted) process only ever ADDS types it newly
 	// discovers in its own lease store on its own account -- it never blindly deletes a
 	// type it simply hasn't relearned about. A type that drops out of this process's own
-	// local knowledge is only actually removed from the upstream record after a live
-	// QueryPTRExists confirms no other registrant (a different process, or an earlier run
-	// of this same one) still provides it.
+	// local knowledge is only actually removed from the upstream record after a live PTR
+	// query at its browsing name confirms no other registrant (a different process, or an
+	// earlier run of this same one) still provides it.
 	serviceTypesMu sync.Mutex
 	serviceTypes   map[string]bool
 
-	// domainEnumPresent is this process's own last-confirmed-written presence state for each
-	// RFC 6763 S11 domain-enumeration prefix (dnssd.BrowseDomainPrefix and friends) -- see
-	// reconcileServiceEnumeration. Guarded by serviceTypesMu alongside serviceTypes since both
-	// are only ever read/written together, inside the same reconcile pass. Starts nil (every
-	// lookup then defaults to false) on every process start, for the same restart-safety
-	// reason serviceTypes starts nil: a prefix is only removed once a live QueryPTRExists
-	// confirms no service type remains anywhere in the zone, not just gone from this
-	// process's own local view.
-	domainEnumPresent map[string]bool
-
-	// advertiseRegistrationDomain gates the "r"/"dr" prefixes (RFC 6763 S11's registration-
-	// domain records) specifically -- unlike "b"/"db"/"lb" (always published once at least
-	// one service type is live), advertising this zone as an open target for direct RFC 2136
-	// Dynamic Update registration (not just SRP) is a deployment policy choice, not implied
-	// by SRP working here. Default false (config: srp_handler.advertise_registration_domain).
+	// advertiseBrowseDomain and advertiseRegistrationDomain say which RFC 6763 S11
+	// domain-enumeration records the zone has, self-pointing at upstreamZone
+	// (reconcileDomainEnumeration): "b"/"db"/"lb", browse here, and "r"/"dr", register here.
+	// Each is the operator's choice about the zone, not a fact about what is registered now.
+	// Config: srp_handler.advertise_browse_domain (default true) and
+	// srp_handler.advertise_registration_domain (default false): telling domain-enumeration
+	// clients to register here invites plain RFC 2136 updates too, not just SRP.
+	advertiseBrowseDomain       bool
 	advertiseRegistrationDomain bool
 }
 
@@ -71,24 +64,30 @@ type srpCoordinator interface {
 	QueryKeyAtName(ctx context.Context, zoneHint, name string) (srp.AuthoritativeKeyState, []*dns.KEY, error)
 	updateSender // every UPDATE sent through upstreamTarget.send
 	ResolveAuthoritativeZone(ctx context.Context, zone string) (string, error)
-	// QueryPTRExists reports whether at least one PTR record currently exists live at
-	// name -- used by reconcileServiceEnumeration (RFC 6763 S9) to confirm a type is truly
-	// gone everywhere before removing it from the enumeration record, not just gone from
-	// this process's own local lease-store view.
-	QueryPTRExists(ctx context.Context, zoneHint, name string) (bool, error)
+	// QueryRRs returns the rrType records at name from zoneHint's authoritative server: the
+	// PTRs reconcileServiceEnumeration (RFC 6763 S9) reads to confirm a type is gone
+	// everywhere before removing it from the enumeration record, not just gone from this
+	// process's own lease store, and those reconcileDomainEnumeration (S11) compares with the
+	// config.
+	QueryRRs(ctx context.Context, zoneHint, name string, rrType uint16) ([]dns.RR, error)
 	// QueryAuthoritative sends a query to zoneHint's authoritative server: answerQuery's.
 	QueryAuthoritative(ctx context.Context, zoneHint string, req *dns.Msg, what string) (*dns.Msg, error)
 }
 
 // NewSRPHandler creates a new handler for opcode 5 (UPDATE), RFC 9665 SRP path.
 func NewSRPHandler() *SRPHandler {
-	h := &SRPHandler{refuseOnForeignData: true}
-	// RFC 6763 S9 self-heal: every reconciliation pass also recomputes the enumeration record
-	// from the store, catching anything a missed or raced incremental call (Handle,
-	// processExpiredNode) left stale -- see reconcileServiceEnumeration's doc comment.
+	h := &SRPHandler{refuseOnForeignData: true, advertiseBrowseDomain: true}
+	// Every reconciliation pass also recomputes the RFC 6763 S9 enumeration record from the
+	// store, catching anything a missed or raced incremental call (Handle,
+	// processExpiredNode) left stale -- see reconcileServiceEnumeration's doc comment -- and
+	// brings the S11 domain-enumeration records in line with the config, which only the pass
+	// does (reconcileDomainEnumeration).
 	h.leaseHandler = newLeaseHandler[srpCoordinator]("srp_handler",
 		func(nodeKey string) []string { return h.lockNames(nodeKey) },
-		h.processExpiredNode, h.reconcileServiceEnumeration)
+		h.processExpiredNode, func(ctx context.Context) {
+			h.reconcileServiceEnumeration(ctx)
+			h.reconcileDomainEnumeration(ctx)
+		})
 	return h
 }
 
@@ -481,9 +480,9 @@ func (h *SRPHandler) collectLiveServiceTypes() []string {
 // from a live upstream read.
 //
 // A type this process's own local knowledge no longer has an instance of is NOT deleted
-// outright: it's confirmed missing everywhere first, via a live QueryPTRExists at its
-// per-type browsing name (RFC 6763 S4.1 -- the exact name a real browse would query, so this
-// is asking the same question a real client would get a real answer to). This closes a gap a
+// outright: it's confirmed missing everywhere first, via a live PTR query at its per-type
+// browsing name (RFC 6763 S4.1 -- the exact name a real browse would query, so this is asking
+// the same question a real client would get a real answer to). This closes a gap a
 // local-store-only view can't see on its own: a shared real zone can have more than one
 // independent registrant (or registrar process, across a restart) providing the SAME type --
 // observed live against the real dev.zenr.io. shared environment, where a second proxy
@@ -492,21 +491,6 @@ func (h *SRPHandler) collectLiveServiceTypes() []string {
 // in the tracked state (so a later reconcile re-checks it, rather than forgetting it was ever
 // a candidate) and simply isn't included in this round's delete. A query that itself fails
 // fails safe the same way -- keep, don't delete, log, and let the next reconcile retry.
-//
-// Alongside the S9 type set, this also maintains all five S11 domain-enumeration PTRs
-// (dnssd.DiffSelfPointingDomainRecord): "b"/"db"/"lb" present whenever at least one service
-// type is known live in the zone (by this process's own local knowledge OR confirmed still
-// live elsewhere via the same survivors check the type diff already performs), absent
-// otherwise; "r"/"dr" present whenever h.advertiseRegistrationDomain is set, independent of
-// whether any service type is currently live (off by default -- advertising this zone as an
-// open target for direct RFC 2136 registration, not just SRP, is a deployment policy choice,
-// not a fact about current occupancy). A domain-enumeration browse tool queries one or
-// more of these FIRST, before ever asking for the S9 type list -- without them, a zone with
-// perfectly correct S9/S4.1 records is still invisible to such a tool, since it never gets
-// that far. Reusing the type diff's own survivors safety check here means the same
-// protection applies to all five: this process only ever removes one once it has
-// independently confirmed, via a live query, that no service type remains anywhere in the
-// zone -- not just gone from its own local view.
 //
 // A no-op diff (nothing left to add or delete after this) sends no upstream UPDATE at all.
 // Called both synchronously after a successful Handle()/expiry (prompt visibility for a
@@ -524,10 +508,6 @@ func (h *SRPHandler) reconcileServiceEnumeration(ctx context.Context) {
 	for t := range h.serviceTypes {
 		previous = append(previous, t)
 	}
-	wasDomainEnumPresent := make(map[string]bool, len(h.domainEnumPresent))
-	for prefix, present := range h.domainEnumPresent {
-		wasDomainEnumPresent[prefix] = present
-	}
 	h.serviceTypesMu.Unlock()
 
 	// previousForDiff feeds DiffEnumerationRecords: it must still include a type this
@@ -543,12 +523,12 @@ func (h *SRPHandler) reconcileServiceEnumeration(ctx context.Context) {
 			previousForDiff = append(previousForDiff, t) // still known locally too -- unaffected
 			continue
 		}
-		stillLive, err := h.upstreamCoordinator.QueryPTRExists(ctx, h.upstreamZone, dnssd.BrowsingOwnerName(t, h.upstreamZone))
+		ptrs, err := h.upstreamCoordinator.QueryRRs(ctx, h.upstreamZone, dnssd.BrowsingOwnerName(t, h.upstreamZone), dns.TypePTR)
 		switch {
 		case err != nil:
 			h.logger.Errorf("SRP handler: service-type enumeration: failed to confirm %s has no other live instances, leaving it listed: %v", t, err)
 			survivors = append(survivors, t)
-		case stillLive:
+		case len(ptrs) > 0:
 			h.logger.Debugf("SRP handler: service-type enumeration: %s still has a live instance this process doesn't manage, leaving it listed", t)
 			survivors = append(survivors, t)
 		default:
@@ -556,48 +536,7 @@ func (h *SRPHandler) reconcileServiceEnumeration(ctx context.Context) {
 		}
 	}
 
-	// anyLive is true once at least one service type is known live in the zone, whether
-	// from this process's own local knowledge (currentSet) or confirmed still live
-	// elsewhere via the survivors check above -- exactly the same fact the type-enumeration
-	// record itself would end up expressing ("is the S9 record non-empty"), just as a
-	// boolean rather than a set. Reusing survivors here means a domain-enumeration record is
-	// never removed just because this process's own local view emptied out; it needs the
-	// same live confirmation a type's own removal does.
-	anyLive := len(currentSet) > 0 || len(survivors) > 0
-	// registrationOptedIn gates "r"/"dr" on h.advertiseRegistrationDomain alone, deliberately
-	// independent of anyLive: unlike "b"/"db"/"lb" (which advertise "there's something to
-	// browse," so they're meaningless while the zone is empty), "r"/"dr" advertise "you may
-	// register here," a deployment policy choice that holds regardless of whether anything
-	// happens to be registered right now. Tying it to anyLive would leave a freshly deployed,
-	// opted-in, still-empty zone unable to advertise itself as a registration target at
-	// all -- exactly the case a plain RFC 2136 client doing domain enumeration before its
-	// first registration needs it for -- and would flap the records offline whenever the
-	// zone's live services happen to hit zero, even though the operator's policy hasn't
-	// changed. If advertiseRegistrationDomain is (or becomes) false while one of them was
-	// previously published, this still naturally emits a delete for it below. A fixed-order
-	// slice, not a map, so the resulting upstream instructions have a deterministic order (map
-	// iteration order doesn't, and DiffEnumerationRecords's own output is already sorted for
-	// the same reason).
-	registrationOptedIn := h.advertiseRegistrationDomain
-	wantedDomainEnum := []struct {
-		prefix    string
-		isPresent bool
-	}{
-		{dnssd.BrowseDomainPrefix, anyLive},
-		{dnssd.DefaultBrowseDomainPrefix, anyLive},
-		{dnssd.LegacyBrowseDomainPrefix, anyLive},
-		{dnssd.RegistrationDomainPrefix, registrationOptedIn},
-		{dnssd.DefaultRegistrationDomainPrefix, registrationOptedIn},
-	}
-	var domainEnumRecords []dns.RR
-	newDomainEnumPresent := make(map[string]bool, len(wantedDomainEnum))
-	for _, w := range wantedDomainEnum {
-		domainEnumRecords = append(domainEnumRecords, dnssd.DiffSelfPointingDomainRecord(w.prefix, h.upstreamZone, wasDomainEnumPresent[w.prefix], w.isPresent, h.recordTTL)...)
-		newDomainEnumPresent[w.prefix] = w.isPresent
-	}
-
 	records := dnssd.DiffEnumerationRecords(h.upstreamZone, previousForDiff, current, h.recordTTL)
-	records = append(records, domainEnumRecords...)
 	newState := func() map[string]bool {
 		state := make(map[string]bool, len(currentSet)+len(survivors))
 		for t := range currentSet {
@@ -611,7 +550,6 @@ func (h *SRPHandler) reconcileServiceEnumeration(ctx context.Context) {
 	if len(records) == 0 {
 		h.serviceTypesMu.Lock()
 		h.serviceTypes = newState()
-		h.domainEnumPresent = newDomainEnumPresent
 		h.serviceTypesMu.Unlock()
 		return
 	}
@@ -623,10 +561,59 @@ func (h *SRPHandler) reconcileServiceEnumeration(ctx context.Context) {
 
 	h.serviceTypesMu.Lock()
 	h.serviceTypes = newState()
-	h.domainEnumPresent = newDomainEnumPresent
 	h.serviceTypesMu.Unlock()
 
 	h.logger.Debugf("SRP handler: service-type enumeration reconciled for zone %s (%d change(s))", h.upstreamZone, len(records))
+}
+
+// reconcileDomainEnumeration brings this zone's five RFC 6763 S11 domain-enumeration PTRs, at
+// "<prefix>._dns-sd._udp.<zone>" and each naming the zone itself, in line with the config:
+// "b"/"db"/"lb" (browse here) while advertiseBrowseDomain is set, "r"/"dr" (register here)
+// while advertiseRegistrationDomain is. A domain-enumeration client asks one of these before
+// it asks for the S9 type list, so without them a zone with correct S9/S4.1 records stays
+// invisible to it. Whether this zone is a domain to browse or to register in is the operator's
+// choice, not a fact about what is registered right now, so neither depends on the lease
+// store, and stopping the proxy leaves them, as it leaves the records registered through it
+// and the zone's _dnssd-srp._tcp SRV (docs/dns-sd-records.md).
+//
+// It compares the config with the zone, one PTR query per name, not with what this process
+// remembers writing: a setting turned off then also deletes what an earlier run published.
+// Only the self-pointing PTR is ever added or deleted; a PTR at the same name naming another
+// domain is left alone. A query that fails leaves its name for the next pass. Two proxies on
+// one zone with different settings would undo each other's records each pass, but several
+// proxies on one zone are not supported (docs/siglease_rfc9665.md S11). Called from the
+// reconciliation pass only, every leaseReconcileInterval from Start, since no request or
+// expiry changes what it wants.
+func (h *SRPHandler) reconcileDomainEnumeration(ctx context.Context) {
+	wanted := []struct {
+		prefix string
+		want   bool
+	}{
+		{dnssd.BrowseDomainPrefix, h.advertiseBrowseDomain},
+		{dnssd.DefaultBrowseDomainPrefix, h.advertiseBrowseDomain},
+		{dnssd.LegacyBrowseDomainPrefix, h.advertiseBrowseDomain},
+		{dnssd.RegistrationDomainPrefix, h.advertiseRegistrationDomain},
+		{dnssd.DefaultRegistrationDomainPrefix, h.advertiseRegistrationDomain},
+	}
+	var records []dns.RR
+	for _, w := range wanted {
+		owner := dnssd.DomainEnumerationOwnerName(w.prefix, h.upstreamZone)
+		ptrs, err := h.upstreamCoordinator.QueryRRs(ctx, h.upstreamZone, owner, dns.TypePTR)
+		if err != nil {
+			h.logger.Errorf("SRP handler: domain enumeration: %s is left for the next pass: %v", owner, err)
+			continue
+		}
+		present := dnssd.HasSelfPointingRecord(ptrs, h.upstreamZone)
+		records = append(records, dnssd.DiffSelfPointingDomainRecord(w.prefix, h.upstreamZone, present, w.want, h.recordTTL)...)
+	}
+	if len(records) == 0 {
+		return
+	}
+	if _, err := h.upstream().send(ctx, nil, records); err != nil {
+		h.logger.Errorf("SRP handler: domain enumeration: %v", err)
+		return
+	}
+	h.logger.Infof("SRP handler: domain enumeration for zone %s: %d change(s)", h.upstreamZone, len(records))
 }
 
 // applyRecordTTL sets the TTL of every add in cu to the one this handler writes upstream

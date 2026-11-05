@@ -42,11 +42,10 @@ func BrowsingOwnerName(svcType, zone string) string {
 // EnumerationOwnerName (or a specific type's BrowsingOwnerName) against whatever it got back
 // -- it never queries those on the originally-entered name directly. A zone with services
 // registered via SRP but none of these records is therefore invisible to such a tool even
-// though its S9/S4.1 records are otherwise perfectly correct. See
-// SRPHandler.reconcileServiceEnumeration for why this registrar publishes a trivial
-// self-pointing answer for each (this zone IS its own recommended browsing/registration
-// domain -- one zone per handler instance): "b"/"db"/"lb" once it has at least one live
-// registration; "r"/"dr" independently, gated only on its own opt-in config setting.
+// though its S9/S4.1 records are otherwise perfectly correct. This registrar publishes a
+// trivial self-pointing answer for each (this zone IS its own recommended browsing/registration
+// domain -- one zone per handler instance), each pair gated on its own config setting alone:
+// see SRPHandler.reconcileDomainEnumeration.
 const (
 	BrowseDomainPrefix              = "b"  // list of domains recommended for browsing
 	DefaultBrowseDomainPrefix       = "db" // single recommended default browsing domain
@@ -61,19 +60,32 @@ func DomainEnumerationOwnerName(prefix, zone string) string {
 	return prefix + "._dns-sd._udp." + zone
 }
 
+// HasSelfPointingRecord reports whether ptrs, the records at one RFC 6763 S11
+// domain-enumeration name in zone, include the PTR naming zone itself -- the one record
+// DiffSelfPointingDomainRecord adds or deletes. A PTR there naming another domain is not it.
+func HasSelfPointingRecord(ptrs []dns.RR, zone string) bool {
+	for _, rr := range ptrs {
+		if ptr, ok := rr.(*dns.PTR); ok && dnsname.EqualFold(ptr.Ptr, zone) {
+			return true
+		}
+	}
+	return false
+}
+
 // DiffSelfPointingDomainRecord returns the single add or delete instruction needed to bring
 // one RFC 6763 S11 domain-enumeration PTR (named by prefix, self-pointing: "this zone IS its
-// own recommended browsing/registration domain") from wasPresent to isPresent, or nil if no
-// change is needed. Unlike DiffEnumerationRecords, which diffs a whole set of service types,
-// every S11 record this registrar ever publishes has the same trivial rdata (the zone itself)
-// regardless of which of the five prefixes it is, so there's nothing to diff beyond the
-// presence flag itself.
-func DiffSelfPointingDomainRecord(prefix, zone string, wasPresent, isPresent bool, ttl uint32) []dns.RR {
-	if wasPresent == isPresent {
+// own recommended browsing/registration domain") from present, whether the zone has it now
+// (HasSelfPointingRecord), to wanted, or nil if no change is needed. Unlike
+// DiffEnumerationRecords, which diffs a whole set of service types, every S11 record this
+// registrar ever publishes has the same trivial rdata (the zone itself) regardless of which of
+// the five prefixes it is, so there's nothing to diff beyond presence. The delete removes that
+// one record (RFC 2136 S2.5.4), never a PTR at the same name naming another domain.
+func DiffSelfPointingDomainRecord(prefix, zone string, present, wanted bool, ttl uint32) []dns.RR {
+	if present == wanted {
 		return nil
 	}
 	owner := DomainEnumerationOwnerName(prefix, zone)
-	if isPresent {
+	if wanted {
 		rr := &dns.PTR{Hdr: dns.Header{Name: owner, Class: dns.ClassINET, TTL: ttl}}
 		rr.Ptr = zone
 		return []dns.RR{rr}

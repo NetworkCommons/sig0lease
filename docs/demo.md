@@ -222,10 +222,12 @@ dns-sd -B _http._tcp          # no domain: the local. and srp.dev.zenr.io. insta
 sudo networksetup -setsearchdomains Wi-Fi Empty                # undo
 ```
 
-While the proxy holds a registration it publishes `lb._dns-sd._udp.srp.dev.zenr.io. PTR
-srp.dev.zenr.io.`; mDNSResponder looks for that record in each search domain and browses what it
-names (RFC 6763 §11). This works with `dns-sd` on macOS 26.7; whether Finder and Screen
-Sharing list the instances too has not been tried.
+The proxy publishes `lb._dns-sd._udp.srp.dev.zenr.io. PTR srp.dev.zenr.io.` (within 30 s of
+starting, and it stays when the proxy stops); mDNSResponder looks for that record in each search
+domain and browses what it names (RFC 6763 §11). This works with `dns-sd` on macOS 26.7; whether
+Finder and Screen Sharing list the instances too has not been tried. Setting the search domain
+stands in for a pointer at a domain the Mac already starts from, which needs the zone's operator
+or a resolver on the network: `docs/dns-sd-records.md`, "Browsing".
 
 ## D5: two communities meet in one chat room
 

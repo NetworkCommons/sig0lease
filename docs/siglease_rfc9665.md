@@ -497,41 +497,56 @@ silently overwrote the first at the authoritative server.
 RFC 9665 itself never populates two kinds of DNS-SD "browse" record — an SRP client's Service
 Description only ever restates its own host/instance data. `pkg/dnssd` (pure logic, kept
 separate from RFC 9665 protocol logic in `pkg/srp` since it's a distinct RFC) plus
-`SRPHandler.reconcileServiceEnumeration` maintain both, unconditionally, for every `srp_handler`
-instance:
+`SRPHandler.reconcileServiceEnumeration` (§9) and `SRPHandler.reconcileDomainEnumeration` (§11)
+maintain both for every `srp_handler` instance. `docs/dns-sd-records.md` lists every DNS-SD
+discovery record, this registrar's and the operator's, and where each belongs:
 
 - **RFC 6763 §9 Service Type Enumeration** — a PTR at `_services._dns-sd._udp.<zone>`, one per
   distinct two-label service type actually registered (e.g. `_http._tcp.<zone>`). Without it,
   individually-registered services are still resolvable by a targeted per-type browse, but
   "browse everything on this zone" tools — which query this name first — find nothing.
 - **RFC 6763 §11 Domain Enumeration** — the `b`/`db`/`lb` (browsing) and `r`/`dr`
-  (registration) prefixes under `_dns-sd._udp.<zone>`. `b`/`db`/`lb` are always published, once
-  at least one service type is live, as trivial self-pointing PTRs — some browse tools query one
-  of these *before* the §9 record, so without it their browse tree dead-ends at the first step
-  and never reaches a query the §9 record would otherwise answer correctly. `r`/`dr` are
-  opt-in only, via `srp_handler.advertise_registration_domain` (default `false`): unlike
-  browsing, these tell a domain-enumeration client "you may attempt direct RFC 2136 registration
-  here," which is a deployment policy choice, not something implied by SRP already working on
-  the zone.
+  (registration) prefixes under `_dns-sd._udp.<zone>`, each a PTR naming the zone itself. Some
+  browse tools query one of these *before* the §9 record, so without it their browse tree
+  dead-ends at the first step and never reaches a query the §9 record would otherwise answer
+  correctly. They follow the config alone: `b`/`db`/`lb` while
+  `srp_handler.advertise_browse_domain` is set (default `true`), `r`/`dr` while
+  `srp_handler.advertise_registration_domain` is (default `false`: these tell a
+  domain-enumeration client "you may attempt direct RFC 2136 registration here," which is a
+  deployment policy choice, not something implied by SRP already working on the zone). Whether
+  to browse or register in a zone is the operator's choice, not a fact about what is registered
+  right now, so neither depends on the lease store. Until 2026-11 `b`/`db`/`lb` were published
+  only while a service type was live, which made them come and go with the zone's occupancy.
 
-**Safety on a real, shared, multi-process zone.** Both mechanisms track their own
-process-local view of "what's currently live" (reset on every process start, never seeded from
-a live upstream read) and only ever delete a record after a live `QueryPTRExists` check at the
-real per-type browsing name confirms it's gone everywhere, not just gone from this process's own
-view. A naive delete-all-then-reinsert design was tried first and found actively destructive
-against the real, shared `dev.zenr.io.` zone: a second proxy process (or a restart of the same
-one) has an empty local view, and reconciling from that empty view deleted another, independently
-registered instance's still-live entry for a type this process didn't yet know about locally. The
-fixed design means a fresh process's first-ever reconcile can only ever *add*, never destroy
+**§9: safety on a real, shared, multi-process zone.** The §9 record is diffed against this
+process's own view of "what's currently live" (reset on every process start, never seeded from
+a live upstream read), and a type is only ever deleted after a live PTR query at its per-type
+browsing name confirms it's gone everywhere, not just gone from this process's own view. A
+naive delete-all-then-reinsert design was tried first and found actively destructive against
+the real, shared `dev.zenr.io.` zone: a second proxy process (or a restart of the same one) has
+an empty local view, and reconciling from that empty view deleted another, independently
+registered instance's still-live entry for a type this process didn't yet know about locally.
+The fixed design means a fresh process's first-ever reconcile can only ever *add*, never destroy
 another process's or another run's still-valid data. A no-op diff sends no upstream UPDATE at
-all.
+all. It reconciles from three call sites: synchronously after a successful registration or
+removal, synchronously after an expiry, and once per tick from the same periodic reconciliation
+pass the lease store's own expiry-timer bookkeeping already uses (a self-heal after a restart or
+a missed/raced write).
 
-Both mechanisms reconcile from three call sites: synchronously after a successful registration
-or removal, synchronously after an expiry, and once per tick from the same periodic
-reconciliation pass the lease store's own expiry-timer bookkeeping already uses (a self-heal
-after a restart or a missed/raced write). Scope is `srp_handler` only — the base RFC 9664
-`UpdateHandler` accepts arbitrary RRs and has no concept of a "service description" to key this
-off of.
+**§11: compared with the zone.** Each reconciliation pass (every 30 s, the first one 30 s after
+start) queries the PTRs at the five names, one query each, and adds or deletes the
+self-pointing record where the zone differs from the config; a PTR there naming another domain
+is left alone. Comparing with the zone, not with what the process remembers writing, is what
+lets a setting turned off delete what an earlier run published: until 2026-11 the comparison was
+with memory, which is empty after a restart, so `r`/`dr` stayed for good once published. A
+query that fails leaves its name for the next pass. Requests and expiries don't touch these
+records. Stopping the proxy leaves them, as it leaves the records registered through it and the
+zone's `_dnssd-srp._tcp` SRV: a stop is not a decommissioning, and a crash would skip any
+removal anyway. Two proxies on one zone with different settings would undo each other's records
+on every pass, but several proxies on one zone are not supported (§11 below).
+
+Scope is `srp_handler` only — the base RFC 9664 `UpdateHandler` accepts arbitrary RRs and has
+no concept of a "service description" to key this off of.
 
 ## 11. Known limitations and possible future work
 
@@ -591,14 +606,16 @@ off of.
 ## 12. Testing and interop
 
 - `make test-srp` runs a full register → refresh → conflict → remove-one → host removal keeping its name → expiry → discovery
-  → concurrent claims → foreign-data takeover suite against a disposable local BIND 9, with no
+  → concurrent claims → foreign-data takeover → domain enumeration suite against a disposable local BIND 9, with no
   external dependency — this is the CI gate. Every update in it is sent by
   `cmd/sig0lease-srp-client`, the same requester users run. The discovery tests find the
   registrar through `_dnssd-srp._tcp` and `_dnssd-srp-tls._tcp`, the latter registering over
   DNS-over-TLS against the proxy's DoT listener with a throwaway certificate generated for the
   run. Two identities then claim one new name at once (one `NOERROR`, one `YXDOMAIN`), and
   the proxy, restarted with `refuse_on_foreign_data: false`, takes over a name holding non-SRP
-  data with the KEY prerequisite, which BIND must accept.
+  data with the KEY prerequisite, which BIND must accept. Last, the §11 domain-enumeration
+  records follow the config, and a proxy restarted with `advertise_browse_domain: false` deletes
+  the `b`/`db`/`lb` the earlier run published (§10).
 - The unit tests for the window in §5 hold one operation inside its upstream send while a
   second runs against the same names (`handlers/node_locks_test.go`): two keys claiming one
   name get one `NOERROR` and one `YXDOMAIN`, leaving one KEY node, which NodeKey-keyed locks

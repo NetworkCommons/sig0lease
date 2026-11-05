@@ -7,7 +7,8 @@
 # -> remove-one -> remove-all -> expiry -> LEASE-only expiry -> registrar discovery -> registrar
 # discovery and update over DNS-over-TLS -> concurrent claims of one name -> foreign-data
 # takeover -> release -> register and release over DNS-over-HTTPS (plain HTTP, as a browser on
-# the LAN reaches it). Every update is sent by the real requester,
+# the LAN reaches it) -> RFC 6763 S11 domain enumeration following the config, also across a
+# restart. Every update is sent by the real requester,
 # cmd/sig0lease-srp-client (client/srp), in -once mode -- no stubs/mocks.
 
 set -euo pipefail
@@ -414,6 +415,48 @@ test_doh() {
     PERFORMED_TESTS="$PERFORMED_TESTS\n  [OK] $log_msg"
 }
 
+test_domain_enumeration() {
+    # RFC 6763 S11: the browsing-domain records (b/db/lb) follow advertise_browse_domain,
+    # default on, and the registration-domain ones (r/dr) advertise_registration_domain,
+    # default off, whatever is registered; each names the zone itself. A proxy restarted with
+    # the settings flipped deletes what the earlier run published, as it compares the config
+    # with the zone, not with what it remembers writing. The reconciliation pass that writes
+    # them runs 30 s after the proxy starts, then every 30 s. It restarts the proxy, as
+    # TEST 11 does, and runs last.
+    local log_msg="TEST 14: Domain enumeration (RFC 6763 S11) follows the config, also across a restart"
+    log_section "$log_msg"
+    local prefix name
+
+    for prefix in b db lb; do
+        name="$prefix._dns-sd._udp.$SRP_ZONE"
+        wait_for_srp_state "$name" PTR present "$SRP_EXPIRY_TIMEOUT" || { log_error "$name not published with advertise_browse_domain on"; return 1; }
+        [ "$(dig_srp "$name" PTR)" = "$SRP_ZONE" ] || { log_error "$name: expected PTR $SRP_ZONE, got '$(dig_srp "$name" PTR)'"; return 1; }
+    done
+    for prefix in r dr; do
+        name="$prefix._dns-sd._udp.$SRP_ZONE"
+        [ -z "$(dig_srp "$name" PTR)" ] || { log_error "$name published with advertise_registration_domain off"; return 1; }
+    done
+
+    stop_srp_proxy
+    SRP_ADVERTISE_BROWSE_DOMAIN=false
+    SRP_ADVERTISE_REGISTRATION_DOMAIN=true
+    start_srp_proxy || return 1
+
+    for prefix in b db lb; do
+        name="$prefix._dns-sd._udp.$SRP_ZONE"
+        wait_for_srp_state "$name" PTR absent "$SRP_EXPIRY_TIMEOUT" || { log_error "$name, published by the earlier run, not deleted with advertise_browse_domain off"; return 1; }
+    done
+    for prefix in r dr; do
+        name="$prefix._dns-sd._udp.$SRP_ZONE"
+        wait_for_srp_state "$name" PTR present "$SRP_EXPIRY_TIMEOUT" || { log_error "$name not published with advertise_registration_domain on"; return 1; }
+        [ "$(dig_srp "$name" PTR)" = "$SRP_ZONE" ] || { log_error "$name: expected PTR $SRP_ZONE, got '$(dig_srp "$name" PTR)'"; return 1; }
+    done
+
+    log_success "b/db/lb and r/dr follow the config; the restarted proxy deleted the earlier run's b/db/lb"
+    PERFORMED_TESTS="$PERFORMED_TESTS\n  [OK] $log_msg"
+}
+
+
 ################################
 # Top level
 ################################
@@ -449,6 +492,7 @@ run_all_tests() {
     test_foreign_data_takeover
     test_release
     test_doh
+    test_domain_enumeration
 
     bind9_report_rejections || return 1
     BIND9_REJECTIONS_REPORTED=1

@@ -31,6 +31,9 @@ SRP_PROXY_DOH_PORT="${SRP_PROXY_DOH_PORT:-8161}" # the proxy's DNS-over-HTTPS li
 SRP_PROXY_DOH_URL="http://${SRP_PROXY_ADDR}:${SRP_PROXY_DOH_PORT}"
 SRP_KEYSTORE_DIR="$BIND9_SRP_KEYSTORE_DIR"
 SRP_REFUSE_ON_FOREIGN_DATA=true # the default; test_srp.sh's test_foreign_data_takeover restarts the proxy with false
+# The defaults; test_srp.sh's test_domain_enumeration restarts the proxy with both flipped.
+SRP_ADVERTISE_BROWSE_DOMAIN=true
+SRP_ADVERTISE_REGISTRATION_DOMAIN=false
 # true: the proxy also runs the RFC 9664 handler (update) on update.test., with fcfs_naming as
 # config.yaml has it, for test_agent.sh's names.
 SRP_UPDATE_HANDLER="${SRP_UPDATE_HANDLER:-false}"
@@ -88,6 +91,8 @@ handlers:
     upstream: "${BIND9_ADDR}:${BIND9_PORT}"
     allow_udp: true
     refuse_on_foreign_data: ${SRP_REFUSE_ON_FOREIGN_DATA}
+    advertise_browse_domain: ${SRP_ADVERTISE_BROWSE_DOMAIN}
+    advertise_registration_domain: ${SRP_ADVERTISE_REGISTRATION_DOMAIN}
     lease_policy:
       min_key_lease_sec: 1
       max_key_lease_sec: 1209600

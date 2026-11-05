@@ -1571,10 +1571,12 @@ type Config struct {
     Config is the top-level configuration structure.
 
 func LoadConfig(path string) (*Config, error)
-    LoadConfig reads configuration from a file.
+    LoadConfig reads the configuration from the file at path, which must exist.
 
 func NewDefaultConfig() *Config
-    NewDefaultConfig returns a configuration with sensible defaults.
+    NewDefaultConfig returns the defaults of the optional settings, which
+    LoadConfig reads the config file over. The rest -- the server's address and
+    networks, and the upstreams -- the file gives.
 
 func (c *Config) GetKeystoreDir() string
     GetKeystoreDir returns the keystore directory from handler configuration.
@@ -1651,7 +1653,7 @@ type TLSConfig struct {
 type UpstreamConfig struct {
 	// Address is the upstream DNS server address (e.g., "8.8.8.8:53")
 	Address string `yaml:"address"`
-	// Protocol is the protocol to use ("udp", "tcp", "tls", "https")
+	// Protocol is the protocol to use ("udp" or "tcp")
 	Protocol string `yaml:"protocol"`
 	// Timeout for upstream queries
 	Timeout time.Duration `yaml:"timeout"`
@@ -1908,13 +1910,15 @@ func (h *SRPHandler) Setup(cfg map[string]any) error
         refuses the update (REFUSED) when a name exists at the authoritative
         server with data but no KEY; false lets the delete-all-then-add clobber
         it. [OPTIONAL, defaults to true]
-      - "advertise_registration_domain": also publish the RFC 6763 S11 "r"/"dr"
-        registration- domain records (self-pointing at upstream_zone),
-        independent of whether any service type is currently live -- unlike the
-        always-on "b"/"db"/"lb" browsing-domain records, which only appear once
-        at least one service type is live. Advertising this zone as an open
-        target for direct RFC 2136 Dynamic Update registration (not just SRP) is
-        a deployment policy choice -- SIG(0)/FCFS still gate who can actually
+      - "advertise_browse_domain": publish the RFC 6763 S11 "b"/"db"/"lb"
+        browsing-domain records, self-pointing at upstream_zone, whether or
+        not anything is registered; false deletes them, also when an earlier
+        run published them (reconcileDomainEnumeration). [OPTIONAL, defaults to
+        true]
+      - "advertise_registration_domain": the same for the S11 "r"/"dr"
+        registration-domain records. Advertising this zone as an open target
+        for direct RFC 2136 Dynamic Update registration (not just SRP) is a
+        deployment policy choice -- SIG(0)/FCFS still gate who can actually
         write, but this controls whether domain-enumeration tools are told to
         try. [OPTIONAL, defaults to false]
 
@@ -2352,17 +2356,16 @@ const (
     RFC 6763 S11 defines five domain-enumeration meta-record prefixes,
     each rooted at "<prefix>._dns-sd._udp.<domain>.": these are a different,
     earlier query than S9 type enumeration -- a browse tool that implements full
-    domain enumeration asks one or more of these FIRST, to learn which domain
-    to browse/register in at all, and only then queries EnumerationOwnerName
-    (or a specific type's BrowsingOwnerName) against whatever it got back --
-    it never queries those on the originally-entered name directly. A zone with
-    services registered via SRP but none of these records is therefore invisible
-    to such a tool even though its S9/S4.1 records are otherwise perfectly
-    correct. See SRPHandler.reconcileServiceEnumeration for why this registrar
-    publishes a trivial self-pointing answer for each (this zone IS its own
-    recommended browsing/registration domain -- one zone per handler instance):
-    "b"/"db"/"lb" once it has at least one live registration; "r"/"dr"
-    independently, gated only on its own opt-in config setting.
+    domain enumeration asks one or more of these FIRST, to learn which domain to
+    browse/register in at all, and only then queries EnumerationOwnerName (or a
+    specific type's BrowsingOwnerName) against whatever it got back -- it never
+    queries those on the originally-entered name directly. A zone with services
+    registered via SRP but none of these records is therefore invisible to such
+    a tool even though its S9/S4.1 records are otherwise perfectly correct.
+    This registrar publishes a trivial self-pointing answer for each (this
+    zone IS its own recommended browsing/registration domain -- one zone
+    per handler instance), each pair gated on its own config setting alone:
+    see SRPHandler.reconcileDomainEnumeration.
 
 
 FUNCTIONS
@@ -2403,15 +2406,17 @@ func DiffEnumerationRecords(zone string, previous, current []string, ttl uint32)
     so a fresh process's first-ever call (previous typically empty) can only
     ever ADD, never destroy another process's data.
 
-func DiffSelfPointingDomainRecord(prefix, zone string, wasPresent, isPresent bool, ttl uint32) []dns.RR
+func DiffSelfPointingDomainRecord(prefix, zone string, present, wanted bool, ttl uint32) []dns.RR
     DiffSelfPointingDomainRecord returns the single add or delete instruction
     needed to bring one RFC 6763 S11 domain-enumeration PTR (named by prefix,
     self-pointing: "this zone IS its own recommended browsing/registration
-    domain") from wasPresent to isPresent, or nil if no change is needed.
-    Unlike DiffEnumerationRecords, which diffs a whole set of service types,
-    every S11 record this registrar ever publishes has the same trivial rdata
-    (the zone itself) regardless of which of the five prefixes it is, so there's
-    nothing to diff beyond the presence flag itself.
+    domain") from present, whether the zone has it now (HasSelfPointingRecord),
+    to wanted, or nil if no change is needed. Unlike DiffEnumerationRecords,
+    which diffs a whole set of service types, every S11 record this registrar
+    ever publishes has the same trivial rdata (the zone itself) regardless
+    of which of the five prefixes it is, so there's nothing to diff beyond
+    presence. The delete removes that one record (RFC 2136 S2.5.4), never a PTR
+    at the same name naming another domain.
 
 func DomainEnumerationOwnerName(prefix, zone string) string
     DomainEnumerationOwnerName returns the RFC 6763 S11 domain-enumeration
@@ -2426,6 +2431,12 @@ func EnumerationOwnerName(zone string) string
     not one per protocol. zone must already be dot-terminated (this package does
     no normalization of its own, matching the rest of this codebase's convention
     of trusting an already-canonical zone at this layer).
+
+func HasSelfPointingRecord(ptrs []dns.RR, zone string) bool
+    HasSelfPointingRecord reports whether ptrs, the records at one RFC 6763 S11
+    domain-enumeration name in zone, include the PTR naming zone itself -- the
+    one record DiffSelfPointingDomainRecord adds or deletes. A PTR there naming
+    another domain is not it.
 
 func ServiceTypeFromInstanceName(name string) (svcType string, ok bool)
     ServiceTypeFromInstanceName extracts the two-label DNS-SD service
@@ -3645,9 +3656,9 @@ type Coordinator struct {
     *Coordinator directly -- there is no per-package wrapper type.
 
 func NewCoordinator(logger *logging.Logger, bootstrapResolvers []string, static *StaticUpstream) *Coordinator
-    NewCoordinator creates a Coordinator. bootstrapResolvers falls back to
-    defaultBootstrapResolvers when empty. static may be nil (discovery for every
-    name).
+    NewCoordinator creates a Coordinator. static may be nil (discovery for every
+    name). With no bootstrapResolvers, discovery fails: only names at or below
+    static's zone can be served.
 
 func (c *Coordinator) QueryAuthoritative(ctx context.Context, zoneHint string, req *dns.Msg, what string) (*dns.Msg, error)
     QueryAuthoritative sends req, with its RD bit cleared, to zoneHint's
@@ -3669,23 +3680,13 @@ func (c *Coordinator) QueryKeyAtName(ctx context.Context, zoneHint, name string)
     when reused by a caller, the "does this name already have a KEY" question
     the base handler asks elsewhere.
 
-func (c *Coordinator) QueryPTRExists(ctx context.Context, zoneHint, name string) (bool, error)
-    QueryPTRExists reports whether at least one PTR record currently exists live
-    at name (typically a per-type browsing name "<type>.<zone>", RFC 6763 S4.1)
-    against zoneHint's resolved authoritative server -- same query/fallback
-    shape as QueryKeyAtName, but a simple presence check rather than a tri-state
-    result, since the only question here is "does anything else still provide
-    this type." Used by handlers.SRPHandler.reconcileServiceEnumeration
-    immediately before removing a type from the RFC 6763 S9 enumeration record,
-    to confirm no OTHER registrant this process's own local lease store doesn't
-    know about still provides it -- see that function's doc comment for why a
-    local-only view can't safely decide this alone.
-
 func (c *Coordinator) QueryRRs(ctx context.Context, zoneHint, name string, rrType uint16) ([]dns.RR, error)
     QueryRRs returns the rrType records at name from zoneHint's authoritative
-    server -- none for NXDOMAIN -- with the same query/fallback shape as
-    QueryKeyAtName. Used by the RFC 9664 handler's checks of what is already
-    published (signer KEYs, duplicate registrations).
+    server -- none for NXDOMAIN -- with the same query/fallback shape
+    as QueryKeyAtName. Used by the RFC 9664 handler's checks of what is
+    already published (signer KEYs, duplicate registrations), and by the SRP
+    handler's RFC 6763 S9 and S11 reconciliation (the PTRs at a browsing or
+    domain-enumeration name).
 
 func (c *Coordinator) ResolveAuthoritativeZone(ctx context.Context, zone string) (string, error)
     ResolveAuthoritativeZone returns the apex of the zone holding zone -- the

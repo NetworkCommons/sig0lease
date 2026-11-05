@@ -119,8 +119,10 @@ dig +noall +answer PTR "_services._dns-sd._udp.srp.dev.zenr.io." @ns1.free2air.o
 
 # RFC 6763 S11: domain enumeration -- some browse tools query this ("is there a browsable
 # domain here at all") before ever trying the S9 query above. db/lb are the same
-# self-pointing answer under a different prefix; r/dr (registration-domain) are omitted
-# here since they're opt-in (advertise_registration_domain) and off by default.
+# self-pointing answer under a different prefix, all three there whenever
+# advertise_browse_domain is on (the default), registered services or not; r/dr
+# (registration-domain) are omitted here since they're opt-in (advertise_registration_domain)
+# and off by default. docs/dns-sd-records.md lists every discovery record.
 dig +noall +answer PTR "b._dns-sd._udp.srp.dev.zenr.io." @ns1.free2air.org
 ```
 
@@ -266,12 +268,15 @@ first appears.
   each, instead of mirrored; `agent.yaml` at the top of the repository shows both.
 
 A second Mac can also list these instances among its ordinary Bonjour results, without being
-told the domain. Once the proxy has a live registration it publishes
-`lb._dns-sd._udp.srp.dev.zenr.io. PTR srp.dev.zenr.io.`, and mDNSResponder looks for that
-record in each DNS search domain (`mDNSCore/uDNS.c`, RFC 6763 §11) and browses what it
+told the domain. The proxy publishes `lb._dns-sd._udp.srp.dev.zenr.io. PTR srp.dev.zenr.io.`
+(`advertise_browse_domain`, on by default, within 30 s of starting), and mDNSResponder looks
+for that record in each DNS search domain (`mDNSCore/uDNS.c`, RFC 6763 §11) and browses what it
 names. On macOS 26.7, `dns-sd -F` then lists `srp.dev.zenr.io` as a recommended and default
 browsing domain, and a browse without a domain returns its instances beside the `local.` ones.
-The search domain must be the registration domain itself, where those records are.
+The search domain must be the registration domain itself, where those records are. Without
+changing the Mac's settings, the pointer would have to be at a domain the Mac already starts
+from, which needs the zone's operator or a resolver on the network: `docs/dns-sd-records.md`,
+"Browsing".
 
 ```bash
 sudo networksetup -setsearchdomains Wi-Fi srp.dev.zenr.io   # undo: ... Wi-Fi Empty

@@ -119,14 +119,16 @@ handlers:
   #                                 hardcodes it, having no other way to discover a zone) as
   #                                 an alias for upstream_zone, rewriting every name in the
   #                                 update before anything else sees it (default false)
-  #   advertise_registration_domain: also publish the RFC 6763 S11 "r"/"dr" registration-
-  #                                 domain records (self-pointing at upstream_zone), independent
-  #                                 of whether any service type is currently live -- unlike the
-  #                                 always-on "b"/"db"/"lb" browsing-domain records, which only
-  #                                 appear once at least one service type is live. Off by
-  #                                 default -- advertising this zone as an open target for
-  #                                 direct RFC 2136 registration (not just SRP) is a deployment
-  #                                 choice.
+  #   advertise_browse_domain:      publish the RFC 6763 S11 "b"/"db"/"lb" browsing-domain
+  #                                 records, self-pointing at upstream_zone, whether or not
+  #                                 anything is registered (default true). false deletes them,
+  #                                 also when an earlier run published them: every
+  #                                 reconciliation pass (30 s) compares this with the zone.
+  #   advertise_registration_domain: the same for the S11 "r"/"dr" registration-domain
+  #                                 records. Off by default -- advertising this zone as an open
+  #                                 target for direct RFC 2136 registration (not just SRP) is a
+  #                                 deployment choice. docs/dns-sd-records.md lists the
+  #                                 discovery records and where each belongs.
   srp_handler:
     upstream_zone: "srp.dev.zenr.io."
     # Optional static "host:port" of the authoritative server, as for handlers.update below.
@@ -135,6 +137,7 @@ handlers:
     rewrite_default_service_arpa: true
     # mDNSResponder's srp-client sends SRP over UDP only (docs/srp-live-demo.md).
     allow_udp: true
+    # advertise_browse_domain: true
     # advertise_registration_domain: false
     lease_policy:
       min_key_lease_sec: 30

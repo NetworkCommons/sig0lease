@@ -45,14 +45,15 @@ type fakeSRPCoordinator struct {
 	// simulated in a single goroutine so the test stays deterministic).
 	onSendUpdate func()
 
-	// ptrExists/ptrExistsErr back QueryPTRExists (RFC 6763 S9's "is anything else still
-	// providing this type" check). Defaulting to (false, nil) matches every existing
-	// test's isolated-single-proxy world -- nothing else could possibly still be
-	// providing a type this process's own store has lost track of -- so a type dropping
-	// out of the local store still gets deleted from the enumeration record exactly as
-	// before, without any test needing to configure this explicitly.
-	ptrExists    bool
-	ptrExistsErr error
+	// zonePTRs and ptrQueryErr back QueryRRs, keyed by dnsname.Normalize(name): the PTRs
+	// the authoritative server holds at a name, for RFC 6763 S9's "is anything else still
+	// providing this type" check and S11's comparison with the config, or the error the
+	// query fails with. Empty by default, matching every existing test's
+	// isolated-single-proxy world -- nothing else could possibly still be providing a type
+	// this process's own store has lost track of -- so a type dropping out of the local store
+	// still gets deleted from the enumeration record without any test configuring this.
+	zonePTRs    map[string][]dns.RR
+	ptrQueryErr map[string]error
 
 	// authoritative, if set, answers QueryAuthoritative: the query route's upstream.
 	authoritative func(zoneHint string, req *dns.Msg) (*dns.Msg, error)
@@ -74,8 +75,30 @@ func (f *fakeSRPCoordinator) ResolveAuthoritativeZone(ctx context.Context, zone 
 	return zone, nil
 }
 
-func (f *fakeSRPCoordinator) QueryPTRExists(ctx context.Context, zoneHint, name string) (bool, error) {
-	return f.ptrExists, f.ptrExistsErr
+// QueryRRs answers PTR queries from zonePTRs and ptrQueryErr; the SRP handler asks for no
+// other type, so any other fails the query.
+func (f *fakeSRPCoordinator) QueryRRs(ctx context.Context, zoneHint, name string, rrType uint16) ([]dns.RR, error) {
+	if rrType != dns.TypePTR {
+		return nil, fmt.Errorf("fakeSRPCoordinator: unexpected %s query for %s", dns.TypeToString[rrType], name)
+	}
+	if err := f.ptrQueryErr[dnsname.Normalize(name)]; err != nil {
+		return nil, err
+	}
+	return f.zonePTRs[dnsname.Normalize(name)], nil
+}
+
+// setZonePTRs makes the fake authoritative server hold PTRs at name, one per target.
+func (f *fakeSRPCoordinator) setZonePTRs(name string, targets ...string) {
+	if f.zonePTRs == nil {
+		f.zonePTRs = map[string][]dns.RR{}
+	}
+	var rrs []dns.RR
+	for _, target := range targets {
+		rr := &dns.PTR{Hdr: dns.Header{Name: name, Class: dns.ClassINET, TTL: 3600}}
+		rr.Ptr = target
+		rrs = append(rrs, rr)
+	}
+	f.zonePTRs[dnsname.Normalize(name)] = rrs
 }
 
 // QueryAuthoritative answers with authoritative, or fails if the test gave the fake none.
@@ -1388,7 +1411,7 @@ func TestSRPHandle_RemoveOneInstance(t *testing.T) {
 	}
 
 	// sent[3] is the removal's own RFC 6763 S9 enumeration reconcile: with no other
-	// registrant providing _http._tcp (the fake's default QueryPTRExists = false), it must
+	// registrant providing _http._tcp (the fake holds no PTR there by default), it must
 	// actually delete the now-unused type from the enumeration record.
 	enumOwner := "_services._dns-sd._udp." + srpTestZone
 	foundEnumDelete := false
@@ -1407,7 +1430,7 @@ func TestSRPHandle_RemoveOneInstance(t *testing.T) {
 // dev.zenr.io. zone: a second, independent proxy process (or a restart of the same one)
 // has no local knowledge of a type a DIFFERENT/earlier registrant provided, so removing the
 // one instance THIS process does know about must not blindly delete the shared enumeration
-// entry out from under that other, still-live registrant. QueryPTRExists standing in for
+// entry out from under that other, still-live registrant. A PTR at the browsing name standing in for
 // "yes, something else still answers a real browse for this type" is exactly the live check
 // reconcileServiceEnumeration performs before ever emitting a delete.
 func TestSRPHandle_ServiceEnumeration_KeepsListedWhenAnotherRegistrantStillProvidesType(t *testing.T) {
@@ -1422,7 +1445,7 @@ func TestSRPHandle_ServiceEnumeration_KeepsListedWhenAnotherRegistrantStillProvi
 	}
 
 	// Another registrant this process doesn't manage still answers a browse for the type.
-	coord.ptrExists = true
+	coord.setZonePTRs("_http._tcp."+srpTestZone, "Other._http._tcp."+srpTestZone)
 
 	removal := []srpInstanceSpec{{name: inst, removalShaped: true}}
 	second := buildSRPUpdate(t, srpTestZone, id, host, []string{"192.0.2.1"}, removal, 30, 1209600, host)
@@ -1449,23 +1472,195 @@ func TestSRPHandle_ServiceEnumeration_KeepsListedWhenAnotherRegistrantStillProvi
 	}
 }
 
-// alwaysOnDomainEnumPrefixes are the three RFC 6763 S11 prefixes reconcileServiceEnumeration
-// publishes whenever at least one service type is live, with no config opt-in required --
-// "r"/"dr" (registration domains) are separately gated behind advertiseRegistrationDomain and
-// covered by their own tests below.
-var alwaysOnDomainEnumPrefixes = []string{"b", "db", "lb"}
+// browsePrefixes and registrationPrefixes are the RFC 6763 S11 domain-enumeration prefixes
+// advertise_browse_domain and advertise_registration_domain control.
+var (
+	browsePrefixes       = []string{"b", "db", "lb"}
+	registrationPrefixes = []string{"r", "dr"}
+)
 
-// TestSRPHandle_BrowseDomains_AddedOnRegistrationRemovedWhenZoneEmpties exercises the three
-// always-on RFC 6763 S11 domain-enumeration PTRs (b/db/lb, all self-pointing at the zone)
-// reconcileServiceEnumeration now also maintains alongside the S9 type-enumeration record: a
-// domain-enumeration browse tool (e.g. a "browse everything" inspector) queries one of these
-// FIRST, before it ever asks for the S9 type list -- without them, a zone with perfectly
-// correct S9/S4.1 data is still invisible to such a tool. This pins all three appearing
-// together on the first registration and disappearing together once the zone's only
-// registration is removed (mirroring the S9 type record's own add-then-delete shape, bundled
-// into the same upstream messages).
-func TestSRPHandle_BrowseDomains_AddedOnRegistrationRemovedWhenZoneEmpties(t *testing.T) {
+// domainEnumOwner is prefix's S11 name in srpTestZone.
+func domainEnumOwner(prefix string) string { return prefix + "._dns-sd._udp." + srpTestZone }
+
+// domainEnumChanges returns the PTRs msg's update section adds (class IN) and deletes one by
+// one (class NONE) at prefix's S11 name.
+func domainEnumChanges(msg *dns.Msg, prefix string) (adds, deletes []*dns.PTR) {
+	for _, rr := range msg.Ns {
+		ptr, ok := rr.(*dns.PTR)
+		if !ok || !dnsname.EqualFold(ptr.Hdr.Name, domainEnumOwner(prefix)) {
+			continue
+		}
+		switch ptr.Hdr.Class {
+		case dns.ClassINET:
+			adds = append(adds, ptr)
+		case dns.ClassNONE:
+			deletes = append(deletes, ptr)
+		}
+	}
+	return adds, deletes
+}
+
+// requireSelfPointingAdd fails unless msg adds prefix's S11 PTR, naming the zone itself, and
+// deletes nothing there.
+func requireSelfPointingAdd(t *testing.T, msg *dns.Msg, prefix string) {
+	t.Helper()
+	adds, deletes := domainEnumChanges(msg, prefix)
+	if len(adds) != 1 || !dnsname.EqualFold(adds[0].Ptr, srpTestZone) || len(deletes) != 0 {
+		t.Fatalf("%s: want one add of PTR %s and no delete, got adds %v, deletes %v", prefix, srpTestZone, adds, deletes)
+	}
+}
+
+// requireSelfPointingDelete fails unless msg deletes prefix's S11 PTR naming the zone itself,
+// that record alone, and adds nothing there.
+func requireSelfPointingDelete(t *testing.T, msg *dns.Msg, prefix string) {
+	t.Helper()
+	adds, deletes := domainEnumChanges(msg, prefix)
+	if len(deletes) != 1 || !dnsname.EqualFold(deletes[0].Ptr, srpTestZone) || len(adds) != 0 {
+		t.Fatalf("%s: want one delete of PTR %s and no add, got adds %v, deletes %v", prefix, srpTestZone, adds, deletes)
+	}
+}
+
+// requireUntouched fails if msg changes anything at prefix's S11 name.
+func requireUntouched(t *testing.T, msg *dns.Msg, prefix string) {
+	t.Helper()
+	if adds, deletes := domainEnumChanges(msg, prefix); len(adds) != 0 || len(deletes) != 0 {
+		t.Fatalf("%s: want no change, got adds %v, deletes %v", prefix, adds, deletes)
+	}
+}
+
+// TestDomainEnumeration_PublishedWithNothingRegistered: with the defaults (browse on, register
+// off) and nothing registered, a pass publishes b/db/lb, each naming the zone, and no r/dr.
+// Whether to browse a zone is the operator's choice, not a fact about what is registered.
+func TestDomainEnumeration_PublishedWithNothingRegistered(t *testing.T) {
 	h, coord := newSRPTestHandler(t)
+
+	h.reconcileDomainEnumeration(context.Background())
+
+	if len(coord.sent) != 1 {
+		t.Fatalf("want one UPDATE, got %d", len(coord.sent))
+	}
+	for _, prefix := range browsePrefixes {
+		requireSelfPointingAdd(t, coord.sent[0], prefix)
+	}
+	for _, prefix := range registrationPrefixes {
+		requireUntouched(t, coord.sent[0], prefix)
+	}
+}
+
+// TestDomainEnumeration_RegistrationDomainsWhenOptedIn: advertise_registration_domain on and
+// advertise_browse_domain off publish r/dr and leave b/db/lb absent.
+func TestDomainEnumeration_RegistrationDomainsWhenOptedIn(t *testing.T) {
+	h, coord := newSRPTestHandler(t)
+	h.advertiseBrowseDomain = false
+	h.advertiseRegistrationDomain = true
+
+	h.reconcileDomainEnumeration(context.Background())
+
+	if len(coord.sent) != 1 {
+		t.Fatalf("want one UPDATE, got %d", len(coord.sent))
+	}
+	for _, prefix := range registrationPrefixes {
+		requireSelfPointingAdd(t, coord.sent[0], prefix)
+	}
+	for _, prefix := range browsePrefixes {
+		requireUntouched(t, coord.sent[0], prefix)
+	}
+}
+
+// TestDomainEnumeration_NothingSentWhenTheZoneMatches: a pass that finds the zone already as
+// the config wants it sends no UPDATE.
+func TestDomainEnumeration_NothingSentWhenTheZoneMatches(t *testing.T) {
+	h, coord := newSRPTestHandler(t)
+	for _, prefix := range browsePrefixes {
+		coord.setZonePTRs(domainEnumOwner(prefix), srpTestZone)
+	}
+
+	h.reconcileDomainEnumeration(context.Background())
+
+	if len(coord.sent) != 0 {
+		t.Fatalf("want no UPDATE, got %d: %v", len(coord.sent), coord.sent)
+	}
+}
+
+// TestDomainEnumeration_SettingOffDeletesWhatAnEarlierRunPublished: a handler that has never
+// written anything, as after a restart, with both settings off, finds all five records in
+// the zone and deletes each, record by record. Comparing with its own memory, it would
+// have sent nothing and left them for good.
+func TestDomainEnumeration_SettingOffDeletesWhatAnEarlierRunPublished(t *testing.T) {
+	h, coord := newSRPTestHandler(t)
+	h.advertiseBrowseDomain = false
+	h.advertiseRegistrationDomain = false
+	all := append(append([]string{}, browsePrefixes...), registrationPrefixes...)
+	for _, prefix := range all {
+		coord.setZonePTRs(domainEnumOwner(prefix), srpTestZone)
+	}
+
+	h.reconcileDomainEnumeration(context.Background())
+
+	if len(coord.sent) != 1 {
+		t.Fatalf("want one UPDATE, got %d", len(coord.sent))
+	}
+	for _, prefix := range all {
+		requireSelfPointingDelete(t, coord.sent[0], prefix)
+	}
+}
+
+// TestDomainEnumeration_LeavesAPTRToAnotherDomainAlone: a PTR at an S11 name naming another
+// domain, such as one the zone's operator publishes, is never deleted, with the setting off or
+// on; only the self-pointing record is added or deleted next to it.
+func TestDomainEnumeration_LeavesAPTRToAnotherDomainAlone(t *testing.T) {
+	const other = "other.example."
+
+	t.Run("setting off", func(t *testing.T) {
+		h, coord := newSRPTestHandler(t)
+		h.advertiseBrowseDomain = false
+		coord.setZonePTRs(domainEnumOwner("b"), other, srpTestZone)
+		coord.setZonePTRs(domainEnumOwner("lb"), other)
+
+		h.reconcileDomainEnumeration(context.Background())
+
+		if len(coord.sent) != 1 {
+			t.Fatalf("want one UPDATE, got %d", len(coord.sent))
+		}
+		requireSelfPointingDelete(t, coord.sent[0], "b")
+		requireUntouched(t, coord.sent[0], "lb")
+	})
+
+	t.Run("setting on", func(t *testing.T) {
+		h, coord := newSRPTestHandler(t)
+		coord.setZonePTRs(domainEnumOwner("b"), other)
+
+		h.reconcileDomainEnumeration(context.Background())
+
+		if len(coord.sent) != 1 {
+			t.Fatalf("want one UPDATE, got %d", len(coord.sent))
+		}
+		requireSelfPointingAdd(t, coord.sent[0], "b")
+	})
+}
+
+// TestDomainEnumeration_FailedQueryLeavesThatNameForTheNextPass: a name whose query fails is
+// neither added nor deleted this pass; the others are still brought in line.
+func TestDomainEnumeration_FailedQueryLeavesThatNameForTheNextPass(t *testing.T) {
+	h, coord := newSRPTestHandler(t)
+	coord.ptrQueryErr = map[string]error{dnsname.Normalize(domainEnumOwner("b")): fmt.Errorf("upstream timeout")}
+
+	h.reconcileDomainEnumeration(context.Background())
+
+	if len(coord.sent) != 1 {
+		t.Fatalf("want one UPDATE, got %d", len(coord.sent))
+	}
+	requireUntouched(t, coord.sent[0], "b")
+	requireSelfPointingAdd(t, coord.sent[0], "db")
+	requireSelfPointingAdd(t, coord.sent[0], "lb")
+}
+
+// TestSRPHandle_RegistrationSendsNoDomainEnumeration: a registration and a removal, with both
+// settings on, touch no S11 record. Only the reconciliation pass does: nothing a request
+// changes decides them.
+func TestSRPHandle_RegistrationSendsNoDomainEnumeration(t *testing.T) {
+	h, coord := newSRPTestHandler(t)
+	h.advertiseRegistrationDomain = true
 	id := newSRPTestIdentity(t)
 	const host = "srptest12c.dev.zenr.io."
 	inst := oneWidgetInstance()[0].name
@@ -1474,222 +1669,18 @@ func TestSRPHandle_BrowseDomains_AddedOnRegistrationRemovedWhenZoneEmpties(t *te
 	if res := h.Handle(context.Background(), stubTCPResponseWriter{}, first); res.Status != StatusProcessed {
 		t.Fatalf("fresh registration: expected Processed, got %s: %v", res.Status, res.Error)
 	}
-
-	// sent[0]=registration forward, sent[1]=its RFC 6763 S9/S11 enumeration reconcile.
-	for _, prefix := range alwaysOnDomainEnumPrefixes {
-		owner := prefix + "._dns-sd._udp." + srpTestZone
-		found := false
-		for _, rr := range coord.sent[1].Ns {
-			if ptr, ok := rr.(*dns.PTR); ok && ptr.Hdr.Class == dns.ClassINET && dnsname.Normalize(ptr.Hdr.Name) == dnsname.Normalize(owner) {
-				if dnsname.Normalize(ptr.Ptr) != dnsname.Normalize(srpTestZone) {
-					t.Fatalf("%s: expected the domain-enumeration PTR to point at the zone itself, got %q", prefix, ptr.Ptr)
-				}
-				found = true
-			}
-		}
-		if !found {
-			t.Fatalf("expected the registration's own enumeration reconcile to add the %q domain-enumeration PTR, got Ns: %+v", prefix, coord.sent[1].Ns)
-		}
-	}
-
 	removal := []srpInstanceSpec{{name: inst, removalShaped: true}}
 	second := buildSRPUpdate(t, srpTestZone, id, host, []string{"192.0.2.1"}, removal, 30, 1209600, host)
 	if res := h.Handle(context.Background(), stubTCPResponseWriter{}, second); res.Status != StatusProcessed {
 		t.Fatalf("removal: expected Processed, got %s: %v", res.Status, res.Error)
 	}
 
-	// sent[2]=removal forward, sent[3]=its own enumeration reconcile.
-	for _, prefix := range alwaysOnDomainEnumPrefixes {
-		owner := prefix + "._dns-sd._udp." + srpTestZone
-		found := false
-		for _, rr := range coord.sent[3].Ns {
-			if ptr, ok := rr.(*dns.PTR); ok && ptr.Hdr.Class == dns.ClassNONE && dnsname.Normalize(ptr.Hdr.Name) == dnsname.Normalize(owner) {
-				found = true
-			}
-		}
-		if !found {
-			t.Fatalf("expected the removal's own enumeration reconcile to delete the now-unused %q domain-enumeration PTR, got Ns: %+v", prefix, coord.sent[3].Ns)
-		}
-	}
-}
-
-// TestSRPHandle_BrowseDomains_KeptWhenAnotherRegistrantStillProvidesAType mirrors
-// TestSRPHandle_ServiceEnumeration_KeepsListedWhenAnotherRegistrantStillProvidesType for the
-// always-on S11 domain-enumeration PTRs: removing the only instance THIS process knows about
-// must not delete b/db/lb out from under a different, still-live registrant elsewhere in the
-// same shared zone.
-func TestSRPHandle_BrowseDomains_KeptWhenAnotherRegistrantStillProvidesAType(t *testing.T) {
-	h, coord := newSRPTestHandler(t)
-	id := newSRPTestIdentity(t)
-	const host = "srptest12d.dev.zenr.io."
-	inst := oneWidgetInstance()[0].name
-
-	first := buildSRPUpdate(t, srpTestZone, id, host, []string{"192.0.2.1"}, oneWidgetInstance(), 30, 1209600, host)
-	if res := h.Handle(context.Background(), stubTCPResponseWriter{}, first); res.Status != StatusProcessed {
-		t.Fatalf("fresh registration: expected Processed, got %s: %v", res.Status, res.Error)
-	}
-
-	// Another registrant this process doesn't manage still answers a browse for the type.
-	coord.ptrExists = true
-
-	removal := []srpInstanceSpec{{name: inst, removalShaped: true}}
-	second := buildSRPUpdate(t, srpTestZone, id, host, []string{"192.0.2.1"}, removal, 30, 1209600, host)
-	if res := h.Handle(context.Background(), stubTCPResponseWriter{}, second); res.Status != StatusProcessed {
-		t.Fatalf("removal: expected Processed, got %s: %v", res.Status, res.Error)
-	}
-
-	// Same as the S9 type-enumeration analogue: with the type still live elsewhere, none of
-	// these records has anything to change, so the removal's own enumeration reconcile sends
-	// nothing at all -- only the removal forward itself (sent[2]) is expected.
-	if len(coord.sent) != 3 {
-		t.Fatalf("expected 3 upstream sends (registration forward, its enumeration add, removal forward -- no enumeration send for the removal), got %d", len(coord.sent))
+	if len(coord.sent) == 0 {
+		t.Fatal("want the registration and removal sent upstream")
 	}
 	for _, msg := range coord.sent {
-		for _, rr := range msg.Ns {
-			ptr, ok := rr.(*dns.PTR)
-			if !ok || ptr.Hdr.Class != dns.ClassNONE {
-				continue
-			}
-			for _, prefix := range alwaysOnDomainEnumPrefixes {
-				owner := prefix + "._dns-sd._udp." + srpTestZone
-				if dnsname.Normalize(ptr.Hdr.Name) == dnsname.Normalize(owner) {
-					t.Fatalf("expected no %q domain-enumeration PTR delete while another registrant still provides a service type, got: %s", prefix, ptr.String())
-				}
-			}
-		}
-	}
-}
-
-// TestSRPHandle_RegistrationDomains_OffByDefault confirms "r"/"dr" (RFC 6763 S11's
-// registration-domain records) are never published unless the operator opts in via
-// advertise_registration_domain -- unlike b/db/lb, advertising this zone as an open target
-// for direct RFC 2136 Dynamic Update registration is a deployment policy choice, not implied
-// by SRP working here.
-func TestSRPHandle_RegistrationDomains_OffByDefault(t *testing.T) {
-	h, coord := newSRPTestHandler(t)
-	id := newSRPTestIdentity(t)
-	const host = "srptest12e.dev.zenr.io."
-
-	msg := buildSRPUpdate(t, srpTestZone, id, host, []string{"192.0.2.1"}, oneWidgetInstance(), 30, 1209600, host)
-	if res := h.Handle(context.Background(), stubTCPResponseWriter{}, msg); res.Status != StatusProcessed {
-		t.Fatalf("fresh registration: expected Processed, got %s: %v", res.Status, res.Error)
-	}
-
-	for _, prefix := range []string{"r", "dr"} {
-		owner := prefix + "._dns-sd._udp." + srpTestZone
-		for _, sent := range coord.sent {
-			for _, rr := range sent.Ns {
-				if ptr, ok := rr.(*dns.PTR); ok && dnsname.Normalize(ptr.Hdr.Name) == dnsname.Normalize(owner) {
-					t.Fatalf("expected no %q record without advertise_registration_domain, got: %s", prefix, ptr.String())
-				}
-			}
-		}
-	}
-}
-
-// TestSRPHandle_RegistrationDomains_PublishedWhenOptedIn confirms "r"/"dr" appear, self-
-// pointing at the zone exactly like b/db/lb, once advertiseRegistrationDomain is set.
-func TestSRPHandle_RegistrationDomains_PublishedWhenOptedIn(t *testing.T) {
-	h, coord := newSRPTestHandler(t)
-	h.advertiseRegistrationDomain = true
-	id := newSRPTestIdentity(t)
-	const host = "srptest12f.dev.zenr.io."
-
-	msg := buildSRPUpdate(t, srpTestZone, id, host, []string{"192.0.2.1"}, oneWidgetInstance(), 30, 1209600, host)
-	if res := h.Handle(context.Background(), stubTCPResponseWriter{}, msg); res.Status != StatusProcessed {
-		t.Fatalf("fresh registration: expected Processed, got %s: %v", res.Status, res.Error)
-	}
-
-	// sent[1] is the registration's own enumeration reconcile.
-	for _, prefix := range []string{"r", "dr"} {
-		owner := prefix + "._dns-sd._udp." + srpTestZone
-		found := false
-		for _, rr := range coord.sent[1].Ns {
-			if ptr, ok := rr.(*dns.PTR); ok && ptr.Hdr.Class == dns.ClassINET && dnsname.Normalize(ptr.Hdr.Name) == dnsname.Normalize(owner) {
-				if dnsname.Normalize(ptr.Ptr) != dnsname.Normalize(srpTestZone) {
-					t.Fatalf("%s: expected the registration-domain PTR to point at the zone itself, got %q", prefix, ptr.Ptr)
-				}
-				found = true
-			}
-		}
-		if !found {
-			t.Fatalf("expected the enumeration reconcile to add the %q registration-domain PTR when opted in, got Ns: %+v", prefix, coord.sent[1].Ns)
-		}
-	}
-}
-
-// TestSRPHandle_RegistrationDomains_PublishedWithNoLiveServices confirms "r"/"dr" are
-// published purely off advertiseRegistrationDomain, with no live service type required --
-// unlike b/db/lb (which advertise "there's something to browse," so stay absent on an empty
-// zone), "r"/"dr" advertise "you may register here," a deployment policy choice that holds
-// regardless of current occupancy. A zone that only ever published "r"/"dr" once something
-// registered would be unreachable by exactly the RFC 2136 client that relies on domain
-// enumeration to find where to register in the first place.
-func TestSRPHandle_RegistrationDomains_PublishedWithNoLiveServices(t *testing.T) {
-	h, coord := newSRPTestHandler(t)
-	h.advertiseRegistrationDomain = true
-
-	h.reconcileServiceEnumeration(context.Background())
-
-	if len(coord.sent) != 1 {
-		t.Fatalf("expected one upstream send for the reconcile, got %d: %+v", len(coord.sent), coord.sent)
-	}
-	for _, prefix := range []string{"r", "dr"} {
-		owner := prefix + "._dns-sd._udp." + srpTestZone
-		found := false
-		for _, rr := range coord.sent[0].Ns {
-			if ptr, ok := rr.(*dns.PTR); ok && ptr.Hdr.Class == dns.ClassINET && dnsname.Normalize(ptr.Hdr.Name) == dnsname.Normalize(owner) {
-				if dnsname.Normalize(ptr.Ptr) != dnsname.Normalize(srpTestZone) {
-					t.Fatalf("%s: expected the registration-domain PTR to point at the zone itself, got %q", prefix, ptr.Ptr)
-				}
-				found = true
-			}
-		}
-		if !found {
-			t.Fatalf("expected the %q registration-domain PTR even with no live service type, got Ns: %+v", prefix, coord.sent[0].Ns)
-		}
-	}
-	for _, prefix := range alwaysOnDomainEnumPrefixes {
-		owner := prefix + "._dns-sd._udp." + srpTestZone
-		for _, rr := range coord.sent[0].Ns {
-			if ptr, ok := rr.(*dns.PTR); ok && dnsname.Normalize(ptr.Hdr.Name) == dnsname.Normalize(owner) {
-				t.Fatalf("expected no %q browsing-domain PTR with no live service type, got: %s", prefix, ptr.String())
-			}
-		}
-	}
-}
-
-// TestSRPHandle_RegistrationDomains_StayPublishedWhenZoneEmpties confirms "r"/"dr" are NOT
-// withdrawn when the zone's last live service type disappears, in contrast to b/db/lb (see
-// TestSRPHandle_BrowseDomains_AddedOnRegistrationRemovedWhenZoneEmpties): the operator's
-// advertise_registration_domain policy hasn't changed just because occupancy hit zero, so
-// re-gating "r"/"dr" on anyLive would incorrectly flap them offline.
-func TestSRPHandle_RegistrationDomains_StayPublishedWhenZoneEmpties(t *testing.T) {
-	h, coord := newSRPTestHandler(t)
-	h.advertiseRegistrationDomain = true
-	id := newSRPTestIdentity(t)
-	const host = "srptest12g.dev.zenr.io."
-	inst := oneWidgetInstance()[0].name
-
-	first := buildSRPUpdate(t, srpTestZone, id, host, []string{"192.0.2.1"}, oneWidgetInstance(), 30, 1209600, host)
-	if res := h.Handle(context.Background(), stubTCPResponseWriter{}, first); res.Status != StatusProcessed {
-		t.Fatalf("fresh registration: expected Processed, got %s: %v", res.Status, res.Error)
-	}
-
-	removal := []srpInstanceSpec{{name: inst, removalShaped: true}}
-	second := buildSRPUpdate(t, srpTestZone, id, host, []string{"192.0.2.1"}, removal, 30, 1209600, host)
-	if res := h.Handle(context.Background(), stubTCPResponseWriter{}, second); res.Status != StatusProcessed {
-		t.Fatalf("removal: expected Processed, got %s: %v", res.Status, res.Error)
-	}
-
-	// sent[2]=removal forward, sent[3]=its own enumeration reconcile, which should delete
-	// b/db/lb (asserted elsewhere) but must leave "r"/"dr" untouched.
-	for _, prefix := range []string{"r", "dr"} {
-		owner := prefix + "._dns-sd._udp." + srpTestZone
-		for _, rr := range coord.sent[3].Ns {
-			if ptr, ok := rr.(*dns.PTR); ok && dnsname.Normalize(ptr.Hdr.Name) == dnsname.Normalize(owner) {
-				t.Fatalf("expected no %q registration-domain PTR delete when the zone empties while still opted in, got: %s", prefix, ptr.String())
-			}
+		for _, prefix := range append(append([]string{}, browsePrefixes...), registrationPrefixes...) {
+			requireUntouched(t, msg, prefix)
 		}
 	}
 }
