@@ -48,8 +48,8 @@ zone apex.
 | `<host>.<R>` | A/AAAA, KEY | RFC 9665 §3.2.1 | the registration domain | the SRP client | absent | same (the KEY's own lease is longer) |
 | `_dnssd-srp._tcp.<Z>` | SRV → registrar host and port | RFC 9665 §3.1.1, §10.4 | the zone apex; also below it for this repo's clients (see below) | the operator, by hand; the proxy never writes it | present | stays |
 | `_dnssd-srp-tls._tcp.<Z>` | SRV → registrar host and DNS-over-TLS port | RFC 9665 §3.1.1, §10.4 | same as above | same as above | present | stays |
-| `_dns-update._udp.<Z>` | SRV → an RFC 2136 primary | RFC 9665 App. B | the zone apex | nobody (not published on `zenr.io.`) | — | — |
-| `_dns-push-tls._tcp.<Z>` | SRV → a DNS Push server | RFC 8765 §6.1 | the zone apex | nobody (no DNS Push here) | — | — |
+| `_dns-update._udp.<Z>` | SRV → an RFC 2136 primary | RFC 9665 App. B | the zone apex | the operator, if at all; the proxy never writes it | — | — |
+| `_dns-push-tls._tcp.<Z>` | SRV → a DNS Push server | RFC 8765 §6.1 | the zone apex | the operator, if at all; the proxy has no DNS Push | — | — |
 
 "Present" or "absent" with nothing registered: a DNS name has no "PTR pointing at nothing".
 A name with no PTR answers NODATA (or NXDOMAIN if nothing at all is below it). The §11 records
@@ -74,8 +74,8 @@ DNS over TLS for DNS Push). It claims all of `in-addr.arpa.` and `ip6.arpa.` and
 record from an in-memory list. Nothing is written to a zone or sent over mDNS, so only clients
 that use the proxy's host as their resolver see it. The refusal only concerns names that an
 Apple `dnssd-proxy` answers for, typically a Thread border router's own domain. It has no effect
-on records in `zenr.io.`, which `ns1.free2air.org` answers. A self-pointing `lb` does no harm to
-a Mac: demo D4 (`docs/demo.md`) uses it on macOS 26.7.
+on records in a zone that an ordinary authoritative server answers, such as `zenr.io.`. A
+self-pointing `lb` does no harm to a Mac: demo D4 (`docs/demo.md`) uses it on macOS 26.7.
 
 ## Browsing: which records a client asks for, and where
 
@@ -96,8 +96,9 @@ that already has `srp.dev.zenr.io.` as a starting domain, as demo D4 sets up wit
 
 The main use of §11 is a record at a domain many clients start from, pointing at ours. A laptop
 on a network whose DHCP hands out `zenr.io` as the search domain asks
-`lb._dns-sd._udp.zenr.io.`. Today that name holds one PTR, to `zenr.io.` itself. For the laptop
-to find the services registered through this proxy, the zone's operator would add:
+`lb._dns-sd._udp.zenr.io.`. For the laptop to find the services registered through this proxy,
+that name needs a PTR to `srp.dev.zenr.io.`, next to whatever PTRs others put there (`b` and
+`lb` can hold several). The zone's operator would add:
 
 ```
 lb._dns-sd._udp.zenr.io.  PTR  srp.dev.zenr.io.
@@ -131,8 +132,8 @@ RFC 9665 §3.1.1, for a full-featured host:
 
 The SRV is at the apex `<Z>`, not at `<R>`, unless the registration domain is itself a zone apex.
 For `srp.dev.zenr.io.` the apex is `zenr.io.`, so a client that follows the RFC asks for
-`_dnssd-srp._tcp.zenr.io.`, which does not exist today. That is why such a client would also
-need a `_dnssd-srp._tcp` record at the apex. There are two ways to give it one:
+`_dnssd-srp._tcp.zenr.io.` and nothing else: an SRV at `srp.dev.zenr.io.` is not seen by such a
+client. There are two ways to give it an SRV it finds:
 
 - **An SRV at the apex:** `_dnssd-srp._tcp.zenr.io. SRV 0 0 8053 <registrar host>.` The apex is
   shared, though: one SRV name serves every registration domain in `zenr.io.`. It would also send
@@ -148,12 +149,13 @@ the RFC by default: they look for the SRV at the registration domain first, then
 name up to the apex, and the first one found wins (`client/srp/discovery.go`,
 `DiscoveryClosest`, issue #46). `sig0lease-srp-client -discovery=apex` keeps the RFC's
 apex-only lookup. For
-`srp.dev.zenr.io.` they look at `srp.dev.zenr.io.`, `dev.zenr.io.`, then `zenr.io.`. Today the
-first SRV found is `_dnssd-srp._tcp.dev.zenr.io.`, which names a different deployment's
-registrar (`sig0lease.dev.zenr.io:8053`, serving `dev.zenr.io.`). So the demos give the
-registrar explicitly (`server: 127.0.0.1:8053` in `demo/*.yaml`, `-server` in
-`docs/srp-live-demo.md`). Publishing `_dnssd-srp._tcp.srp.dev.zenr.io.` would make this repo's
-clients find ours, but not a client that follows only the RFC.
+`srp.dev.zenr.io.` they look at `srp.dev.zenr.io.`, `dev.zenr.io.`, then `zenr.io.`. An SRV at
+`dev.zenr.io.`, published for a registrar that serves `dev.zenr.io.`, is found before one at the
+apex, so these clients would register with that registrar. The demos give the registrar
+explicitly (`server: 127.0.0.1:8053` in `demo/*.yaml`, `-server` in `docs/srp-live-demo.md`):
+the demo proxy runs on the presenter's machine and no SRV names it. Publishing
+`_dnssd-srp._tcp.srp.dev.zenr.io.`, for a proxy clients can reach, would make this repo's clients
+find it, but not a client that follows only the RFC.
 
 Constrained hosts (RFC 9665 §3.1.2) look up none of this. They register under
 `default.service.arpa.` with a registrar address from the network, and the proxy rewrites the
@@ -205,24 +207,24 @@ To take the deployment down for good:
 `demo/leftovers.sh` lists what is left under the domain and which store, if any, still holds
 each name.
 
-Two proxies on one zone with different settings would undo each other's §11 records on every
-pass. Several proxies on one zone are not supported anyway (`docs/siglease_rfc9665.md` §11):
-each process has its own lease store and its own in-memory name locks.
+Two proxies on one zone with the same settings agree on the §11 records: each compares the zone
+with the same config, so whichever pass comes first makes a change and the other then finds
+nothing to do. With different settings they would undo each other's records on every pass.
+Several proxies on one zone are not supported anyway (`docs/siglease_rfc9665.md` §11): each
+process has its own lease store and its own in-memory name locks.
 
-## On the live zone (checked 2026-11-05)
+## Checking the zone
 
-| Domain | Kind | §11 records | `_dnssd-srp._tcp` | Probably written by |
-|---|---|---|---|---|
-| `zenr.io.` | zone apex (SOA `ns1.free2air.org.`) | `b`, `lb` → `zenr.io.` | none | sig0namectl's `dnssd-domain` script (it writes this self-pointing shape; `db`, `r`, `dr` are not there) |
-| `dev.zenr.io.` | inside `zenr.io.` | `r`, `dr` → `dev.zenr.io.` | `SRV 0 0 8053 sig0lease.dev.zenr.io.` | the `dev.zenr.io.` deployment (not confirmed) |
-| `srp.dev.zenr.io.` | inside `zenr.io.` | none (the proxy is not running; it publishes `b`/`db`/`lb` within 30 s of starting) | none | this proxy |
-
-`_dnssd-srp-tls._tcp`, `_dns-update._udp`, `_dns-update-tls._tcp`, `_dns-push-tls._tcp` and
-`_dns-llq._udp` are absent at all three. To check again:
+What the zone holds changes with every run and every operator edit, so this page does not list
+it. To see the discovery records a client meets from `srp.dev.zenr.io.` up to the apex, asking
+the zone's primary server:
 
 ```bash
+ns=$(dig +short SOA zenr.io. | cut -d' ' -f1)
 for d in zenr.io dev.zenr.io srp.dev.zenr.io; do
-  for p in b db lb r dr; do echo "$p._dns-sd._udp.$d: $(dig +short @ns1.free2air.org $p._dns-sd._udp.$d PTR)"; done
-  echo "_dnssd-srp._tcp.$d: $(dig +short @ns1.free2air.org _dnssd-srp._tcp.$d SRV)"
+  for p in b db lb r dr; do echo "$p._dns-sd._udp.$d: $(dig +short @"$ns" $p._dns-sd._udp.$d PTR)"; done
+  for s in _dnssd-srp._tcp _dnssd-srp-tls._tcp; do echo "$s.$d: $(dig +short @"$ns" $s.$d SRV)"; done
 done
 ```
+
+`demo/leftovers.sh` lists every record under a domain and which lease store, if any, holds it.
