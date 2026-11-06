@@ -1,0 +1,73 @@
+# The release, built on this machine from the checkout: the proxy for the registrar's Linux, the
+# page (make web), and config.base.yaml, the checkout's config.yaml, which each instance's config
+# is made from (config.yml), before anything is built.
+
+- name: Build the release
+  delegate_to: localhost
+  run_once: true
+  block:
+    # The git module clones and checks out; it does not read a checkout's state.
+    - name: List the checkout's uncommitted changes
+      ansible.builtin.command: git -C {{ sig0lease_repo }} status --porcelain  # noqa: command-instead-of-module
+      register: sig0lease_git_status
+      changed_when: false
+
+    - name: Refuse uncommitted changes
+      ansible.builtin.assert:
+        that: sig0lease_git_status.stdout == '' or sig0lease_allow_dirty | bool
+        fail_msg: |-
+          {{ sig0lease_repo }} has uncommitted changes. Commit them, or deploy them anyway with
+          -e sig0lease_allow_dirty=true:
+          {{ sig0lease_git_status.stdout }}
+        quiet: true
+
+    - name: Read the commit
+      ansible.builtin.command: git -C {{ sig0lease_repo }} rev-parse --short=12 HEAD  # noqa: command-instead-of-module
+      register: sig0lease_git_commit
+      changed_when: false
+
+    - name: Name the release, and the registrar's Go architecture
+      ansible.builtin.set_fact:
+        sig0lease_release: >-
+          {{ now(utc=true, fmt='%Y%m%dT%H%M%SZ') }}-{{ sig0lease_git_commit.stdout
+          }}{{ '-dirty' if sig0lease_git_status.stdout else '' }}
+        sig0lease_goarch: "{{ {'x86_64': 'amd64', 'aarch64': 'arm64'}[ansible_facts.architecture] }}"
+
+    - name: Read config.yaml
+      ansible.builtin.set_fact:
+        sig0lease_base_config: "{{ lookup('ansible.builtin.file', sig0lease_repo ~ '/config.yaml') | from_yaml }}"
+
+- name: Make the instance's config, before building anything
+  ansible.builtin.include_tasks: config.yml
+
+- name: Build the release
+  delegate_to: localhost
+  run_once: true
+  block:
+    - name: Make the release's build directory
+      ansible.builtin.file:
+        path: "{{ sig0lease_build_dir }}"
+        state: directory
+        mode: "0755"
+
+    - name: Build the proxy for linux/{{ sig0lease_goarch }}
+      ansible.builtin.command:
+        cmd: go build -trimpath -o {{ sig0lease_build_dir }}/sig0lease ./cmd/sig0lease
+        chdir: "{{ sig0lease_repo }}"
+      environment:
+        GOOS: linux
+        GOARCH: "{{ sig0lease_goarch }}"
+        CGO_ENABLED: "0"
+      changed_when: true
+
+    - name: Build the page
+      ansible.builtin.command:
+        cmd: make -s web
+        chdir: "{{ sig0lease_repo }}"
+      changed_when: true
+
+    - name: Copy config.yaml, which each instance's config is made from
+      ansible.builtin.copy:
+        src: "{{ sig0lease_repo }}/config.yaml"
+        dest: "{{ sig0lease_build_dir }}/config.base.yaml"
+        mode: "0644"

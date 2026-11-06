@@ -86,7 +86,9 @@ REGISTRAR=<registrar>:853 TRANSPORT=tls demo/ipfs.sh member     # over DNS-over-
   zone, and `server: 127.0.0.1:8053` replaced by `REGISTRAR`; the files in `demo/` stay as they are.
 - D6: the page, still served by the laptop, asks the registrar's web server,
   `https://<registrar>/dns-query`, over DNS-over-HTTPS; `DOH=<url>` names another. The phones then
-  need the internet, not the laptop's proxy.
+  need the internet, not the laptop's proxy. The registrar serves the page too, at
+  `https://<registrar>/`; its staging instance, on zones of its own, at `https://<registrar>:8444/`
+  (deploy/README.md).
 - Other people use the same registrar: a name another key holds stays theirs ("When something
   fails"), and the registrar's own lease limits apply.
 - A shared registrar keeps its error reasons and its lease-store dump to itself

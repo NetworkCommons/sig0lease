@@ -1,0 +1,47 @@
+# The checkout the release is built from: this repository.
+sig0lease_repo: "{{ playbook_dir | dirname | dirname }}"
+
+# Deploy a checkout with uncommitted changes; the release's name then ends in -dirty.
+sig0lease_allow_dirty: false
+
+# Releases kept in each instance besides the one it runs, for going back to.
+sig0lease_keep_releases: 5
+
+# The instance's (group_vars/all.yml, registrar_instance).
+sig0lease_root: "{{ registrar_root }}/{{ registrar_instance }}"  # releases/<release>/, current
+sig0lease_state: "{{ sig0lease_state_root }}/{{ registrar_instance }}"  # its lease stores
+sig0lease_service: "sig0lease@{{ registrar_instance }}"
+sig0lease_port: "{{ registrar_settings.port }}"
+
+# The zones' keys, which every instance uses, and where each instance's lease stores are, in a
+# directory of its own.
+sig0lease_etc: /etc/sig0lease
+sig0lease_state_root: /var/lib/sig0lease
+
+# Where this machine builds a release: under bin/, which git ignores.
+sig0lease_build_dir: "{{ sig0lease_repo }}/bin/deploy/{{ sig0lease_release }}"
+
+# The zones the release's handlers serve, which its checks ask for (tasks/check.yml).
+sig0lease_zones: "{{ sig0lease_config.handlers.values() | map(attribute='upstream_zone') | list }}"
+
+# What the instance's config changes in the repository's config.yaml at the release's commit
+# (config.base.yaml in the release), merged into it: a map merges into a map, anything else
+# replaces what config.yaml has. Each handler named must be one config.yaml has, and each of
+# config.yaml's handlers gets the instance's zone for it.
+sig0lease_config_overrides:
+  server:
+    address: ":{{ sig0lease_port }}"
+    networks: [udp, tcp, doh]
+    doh:
+      address: "{{ registrar_settings.doh_address }}"
+  handlers:
+    srp_handler:
+      upstream_zone: "{{ registrar_settings.zones['srp_handler'] }}"
+      keystore_dir: "{{ sig0lease_etc }}/keystore"
+      storage:
+        path: "{{ sig0lease_state }}/srp_lease_snapshot.json"
+    update:
+      upstream_zone: "{{ registrar_settings.zones['update'] }}"
+      keystore_dir: "{{ sig0lease_etc }}/keystore"
+      storage:
+        path: "{{ sig0lease_state }}/lease_snapshot.json"

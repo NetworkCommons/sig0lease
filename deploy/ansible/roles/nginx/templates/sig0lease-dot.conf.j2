@@ -1,0 +1,23 @@
+# {{ ansible_managed }}: deploy/ansible, roles/nginx (deploy/README.md).
+# DNS-over-TLS (RFC 7858) for each instance of the registrar that has a release, inside
+# nginx.conf's stream block: TLS ends here, with the registrar's certificate, and the
+# DNS-over-TCP inside goes to the instance's proxy on 127.0.0.1.
+{% for name in nginx_served %}
+{%   set instance = registrar_instances[name] %}
+
+# {{ name }}
+limit_conn_zone $binary_remote_addr zone=sig0lease_dot_{{ name }}:10m;
+
+server {
+    listen {{ instance.dot_port }} ssl;
+    listen [::]:{{ instance.dot_port }} ssl;
+
+    ssl_certificate {{ nginx_cert_dir }}/fullchain.pem;
+    ssl_certificate_key {{ nginx_cert_dir }}/privkey.pem;
+    ssl_protocols TLSv1.2 TLSv1.3;
+
+    limit_conn sig0lease_dot_{{ name }} {{ nginx_dot_connections }};
+    proxy_pass 127.0.0.1:{{ instance.port }};
+    proxy_timeout {{ nginx_dot_idle }};
+}
+{% endfor %}

@@ -1,0 +1,70 @@
+# {{ ansible_managed }}: deploy/ansible, roles/nginx (deploy/README.md).
+# The registrar's web servers: port 80, for Let's Encrypt's challenges; and for each instance
+# that has a release, at its HTTPS port, the page (docs/demo.md, D6), opened on the instance's
+# zones, and DNS-over-HTTPS (RFC 8484), passed to the instance's plain-HTTP listener, which
+# answers every request with CORS headers, so a page served elsewhere can use it too.
+{% set nginx_https_443 = nginx_served | map('extract', registrar_instances) | selectattr('https_port', 'equalto', 443) | list %}
+
+server {
+    listen 80 default_server;
+    listen [::]:80 default_server;
+    server_name {{ registrar_name }};
+
+    location /.well-known/acme-challenge/ {
+        root /var/www/acme;
+    }
+{% if nginx_cert.stat.exists and nginx_https_443 %}
+
+    location / {
+        return 301 https://{{ registrar_name }}$request_uri;
+    }
+{% else %}
+
+    # No certificate, or no instance on port 443, yet: only the ACME challenges are served.
+    location / {
+        return 404;
+    }
+{% endif %}
+}
+{% if nginx_cert.stat.exists %}
+{%   for name in nginx_served %}
+{%     set instance = registrar_instances[name] %}
+
+# {{ name }}
+limit_req_zone $binary_remote_addr zone=sig0lease_doh_{{ name }}:10m rate={{ nginx_doh_rate }};
+
+server {
+    listen {{ instance.https_port }} ssl default_server;
+    listen [::]:{{ instance.https_port }} ssl default_server;
+    http2 on;
+    server_name {{ registrar_name }};
+
+    ssl_certificate {{ nginx_cert_dir }}/fullchain.pem;
+    ssl_certificate_key {{ nginx_cert_dir }}/privkey.pem;
+    ssl_protocols TLSv1.2 TLSv1.3;
+
+    root {{ registrar_root }}/{{ name }}/current/web;
+
+    # The page, asked for with no parameters, opens on this instance's zones.
+    location = / {
+        if ($args = "") {
+            return 302 "/?zone={{ instance.zones['update'] | regex_replace('\.$', '') }}&domain={{ instance.zones['srp_handler'] | regex_replace('\.$', '') }}";
+        }
+        try_files /index.html =404;
+    }
+
+    location = /dns-query {
+        limit_req zone=sig0lease_doh_{{ name }} burst={{ nginx_doh_burst }} nodelay;
+        limit_req_status 429;
+        proxy_pass http://{{ instance.doh_address }};
+        proxy_http_version 1.1;
+        proxy_set_header Host $host;
+        proxy_set_header X-Forwarded-For $remote_addr;
+    }
+
+    location / {
+        try_files $uri $uri/ =404;
+    }
+}
+{%   endfor %}
+{% endif %}

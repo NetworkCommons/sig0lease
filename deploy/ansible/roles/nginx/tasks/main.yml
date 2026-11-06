@@ -1,0 +1,70 @@
+# nginx in front of the proxy: HTTPS (the page, and DNS-over-HTTPS proxied to the proxy's
+# plain-HTTP listener) and DNS-over-TLS (TLS ended here, the DNS-over-TCP inside passed to the
+# proxy), with the registrar's Let's Encrypt certificate, which certbot renews.
+
+- name: Install nginx, its stream module, and certbot
+  ansible.builtin.apt:
+    name: [nginx, libnginx-mod-stream, certbot]
+    state: present
+    update_cache: true
+    cache_valid_time: 3600
+
+- name: Remove Debian's default site, which takes port 80 for itself
+  ansible.builtin.file:
+    path: /etc/nginx/sites-enabled/default
+    state: absent
+  notify: Reload nginx
+
+- name: Make the directories for the ACME challenges and the stream servers
+  ansible.builtin.file:
+    path: "{{ item }}"
+    state: directory
+    mode: "0755"
+  loop: [/var/www/acme, /etc/nginx/stream.d]
+
+- name: Include the stream servers at the top level of nginx.conf, where a stream block goes
+  ansible.builtin.lineinfile:
+    path: /etc/nginx/nginx.conf
+    line: "stream { include /etc/nginx/stream.d/*.conf; }  # deploy/ansible, roles/nginx"
+    insertafter: EOF
+  notify: Reload nginx
+
+- name: Start nginx, and start it at boot
+  ansible.builtin.systemd_service:
+    name: nginx
+    state: started
+    enabled: true
+
+- name: Configure the sites, without HTTPS while there is no certificate
+  ansible.builtin.include_tasks: sites.yml
+
+- name: Get the certificate from Let's Encrypt, over port 80 (HTTP-01)
+  ansible.builtin.command:
+    argv: >-
+      {{ ['certbot', 'certonly', '--webroot', '-w', '/var/www/acme',
+          '-d', registrar_name, '--cert-name', registrar_name,
+          '--non-interactive', '--agree-tos']
+         + (['--email', nginx_acme_email] if nginx_acme_email else ['--register-unsafely-without-email'])
+         + (['--test-cert'] if nginx_acme_staging | bool else []) }}
+    creates: "{{ nginx_cert_dir }}/fullchain.pem"
+  register: nginx_certbot
+
+# A step of the first run, not a handler: the certificate exists only now, and HTTPS needs it.
+- name: Configure the sites again, with HTTPS
+  ansible.builtin.include_tasks: sites.yml
+  when: nginx_certbot is changed  # noqa: no-handler
+
+- name: Reload nginx when certbot renews the certificate
+  ansible.builtin.copy:
+    dest: /etc/letsencrypt/renewal-hooks/deploy/reload-nginx
+    content: |
+      #!/bin/sh
+      # deploy/ansible, roles/nginx: nginx serves the renewed certificate.
+      exec systemctl reload nginx
+    mode: "0755"
+
+- name: Renew the certificate on certbot's timer
+  ansible.builtin.systemd_service:
+    name: certbot.timer
+    state: started
+    enabled: true

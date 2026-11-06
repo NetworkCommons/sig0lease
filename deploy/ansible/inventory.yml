@@ -1,0 +1,6 @@
+# The registrar is the host the ssh alias "registrar" names in the operator's ~/.ssh/config,
+# with the user to log in as (deploy/README.md): the machine's name is in no file of this
+# repository.
+all:
+  hosts:
+    registrar:

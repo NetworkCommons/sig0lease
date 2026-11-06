@@ -1,0 +1,21 @@
+# Where certbot keeps the registrar's certificate.
+nginx_cert_dir: "/etc/letsencrypt/live/{{ registrar_name }}"
+
+# The address Let's Encrypt has for the registrar's account, for its notices about the account
+# and its policies (it sends no reminders that a certificate expires). Empty: none.
+nginx_acme_email: sig0lease@networkcommons.org
+
+# Let's Encrypt's staging service, whose certificates no browser trusts, for trying the role
+# out without using up the real service's rate limits.
+nginx_acme_staging: false
+
+# Requests to an instance's /dns-query (DNS-over-HTTPS) per source address: a steady rate, and a burst above
+# it served at once. The demo's page asks several questions every 3 seconds, and the phones of a
+# room may all come from one address, behind its network's NAT.
+nginx_doh_rate: 50r/s
+nginx_doh_burst: 200
+
+# DNS-over-TLS connections one source address may hold open to an instance at once, and how long
+# one may stay idle.
+nginx_dot_connections: 50
+nginx_dot_idle: 60s

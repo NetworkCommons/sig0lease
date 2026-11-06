@@ -1,0 +1,46 @@
+# make promote: the release staging runs, once it passes staging's checks again, copied into
+# stable's releases/ and made the one stable runs (activate.yml), with stable's config made from
+# the release's own config.base.yaml. Nothing is built: stable runs the very files staging was
+# checked with. Each instance keeps its lease stores; only the release moves.
+
+- name: Find the release staging runs
+  ansible.builtin.include_tasks: current.yml
+  vars:
+    registrar_instance: staging
+
+- name: Check it on staging again
+  ansible.builtin.include_tasks: check.yml
+  vars:
+    registrar_instance: staging
+
+- name: Read the release's config.base.yaml
+  ansible.builtin.slurp:
+    src: "{{ registrar_root }}/staging/releases/{{ sig0lease_release }}/config.base.yaml"
+  register: sig0lease_base_config_file
+
+- name: Remember it
+  ansible.builtin.set_fact:
+    sig0lease_base_config: "{{ sig0lease_base_config_file.content | b64decode | from_yaml }}"
+
+- name: Make stable's config
+  ansible.builtin.include_tasks: config.yml
+
+- name: Prepare the registrar
+  ansible.builtin.include_tasks: prepare.yml
+
+- name: Make the release's directory in stable
+  ansible.builtin.file:
+    path: "{{ sig0lease_root }}/releases/{{ sig0lease_release }}"
+    state: directory
+    mode: "0755"
+
+- name: Copy the release's files from staging
+  ansible.builtin.copy:
+    remote_src: true
+    src: "{{ registrar_root }}/staging/releases/{{ sig0lease_release }}/{{ item }}"
+    dest: "{{ sig0lease_root }}/releases/{{ sig0lease_release }}/{{ item }}"
+    mode: preserve
+  loop: [sig0lease, config.base.yaml, web/]
+
+- name: Make it the release stable runs
+  ansible.builtin.include_tasks: activate.yml

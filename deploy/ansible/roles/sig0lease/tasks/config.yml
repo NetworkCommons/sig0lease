@@ -1,0 +1,48 @@
+# The instance's config, as sig0lease_config: sig0lease_base_config, the repository's config.yaml
+# at the release's commit, with sig0lease_config_overrides merged in. Changes nothing anywhere.
+
+- name: The instances serve zones apart, and each a zone for every handler config.yaml has
+  ansible.builtin.assert:
+    that:
+      - registrar_instance in registrar_instances
+      - sig0lease_unknown_handlers == []
+      - sig0lease_zones_given | sort == sig0lease_base_config.handlers.keys() | sort
+      - sig0lease_all_zones | length == sig0lease_all_zones | unique | length
+    fail_msg: >-
+      registrar_instances (group_vars/all.yml) and config.yaml disagree: the instance
+      "{{ registrar_instance }}" of {{ registrar_instances.keys() | list }} gives zones for the
+      handlers {{ sig0lease_zones_given }}, its config changes {{ sig0lease_config_overrides.handlers.keys() | list }},
+      config.yaml has {{ sig0lease_base_config.handlers.keys() | list }}; every zone of every
+      instance: {{ sig0lease_all_zones }}, each to be served by one only.
+    quiet: true
+  vars:
+    sig0lease_zones_given: "{{ registrar_settings.zones.keys() | list }}"
+    sig0lease_unknown_handlers: >-
+      {{ sig0lease_config_overrides.handlers.keys() | difference(sig0lease_base_config.handlers.keys()) }}
+    sig0lease_all_zones: >-
+      {{ registrar_instances.values() | map(attribute='zones') | map('dict2items') | flatten
+         | map(attribute='value') | map('lower') | map('regex_replace', '[.]$', '') | list }}
+
+- name: Merge the instance's changes into config.yaml
+  ansible.builtin.set_fact:
+    sig0lease_config: "{{ sig0lease_base_config | combine(sig0lease_config_overrides, recursive=true) }}"
+
+- name: Every handler serves the instance's zone for it, with its keys and lease store where the registrar keeps them
+  ansible.builtin.assert:
+    that:
+      - item.value.upstream_zone == registrar_settings.zones[item.key]
+      - item.value.upstream_zone is string and item.value.upstream_zone is match('^([A-Za-z0-9_-]+[.])+$')
+      - item.value.keystore_dir is match('/')
+      - item.value.storage.type == 'file'
+      - item.value.storage.path is match('/')
+    fail_msg: >-
+      handlers.{{ item.key }} of the instance's config has upstream_zone
+      {{ item.value.upstream_zone | string }}, for the zone {{ registrar_settings.zones[item.key] | string }} of
+      registrar_instances.{{ registrar_instance }}, keystore_dir
+      {{ item.value.keystore_dir | default('(none)') }} and storage {{ item.value.storage | default('(none)') }}:
+      want a zone name ending in a dot, an absolute keystore_dir and a file store at an absolute
+      path (sig0lease_config_overrides).
+    quiet: true
+  loop: "{{ sig0lease_config.handlers | dict2items }}"
+  loop_control:
+    label: "{{ item.key }}"
