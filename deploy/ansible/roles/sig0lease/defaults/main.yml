@@ -12,9 +12,10 @@ sig0lease_root: "{{ registrar_root }}/{{ registrar_instance }}"  # releases/<rel
 sig0lease_state: "{{ sig0lease_state_root }}/{{ registrar_instance }}"  # its lease stores
 sig0lease_service: "sig0lease@{{ registrar_instance }}"
 sig0lease_port: "{{ registrar_settings.port }}"
+sig0lease_user: "sig0lease-{{ registrar_instance }}"  # runs its proxy, the only user who reads its key and lease stores
+sig0lease_keystore: "{{ sig0lease_etc }}/{{ registrar_instance }}/keystore"  # its key, and nothing else
 
-# The zones' keys, which every instance uses, and where each instance's lease stores are, in a
-# directory of its own.
+# Where each instance's keystore, and its lease stores, are, in a directory of its own.
 sig0lease_etc: /etc/sig0lease
 sig0lease_state_root: /var/lib/sig0lease
 
@@ -37,11 +38,11 @@ sig0lease_config_overrides:
   handlers:
     srp_handler:
       upstream_zone: "{{ registrar_settings.zones['srp_handler'] }}"
-      keystore_dir: "{{ sig0lease_etc }}/keystore"
+      keystore_dir: "{{ sig0lease_keystore }}"
       storage:
         path: "{{ sig0lease_state }}/srp_lease_snapshot.json"
     update:
       upstream_zone: "{{ registrar_settings.zones['update'] }}"
-      keystore_dir: "{{ sig0lease_etc }}/keystore"
+      keystore_dir: "{{ sig0lease_keystore }}"
       storage:
         path: "{{ sig0lease_state }}/lease_snapshot.json"

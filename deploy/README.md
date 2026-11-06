@@ -16,24 +16,24 @@ the registrar to deploy it, and its name is in no file of this repository.
 | DNS-over-TLS | 853 | 8853 |
 | The page, and DNS-over-HTTPS at `/dns-query` | `https://<registrar>/` | `https://<registrar>:8444/` |
 
-These, and the proxy's DNS-over-HTTPS listener behind nginx, are each instance's settings in
-`registrar_instances` ([group_vars/all.yml](ansible/group_vars/all.yml)). Every zone the
-registrar serves is set there; none comes from `config.yaml`. Each instance's zones lie outside
-the other's: with one inside the other, a name could be registered through both, and each
-instance would delete records the other still renews.
+These, the proxy's DNS-over-HTTPS listener behind nginx and the name of its key are each
+instance's settings in `registrar_instances` ([group_vars/all.yml](ansible/group_vars/all.yml)).
+Every zone the registrar serves is set there; none comes from `config.yaml`. Each instance's
+zones lie outside the other's: with one inside the other, a name could be registered through
+both, and each instance would delete records the other still renews.
 
 | On the registrar | What it is |
 |---|---|
-| `sig0lease@stable.service`, `sig0lease@staging.service` | each instance's proxy, as user `sig0lease`: plain DNS at the instance's port, for everyone; DNS-over-HTTPS in plain HTTP on 127.0.0.1, for nginx only |
+| `sig0lease@stable.service`, `sig0lease@staging.service` | each instance's proxy, as a user of its own, `sig0lease-<instance>`: plain DNS at the instance's port, for everyone; DNS-over-HTTPS in plain HTTP on 127.0.0.1, for nginx only |
 | `/opt/sig0lease/<instance>/releases/<time>-<commit>/` | a release: the proxy (`sig0lease`), the page (`web/`), `config.base.yaml` (the repository's `config.yaml` at the commit) and `config.yaml` (the instance's config, made from it); `/opt/sig0lease/<instance>/current` links to the one the instance runs |
-| `/etc/sig0lease/keystore/` | the zones' keys, from `keystore/server` on the operator's machine |
-| `/var/lib/sig0lease/<instance>/` | the instance's lease stores |
+| `/etc/sig0lease/<instance>/keystore/` | the instance's key, from `keystore/server` on the operator's machine, and nothing else, readable by the instance's user only ("The zones' keys") |
+| `/var/lib/sig0lease/<instance>/` | the instance's lease stores, readable by the instance's user only |
 | nginx | port 80: Let's Encrypt's challenges, and a redirect to stable's HTTPS. For each instance that has a release, at its ports: HTTPS, with the page, opened on the instance's zones, and `/dns-query`, passed to the instance's DNS-over-HTTPS, with a request rate per source address; DNS-over-TLS, its TLS ended here and the DNS-over-TCP inside passed to the instance's plain DNS port, with a number of connections per source address |
 | certbot | the registrar's certificate, renewed by `certbot.timer`; nginx reloads it. Its Let's Encrypt account has the address in `nginx_acme_email` ([roles/nginx/defaults/main.yml](ansible/roles/nginx/defaults/main.yml)) |
 
 An instance's config is `config.base.yaml` with the changes in `sig0lease_config_overrides`
 ([roles/sig0lease/defaults/main.yml](ansible/roles/sig0lease/defaults/main.yml)): the instance's
-zones and listeners, and where its keys and lease stores are. Everything else is `config.yaml`'s:
+zones and listeners, and where its key and lease stores are. Everything else is `config.yaml`'s:
 the lease policy, `server.diagnostics` and `server.forward` off. Change `config.yaml`, the
 overrides or `registrar_instances`, and deploy.
 
@@ -51,8 +51,19 @@ overrides or `registrar_instances`, and deploy.
   ```
 
   `ssh registrar true` must work without a password prompt.
-- The zones' keys in `keystore/server`: `dev.zenr.io.`'s for stable, as for the demos, and
-  `stg.zenr.io.`'s for staging.
+- In `keystore/server`, each instance's key ("The zones' keys").
+
+## The zones' keys
+
+Each instance has one key, the one in `keystore/server` at the name its `key` in
+`registrar_instances` gives: `dev.zenr.io.` for stable, `stg.zenr.io.` for staging. Its zones are
+at that name or below it.
+
+Every deploy and promote copies that key, and no other, into the instance's keystore on the
+registrar, and removes whatever else is there, a key it replaces included. Before it builds or
+switches anything, the play stops if `keystore/server` has no key at that name, or more than one,
+or if one of the instance's zones is not at that name or below it. An instance loads its key when
+it starts: a deploy restarts staging, a promote restarts stable.
 
 ## Releasing
 
@@ -63,7 +74,7 @@ make promote     # the release staging runs, moved to stable
 
 `make deploy`:
 
-1. On this machine: makes staging's config, then builds the proxy for the registrar's Linux from
+1. On this machine: makes staging's config and finds its key, then builds the proxy for the registrar's Linux from
    the checkout, refusing uncommitted changes (`make deploy ARGS="-e
    sig0lease_allow_dirty=true"` deploys them, as a release whose name ends in `-dirty`), and the
    page (`make web`).
@@ -150,7 +161,7 @@ names it. With that proxy's operators:
 
 ```bash
 ssh registrar journalctl -u sig0lease@stable -f      # stable's log
-ssh registrar runuser -u sig0lease -- /opt/sig0lease/stable/current/sig0lease --dump /opt/sig0lease/stable/current/config.yaml
+ssh registrar runuser -u sig0lease-stable -- /opt/sig0lease/stable/current/sig0lease --dump /opt/sig0lease/stable/current/config.yaml
 ```
 
 `--dump` (`--dump-debug` for every record) reads the lease stores and changes nothing. The dump
@@ -163,8 +174,8 @@ query over DNS is refused, as `server.diagnostics` is off.
 - nginx limits each source address's DNS-over-HTTPS requests and DNS-over-TLS connections, per
   instance ([roles/nginx/defaults/main.yml](ansible/roles/nginx/defaults/main.yml)). Behind
   nginx, a proxy sees every such client as 127.0.0.1.
-- The proxies run as their own user, with no capabilities, in systemd's sandbox: each writes only
-  its own lease stores.
+- Each proxy runs as a user of its own, with no capabilities, in systemd's sandbox: neither can
+  read the other's key or lease stores, and each writes only its own stores.
 - The plain DNS ports themselves have no limit, and the machine no firewall from these roles: its
   other services belong to their own operators, and a firewall of its own (an nftables table
   beside theirs) is still to come. It would open, besides theirs and ssh: 80, 443, 853, 8053,
