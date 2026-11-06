@@ -23,113 +23,42 @@ shared registrar").
 The demos use this repository's programs and tools that come with the system, except IPFS
 Desktop or kubo for D3, and Prosody for D5, whose page loads Converse.js from `cdn.jsdelivr.net`.
 
-## Before the day
+## Preparation
 
-1. Build, and name the binaries' directory (`demo/run.sh` builds them itself):
+What every demo needs. Each demo's section starts with what else it needs, what to set up for it
+once, and how to rehearse it.
+
+1. Build, and name the binaries' directory, for the commands run by hand (each script builds what
+   it runs itself):
 
    ```bash
    make build build-client
    B=./bin/$(uname -s | tr A-Z a-z)
    ```
 
-2. Check that the network reaches the zone's server, over UDP and TCP:
+2. Check that the network reaches the zone's server, over UDP and TCP: the proxy sends it the
+   updates, and the scripts ask it whether each change is there.
 
    ```bash
    dig +short SOA zenr.io @ns1.free2air.org
    dig +tcp +short SOA zenr.io @ns1.free2air.org
    ```
 
-3. Check that the names are free: `demo/watch.sh once` shows no `demo` instance, and
-   `(no records)` under the name `demo`. If another key holds them, change `name: demo` in `demo/demo.yaml` (both
-   registrars) and run `watch.sh` with `NAME=<the new label>`.
+3. Choose the registrar the agents use: the proxy each script starts on the laptop, by default,
+   or a shared one ("Against a shared registrar").
 
-4. Rehearse once with `demo/run.sh`. Stopping frees the names (`on_stop: release` in every
-   registrar of the demo's templates), so someone else may take them before the day: check them
-   again then (step 3).
+4. Record the rehearsal: if the venue's network blocks port 53, the recording is the demo.
 
-5. For D3, once, on A (the presenter's laptop, the member) and B (the community node): IPFS
-   Desktop, or kubo (`ipfs init`), and kubo's `ipfs` command, which works on IPFS Desktop's
-   node too (its repository is `~/.ipfs`). Quit IPFS Desktop, or stop `ipfs daemon`, then on
-   each:
+A script that stops frees its demo's names (`on_stop: release` in every registrar of the demo's
+templates), so someone else may take them between the rehearsal and the day: check them again
+on the day, as each demo's section says.
 
-   ```bash
-   ipfs config profile apply autoconf-off               # no public peers, resolvers or routers
-   ipfs config Routing.Type dht
-   ipfs config --json AutoTLS.Enabled false
-   ipfs config --json Swarm.Transports.Network.Websocket false
-   ipfs config --json Discovery.MDNS.Enabled false      # nodes found by DNS alone
-   ipfs config Addresses.Gateway /ip4/0.0.0.0/tcp/8080  # the gateway reachable on the network
-   ipfs id -f '<id>\n'                                  # the node's ID, for the other's peer list
-   ```
+### Demos on two machines
 
-   The two nodes are a private swarm: they share a key no other node has, so the folder reaches
-   no other node. Make it on A and copy the file to B's `~/.ipfs/swarm.key`, by hand, never
-   into DNS or the repository:
-
-   ```bash
-   printf '/key/swarm/psk/1.0.0/\n/base16/\n%s\n' "$(openssl rand -hex 32)" > ~/.ipfs/swarm.key
-   ```
-
-   Each node's peer list is the other's name, whose addresses the agents publish:
-   `ipfs bootstrap add /dnsaddr/site.dev.zenr.io/p2p/<B's ID>` on A,
-   `ipfs bootstrap add /dnsaddr/a.dev.zenr.io/p2p/<A's ID>` on B. Start the nodes again:
-   `ipfs daemon` says "Swarm is limited to private network of peers with the swarm key", and,
-   until the agents publish those names, "failed to bootstrap (no peers found)": it tries again
-   by itself. On A, make the folder, `ipfs files mkdir /community` (IPFS Desktop: Files, New
-   folder), and put a first file in it: without an `index.html`, gateways show it as a list of
-   files. Check that `a` and `site` are free: `dig +short KEY a.dev.zenr.io @ns1.free2air.org`
-   answers nothing, and so for `site`. On B, also `qrencode`, which prints the QR code the
-   phones scan: `brew install qrencode` on a Mac, `sudo apt install qrencode` on Linux.
-   Rehearse: `demo/ipfs.sh member` on A, then `demo/ipfs.sh community` on B.
-
-6. For D2, the rehearsal on a Mac writes the Mac's template, `demo/mac.yaml`: it names this Mac,
-   so it is not in the repository. On first use macOS asks whether Terminal may find
-   devices on the local network: allow it.
-
-7. For D5, on each of its two machines: on a Mac, Docker Desktop, then
-   `docker pull prosodyim/prosody:13.0`; on Linux, Prosody 13 (`apt install prosody` on Debian
-   13, which brings luaunbound, then `sudo systemctl disable --now prosody`: the package's own
-   server would hold the ports), or Docker with `PROSODY=docker`. Also `qrencode`, as for D3.
-   Check that `chat-a` and `chat-b` are free:
-   `dig +short KEY chat-a.dev.zenr.io @ns1.free2air.org` answers nothing. Rehearse on one
-   machine with `demo/chat.sh chat-a chat-b`.
-
-8. For D6, on the laptop: `qrencode`, as for D3. Rehearse with `demo/web.sh` and a phone on the
-   same network: it builds the page (`make web`), and the phone has to reach the laptop's ports
-   8090 and 8443.
-
-9. Record the rehearsal: if the venue's network blocks port 53, the recording is the demo.
-
-## The terminals
-
-For D1, and D2 on a Mac, one terminal is enough: `demo/run.sh` builds the proxy and the clients,
-starts the proxy, the site and the agents, pauses before each step until Enter, and prints how
-long `ns1.free2air.org` took to show it. The last Enter, or Ctrl-C, stops everything. To run D1
-by hand instead, use these terminals:
-
-| | Command | What it is |
-|---|---|---|
-| 1 | `$B/sig0lease` | the proxy, on 127.0.0.1:8053: `srp_handler` for `srp.dev.zenr.io.`, `update_handler` for `dev.zenr.io.`, signing upstream with `keystore/server` |
-| 2 | `python3 -m http.server 8000 -d demo/site` | the site |
-| 3 | `$B/sig0lease-agent run -probe-interval 5s demo/demo.yaml` | the agent: host `demo`, its services and the name `demo` |
-| 4 | `demo/watch.sh` | what anyone can see, asked of `ns1.free2air.org` every 2 s |
-
-What the audience can run:
-
-```bash
-dig +short demo.dev.zenr.io                         # any machine
-dig +short TXT demo.dev.zenr.io
-dns-sd -B _http._tcp srp.dev.zenr.io                # a Mac: browse
-dns-sd -L "demo http" _http._tcp srp.dev.zenr.io    #        resolve one instance
-avahi-browse -d srp.dev.zenr.io. -r _http._tcp      # Linux with avahi-daemon
-```
-
-and, on the same network as the laptop, open `http://demo.srp.dev.zenr.io:8000/`. The addresses
-the agent publishes are the laptop's on that network.
-
-Ask the audience to look only once the name is published: a resolver that was told "no such
-name" keeps that answer for up to 6 minutes (the zone's SOA TTL). `@ns1.free2air.org` always
-gives the current answer.
+D3 and D5 run on two machines, A and B, on the same network. Each can be rehearsed on one
+machine, as its section says: no second machine is needed for that. A Docker container as B has
+not been tried: its agent would publish the container's own addresses, which neither A nor the
+phones reach, unless `ADDRESS` gives the host's and the container publishes the demo's ports.
 
 ## Against a shared registrar
 
@@ -159,6 +88,42 @@ REGISTRAR=<registrar>:853 TRANSPORT=tls demo/ipfs.sh member     # over DNS-over-
 
 ## D1: the laptop publishes itself
 
+**Needs**: the laptop. Check that the names are free, before the rehearsal and on the day:
+`demo/watch.sh once` shows no `demo` instance, and `(no records)` under the name `demo`. If
+another key holds them, change `name: demo` in `demo/demo.yaml` (both registrars) and run
+`watch.sh` with `NAME=<the new label>`.
+
+**Rehearsal**: `demo/run.sh`, as on the day.
+
+One terminal is enough: `demo/run.sh` builds the proxy and the clients, starts the proxy, the
+site and the agents, pauses before each step until Enter, and prints how long
+`ns1.free2air.org` took to show it. The last Enter, or Ctrl-C, stops everything. To run D1 by
+hand instead, use these terminals:
+
+| | Command | What it is |
+|---|---|---|
+| 1 | `$B/sig0lease` | the proxy, on 127.0.0.1:8053: `srp_handler` for `srp.dev.zenr.io.`, `update_handler` for `dev.zenr.io.`, signing upstream with `keystore/server` |
+| 2 | `python3 -m http.server 8000 -d demo/site` | the site |
+| 3 | `$B/sig0lease-agent run -probe-interval 5s demo/demo.yaml` | the agent: host `demo`, its services and the name `demo` |
+| 4 | `demo/watch.sh` | what anyone can see, asked of `ns1.free2air.org` every 2 s |
+
+What the audience can run:
+
+```bash
+dig +short demo.dev.zenr.io                         # any machine
+dig +short TXT demo.dev.zenr.io
+dns-sd -B _http._tcp srp.dev.zenr.io                # a Mac: browse
+dns-sd -L "demo http" _http._tcp srp.dev.zenr.io    #        resolve one instance
+avahi-browse -d srp.dev.zenr.io. -r _http._tcp      # Linux with avahi-daemon
+```
+
+and, on the same network as the laptop, open `http://demo.srp.dev.zenr.io:8000/`. The addresses
+the agent publishes are the laptop's on that network.
+
+Ask the audience to look only once the name is published: a resolver that was told "no such
+name" keeps that answer for up to 6 minutes (the zone's SOA TTL). `@ns1.free2air.org` always
+gives the current answer.
+
 1. Start terminals 1 to 4. The agent logs `registered` for host `demo` and name `demo`, and
    `watch.sh` shows the instance `demo http` under `_http._tcp`, and the name's addresses and
    TXT.
@@ -186,7 +151,13 @@ REGISTRAR=<registrar>:853 TRANSPORT=tls demo/ipfs.sh member     # over DNS-over-
 
 ## D2: the Mac's own services
 
-`demo/run.sh` does it on a Mac, as its step 5. By hand, beside terminals 1 to 4, in another
+**Needs**: a Mac as the laptop, and D1's names free. The rehearsal on it writes the Mac's
+template, `demo/mac.yaml`: it names this Mac, so it is not in the repository. On first use
+macOS asks whether Terminal may find devices on the local network: allow it.
+
+**Rehearsal**: `demo/run.sh` on the Mac, as on the day.
+
+`demo/run.sh` does it on a Mac, as its step 5. By hand, beside D1's terminals 1 to 4, in another
 terminal: `$B/sig0lease-agent run demo/mac.yaml`. In System Settings > General >
 Sharing, turn on Remote Login (`_ssh._tcp`) or Screen Sharing (`_rfb._tcp`): a few seconds later
 the agent logs `registered`, and `watch.sh` shows the Mac's instance. Turn it off and it goes.
@@ -209,6 +180,74 @@ a small always-on machine in real life), keeps every version of it and serves it
 B's agent reads `a`'s folder through its proxy, which answers from `ns1.free2air.org`: B follows
 each change as soon as the zone has it.
 
+**Needs**:
+
+- Two machines: A, the presenter's laptop, and B. Each has IPFS Desktop, or kubo (`ipfs init`),
+  and kubo's `ipfs` command, which works on IPFS Desktop's node too (its repository is
+  `~/.ipfs`).
+- On B, `qrencode`, which prints the QR code the phones scan: `brew install qrencode` on a Mac,
+  `sudo apt install qrencode` on Linux.
+- Phones on the network, which reach B's port 8080.
+- The names `a` and `site` free, before the rehearsal and on the day:
+  `dig +short KEY a.dev.zenr.io @ns1.free2air.org` answers nothing, and so for `site`.
+
+Once, on each node: quit IPFS Desktop, or stop `ipfs daemon`, then
+
+```bash
+ipfs config profile apply autoconf-off               # no public peers, resolvers or routers
+ipfs config Routing.Type dht
+ipfs config --json AutoTLS.Enabled false
+ipfs config --json Swarm.Transports.Network.Websocket false
+ipfs config --json Discovery.MDNS.Enabled false      # nodes found by DNS alone
+ipfs config Addresses.Gateway /ip4/0.0.0.0/tcp/8080  # the gateway reachable on the network
+ipfs id -f '<id>\n'                                  # the node's ID, for the other's peer list
+```
+
+The two nodes are a private swarm: they share a key no other node has, so the folder reaches no
+other node. Make it on A and copy the file to B's `~/.ipfs/swarm.key`, by hand, never into DNS
+or the repository:
+
+```bash
+printf '/key/swarm/psk/1.0.0/\n/base16/\n%s\n' "$(openssl rand -hex 32)" > ~/.ipfs/swarm.key
+```
+
+Each node's peer list is the other's name, whose addresses the agents publish:
+`ipfs bootstrap add /dnsaddr/site.dev.zenr.io/p2p/<B's ID>` on A,
+`ipfs bootstrap add /dnsaddr/a.dev.zenr.io/p2p/<A's ID>` on B. Start the nodes again:
+`ipfs daemon` says "Swarm is limited to private network of peers with the swarm key", and,
+until the agents publish those names, "failed to bootstrap (no peers found)": it tries again by
+itself. On A, make the folder, `ipfs files mkdir /community` (IPFS Desktop: Files, New folder),
+and put a first file in it: without an `index.html`, gateways show it as a list of files.
+
+**Rehearsal**: on the two machines, `demo/ipfs.sh member` on A, then `demo/ipfs.sh community` on
+B. On one machine, B's node is a second one beside A's, with a repository of its own and other
+ports, and the two scripts share a proxy started by hand: each script otherwise starts its own,
+and refuses to start beside another. This has not been tried yet. In B's terminal:
+
+```bash
+export IPFS_PATH=~/.ipfs-b                         # B's node, in this terminal only
+ipfs init
+# the configuration above, its gateway on 8081 instead of 8080, then:
+ipfs config Addresses.API /ip4/127.0.0.1/tcp/5002
+ipfs config --json Addresses.Swarm '["/ip4/0.0.0.0/tcp/4002", "/ip4/0.0.0.0/udp/4002/quic-v1"]'
+cp ~/.ipfs/swarm.key ~/.ipfs-b/                    # A's key
+ipfs bootstrap add /dnsaddr/a.dev.zenr.io/p2p/<A's ID>
+ipfs daemon
+```
+
+and A's peer list gets B's ID as above. Then, each in a terminal of its own:
+
+```bash
+$B/sig0lease                                       # the proxy both use
+REGISTRAR=127.0.0.1:8053 demo/ipfs.sh member
+REGISTRAR=127.0.0.1:8053 IPFS_PATH=~/.ipfs-b IPFS_API=http://127.0.0.1:5002 GATEWAY=8081 \
+    demo/ipfs.sh community
+```
+
+The gateway address B's script prints then has port 8081.
+
+On the day:
+
 1. The projector shows `NAME="a site" demo/watch.sh`, and IPFS Desktop's Peers on A, empty.
 2. On A, `demo/ipfs.sh member`: `_dnslink.a` and `_dnsaddr.a` appear. Then on B,
    `demo/ipfs.sh community`: B's node reaches A's at `_dnsaddr.a`'s addresses (A's Peers now
@@ -227,8 +266,7 @@ each change as soon as the zone has it.
 
 B's node keeps the last version pinned after the demo, under the name
 `sig0lease-agent site.dev.zenr.io.` (`ipfs pin ls --type=recursive --names`), and the next start
-gives it as `site` until `a` publishes again. The two roles can be rehearsed on one machine with
-a second node: `IPFS_PATH`, `IPFS_API` and `GATEWAY` tell `ipfs.sh` where it is.
+gives it as `site` until `a` publishes again.
 
 Why a DNS record, and not IPNS, IPFS's own name for content that changes: an IPNS name is the
 hash of a key (`k51…`), and its record, signed by that key, is published in IPFS's distributed
@@ -241,6 +279,11 @@ servers seconds after the agent's update; a resolver that cached the old one kee
 its TTL.
 
 ## D4: an audience Mac finds them without being told where
+
+**Needs**: a Mac in the audience, whose owner may run `sudo`, and a demo running whose agent
+registers `_http._tcp` services in `srp.dev.zenr.io`: D1 or D6.
+
+**Rehearsal**: on any Mac, the laptop itself included, while `demo/run.sh` runs.
 
 On a Mac in the audience:
 
@@ -268,6 +311,20 @@ certificates are self-signed: a server accepts another only when its key matches
 record, which DNSSEC vouches for (DANE). Nothing is configured between the two servers, and
 nobody makes an account.
 
+**Needs**:
+
+- Two machines, A and B, each with: on a Mac, Docker Desktop, then
+  `docker pull prosodyim/prosody:13.0`; on Linux, Prosody 13 (`apt install prosody` on Debian
+  13, which brings luaunbound, then `sudo systemctl disable --now prosody`: the package's own
+  server would hold the ports), or Docker with `PROSODY=docker`. Also `qrencode`, as for D3.
+- Ports 5222, 5269 and 5280 open to the network on each.
+- Phones on the network, which also reach the internet, for Converse.js.
+- The names `chat-a` and `chat-b` free, before the rehearsal and on the day:
+  `dig +short KEY chat-a.dev.zenr.io @ns1.free2air.org` answers nothing, and so for `chat-b`.
+
+**Rehearsal**: on one machine, `demo/chat.sh chat-a chat-b`, which gives the second server ports
+10 above: 5232, 5279, 5290.
+
 1. On A, `demo/chat.sh chat-a`; on B, `ROOM=meet@rooms.chat-a.dev.zenr.io demo/chat.sh chat-b`.
    Each starts its proxy, its server (in Docker on a Mac, Prosody installed on Linux;
    `PROSODY=docker` or `native` chooses) and its agent, waits until `ns1.free2air.org` has the
@@ -289,12 +346,11 @@ nobody makes an account.
    and the proxy.
 
 Phones talk to their server over plain HTTP on the venue's network, so the guests' messages are
-not encrypted there; the servers talk to each other over TLS. A phone needs the internet too,
-for Converse.js. Each server keeps its certificate and key in `demo/chat/servers/<name>/`, so
-its TLSA record is the same at every run; delete the directory for a new key. A rehearsal on
-one machine, `demo/chat.sh chat-a chat-b`, gives the second server ports 10 above: 5232, 5279,
-5290. A server whose key its TLSA record does not match is refused ("certificate does not match
-any DANE TLSA records" in the other server's log), as the rehearsal on `dev.zenr.io` checked.
+not encrypted there; the servers talk to each other over TLS. Each server keeps its certificate
+and key in `demo/chat/servers/<name>/`, so its TLSA record is the same at every run; delete the
+directory for a new key. A server whose key its TLSA record does not match is refused
+("certificate does not match any DANE TLSA records" in the other server's log), as the
+rehearsal on `dev.zenr.io` checked.
 
 ## D6: the zone in a browser
 
@@ -303,6 +359,14 @@ The page has a DNS client in it: this repository's client code, built for WebAss
 DNS-over-HTTPS, the one DNS transport a browser has, and the proxy answers the questions about
 its zones from the zone's own server: the page sees a change as soon as `ns1.free2air.org` has
 it, not what a resolver cached.
+
+**Needs**: the laptop, with `qrencode`, as for D3, and D1's names free; phones on the same
+network, with a browser from 2023 or later, which reach the laptop's ports 8090 and 8443 (with
+`REGISTRAR`, port 8090 and the internet). On a Mac, allow `sig0lease`'s incoming connections
+when asked.
+
+**Rehearsal**: `demo/web.sh`, and a phone on the same network, or a browser on the laptop, at
+the address it prints.
 
 1. `demo/web.sh` builds the proxy, the agent and the page, and starts: the proxy, with its
    DNS-over-HTTPS listener on (port 8443, plain HTTP); a site and an agent that registers it as
@@ -330,7 +394,7 @@ closes (its lease), the name for 30 (its key's, the most the zone grants). Opene
 that time, from the same browser, the page claims it again. Clearing the browser's data for the
 site loses the key, and the name with it until those 30 minutes are over. The page reaches the
 proxy over plain HTTP on the venue's network: every update is signed with the phone's key, so
-nobody can forge one, but anyone there can read them. It needs a browser from 2023 or later.
+nobody can forge one, but anyone there can read them.
 
 ## After the demo
 
@@ -345,18 +409,18 @@ nobody can forge one, but anyone there can read them. It needs a browser from 20
 ## When something fails
 
 - A script stops at once: "Port 8053, for this demo's proxy, is in use". Another demo still runs,
-  or the proxy of terminal 1 ("The terminals"): stop it, then start the script again.
+  or the proxy of D1's terminal 1: stop it, then start the script again.
 - The proxy logs errors reaching `ns1.free2air.org`: the network blocks port 53. Use a phone's
   hotspot, or the recording.
-- The agent logs a name held by another key: change `name: demo` (step 3 of "Before the day").
+- The agent logs a name held by another key: change `name: demo` (D1, "Needs").
 - D3: B's script waits for `site`: B's node does not reach A's. `ipfs swarm peers` on B lists
   nobody: both `ipfs daemon` logs show the same swarm key fingerprint? B's resolver may have
   answered "no such name" for `_dnsaddr.a` before A published it, and keeps that answer for up
   to 6 minutes: connect by hand, `ipfs swarm connect <address>`, with an address from
   `dig +short TXT _dnsaddr.a.dev.zenr.io @ns1.free2air.org`. The log in the directory B's script
   printed says what B's agent waits for (`agent.log`).
-- D3: phones get no answer from B's gateway: it listens on 127.0.0.1 only (Before the day, step
-  5), and then `b ipfs-gateway` is not registered either.
+- D3: phones get no answer from B's gateway: it listens on 127.0.0.1 only (`Addresses.Gateway`,
+  D3's "Needs"), and then `b ipfs-gateway` is not registered either.
 - `watch.sh` shows a record and the audience does not: their resolver answered "no such name"
   before it was published. Ask `@ns1.free2air.org`, or wait up to 6 minutes.
 - `demo http` is never registered: the probe asks the site at the published addresses

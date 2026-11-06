@@ -1,6 +1,6 @@
 //go:build js && wasm
 
-// Command sig0lease-web is the program of the demo's browser page (docs/demo.md, E3): a
+// Command sig0lease-web is the program of the demo's browser page (docs/demo.md, D6): a
 // client/web Page, as the global object sig0lease, whose functions all return a Promise:
 //
 //	sig0lease.start({doh, zone, domain, log})  starts the Page (web.Config): the proxy's DoH

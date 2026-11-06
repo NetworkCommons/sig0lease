@@ -57,7 +57,7 @@ for label in "$member" "$site" "$host"; do
     fi
 done
 if [ ! -f "$repo/swarm.key" ]; then
-    echo "$repo has no swarm.key: the demo's nodes are a private swarm (docs/demo.md, before the day, D3)" >&2
+    echo "$repo has no swarm.key: the demo's nodes are a private swarm (docs/demo.md, D3: Needs)" >&2
     exit 1
 fi
 if ! curl -sf -o /dev/null -X POST "$api/api/v0/id"; then

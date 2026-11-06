@@ -1,4 +1,4 @@
-// Package web is what the demo's browser page does (docs/demo.md, E3), apart from showing it:
+// Package web is what the demo's browser page does (docs/demo.md, D6), apart from showing it:
 // it browses a DNS-SD domain (client/browse), and lets the visitor claim a name in a zone with
 // a short message, a TXT record at the name that client/rfc9664's Name keeps registered while
 // the page is open. Everything goes to the proxy over DNS-over-HTTPS, the one DNS transport a
