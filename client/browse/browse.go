@@ -72,25 +72,57 @@ func Querier(send client.Transport, server string, network client.Network) Query
 	})
 }
 
+// maxAliases is how many CNAMEs Answers follows for one question, so that a loop of them ends.
+const maxAliases = 8
+
 // Answers returns the Query that reads the answer ask returns to each question, as
-// client/srp's LiveDNSQuery, which asks resolvers, does.
+// client/srp's LiveDNSQuery, which asks resolvers, does. From the name asked it follows the
+// CNAMEs in the answer, to the records of the name they end at; when the answer has none of
+// that name's, it asks for that name: a resolver's answer holds the whole chain, but an
+// authoritative server's, which the proxy relays for its zones, only the part in its zones.
 func Answers(ask func(ctx context.Context, name string, qtype uint16) (*dns.Msg, error)) Query {
 	return func(ctx context.Context, name string, qtype uint16) ([]dns.RR, error) {
-		resp, err := ask(ctx, name, qtype)
-		if err != nil {
-			return nil, fmt.Errorf("%s %s: %w", name, dnsutil.TypeToString(qtype), err)
-		}
-		if resp.Rcode != dns.RcodeSuccess && resp.Rcode != dns.RcodeNameError {
-			return nil, &RcodeError{Name: name, Type: qtype, Rcode: resp.Rcode, EDEs: dnsmsg.EDEs(resp)}
-		}
-		var rrs []dns.RR
-		for _, rr := range resp.Answer {
-			if dns.RRToType(rr) == qtype && dnsname.EqualFold(rr.Header().Name, name) {
-				rrs = append(rrs, rr)
+		owner, aliases := name, 0
+		for {
+			resp, err := ask(ctx, owner, qtype)
+			if err != nil {
+				return nil, fmt.Errorf("%s %s: %w", owner, dnsutil.TypeToString(qtype), err)
+			}
+			if resp.Rcode != dns.RcodeSuccess && resp.Rcode != dns.RcodeNameError {
+				return nil, &RcodeError{Name: owner, Type: qtype, Rcode: resp.Rcode, EDEs: dnsmsg.EDEs(resp)}
+			}
+			asked := owner
+			for target := cnameTarget(resp.Answer, owner, qtype); target != ""; target = cnameTarget(resp.Answer, owner, qtype) {
+				if aliases++; aliases > maxAliases {
+					return nil, fmt.Errorf("%s %s: more than %d CNAMEs", name, dnsutil.TypeToString(qtype), maxAliases)
+				}
+				owner = target
+			}
+			var rrs []dns.RR
+			for _, rr := range resp.Answer {
+				if dns.RRToType(rr) == qtype && dnsname.EqualFold(rr.Header().Name, owner) {
+					rrs = append(rrs, rr)
+				}
+			}
+			if len(rrs) > 0 || dnsname.EqualFold(owner, asked) {
+				return rrs, nil
 			}
 		}
-		return rrs, nil
 	}
+}
+
+// cnameTarget returns the target of the CNAME at owner in answer; "" when answer has none, or
+// qtype asks for CNAME records themselves.
+func cnameTarget(answer []dns.RR, owner string, qtype uint16) string {
+	if qtype == dns.TypeCNAME {
+		return ""
+	}
+	for _, rr := range answer {
+		if c, ok := rr.(*dns.CNAME); ok && dnsname.EqualFold(c.Hdr.Name, owner) {
+			return c.Target
+		}
+	}
+	return ""
 }
 
 // Fallback returns the Query that asks q, and asks other the questions q's server refuses as

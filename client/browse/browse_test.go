@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"reflect"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -12,6 +13,7 @@ import (
 	"codeberg.org/miekg/dns/dnsutil"
 
 	"github.com/NetworkCommons/sig0lease/client"
+	"github.com/NetworkCommons/sig0lease/pkg/dnsmsg"
 )
 
 // zone answers queries from records given in presentation format, as an authoritative server
@@ -162,7 +164,7 @@ func TestQuerier(t *testing.T) {
 		return Querier(send, "http://proxy:8443", client.NetworkDoH)(context.Background(), "demo.srp.example.", dns.TypeA)
 	}
 
-	rrs, err := ask(answer(dns.RcodeSuccess, nil, "DEMO.srp.example. A 192.0.2.7", "demo.srp.example. CNAME other.example.", "other.example. A 192.0.2.8"))
+	rrs, err := ask(answer(dns.RcodeSuccess, nil, "DEMO.srp.example. A 192.0.2.7", `demo.srp.example. TXT "x"`, "other.example. A 192.0.2.8"))
 	if err != nil || len(rrs) != 1 || rrs[0].(*dns.A).Addr.String() != "192.0.2.7" {
 		t.Fatalf("NOERROR: %v, %v; want the one A record at the name", rrs, err)
 	}
@@ -180,6 +182,71 @@ func TestQuerier(t *testing.T) {
 	}
 	if _, err := ask(answer(0, errors.New("connection refused"))); err == nil || !strings.Contains(err.Error(), "connection refused") {
 		t.Fatalf("failed exchange: %v, want its error", err)
+	}
+}
+
+// Answers follows CNAMEs: through a resolver's answer, which holds the whole chain; by asking
+// for the target an authoritative server's answer stops at; to no records when the target has
+// none; not at all for a CNAME question; and not round a loop. Through the proxy, a target
+// outside its zones is refused, and Fallback asks the resolvers the name asked.
+func TestAnswers_CNAMEs(t *testing.T) {
+	rr := func(s string) dns.RR {
+		r, err := dns.New(s)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return r
+	}
+	const name = "_dnslink.site.example.org."
+	alias := rr(name + " CNAME _dnslink.site.host.example.")
+	txt := rr(`_dnslink.site.host.example. TXT "dnslink=/ipfs/QmOne"`)
+	type answers map[string][]dns.RR // by name asked
+	server := func(a answers, asked *[]string) func(context.Context, string, uint16) (*dns.Msg, error) {
+		return func(_ context.Context, n string, qtype uint16) (*dns.Msg, error) {
+			*asked = append(*asked, n)
+			resp := &dns.Msg{MsgHeader: dns.MsgHeader{Response: true}, Answer: a[n]}
+			if a[n] == nil {
+				req := dns.NewMsg(n, qtype)
+				req.UDPSize = dns.DefaultMsgSize
+				resp.Rcode = dns.RcodeRefused
+				dnsmsg.AddEDE(resp, req, dns.ExtendedErrorNotAuthoritative, "")
+			}
+			return resp, nil
+		}
+	}
+	for _, tc := range []struct {
+		name    string
+		qtype   uint16
+		answers answers
+		want    []dns.RR
+		asked   []string
+		wantErr string
+	}{
+		{"resolver: the whole chain", dns.TypeTXT, answers{name: {alias, txt}}, []dns.RR{txt}, []string{name}, ""},
+		{"authoritative: the target asked", dns.TypeTXT, answers{name: {alias}, "_dnslink.site.host.example.": {txt}}, []dns.RR{txt}, []string{name, "_dnslink.site.host.example."}, ""},
+		{"the target has none", dns.TypeTXT, answers{name: {alias}, "_dnslink.site.host.example.": {}}, nil, []string{name, "_dnslink.site.host.example."}, ""},
+		{"a CNAME question", dns.TypeCNAME, answers{name: {alias}}, []dns.RR{alias}, []string{name}, ""},
+		{"a loop", dns.TypeTXT, answers{name: {alias, rr("_dnslink.site.host.example. CNAME " + name)}}, nil, nil, "more than 8 CNAMEs"},
+	} {
+		var asked []string
+		rrs, err := Answers(server(tc.answers, &asked))(context.Background(), name, tc.qtype)
+		switch {
+		case tc.wantErr != "":
+			if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
+				t.Errorf("%s: error %v, want %q", tc.name, err, tc.wantErr)
+			}
+		case err != nil:
+			t.Errorf("%s: %v", tc.name, err)
+		case !slices.Equal(rrs, tc.want) || !slices.Equal(asked, tc.asked):
+			t.Errorf("%s: %v, asking %v; want %v, asking %v", tc.name, rrs, asked, tc.want, tc.asked)
+		}
+	}
+
+	var proxyAsked, resolverAsked []string
+	q := Fallback(Answers(server(answers{name: {alias}}, &proxyAsked)), Answers(server(answers{name: {alias, txt}}, &resolverAsked)))
+	rrs, err := q(context.Background(), name, dns.TypeTXT)
+	if err != nil || !slices.Equal(rrs, []dns.RR{txt}) || !slices.Equal(resolverAsked, []string{name}) {
+		t.Errorf("through the proxy: %v, %v, the resolvers asked %v; want the TXT record, the resolvers asked %s", rrs, err, resolverAsked, name)
 	}
 }
 

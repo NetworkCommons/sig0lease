@@ -317,7 +317,8 @@ with `server.forward` off, as in `config.yaml`, it refuses it, `REFUSED` with Ex
 20 (Not Authoritative), and the follower asks the registrar's `resolvers` instead
 (`docs/siglease_rfc9664.md`, "Requests No Handler Takes"); with it on, it asks its upstream
 resolvers itself. Resolvers may answer from their cache, for up to the record's TTL, and a "no
-such name" for up to the zone's negative TTL. The TTL of a site in the proxy's
+such name" for up to the zone's negative TTL. A `_dnslink` record that is a CNAME into another
+zone, as a hosting service's often is, is followed there. The TTL of a site in the proxy's
 zones, its `record_ttl_sec` (30 s in `config.yaml`), is also how long gateways and resolvers may
 keep a site that changed. [demo.md](demo.md), D3, is a member and a community node in a
 private swarm.
@@ -327,7 +328,7 @@ authoritative server of the site's zone first, by address, then resolvers:
 `resolvers: [192.0.2.53:53, 8.8.8.8:53]`, with the address of a server `dig +short NS
 example.org` names. They are asked in turn, and one that does not answer, or refuses the name,
 as an authoritative server refuses a name outside its zones (BIND with recursion off), is passed
-over for the next. A
+over for the next: the resolvers answer the rest, such as a CNAME's target in another zone. A
 server given by host name is asked at one of its addresses only, which may be one it does not
 answer on.
 

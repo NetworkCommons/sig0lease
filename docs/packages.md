@@ -563,7 +563,11 @@ type Query func(ctx context.Context, name string, qtype uint16) ([]dns.RR, error
 
 func Answers(ask func(ctx context.Context, name string, qtype uint16) (*dns.Msg, error)) Query
     Answers returns the Query that reads the answer ask returns to each
-    question, as client/srp's LiveDNSQuery, which asks resolvers, does.
+    question, as client/srp's LiveDNSQuery, which asks resolvers, does. From the
+    name asked it follows the CNAMEs in the answer, to the records of the name
+    they end at; when the answer has none of that name's, it asks for that name:
+    a resolver's answer holds the whole chain, but an authoritative server's,
+    which the proxy relays for its zones, only the part in its zones.
 
 func Fallback(q, other Query) Query
     Fallback returns the Query that asks q, and asks other the questions q's
