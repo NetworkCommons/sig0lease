@@ -7,8 +7,8 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-User=sig0lease
-Group=sig0lease
+User=sig0lease-%i
+Group=sig0lease-%i
 ExecStart={{ registrar_root }}/%i/current/sig0lease {{ registrar_root }}/%i/current/config.yaml
 WorkingDirectory={{ sig0lease_state_root }}/%i
 # SIGTERM: the proxy stops its handlers and saves its lease stores once more.
@@ -16,7 +16,7 @@ TimeoutStopSec=30
 Restart=on-failure
 RestartSec=5
 
-# It reads its release, its config and the zones' keys, and writes only its own lease stores. Its
+# It reads its release, its config and its key, and writes only its own lease stores. Its
 # port is no privileged one, and nginx ends TLS for it.
 UMask=0077
 ReadWritePaths={{ sig0lease_state_root }}/%i

@@ -16,12 +16,16 @@ registrar_name: '{{ lookup("ansible.builtin.pipe", "ssh -G " ~ inventory_hostnam
 #   dot_port     DNS-over-TLS, in nginx
 #   https_port   the page and /dns-query (DNS-over-HTTPS), in nginx
 #   doh_address  the proxy's DNS-over-HTTPS listener, in plain HTTP, which only nginx reaches
+#   key          the name of the instance's key in keystore/server, K<key>+<algorithm>+<tag>,
+#                at its zones or above them, the only key it is given (deploy/README.md, "The
+#                zones' keys")
 # Each instance's zones lie outside the other's (deploy/README.md).
 registrar_instances:
   stable:
     zones:
       update: dev.zenr.io.
       srp_handler: srp.dev.zenr.io.
+    key: dev.zenr.io.
     port: 8053
     dot_port: 853
     https_port: 443
@@ -30,6 +34,7 @@ registrar_instances:
     zones:
       update: stg.zenr.io.
       srp_handler: srp.stg.zenr.io.
+    key: stg.zenr.io.
     port: 8054
     dot_port: 8853
     https_port: 8444
