@@ -358,7 +358,9 @@ The page has a DNS client in it: this repository's client code, built for WebAss
 (`make web`). It sends every question and every update to the laptop's proxy over
 DNS-over-HTTPS, the one DNS transport a browser has, and the proxy answers the questions about
 its zones from the zone's own server: the page sees a change as soon as `ns1.free2air.org` has
-it, not what a resolver cached.
+it, not what a resolver cached. A question about a name outside the zones, such as the address
+of a service's host elsewhere, the proxy refuses, as it is no resolver, and the page asks
+Google's DNS-over-HTTPS resolver instead, over the internet.
 
 **Needs**: the laptop, with `qrencode`, as for D3, and D1's names free; phones on the same
 network, with a browser from 2023 or later, which reach the laptop's ports 8090 and 8443 (with

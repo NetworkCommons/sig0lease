@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/tls"
+	"encoding/base64"
 	"fmt"
 	"net"
 	"net/http"
@@ -176,21 +177,34 @@ func (c *Client) queryTCP(msg *dns.Msg) (*dns.Msg, error) {
 	return resp, err
 }
 
-// queryDoH sends a DNS message as an RFC 8484 POST to the server URL's "/dns-query". The
-// message goes as packed, its ID included: a SIG(0) signature covers the ID, so it cannot
-// be set to 0 after signing, as RFC 8484 S4.1 suggests for caching (which a POST does not
-// get anyway). Anything but a 200 answer with a DNS message is an error.
+// queryDoH sends a DNS message to the server URL's "/dns-query" (RFC 8484): a query as a GET,
+// with the message in its "dns" parameter, anything else, an UPDATE, as a POST. A GET has no
+// body and no Content-Type, so a browser sends it to a server of another origin without asking
+// first whether it may (a CORS preflight), which a public resolver such as dns.google does not
+// answer; the proxy answers both. The message goes as packed, its ID included: a SIG(0)
+// signature covers the ID, so it cannot be set to 0 after signing, as RFC 8484 S4.1 suggests
+// for caching, and a query's random ID keeps any HTTP cache on the way from answering it.
+// Anything but a 200 answer with a DNS message is an error.
 func (c *Client) queryDoH(msg *dns.Msg) (*dns.Msg, error) {
 	if err := msg.Pack(); err != nil {
 		return nil, fmt.Errorf("pack error: %w", err)
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), c.timeout)
 	defer cancel()
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, strings.TrimSuffix(c.server, "/")+dnshttp.Path, bytes.NewReader(msg.Data))
+	url := strings.TrimSuffix(c.server, "/") + dnshttp.Path
+	var req *http.Request
+	var err error
+	if msg.Opcode == dns.OpcodeQuery {
+		req, err = http.NewRequestWithContext(ctx, http.MethodGet, url+"?dns="+base64.RawURLEncoding.EncodeToString(msg.Data), nil)
+	} else {
+		req, err = http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(msg.Data))
+		if err == nil {
+			req.Header.Set("Content-Type", dnshttp.MimeType)
+		}
+	}
 	if err != nil {
 		return nil, fmt.Errorf("doh request: %w", err)
 	}
-	req.Header.Set("Content-Type", dnshttp.MimeType)
 	req.Header.Set("Accept", dnshttp.MimeType)
 	resp, err := c.httpClient.Do(req)
 	if err != nil {

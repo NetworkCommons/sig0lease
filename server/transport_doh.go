@@ -81,6 +81,18 @@ func (s *Server) serveDoH(ctx context.Context, handler dns.HandlerFunc) error {
 	}
 }
 
+// noStore is the http.ResponseWriter under dnshttp's: it replaces the Cache-Control dnshttp
+// sets on every answer, max-age=600, with no-store, as the header goes out. The proxy answers
+// a query for its zones from their authoritative server so that the asker sees a change at
+// once; a browser that kept the answer of a GET for 10 minutes would undo that, as would an
+// HTTP cache on the way. An answer to a POST, an UPDATE's, is not cached anyway.
+type noStore struct{ http.ResponseWriter }
+
+func (w noStore) WriteHeader(code int) {
+	w.Header().Set("Cache-Control", "no-store")
+	w.ResponseWriter.WriteHeader(code)
+}
+
 // dohHandler turns each RFC 8484 request into a DNS message and serves it as the dns.Server
 // of the other transports does (serveNetwork): acceptMsg first, which ignores a response,
 // answers FORMERR or NOTIMP without dispatching, or accepts; then next, with a
@@ -110,7 +122,7 @@ func (s *Server) dohHandler(next dns.HandlerFunc) http.Handler {
 			return
 		}
 		laddr, _ := r.Context().Value(http.LocalAddrContextKey).(net.Addr)
-		dw := dnshttp.NewResponseWriter(w, r, laddr)
+		dw := dnshttp.NewResponseWriter(noStore{w}, r, laddr)
 
 		switch action := s.acceptMsg(m); action {
 		case dns.MsgIgnore:

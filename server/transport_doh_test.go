@@ -58,7 +58,8 @@ func TestServeDoH_HTTPSRoundTripKeepsID(t *testing.T) {
 }
 
 // A GET request (RFC 8484 S4.1's other form) reaches the handler too, and every response
-// allows any origin; a browser's preflight request is answered without a DNS message.
+// allows any origin, and may not be stored by a cache; a browser's preflight request is
+// answered without a DNS message.
 func TestServeDoH_GETAndCORS(t *testing.T) {
 	addr := reserveAddr(t, "tcp")
 	startDoH(t, &config.TLSConfig{Address: addr})
@@ -82,6 +83,9 @@ func TestServeDoH_GETAndCORS(t *testing.T) {
 	}
 	if got := resp.Header.Get("Access-Control-Allow-Origin"); got != "*" {
 		t.Errorf("Access-Control-Allow-Origin = %q, want *", got)
+	}
+	if got := resp.Header.Values("Cache-Control"); len(got) != 1 || got[0] != "no-store" {
+		t.Errorf("Cache-Control = %q, want no-store alone", got)
 	}
 
 	preflight, err := http.NewRequest(http.MethodOptions, url+dnshttp.Path, nil)

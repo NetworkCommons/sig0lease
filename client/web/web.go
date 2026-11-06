@@ -3,9 +3,11 @@
 // a short message, a TXT record at the name that client/rfc9664's Name keeps registered while
 // the page is open. Everything goes to the proxy over DNS-over-HTTPS, the one DNS transport a
 // browser has; the proxy answers queries for its zones from their authoritative server, so the
-// page sees a change as soon as the server has it. The name's key, what the name holds and the
-// claim are kept in the browser's storage, so that a visitor who comes back within the name's
-// KEY-LEASE gets the name back. cmd/sig0lease-web makes a Page the page's JavaScript API.
+// page sees a change as soon as the server has it. A question about any other name, which a
+// proxy that forwards none refuses, goes to the Fallback resolver. The name's key, what the
+// name holds and the claim are kept in the browser's storage, so that a visitor who comes back
+// within the name's KEY-LEASE gets the name back. cmd/sig0lease-web makes a Page the page's
+// JavaScript API.
 package web
 
 import (
@@ -41,6 +43,11 @@ type Config struct {
 	Zone    string  // the zone names are claimed in: the proxy's RFC 9664 handler's
 	Domain  string  // the DNS-SD domain Browse reads
 	Storage Storage // required
+	// Fallback is the DNS-over-HTTPS server asked the questions DoH refuses as names it does
+	// not serve (browse.Fallback), as a URL with no path, which a page may ask from any
+	// origin: a public resolver, such as https://dns.google. Default: none, and those
+	// questions fail.
+	Fallback string
 	// Logf receives the claimed name's log lines. Default: none.
 	Logf    func(format string, args ...any)
 	Timeout time.Duration    // per exchange; default 10s
@@ -82,6 +89,11 @@ func New(cfg Config) (*Page, error) {
 	if err := client.NetworkDoH.CheckServer(cfg.DoH); err != nil {
 		return nil, fmt.Errorf("web: DoH: %w", err)
 	}
+	if cfg.Fallback != "" {
+		if err := client.NetworkDoH.CheckServer(cfg.Fallback); err != nil {
+			return nil, fmt.Errorf("web: Fallback: %w", err)
+		}
+	}
 	if cfg.Zone == "" || cfg.Domain == "" {
 		return nil, errors.New("web: Zone and Domain are required")
 	}
@@ -98,7 +110,11 @@ func New(cfg Config) (*Page, error) {
 	if cfg.Send == nil {
 		cfg.Send = client.LiveTransport(cfg.Timeout)
 	}
-	return &Page{cfg: cfg, query: browse.Querier(cfg.Send, cfg.DoH, client.NetworkDoH)}, nil
+	query := browse.Querier(cfg.Send, cfg.DoH, client.NetworkDoH)
+	if cfg.Fallback != "" {
+		query = browse.Fallback(query, browse.Querier(cfg.Send, cfg.Fallback, client.NetworkDoH))
+	}
+	return &Page{cfg: cfg, query: query}, nil
 }
 
 // Browse reads the domain (browse.Browse).

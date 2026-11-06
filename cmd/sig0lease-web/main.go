@@ -14,8 +14,9 @@
 //	sig0lease.claim(label, message)             claims the name with the message
 //	sig0lease.release()                         frees the name claimed
 //
-// The browser's localStorage keeps the name's key and the claim. make web builds it, with the
-// page and Go's loader beside it.
+// The browser's localStorage keeps the name's key and the claim. A question the proxy refuses
+// as a name it does not serve goes to fallback, Google's public resolver, which any page may
+// ask. make web builds it, with the page and Go's loader beside it.
 package main
 
 import (
@@ -59,6 +60,10 @@ func main() {
 	select {} // the page calls in until it closes
 }
 
+// fallback is the page's web.Config.Fallback: Google's public DNS-over-HTTPS resolver, which
+// allows any origin, for a GET (client.Client's queryDoH sends queries so).
+const fallback = "https://dns.google"
+
 // start makes the Page from the configuration object args[0].
 func start(args []js.Value) (err error) {
 	if page != nil {
@@ -77,11 +82,12 @@ func start(args []js.Value) (err error) {
 		return err
 	}
 	page, err = web.New(web.Config{
-		DoH:     field(o, "doh"),
-		Zone:    field(o, "zone"),
-		Domain:  field(o, "domain"),
-		Storage: storage,
-		Logf:    func(format string, a ...any) { log.Invoke(fmt.Sprintf(format, a...)) },
+		DoH:      field(o, "doh"),
+		Zone:     field(o, "zone"),
+		Domain:   field(o, "domain"),
+		Storage:  storage,
+		Fallback: fallback,
+		Logf:     func(format string, a ...any) { log.Invoke(fmt.Sprintf(format, a...)) },
 	})
 	return err
 }

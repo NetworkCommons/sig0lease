@@ -259,6 +259,8 @@ With a processing rule for opcode 0 (QUERY) listing the handlers, as `config.yam
 
 What no handler takes -- a query for a name outside the handlers' zones, an UPDATE without the Update Lease option, a request with an opcode no processing rule lists -- is refused by default: `REFUSED` with Extended DNS Error 20 (Not Authoritative), RFC 8914's code for a server that is not authoritative for the name and is not configured to recurse (`Router.answerUnhandled`). With `server.forward: true` it goes to the upstream resolvers instead, and their answer is relayed; one that cannot be forwarded gets `SERVFAIL` with Extended DNS Error 22. Forwarding is off by default so that a proxy on an address the internet reaches is no open resolver, which anyone could resolve names through and aim amplified answers at a forged source address with. The handlers ask the upstream resolvers either way for their own lookups: a zone's SOA, when no static `upstream` is set (`bootstrap_resolvers`). `tests/test_forward.sh` checks both settings.
 
+The refusal is the client's cue to ask a resolver instead, which needs the EDE: a server sends one only in reply to a request with an OPT RR (RFC 8914 §2), and a bare `REFUSED` says nothing about why. The demo's page (`client/web`) does this, through `browse.Fallback`: it asks the proxy first, which answers for its zones from their authoritative server, and Google's public DNS-over-HTTPS resolver only the questions the proxy refuses with Extended DNS Error 20, for instance for the addresses of an SRV target outside the zones. A page can ask that resolver from any origin over a GET, which needs no CORS preflight (Google's resolver does not answer one); `client.Client` sends every DoH query as a GET and every UPDATE as a POST.
+
 ### The Zone Section
 
 Both handlers read the Zone Section the same way (`handlers.refuseOutsideZoneSection`): it must enclose every name in the Update section, as RFC 2136 §3.4.1.3 requires, or the answer is `NOTZONE`; anything but one entry is `FORMERR`. Nothing else reads it. Which handler takes an UPDATE, and what it may change, go by the names: this handler's zone check (above), the signer's name and the SIG(0) checks; SRP takes an update by its host name (`docs/siglease_rfc9665.md` §3). The UPDATE sent upstream names the handler's own zone, and its lookups ask that zone's server.
@@ -515,13 +517,17 @@ What the listener does beyond the RFC:
 - A request that is not a DNS message (wrong Content-Type, a body that does not unpack), or a
   message `acceptMsg` ignores (a response), gets HTTP 400: there is no DNS reply to send, as UDP
   and TCP send none.
-- Every answer carries the library's `Cache-Control: max-age=600`. RFC 8484 §5.1 asks for no
-  longer than the smallest TTL, so a GET answer may be cached by a browser longer than its
-  records live. The clients here POST, which browsers do not cache.
+- Every answer carries `Cache-Control: no-store`, in place of the library's `max-age=600`
+  (`server.noStore`): the proxy answers a query for its zones from their authoritative server
+  so that the asker sees a change at once, and a browser that kept a GET's answer would undo
+  that. RFC 8484 §5.1 asks for a freshness lifetime no longer than the smallest TTL; none is
+  shorter.
 
 The clients send over DoH with `-transport doh` (template `transport: doh`), `-server` then
 being the URL (`https://host:port`, or `http://` for a plain listener) instead of
-`host:port` (`client.Network.CheckServer`). They POST the message as packed, its ID included.
+`host:port` (`client.Network.CheckServer`). They send the message as packed, its ID
+included: a query as a GET, which a browser sends to another origin without a preflight, and
+an UPDATE as a POST.
 An https server's certificate is not checked, the Opportunistic Privacy profile DoT has; in a
 browser, `net/http` sends through `fetch`, which checks it itself. RFC 9665 names no DoH
 service, so an SRP registrar reached over DoH is never discovered: `-server` is required.

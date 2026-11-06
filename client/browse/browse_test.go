@@ -125,18 +125,29 @@ func TestBrowse_FailedQuestion(t *testing.T) {
 	}
 }
 
-// TestQuerier: the answer's records of the type asked at the name asked; none for NXDOMAIN;
-// an error for any other rcode, or when the exchange fails.
+// TestQuerier: each question carries an OPT RR; the answer's records of the type asked at the
+// name asked; none for NXDOMAIN; a *RcodeError for any other rcode, with the answer's Extended
+// DNS Errors; an error when the exchange fails.
 func TestQuerier(t *testing.T) {
 	answer := func(rcode uint16, err error, rrs ...string) client.Transport {
 		return func(ctx context.Context, addr string, network client.Network, msg *dns.Msg) (*dns.Msg, error) {
 			if addr != "http://proxy:8443" || network != client.NetworkDoH {
 				t.Fatalf("sent to %s over %s", addr, network)
 			}
+			if err := msg.Pack(); err != nil {
+				t.Fatal(err)
+			}
+			wire := &dns.Msg{Data: msg.Data}
+			if err := wire.Unpack(); err != nil || wire.UDPSize == 0 {
+				t.Fatalf("the question has no OPT RR (UDPSize %d, %v)", wire.UDPSize, err)
+			}
 			if err != nil {
 				return nil, err
 			}
 			resp := &dns.Msg{MsgHeader: dns.MsgHeader{ID: msg.ID, Response: true, Rcode: rcode}, Question: msg.Question}
+			if rcode == dns.RcodeRefused {
+				resp.Pseudo = []dns.RR{&dns.EDE{InfoCode: dns.ExtendedErrorNotAuthoritative}}
+			}
 			for _, s := range rrs {
 				rr, err := dns.New(s)
 				if err != nil {
@@ -161,7 +172,74 @@ func TestQuerier(t *testing.T) {
 	if _, err := ask(answer(dns.RcodeServerFailure, nil)); err == nil || !strings.Contains(err.Error(), "SERVFAIL") {
 		t.Fatalf("SERVFAIL: %v, want an error naming it", err)
 	}
+	_, err = ask(answer(dns.RcodeRefused, nil))
+	var re *RcodeError
+	if !errors.As(err, &re) || re.Rcode != dns.RcodeRefused || len(re.EDEs) != 1 || re.EDEs[0].InfoCode != dns.ExtendedErrorNotAuthoritative ||
+		!strings.Contains(err.Error(), "REFUSED, Extended DNS Error 20 (Not Authoritative)") {
+		t.Fatalf("REFUSED with EDE 20: %v, want a *RcodeError with the EDE, naming both", err)
+	}
 	if _, err := ask(answer(0, errors.New("connection refused"))); err == nil || !strings.Contains(err.Error(), "connection refused") {
 		t.Fatalf("failed exchange: %v, want its error", err)
+	}
+}
+
+// TestFallback: only a refusal as not served, REFUSED with Extended DNS Error 20, is asked of
+// the other Query, whose answer is then the answer; every other answer and failure is the first
+// Query's, and a failure of the other carries both.
+func TestFallback(t *testing.T) {
+	refusal := func(rcode uint16, codes ...uint16) error {
+		e := &RcodeError{Name: "xmpp.example.org.", Type: dns.TypeA, Rcode: rcode}
+		for _, c := range codes {
+			e.EDEs = append(e.EDEs, &dns.EDE{InfoCode: c})
+		}
+		return e
+	}
+	a, err := dns.New("xmpp.example.org. A 192.0.2.9")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, tc := range []struct {
+		name    string
+		first   error
+		other   error
+		asked   bool
+		wantErr []string // what the error names; nil: no error
+		wantRRs int
+	}{
+		{"answered", nil, nil, false, nil, 0},
+		{"not served", refusal(dns.RcodeRefused, dns.ExtendedErrorProhibited, dns.ExtendedErrorNotAuthoritative), nil, true, nil, 1},
+		{"not served, other fails", refusal(dns.RcodeRefused, dns.ExtendedErrorNotAuthoritative), errors.New("timeout"), true, []string{"REFUSED", "timeout"}, 0},
+		{"refused, no EDE", refusal(dns.RcodeRefused), nil, false, []string{"REFUSED"}, 0},
+		{"refused, another EDE", refusal(dns.RcodeRefused, dns.ExtendedErrorProhibited), nil, false, []string{"REFUSED"}, 0},
+		{"SERVFAIL with EDE 20", refusal(dns.RcodeServerFailure, dns.ExtendedErrorNotAuthoritative), nil, false, []string{"SERVFAIL"}, 0},
+		{"exchange fails", errors.New("connection refused"), nil, false, []string{"connection refused"}, 0},
+	} {
+		asked := false
+		first := func(context.Context, string, uint16) ([]dns.RR, error) { return nil, tc.first }
+		other := func(_ context.Context, name string, qtype uint16) ([]dns.RR, error) {
+			asked = true
+			if name != "xmpp.example.org." || qtype != dns.TypeA {
+				t.Errorf("%s: other asked %s %d", tc.name, name, qtype)
+			}
+			if tc.other != nil {
+				return nil, tc.other
+			}
+			return []dns.RR{a}, nil
+		}
+		rrs, err := Fallback(first, other)(context.Background(), "xmpp.example.org.", dns.TypeA)
+		if asked != tc.asked {
+			t.Errorf("%s: other asked: %v, want %v", tc.name, asked, tc.asked)
+		}
+		if len(rrs) != tc.wantRRs {
+			t.Errorf("%s: %d records, want %d", tc.name, len(rrs), tc.wantRRs)
+		}
+		if (err != nil) != (tc.wantErr != nil) {
+			t.Fatalf("%s: error %v, want one naming %q", tc.name, err, tc.wantErr)
+		}
+		for _, w := range tc.wantErr {
+			if !strings.Contains(err.Error(), w) {
+				t.Errorf("%s: error %q does not name %q", tc.name, err, w)
+			}
+		}
 	}
 }

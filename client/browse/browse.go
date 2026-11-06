@@ -6,6 +6,7 @@ package browse
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net/netip"
 	"slices"
@@ -40,18 +41,39 @@ type Domain struct {
 }
 
 // Query asks one question and returns the answer's records of type qtype at name: none for
-// NXDOMAIN or NODATA, an error for any other failure.
+// NXDOMAIN or NODATA, an error for any other failure: a *RcodeError for an answer with another
+// RCODE.
 type Query func(ctx context.Context, name string, qtype uint16) ([]dns.RR, error)
 
-// Querier returns the Query that sends each question to server over network with send.
+// RcodeError is a Query's failure for an answer whose RCODE is neither NOERROR nor NXDOMAIN.
+type RcodeError struct {
+	Name  string
+	Type  uint16
+	Rcode uint16
+	EDEs  []*dns.EDE // the answer's Extended DNS Errors (RFC 8914), which say why
+}
+
+func (e *RcodeError) Error() string {
+	s := fmt.Sprintf("%s %s: %s", e.Name, dnsutil.TypeToString(e.Type), dnsutil.RcodeToString(e.Rcode))
+	for _, ede := range e.EDEs {
+		s += ", Extended DNS Error " + dnsmsg.FormatEDE(ede)
+	}
+	return s
+}
+
+// Querier returns the Query that sends each question to server over network with send. Each
+// carries an OPT RR, without which a server sends no Extended DNS Error (RFC 8914 S2), as the
+// one Fallback looks for.
 func Querier(send client.Transport, server string, network client.Network) Query {
 	return func(ctx context.Context, name string, qtype uint16) ([]dns.RR, error) {
-		resp, err := send(ctx, server, network, dns.NewMsg(name, qtype))
+		msg := dns.NewMsg(name, qtype)
+		msg.UDPSize = dns.DefaultMsgSize
+		resp, err := send(ctx, server, network, msg)
 		if err != nil {
 			return nil, fmt.Errorf("%s %s: %w", name, dnsutil.TypeToString(qtype), err)
 		}
 		if resp.Rcode != dns.RcodeSuccess && resp.Rcode != dns.RcodeNameError {
-			return nil, fmt.Errorf("%s %s: %s", name, dnsutil.TypeToString(qtype), dnsutil.RcodeToString(resp.Rcode))
+			return nil, &RcodeError{Name: name, Type: qtype, Rcode: resp.Rcode, EDEs: dnsmsg.EDEs(resp)}
 		}
 		var rrs []dns.RR
 		for _, rr := range resp.Answer {
@@ -61,6 +83,41 @@ func Querier(send client.Transport, server string, network client.Network) Query
 		}
 		return rrs, nil
 	}
+}
+
+// Fallback returns the Query that asks q, and asks other the questions q's server refuses as
+// names it does not serve: REFUSED with Extended DNS Error 20, Not Authoritative, as the proxy
+// answers for a name outside its zones when it forwards no queries (server.forward off). q
+// would be the proxy, for its zones' answers from their authoritative server, and other
+// resolvers, for every other name, such as the target of an SRV record outside the zones: the
+// browser page's. Any other answer, or failure, is q's.
+func Fallback(q, other Query) Query {
+	return func(ctx context.Context, name string, qtype uint16) ([]dns.RR, error) {
+		rrs, err := q(ctx, name, qtype)
+		if !notServed(err) {
+			return rrs, err
+		}
+		rrs, oerr := other(ctx, name, qtype)
+		if oerr != nil {
+			return nil, fmt.Errorf("%w; asked instead: %w", err, oerr)
+		}
+		return rrs, nil
+	}
+}
+
+// notServed reports whether err is the answer of a server that refuses the name as not one it
+// serves: REFUSED, with Extended DNS Error 20, Not Authoritative.
+func notServed(err error) bool {
+	var re *RcodeError
+	if !errors.As(err, &re) || re.Rcode != dns.RcodeRefused {
+		return false
+	}
+	for _, ede := range re.EDEs {
+		if ede.InfoCode == dns.ExtendedErrorNotAuthoritative {
+			return true
+		}
+	}
+	return false
 }
 
 // parallel is how many questions Browse has out at once.

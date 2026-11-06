@@ -550,12 +550,34 @@ type Instance struct {
     Instance is one service instance found in the domain.
 
 type Query func(ctx context.Context, name string, qtype uint16) ([]dns.RR, error)
-    Query asks one question and returns the answer's records of type qtype at
-    name: none for NXDOMAIN or NODATA, an error for any other failure.
+    Query asks one question and returns the answer's records of type qtype
+    at name: none for NXDOMAIN or NODATA, an error for any other failure:
+    a *RcodeError for an answer with another RCODE.
+
+func Fallback(q, other Query) Query
+    Fallback returns the Query that asks q, and asks other the questions q's
+    server refuses as names it does not serve: REFUSED with Extended DNS Error
+    20, Not Authoritative, as the proxy answers for a name outside its zones
+    when it forwards no queries (server.forward off). q would be the proxy,
+    for its zones' answers from their authoritative server, and other resolvers,
+    for every other name, such as the target of an SRV record outside the zones:
+    the browser page's. Any other answer, or failure, is q's.
 
 func Querier(send client.Transport, server string, network client.Network) Query
     Querier returns the Query that sends each question to server over network
-    with send.
+    with send. Each carries an OPT RR, without which a server sends no Extended
+    DNS Error (RFC 8914 S2), as the one Fallback looks for.
+
+type RcodeError struct {
+	Name  string
+	Type  uint16
+	Rcode uint16
+	EDEs  []*dns.EDE // the answer's Extended DNS Errors (RFC 8914), which say why
+}
+    RcodeError is a Query's failure for an answer whose RCODE is neither NOERROR
+    nor NXDOMAIN.
+
+func (e *RcodeError) Error() string
 
 ```
 
@@ -1307,16 +1329,17 @@ func (l Labels) Renamed(hostLabel string) bool
 ```
 package web // import "github.com/NetworkCommons/sig0lease/client/web"
 
-Package web is what the demo's browser page does (docs/demo.md, D6),
-apart from showing it: it browses a DNS-SD domain (client/browse), and lets the
-visitor claim a name in a zone with a short message, a TXT record at the name
-that client/rfc9664's Name keeps registered while the page is open. Everything
-goes to the proxy over DNS-over-HTTPS, the one DNS transport a browser has;
-the proxy answers queries for its zones from their authoritative server,
-so the page sees a change as soon as the server has it. The name's key, what the
-name holds and the claim are kept in the browser's storage, so that a visitor
-who comes back within the name's KEY-LEASE gets the name back. cmd/sig0lease-web
-makes a Page the page's JavaScript API.
+Package web is what the demo's browser page does (docs/demo.md, D6), apart from
+showing it: it browses a DNS-SD domain (client/browse), and lets the visitor
+claim a name in a zone with a short message, a TXT record at the name that
+client/rfc9664's Name keeps registered while the page is open. Everything goes
+to the proxy over DNS-over-HTTPS, the one DNS transport a browser has; the proxy
+answers queries for its zones from their authoritative server, so the page
+sees a change as soon as the server has it. A question about any other name,
+which a proxy that forwards none refuses, goes to the Fallback resolver. The
+name's key, what the name holds and the claim are kept in the browser's storage,
+so that a visitor who comes back within the name's KEY-LEASE gets the name back.
+cmd/sig0lease-web makes a Page the page's JavaScript API.
 
 TYPES
 
@@ -1332,6 +1355,11 @@ type Config struct {
 	Zone    string  // the zone names are claimed in: the proxy's RFC 9664 handler's
 	Domain  string  // the DNS-SD domain Browse reads
 	Storage Storage // required
+	// Fallback is the DNS-over-HTTPS server asked the questions DoH refuses as names it does
+	// not serve (browse.Fallback), as a URL with no path, which a page may ask from any
+	// origin: a public resolver, such as https://dns.google. Default: none, and those
+	// questions fail.
+	Fallback string
 	// Logf receives the claimed name's log lines. Default: none.
 	Logf    func(format string, args ...any)
 	Timeout time.Duration    // per exchange; default 10s
