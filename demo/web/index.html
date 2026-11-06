@@ -6,7 +6,8 @@
 <title>sig0lease live zone</title>
 <!-- E3 of docs/demo.md: make web builds this page into bin/web, beside sig0lease-web.wasm.gz (cmd/sig0lease-web)
      and Go's wasm_exec.js; demo/web.sh serves it. Query parameters: doh, the proxy's DNS-over-HTTPS server
-     (default this host, port 8443); zone, where names are claimed (default dev.zenr.io); domain, the DNS-SD
+     (default the page's own origin, as on the registrar, whose web server serves both; demo/web.sh
+     always gives it); zone, where names are claimed (default dev.zenr.io); domain, the DNS-SD
      domain shown (default srp.dev.zenr.io); ns, a server for the dig commands shown (default none). -->
 <style>
   :root { --fg: #222; --bg: #fafafa; --muted: #666; --line: #ddd; --code: #eee; --card: #fff;
@@ -95,7 +96,7 @@
 "use strict";
 const params = new URLSearchParams(location.search);
 const cfg = {
-  doh: params.get("doh") || `${location.protocol}//${location.hostname}:8443`,
+  doh: params.get("doh") || location.origin,
   zone: params.get("zone") || "dev.zenr.io",
   domain: params.get("domain") || "srp.dev.zenr.io",
 };
@@ -281,7 +282,7 @@ $("lookup-form").addEventListener("submit", async (ev) => {
     const { instance } = await WebAssembly.instantiate(wasm, go.importObject);
     go.run(instance); // sets the global sig0lease, then waits for calls
     await sig0lease.start({ ...cfg, log });
-    $("status").textContent = `A DNS client running in this page asks this laptop's proxy, over DNS-over-HTTPS at ${cfg.doh}. The proxy answers from the zone's own server.`;
+    $("status").textContent = `A DNS client running in this page asks the proxy at ${cfg.doh}, over DNS-over-HTTPS. The proxy answers from the zone's own server.`;
     $("claim").disabled = $("lookup").disabled = false;
   } catch (e) {
     $("status").textContent = `The DNS client did not start: ${e.message}`;

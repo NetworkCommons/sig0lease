@@ -1,6 +1,28 @@
 # demo/lib.sh -- what the demo's scripts (run.sh, chat.sh, web.sh, ipfs.sh) share, sourced by
-# them. They set log, the directory for the programs' logs, and ns, the server ask() asks, before
-# using these.
+# them. They set B, the binaries' directory, log, the directory for the programs' logs, and ns,
+# the server ask() asks, before using these.
+#
+# REGISTRAR, when set, is the registrar the agents send their updates to, in place of the proxy
+# each demo otherwise starts on this machine, at 127.0.0.1:8053: a shared one, as the public
+# registrar (docs/demo.md, "Against a shared registrar"). It is what the agents' templates take
+# as server: host:port, or an https URL with TRANSPORT=doh. TRANSPORT, with REGISTRAR only, is how
+# they reach it: tcp (the agents' default), udp, tls or doh.
+
+if [ -n "${TRANSPORT:-}" ] && [ -z "${REGISTRAR:-}" ]; then
+    echo "TRANSPORT is how the agents reach REGISTRAR, which is not set: this machine's proxy takes the agents' default, tcp" >&2
+    exit 1
+fi
+
+# remote -- whether the demo uses REGISTRAR, and starts no proxy.
+remote() { [ -n "${REGISTRAR:-}" ]; }
+
+# via -- how the demo's updates reach the zone, for the scripts' messages; our_proxy -- "the
+# proxy, " when the demo starts one, for the steps that list what they start and stop.
+if remote; then
+    via="through the registrar at $REGISTRAR" our_proxy=
+else
+    via="through this machine's proxy" our_proxy="the proxy, "
+fi
 
 # start <var> <log> <command...> -- runs the command in the background, its pid in <var>.
 start() {
@@ -38,15 +60,59 @@ in_use() { (exec 3<> "/dev/tcp/127.0.0.1/$1") 2> /dev/null; }
 # check_proxy_ports [port...] -- exits unless port 8053, where the demo's proxy listens, and the
 # other ports given are free on this machine. Each demo starts its own proxy, with the config it
 # needs, so it does not run beside another proxy: another demo's, or one whose config it cannot
-# know.
+# know. With REGISTRAR, it starts none, and this checks nothing.
 check_proxy_ports() {
     local port
+    remote && return 0
     for port in 8053 "$@"; do
         if in_use "$port"; then
             echo "Port $port, for this demo's proxy, is in use: another demo, or another proxy, runs on this machine. Stop it first: each demo starts its own proxy (docs/demo.md)." >&2
             exit 1
         fi
     done
+}
+
+# build [web] -- builds the clients, the proxy unless REGISTRAR is set, and with web the page.
+build() {
+    local targets=(build-client) what="the clients"
+    if ! remote; then
+        targets=(build "${targets[@]}") what="the proxy and $what"
+    fi
+    if [ "${1:-}" = web ]; then
+        targets+=(web) what="$what, and the page"
+    fi
+    echo "Building $what."
+    make -s "${targets[@]}" || exit 1
+}
+
+# start_proxy [config] -- starts this demo's proxy, with config.yaml or the config given; with
+# REGISTRAR, nothing.
+start_proxy() {
+    remote && return 0
+    start proxy proxy.log "$B/sig0lease" "$@"
+}
+
+# template <file> <copy> -- copies an agent template for this run (the copy may be the file): a
+# relative keystore made absolute, as the agent takes it relative to the template's directory,
+# and with REGISTRAR each registrar's server, this machine's proxy (127.0.0.1:8053), replaced
+# by REGISTRAR, with TRANSPORT.
+template() {
+    local dir
+    dir="$(cd "$(dirname "$1")" && pwd)" || exit 1
+    awk -v dir="$dir" -v server="${REGISTRAR:-}" -v transport="${TRANSPORT:-}" '
+        /^keystore: [^\/ #]/ { sub(/^keystore: /, "keystore: " dir "/") }
+        server != "" && /^ *server: 127\.0\.0\.1:8053/ {
+            indent = $0
+            sub(/[^ ].*/, "", indent)
+            print indent "server: " server
+            if (transport != "") print indent "transport: " transport
+            next
+        }
+        { print }' "$1" > "$2.new" && mv "$2.new" "$2" || exit 1
+    if ! grep -q '^keystore: /' "$2" || { remote && grep -q '127\.0\.0\.1:8053' "$2"; }; then
+        echo "Could not copy $1 to $2 for this run: a template needs a keystore line, and each registrar the server: 127.0.0.1:8053 that REGISTRAR replaces" >&2
+        exit 1
+    fi
 }
 
 ask() { dig +short +time=2 +tries=1 "@$ns" "$@"; }

@@ -19,6 +19,8 @@
 #            with luaunbound, installed (default elsewhere).
 #   ADDRESS  the address to publish for the servers; default, all of this machine's (auto).
 #   NS, ZONE as for watch.sh.
+#   REGISTRAR, TRANSPORT  the registrar the agent uses instead of a proxy this script starts
+#            (demo/lib.sh).
 # Each label's certificate and key stay in demo/chat/servers/<label>.<zone>/ from one run to
 # the next, and so does its TLSA record.
 
@@ -51,8 +53,7 @@ for tool in "$need" openssl dig curl qrencode; do
 done
 
 check_proxy_ports
-echo "Building the proxy and the clients."
-make -s build build-client || exit 1
+build
 
 # Each program runs in its own process group (set -m), so Ctrl-C reaches only this script, which
 # then stops them in order: the proxy has to outlive the agent's deregistrations.
@@ -144,14 +145,15 @@ EOF
 EOF
     done
 } > "$log/chat.yaml"
+template "$log/chat.yaml" "$log/chat.yaml"
 
 cat << EOF
 XMPP servers for ${labels[*]/%/.$zone}, run by $PROSODY Prosody, published on the live $zone zone
-through this machine's proxy. Logs: $log
+$via. Logs: $log
 Answers are asked of $ns, the zone's authoritative server.
 EOF
 
-step "1. Start the proxy, the servers and the agent."
+step "1. Start ${our_proxy}the servers and the agent."
 for i in "${!labels[@]}"; do
     # Prosody goes on running without a port it cannot have.
     for port in "$(c2s_port "$i")" "$(s2s_port "$i")" "$(http_port "$i")"; do
@@ -162,7 +164,7 @@ for i in "${!labels[@]}"; do
     done
     cert "$(server_dir "$i")" "${labels[$i]}.$zone" || exit 1
 done
-start proxy proxy.log "$B/sig0lease"
+start_proxy
 for i in "${!labels[@]}"; do server "$i"; done
 for i in "${!labels[@]}"; do wait_until "${labels[$i]}.$zone serves its page" page "$(http_port "$i")"; done
 start agent agent.log "$B/sig0lease-agent" run -probe-interval 5s "$log/chat.yaml"
@@ -192,4 +194,4 @@ for i in "${!labels[@]}"; do
     qrencode -t ANSIUTF8 "$url"
 done
 
-step "Last, stop the agent, the servers and the proxy: the agent frees the names (on_stop: release)."
+step "Last, stop the agent, the servers${our_proxy:+ and the proxy}: the agent frees the names (on_stop: release)."

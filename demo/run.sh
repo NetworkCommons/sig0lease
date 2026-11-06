@@ -7,7 +7,8 @@
 # a temporary directory, printed at the start. On a Mac it writes demo/mac.yaml, D2's template,
 # when there is none. It builds the proxy and the clients first (make build build-client).
 #
-# NS, DOMAIN, ZONE and NAME change what it asks, as for watch.sh.
+# NS, DOMAIN, ZONE and NAME change what it asks, as for watch.sh. REGISTRAR sends the agents'
+# updates to that registrar instead, and starts no proxy (demo/lib.sh).
 
 cd "$(dirname "$0")/.." || exit 1
 . demo/lib.sh
@@ -20,8 +21,7 @@ instance="$name\\032http"         # "demo http", as browsing lists it
 renamed="$name\\032http-2"        # the second key's
 
 check_proxy_ports
-echo "Building the proxy and the clients."
-make -s build build-client || exit 1
+build
 
 # D2's template names this Mac, so it is not in the repository.
 machost=
@@ -75,14 +75,12 @@ mirrored() {
     return 1
 }
 
-sed "s|^keystore: keys |keystore: $PWD/demo/keys |" demo/demo.yaml > "$log/demo.yaml"
-if ! grep -qF "keystore: $PWD/demo/keys " "$log/demo.yaml"; then
-    echo "demo/demo.yaml has no 'keystore: keys' line to point at $PWD/demo/keys" >&2
-    exit 1
-fi
+template demo/demo.yaml "$log/demo.yaml"
+template demo/conflict.yaml "$log/conflict.yaml"
+[ -z "$machost" ] || template demo/mac.yaml "$log/mac.yaml"
 
 cat << EOF
-This machine publishes itself on the live $zone zone, through its own proxy.
+This machine publishes itself on the live $zone zone, $via.
 Logs: $log
 Answers are asked of $ns, the zone's authoritative server.
 
@@ -94,8 +92,8 @@ What anyone can run meanwhile:
 and, on this network, open http://$name.$domain:8000/
 EOF
 
-step "1. Start the proxy, the site and the agent."
-start proxy proxy.log "$B/sig0lease"
+step "1. Start ${our_proxy}the site and the agent."
+start_proxy
 start_site
 start agent agent.log "$B/sig0lease-agent" run -probe-interval 5s "$log/demo.yaml"
 wait_until "\"$name http\" is listed" listed "$instance"
@@ -121,7 +119,7 @@ wait_until "hello.$name.$zone has its TXT" answers TXT "hello.$name.$zone"
 echo "  dig +short TXT hello.$name.$zone: $(ask TXT "hello.$name.$zone")"
 
 step "4. A second key wants the same names (demo/conflict.yaml)."
-start other other-agent.log "$B/sig0lease-agent" run -probe-interval 5s demo/conflict.yaml
+start other other-agent.log "$B/sig0lease-agent" run -probe-interval 5s "$log/conflict.yaml"
 wait_until "its host is renamed: \"$name http-2\" is listed" listed "$renamed"
 wait_until "it is refused $name.$zone" grep -q "held by another key" "$log/other-agent.log"
 echo
@@ -133,7 +131,7 @@ echo "  dig +short TXT $name.$zone: $(ask TXT "$name.$zone")"
 
 if [ -n "$machost" ]; then
     step "5. This Mac's own services: a second agent (demo/mac.yaml) publishes what macOS advertises on the local network for $machost.local: Remote Login, File Sharing, Screen Sharing."
-    start mirror mac-agent.log "$B/sig0lease-agent" run demo/mac.yaml
+    start mirror mac-agent.log "$B/sig0lease-agent" run "$log/mac.yaml"
     wait_until "its Screen Sharing is listed" mirrored _rfb._tcp
     echo
     demo/watch.sh once

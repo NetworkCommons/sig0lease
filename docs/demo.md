@@ -7,7 +7,9 @@ devices, with the DNS tools they already have. Everything runs from `./main`, wi
 [`demo/`](../demo).
 
 Each demo's script starts its own proxy, with the config that demo needs, and refuses to start
-while another proxy runs on the machine, another demo's included: run one demo at a time.
+while another proxy runs on the machine, another demo's included: run one demo at a time. With
+`REGISTRAR` set, a script uses that registrar instead, and starts no proxy (see "Against a
+shared registrar").
 
 | Demo | What the audience sees | Needs |
 |---|---|---|
@@ -128,6 +130,32 @@ the agent publishes are the laptop's on that network.
 Ask the audience to look only once the name is published: a resolver that was told "no such
 name" keeps that answer for up to 6 minutes (the zone's SOA TTL). `@ns1.free2air.org` always
 gives the current answer.
+
+## Against a shared registrar
+
+Every script takes `REGISTRAR`, the address of a registrar that serves the same zones, such as
+the public one: the agents send their updates there, in place of the proxy the script otherwise
+starts on the laptop, and the script starts no proxy and checks no ports for it. Its host name is
+not in this repository; its operators give it.
+
+```bash
+REGISTRAR=<registrar>:8053 demo/run.sh
+REGISTRAR=<registrar>:853 TRANSPORT=tls demo/ipfs.sh member     # over DNS-over-TLS
+```
+
+- `TRANSPORT` is how the agents reach it: `tcp`, their default, `udp`, `tls`, or `doh` with
+  `REGISTRAR=https://<registrar>`.
+- The scripts copy each template they run (`demo/demo.yaml`, `demo/conflict.yaml`,
+  `demo/mac.yaml`, and the ones `ipfs.sh` and `chat.sh` write) into their log directory, with
+  `server: 127.0.0.1:8053` replaced by `REGISTRAR`; the files in `demo/` stay as they are.
+- D6: the page, still served by the laptop, asks the registrar's web server,
+  `https://<registrar>/dns-query`, over DNS-over-HTTPS; `DOH=<url>` names another. The phones then
+  need the internet, not the laptop's proxy.
+- Other people use the same registrar: a name another key holds stays theirs ("When something
+  fails"), and the registrar's own lease limits apply.
+- A shared registrar keeps its error reasons and its lease-store dump to itself
+  (`server.diagnostics` off): a refusal shows only its Extended DNS Error's code, and
+  `demo/leftovers.sh -r` cannot read its stores.
 
 ## D1: the laptop publishes itself
 

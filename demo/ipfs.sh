@@ -23,6 +23,8 @@
 #   GATEWAY    the community node's gateway port; default 8080
 #   ADDRESS    the community node's address to publish; default, all of this machine's (auto)
 #   NS, ZONE   as for watch.sh.
+#   REGISTRAR, TRANSPORT  the registrar the agent uses instead of a proxy this script starts
+#              (demo/lib.sh).
 # The member starts first: the community node's agent follows a site that is there, and its node
 # reaches the member's at the addresses published for it.
 
@@ -64,8 +66,7 @@ if ! curl -sf -o /dev/null -X POST "$api/api/v0/id"; then
 fi
 check_proxy_ports
 
-echo "Building the proxy and the clients."
-make -s build build-client || exit 1
+build
 
 set -m
 log="$(mktemp -d "${TMPDIR:-/tmp}/sig0lease-ipfs.XXXXXX")" || exit 1
@@ -121,15 +122,16 @@ EOF
 EOF
     fi
 } > "$log/ipfs.yaml"
+template "$log/ipfs.yaml" "$log/ipfs.yaml"
 
 cat << EOF
-D3's $role, its node at $api, published on the live $zone zone through this machine's proxy.
+D3's $role, its node at $api, published on the live $zone zone $via.
 Logs: $log
 Answers are asked of $ns, the zone's authoritative server.
 EOF
 
-step "1. Start the proxy and the agent."
-start proxy proxy.log "$B/sig0lease"
+step "1. Start ${our_proxy:+the proxy and }the agent."
+start_proxy
 start agent agent.log "$B/sig0lease-agent" run -probe-interval 5s "$log/ipfs.yaml"
 if [ "$role" = member ]; then
     wait_until "$member.$zone has the folder's site" answers TXT "_dnslink.$member.$zone"
@@ -158,4 +160,4 @@ EOF
     qrencode -t ANSIUTF8 "$url"
 fi
 
-step "2. Stop the agent and the proxy."
+step "2. Stop the agent${our_proxy:+ and the proxy}."
