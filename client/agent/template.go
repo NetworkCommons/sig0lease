@@ -76,6 +76,7 @@ var complexTypes = map[string]complexType{
 type Plan struct {
 	Keystore   string      // absolute: one key per host and name, and the agent's state file
 	Registrars []Registrar // in the template's order
+	Warnings   []string    // what the template gives that does nothing in it (unused)
 }
 
 // Mirror returns the template's mirror of type t, and the registrar it registers through.
@@ -104,11 +105,14 @@ type Registrar struct {
 	Domain    string             // SRP: the domain; RFC 9664: the zone. Fully qualified.
 	Server    string             // "host:port", a URL with NetworkDoH; SRP only: "" to discover the registrar
 	Transport baseclient.Network //
-	Resolvers []string           // SRP: for discovery and KEY lookups; nil: client/srp's default
-	Lifetime                     // every host's or name's, unless it gives its own; the mirrors' hosts'
-	Hosts     []Host             // SRP
-	Mirrors   []Mirror           // SRP
-	Names     []Name             // RFC 9664
+	// Resolvers are asked, as "host:port" over UDP, by SRP for discovery and KEY lookups, and by
+	// RFC 9664's names for a followed site the registrar refuses as not its own. nil: client/srp's
+	// default ones.
+	Resolvers []string
+	Lifetime           // every host's or name's, unless it gives its own; the mirrors' hosts'
+	Hosts     []Host   // SRP
+	Mirrors   []Mirror // SRP
+	Names     []Name   // RFC 9664
 }
 
 // Owner returns the name a host or name labelled label registers through r, fully qualified.
@@ -288,8 +292,8 @@ type templateDoc struct {
 	Registrars []registrarDoc     `yaml:"registrars"`
 }
 
-// registrarDoc is either protocol's: domain, resolvers, hosts and mirrors are srp's, zone and
-// names rfc9664's.
+// registrarDoc is either protocol's: domain, hosts and mirrors are srp's, zone and names
+// rfc9664's.
 type registrarDoc struct {
 	Protocol  string      `yaml:"protocol"`
 	Domain    string      `yaml:"domain"`
@@ -555,7 +559,23 @@ func Parse(data []byte, path string) (*Plan, error) {
 	if len(problems) > 0 {
 		return nil, &ValidationError{Path: path, Problems: problems}
 	}
+	plan.Warnings = unused(plan.Registrars)
 	return plan, nil
+}
+
+// unused returns a warning for each field the registrars give that does nothing in this
+// template: the resolvers of an rfc9664 registrar none of whose names follows a site. Such a
+// field is no problem: removing the last name that uses it would otherwise make the template
+// invalid until the field went too.
+func unused(registrars []Registrar) []string {
+	var warnings []string
+	for i, r := range registrars {
+		follows := slices.ContainsFunc(r.Names, func(n Name) bool { return n.IPFS != nil && n.IPFS.Follow != "" })
+		if r.Protocol == RFC9664 && len(r.Resolvers) > 0 && !follows {
+			warnings = append(warnings, fmt.Sprintf("registrars[%d] (%s %s): resolvers: unused: none of its names follows a site (ipfs: {follow:})", i, r.Protocol, r.Domain))
+		}
+	}
+	return warnings
 }
 
 func parseKeystore(given, dir string, problems *[]string) string {
@@ -600,7 +620,6 @@ func parseRegistrar(d registrarDoc, types map[string]typeDef, dir, where string,
 		misplaced("names", d.Names != nil, RFC9664)
 	} else {
 		misplaced("domain", d.Domain != "", SRP)
-		misplaced("resolvers", d.Resolvers != nil, SRP)
 		misplaced("hosts", d.Hosts != nil, SRP)
 		misplaced("mirrors", d.Mirrors != nil, SRP)
 		if d.Server == "" {

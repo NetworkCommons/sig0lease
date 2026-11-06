@@ -65,10 +65,18 @@ func (e *RcodeError) Error() string {
 // carries an OPT RR, without which a server sends no Extended DNS Error (RFC 8914 S2), as the
 // one Fallback looks for.
 func Querier(send client.Transport, server string, network client.Network) Query {
-	return func(ctx context.Context, name string, qtype uint16) ([]dns.RR, error) {
+	return Answers(func(ctx context.Context, name string, qtype uint16) (*dns.Msg, error) {
 		msg := dns.NewMsg(name, qtype)
 		msg.UDPSize = dns.DefaultMsgSize
-		resp, err := send(ctx, server, network, msg)
+		return send(ctx, server, network, msg)
+	})
+}
+
+// Answers returns the Query that reads the answer ask returns to each question, as
+// client/srp's LiveDNSQuery, which asks resolvers, does.
+func Answers(ask func(ctx context.Context, name string, qtype uint16) (*dns.Msg, error)) Query {
+	return func(ctx context.Context, name string, qtype uint16) ([]dns.RR, error) {
+		resp, err := ask(ctx, name, qtype)
 		if err != nil {
 			return nil, fmt.Errorf("%s %s: %w", name, dnsutil.TypeToString(qtype), err)
 		}
@@ -90,7 +98,8 @@ func Querier(send client.Transport, server string, network client.Network) Query
 // answers for a name outside its zones when it forwards no queries (server.forward off). q
 // would be the proxy, for its zones' answers from their authoritative server, and other
 // resolvers, for every other name, such as the target of an SRV record outside the zones: the
-// browser page's. Any other answer, or failure, is q's.
+// browser page's, and a sig0lease-agent name's that follows a site. Any other answer, or
+// failure, is q's.
 func Fallback(q, other Query) Query {
 	return func(ctx context.Context, name string, qtype uint16) ([]dns.RR, error) {
 		rrs, err := q(ctx, name, qtype)

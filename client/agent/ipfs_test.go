@@ -1,6 +1,7 @@
 package agent
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -10,6 +11,8 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"codeberg.org/miekg/dns"
 )
 
 // fakeKubo is a kubo node's RPC API: its ID and addresses, the CIDs of paths in its files, and
@@ -220,4 +223,37 @@ func TestRun_IPFSFollow(t *testing.T) {
 	}
 	h.logs.waitFor(t, "site.dev.test.: giving QmThree, which its node pinned before, until a.dev.test.'s site is pinned")
 	h.logs.waitFor(t, "site.dev.test.: a.dev.test. gives no site (no dnslink= record at _dnslink.a.dev.test.); the name keeps giving QmThree")
+}
+
+// A name that follows a site its registrar refuses as not its own, REFUSED with Extended DNS
+// Error 20 as a proxy that forwards no queries answers, asks the resolvers (Options.Query) for
+// it, and gives it once pinned.
+func TestRun_IPFSFollowOutsideTheZone(t *testing.T) {
+	k := newFakeKubo(t, "12D3KooB", "/ip4/192.0.2.6/tcp/4001/p2p/12D3KooB")
+	h := newHarness(t, nameTemplate(fmt.Sprintf("names: [{name: site, ipfs: {api: %q, follow: a.example.org}}]\n", k.srv.URL)))
+	h.reg.zone = "dev.test."
+	var mu sync.Mutex
+	var asked []string
+	resolvers := func(ctx context.Context, name string, qtype uint16) (*dns.Msg, error) {
+		mu.Lock()
+		asked = append(asked, name)
+		mu.Unlock()
+		resp := &dns.Msg{MsgHeader: dns.MsgHeader{Response: true, Rcode: dns.RcodeNameError}}
+		if name == "_dnslink.a.example.org." && qtype == dns.TypeTXT {
+			txt := &dns.TXT{Hdr: dns.Header{Name: name, Class: dns.ClassINET, TTL: 30}}
+			txt.TXT.Txt = []string{"dnslink=/ipfs/QmOne"}
+			resp.Rcode, resp.Answer = dns.RcodeSuccess, []dns.RR{txt}
+		}
+		return resp, nil
+	}
+	h.start(t, func(o *Options) { o.Query = resolvers })
+
+	link := `_dnslink.site.dev.test. TXT "dnslink=/ipfs/QmOne"`
+	h.until(t, "registering the site the resolvers give", func(u update) bool { return slices.Contains(u.records, link) })
+	h.logs.waitFor(t, "site.dev.test.: pinned QmOne; the name gives it")
+	mu.Lock()
+	defer mu.Unlock()
+	if len(asked) == 0 || slices.ContainsFunc(asked, func(n string) bool { return n != "_dnslink.a.example.org." }) {
+		t.Fatalf("asked of the resolvers: %v, want _dnslink.a.example.org. alone", asked)
+	}
 }

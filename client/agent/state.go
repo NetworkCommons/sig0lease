@@ -86,7 +86,6 @@ type savedInstance struct {
 }
 
 func savedRegistrarOf(r Registrar) savedRegistrar {
-	// An rfc9664 registrar has no resolvers (Parse).
 	return savedRegistrar{Domain: r.Domain, Server: r.Server, Transport: r.Transport, Resolvers: r.Resolvers}
 }
 

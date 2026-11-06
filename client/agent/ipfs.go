@@ -33,8 +33,10 @@ type ipfsReport struct {
 
 // watchIPFS starts watching nr's node (ipfsNode.run), each kubo request lasting at most
 // ProbeTimeout. The followed name's site is asked of nr's registrar, which answers as soon
-// as the zone has it when it is this project's proxy. nr registers nothing until the first
-// report.
+// as the zone has it when it is this project's proxy, and of the registrar's resolvers when
+// the registrar refuses it as a name it does not serve (browse.Fallback): a proxy that
+// forwards no queries refuses every name outside its zones. nr registers nothing until the
+// first report.
 func (a *agent) watchIPFS(nr *nameRun) *ipfsWatch {
 	ctx, cancel := context.WithCancel(context.Background())
 	w := &ipfsWatch{cancel: cancel, done: make(chan struct{})}
@@ -43,10 +45,12 @@ func (a *agent) watchIPFS(nr *nameRun) *ipfsWatch {
 		send = baseclient.LiveTransport(a.opts.ProbeTimeout)
 	}
 	n := &ipfsNode{
-		owner:    nr.label(),
-		cfg:      *nr.name.IPFS,
-		kubo:     kubo.New(nr.name.IPFS.API, a.opts.ProbeTimeout),
-		query:    browse.Querier(send, nr.registrar.Server, nr.registrar.Transport),
+		owner: nr.label(),
+		cfg:   *nr.name.IPFS,
+		kubo:  kubo.New(nr.name.IPFS.API, a.opts.ProbeTimeout),
+		query: browse.Fallback(
+			browse.Querier(send, nr.registrar.Server, nr.registrar.Transport),
+			browse.Answers(a.resolverQuery(nr.registrar.Resolvers))),
 		logf:     a.opts.Logf,
 		interval: a.opts.PollInterval,
 		failed:   map[string]string{},
@@ -87,7 +91,7 @@ type ipfsNode struct {
 	owner    string // the name, fully qualified
 	cfg      IPFS
 	kubo     *kubo.Client
-	query    browse.Query // the registrar's
+	query    browse.Query // the registrar's, and the resolvers' for a name it does not serve
 	logf     func(format string, args ...any)
 	interval time.Duration
 

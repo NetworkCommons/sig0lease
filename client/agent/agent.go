@@ -46,7 +46,9 @@ type Options struct {
 	// InterfaceAddresses. Only publishable ones are used (clientsrp.PublishableAddresses).
 	Interfaces func() ([]netip.Addr, error)
 	// Send, Query and Sleep are every SRP client's (clientsrp.Config), Send and Sleep every
-	// RFC 9664 client's too (rfc9664.Config); nil: the clients' own.
+	// RFC 9664 client's too (rfc9664.Config); nil: the clients' own. Query also asks what a
+	// name that follows a site asks the resolvers (watchIPFS); nil: the registrar's resolvers
+	// (clientsrp.LiveDNSQuery).
 	Send  baseclient.Transport
 	Query clientsrp.DNSQuery
 	Sleep func(context.Context, time.Duration) error
@@ -131,7 +133,8 @@ func InterfaceAddresses() ([]netip.Addr, error) {
 // it all and returns ctx's error. It reads the template again every PollInterval: a valid
 // change is applied, an invalid one logged while the agent keeps what it runs. Run returns
 // early only for what it cannot go on without: a first template that is invalid, a keystore
-// it cannot use, a state file edited by hand, a host or name its client refuses.
+// it cannot use, a state file edited by hand, a host or name its client refuses. A template's
+// warnings (Plan.Warnings) are logged, at the start and with each change.
 func Run(ctx context.Context, path string, opts Options) error {
 	opts.defaults()
 	data, err := os.ReadFile(path)
@@ -167,6 +170,7 @@ func Run(ctx context.Context, path string, opts Options) error {
 		a.end()
 		a.probes.Wait()
 	}()
+	a.warn(plan)
 	if err := a.start(plan); err != nil {
 		return err
 	}
@@ -372,12 +376,21 @@ func (a *agent) srpConfig(r savedRegistrar) clientsrp.Config {
 	return clientsrp.Config{
 		Domain:        r.Domain,
 		RegistrarAddr: r.Server,
-		Resolvers:     r.Resolvers,
 		Network:       r.Transport,
 		Send:          a.opts.Send,
-		Query:         a.opts.Query,
+		Query:         a.resolverQuery(r.Resolvers),
 		Sleep:         a.opts.Sleep,
 	}
+}
+
+// resolverQuery is how the agent asks a registrar's resolvers, given in its template (nil:
+// client/srp's default ones): an SRP client, for discovery and KEY lookups, and a name that
+// follows a site, for a name its registrar does not serve.
+func (a *agent) resolverQuery(resolvers []string) clientsrp.DNSQuery {
+	if a.opts.Query != nil {
+		return a.opts.Query
+	}
+	return clientsrp.LiveDNSQuery(resolvers)
 }
 
 // nameConfig is every RFC 9664 client's configuration for registering through r, before a
@@ -741,6 +754,7 @@ func (a *agent) poll() error {
 			break
 		}
 		a.seen, a.bad = data, ""
+		a.warn(plan)
 		if err := a.apply(plan); err != nil {
 			return err
 		}
@@ -754,6 +768,13 @@ func (a *agent) poll() error {
 		}
 	}
 	return nil
+}
+
+// warn logs plan's warnings, when the agent starts and when the template changes.
+func (a *agent) warn(plan *Plan) {
+	for _, w := range plan.Warnings {
+		a.logf("template: %s", w)
+	}
 }
 
 // apply moves what runs from a.plan to plan, freeing the names of what plan no longer

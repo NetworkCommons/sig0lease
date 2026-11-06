@@ -28,7 +28,7 @@ proxy and a local BIND 9).
 
 | Command | Does |
 |---|---|
-| `sig0lease-agent validate <template>` | Checks the template and lists every problem at once; exit 1 if there is any. |
+| `sig0lease-agent validate <template>` | Checks the template and lists every problem at once; exit 1 if there is any. It also warns of what the template gives that does nothing in it, such as an `rfc9664` registrar's `resolvers` with no name that follows a site: a warning is no problem, and `plan` and `run` (in its log, at the start and with each change) give it too. |
 | `sig0lease-agent plan <template>` | Validates, then shows what `run` would register, registrar by registrar: hosts with their addresses (`auto` resolved now) and services with their TXT, subtypes and probes; names with their addresses and records; which keys exist, and the names from an earlier run that `run` frees: those an earlier rename holds, and those of hosts and names the template no longer registers. Writes nothing. |
 | `sig0lease-agent run [-poll-interval=10s] [-probe-interval=30s] <template>` | Validates (and refuses to start on any problem), then registers and keeps registered until Ctrl-C or SIGTERM, which deregister everything. |
 | `sig0lease-agent types` | Lists the presets, with their fields, and the complex types. |
@@ -90,7 +90,7 @@ An `srp` registrar also takes:
 | Field | Default | Meaning |
 |---|---|---|
 | `domain` | required | The registration domain. Hosts become `<name>.<domain>`. |
-| `resolvers` | `8.8.8.8:53`, `8.8.4.4:53` | Used for discovery, and after a conflict to find which names another key holds. |
+| `resolvers` | `8.8.8.8:53`, `8.8.4.4:53` | `host:port`, asked over UDP, each in turn until one answers: for discovery, and after a conflict to find which names another key holds. |
 | `hosts`, `mirrors` | none | What it registers (below). |
 
 An `rfc9664` registrar also takes:
@@ -98,6 +98,7 @@ An `rfc9664` registrar also takes:
 | Field | Default | Meaning |
 |---|---|---|
 | `zone` | required | The proxy's zone (`update_handler`'s `upstream_zone`). Names become `<name>.<zone>`. |
+| `resolvers` | `8.8.8.8:53`, `8.8.4.4:53` | As for `srp`, asked for a site one of its names follows (`ipfs: {follow:}`) when the proxy refuses it as a name it does not serve. Unused without such a name, which `validate` warns of. |
 | `names` | none | What it registers (below). |
 
 A domain or zone may have one registrar of each protocol, and an rfc9664 name may not be in an
@@ -293,7 +294,7 @@ and nodes open as `/ipns/<name>`:
 |---|---|
 | `api` | The node's RPC API, `http://host:port`. Default `http://127.0.0.1:5001`. |
 | `publish: {mfs: <path>}` | A path in the node's files (MFS, IPFS Desktop's Files): the site is its CID, which changes with anything in it. |
-| `follow: <name>` | Another name's site, its `_dnslink` record, asked of the registrar: the node pins each new one, fetching what it lacks, and the name gives it once the node holds it all; the node's earlier pins of it are then removed. Only a site given as `/ipfs/<CID>` can be followed. |
+| `follow: <name>` | Another name's site, its `_dnslink` record, asked of the registrar (or of its `resolvers`, below): the node pins each new one, fetching what it lacks, and the name gives it once the node holds it all; the node's earlier pins of it are then removed. Only a site given as `/ipfs/<CID>` can be followed. |
 
 With neither, the name publishes the node's addresses alone; not both. Nothing else at the name
 may be at `_dnslink` or `_dnsaddr`.
@@ -311,10 +312,24 @@ leaves the template; `ipfs pin rm` removes them.
 
 The followed name's site is asked of the registrar. This project's proxy, with the `opcode: 0`
 rule of `config.yaml`, answers it from the zone's authoritative server, so a follower sees a
-change as soon as the zone has it; without that rule the proxy asks its upstream resolvers,
-which may answer from their cache for up to the record's TTL. That TTL, the proxy's
-`record_ttl_sec` (30 s in `config.yaml`), is also how long gateways and resolvers may keep a site
-that changed. [demo.md](demo.md), D3, is a member and a community node in a private swarm.
+change as soon as the zone has it. A name outside the proxy's zones it does not answer for:
+with `server.forward` off, as in `config.yaml`, it refuses it, `REFUSED` with Extended DNS Error
+20 (Not Authoritative), and the follower asks the registrar's `resolvers` instead
+(`docs/siglease_rfc9664.md`, "Requests No Handler Takes"); with it on, it asks its upstream
+resolvers itself. Resolvers may answer from their cache, for up to the record's TTL, and a "no
+such name" for up to the zone's negative TTL. The TTL of a site in the proxy's
+zones, its `record_ttl_sec` (30 s in `config.yaml`), is also how long gateways and resolvers may
+keep a site that changed. [demo.md](demo.md), D3, is a member and a community node in a
+private swarm.
+
+For a site outside the zones whose changes a follower should see at once, list the
+authoritative server of the site's zone first, by address, then resolvers:
+`resolvers: [192.0.2.53:53, 8.8.8.8:53]`, with the address of a server `dig +short NS
+example.org` names. They are asked in turn, and one that does not answer, or refuses the name,
+as an authoritative server refuses a name outside its zones (BIND with recursion off), is passed
+over for the next. A
+server given by host name is asked at one of its addresses only, which may be one it does not
+answer on.
 
 ## Running
 

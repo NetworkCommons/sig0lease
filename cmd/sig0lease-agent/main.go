@@ -75,11 +75,20 @@ func validate(path string, p *agent.Plan) error {
 		}
 	}
 	fmt.Printf("%s is valid: %d registrar(s); %d host(s), %d service(s), %d mirror(s); %d name(s)\n", path, len(p.Registrars), hosts, services, mirrors, names)
+	warn(path, p)
 	return nil
 }
 
-func plan(_ string, p *agent.Plan) error {
+func plan(path string, p *agent.Plan) error {
+	warn(path, p)
 	return agent.Describe(os.Stdout, p, nil, logging.NewLogger("info"))
+}
+
+// warn prints the template's warnings, what it gives that does nothing in it; run logs them.
+func warn(path string, p *agent.Plan) {
+	for _, w := range p.Warnings {
+		fmt.Fprintf(os.Stderr, "WARNING: template %s: %s\n", path, w)
+	}
 }
 
 func logf(format string, args ...any) {

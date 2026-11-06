@@ -255,19 +255,47 @@ registrars:
 	}
 }
 
-// A name's ipfs: publishes a path in its node's files or follows another name's site, or
-// gives the node's addresses alone; the node's RPC API defaults to kubo's.
-func TestParse_NameIPFS(t *testing.T) {
-	n := mustParse(t, `
+// An rfc9664 registrar's resolvers, with no name that follows a site, do nothing: a warning,
+// not a problem, so that removing the last follower leaves the template valid.
+func TestParse_UnusedResolvers(t *testing.T) {
+	p := mustParse(t, `
 registrars:
   - protocol: rfc9664
     zone: dev.test.
     server: 192.0.2.1:53
+    resolvers: [192.0.2.53:53]
+    names:
+      - {name: a, ipfs: {publish: {mfs: /community}}}
+`)
+	want := []string{"registrars[0] (rfc9664 dev.test.): resolvers: unused: none of its names follows a site (ipfs: {follow:})"}
+	if !slices.Equal(p.Warnings, want) {
+		t.Errorf("warnings = %q, want %q", p.Warnings, want)
+	}
+}
+
+// A name's ipfs: publishes a path in its node's files or follows another name's site, or
+// gives the node's addresses alone; the node's RPC API defaults to kubo's. The registrar's
+// resolvers are what a follower asks for a site the registrar does not serve.
+func TestParse_NameIPFS(t *testing.T) {
+	p := mustParse(t, `
+registrars:
+  - protocol: rfc9664
+    zone: dev.test.
+    server: 192.0.2.1:53
+    resolvers: [192.0.2.53:53]
     names:
       - {name: a, ipfs: {publish: {mfs: /community}}}
       - {name: site, ipfs: {api: "http://127.0.0.1:5002", follow: a.dev.test}}
       - {name: b, ipfs: {}}
-`).Registrars[0].Names
+`)
+	r := p.Registrars[0]
+	if !slices.Equal(r.Resolvers, []string{"192.0.2.53:53"}) {
+		t.Errorf("resolvers = %v, want 192.0.2.53:53", r.Resolvers)
+	}
+	if w := p.Warnings; w != nil {
+		t.Errorf("warnings = %q, want none: a name follows a site", w)
+	}
+	n := r.Names
 	for i, want := range []IPFS{
 		{API: "http://127.0.0.1:5001", Publish: "/community"},
 		{API: "http://127.0.0.1:5002", Follow: "a.dev.test."},
@@ -463,7 +491,7 @@ registrars:
       - {type: ssh}
   - protocol: rfc9664
     zone: dev.test.
-    resolvers: [192.0.2.1:53]
+    resolvers: [nope]
     hosts: []
     names:
       - name: a.b
@@ -512,7 +540,7 @@ registrars:
 		"box.local. would be registered as box",
 		`"ssh" is not a complex type`,
 		"registrars[1] (rfc9664 dev.test.): server is required",
-		"resolvers: is an srp registrar's",
+		`registrars[1] (rfc9664 dev.test.): resolvers: "nope": want host:port`,
 		"hosts: is an srp registrar's",
 		`names[0] (a.b): name "a.b": one label`,
 		"names[1] (empty): nothing to register",

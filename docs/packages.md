@@ -304,7 +304,8 @@ func Run(ctx context.Context, path string, opts Options) error
     every PollInterval: a valid change is applied, an invalid one logged while
     the agent keeps what it runs. Run returns early only for what it cannot go
     on without: a first template that is invalid, a keystore it cannot use,
-    a state file edited by hand, a host or name its client refuses.
+    a state file edited by hand, a host or name its client refuses. A template's
+    warnings (Plan.Warnings) are logged, at the start and with each change.
 
 func TLSARecord(owner, file string) (*dns.TLSA, error)
     TLSARecord reads the PEM certificate file, the first certificate in it
@@ -392,7 +393,9 @@ type Options struct {
 	// InterfaceAddresses. Only publishable ones are used (clientsrp.PublishableAddresses).
 	Interfaces func() ([]netip.Addr, error)
 	// Send, Query and Sleep are every SRP client's (clientsrp.Config), Send and Sleep every
-	// RFC 9664 client's too (rfc9664.Config); nil: the clients' own.
+	// RFC 9664 client's too (rfc9664.Config); nil: the clients' own. Query also asks what a
+	// name that follows a site asks the resolvers (watchIPFS); nil: the registrar's resolvers
+	// (clientsrp.LiveDNSQuery).
 	Send  baseclient.Transport
 	Query clientsrp.DNSQuery
 	Sleep func(context.Context, time.Duration) error
@@ -405,6 +408,7 @@ type Options struct {
 type Plan struct {
 	Keystore   string      // absolute: one key per host and name, and the agent's state file
 	Registrars []Registrar // in the template's order
+	Warnings   []string    // what the template gives that does nothing in it (unused)
 }
     Plan is a valid template: everything the agent registers.
 
@@ -449,11 +453,14 @@ type Registrar struct {
 	Domain    string             // SRP: the domain; RFC 9664: the zone. Fully qualified.
 	Server    string             // "host:port", a URL with NetworkDoH; SRP only: "" to discover the registrar
 	Transport baseclient.Network //
-	Resolvers []string           // SRP: for discovery and KEY lookups; nil: client/srp's default
-	Lifetime                     // every host's or name's, unless it gives its own; the mirrors' hosts'
-	Hosts     []Host             // SRP
-	Mirrors   []Mirror           // SRP
-	Names     []Name             // RFC 9664
+	// Resolvers are asked, as "host:port" over UDP, by SRP for discovery and KEY lookups, and by
+	// RFC 9664's names for a followed site the registrar refuses as not its own. nil: client/srp's
+	// default ones.
+	Resolvers []string
+	Lifetime           // every host's or name's, unless it gives its own; the mirrors' hosts'
+	Hosts     []Host   // SRP
+	Mirrors   []Mirror // SRP
+	Names     []Name   // RFC 9664
 }
     Registrar is where and how its hosts or names register.
 
@@ -554,6 +561,10 @@ type Query func(ctx context.Context, name string, qtype uint16) ([]dns.RR, error
     at name: none for NXDOMAIN or NODATA, an error for any other failure:
     a *RcodeError for an answer with another RCODE.
 
+func Answers(ask func(ctx context.Context, name string, qtype uint16) (*dns.Msg, error)) Query
+    Answers returns the Query that reads the answer ask returns to each
+    question, as client/srp's LiveDNSQuery, which asks resolvers, does.
+
 func Fallback(q, other Query) Query
     Fallback returns the Query that asks q, and asks other the questions q's
     server refuses as names it does not serve: REFUSED with Extended DNS Error
@@ -561,7 +572,8 @@ func Fallback(q, other Query) Query
     when it forwards no queries (server.forward off). q would be the proxy,
     for its zones' answers from their authoritative server, and other resolvers,
     for every other name, such as the target of an SRV record outside the zones:
-    the browser page's. Any other answer, or failure, is q's.
+    the browser page's, and a sig0lease-agent name's that follows a site.
+    Any other answer, or failure, is q's.
 
 func Querier(send client.Transport, server string, network client.Network) Query
     Querier returns the Query that sends each question to server over network

@@ -25,17 +25,20 @@ import (
 	"github.com/NetworkCommons/sig0lease/client/rfc9664"
 	clientsrp "github.com/NetworkCommons/sig0lease/client/srp"
 	"github.com/NetworkCommons/sig0lease/pkg/dnsmsg"
+	"github.com/NetworkCommons/sig0lease/pkg/dnsname"
 	leasepkg "github.com/NetworkCommons/sig0lease/pkg/lease"
 )
 
 // registrar records every update the agent's clients send. It answers YXDOMAIN to an update
 // whose host name is in taken, REFUSED to one whose host name is in refused, NOERROR to the
 // rest. taken and refused are set while the agent is not running. It answers a query from
-// the TXT records setTXT gives, without recording it.
+// the TXT records setTXT gives, without recording it; with zone set, a query outside it gets
+// what the proxy answers when it forwards no queries: REFUSED, with Extended DNS Error 20.
 type registrar struct {
 	sent    chan *dns.Msg
 	taken   []string
 	refused []string
+	zone    string
 	mu      sync.Mutex
 	txt     map[string][]string // the strings of one TXT record each, by owner
 }
@@ -56,6 +59,11 @@ func (r *registrar) Send(ctx context.Context, addr string, network baseclient.Ne
 		name := msg.Question[0].Header().Name
 		r.mu.Lock()
 		defer r.mu.Unlock()
+		if r.zone != "" && !dnsname.IsAtOrBelow(name, r.zone) {
+			resp.Rcode = dns.RcodeRefused
+			dnsmsg.AddEDE(resp, msg, dns.ExtendedErrorNotAuthoritative, "")
+			return resp, nil
+		}
 		for _, v := range r.txt[name] {
 			txt := &dns.TXT{Hdr: dns.Header{Name: name, Class: dns.ClassINET, TTL: 30}}
 			txt.TXT.Txt = []string{dnsmsg.EscapeTXT(v)}
@@ -762,6 +770,20 @@ names:
 	u = h.until(t, "deregistering site", func(update) bool { return true })
 	if !slices.Equal(u.addrs, []string{"192.0.2.11"}) || len(u.records) != 1 || u.lease != 0 || u.keyLease != 1209600 {
 		t.Fatalf("update on stop %+v, want the records deleted and the name kept (on_stop: keep)", u)
+	}
+}
+
+// A template's warnings are logged when the agent starts and with each change it applies.
+func TestRun_LogsWarnings(t *testing.T) {
+	const warning = "template: registrars[0] (rfc9664 dev.test.): resolvers: unused"
+	h := newHarness(t, nameTemplate("resolvers: [192.0.2.53:53]\nnames: [{name: site, addresses: [auto]}]\n"))
+	h.start(t, nil)
+	h.logs.waitFor(t, warning)
+
+	h.write(t, nameTemplate("resolvers: [192.0.2.53:53]\nnames: [{name: site, addresses: [auto], records: ['@ TXT \"hello\"']}]\n"))
+	h.until(t, "registering the TXT record", func(u update) bool { return len(u.records) == 1 })
+	if n := h.logs.count(warning); n != 2 {
+		t.Errorf("warning logged %d times, want 2: at the start and with the change", n)
 	}
 }
 
