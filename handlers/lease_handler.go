@@ -8,6 +8,7 @@ import (
 	"codeberg.org/miekg/dns"
 	"github.com/NetworkCommons/sig0lease/pkg/dnsname"
 	"github.com/NetworkCommons/sig0lease/pkg/keyrec"
+	leasepkg "github.com/NetworkCommons/sig0lease/pkg/lease"
 	"github.com/NetworkCommons/sig0lease/pkg/updatecore"
 )
 
@@ -87,6 +88,7 @@ type ZoneHandler interface {
 	// UpstreamZone is the zone the handler serves (upstream_zone), once Setup has read it.
 	UpstreamZone() string
 	setDeeperZones(zones []servedZone)
+	checkStoredNames() error
 }
 
 // UpstreamZone is the zone this handler serves.
@@ -98,8 +100,9 @@ func (b *leaseHandler[C]) setDeeperZones(zones []servedZone) { b.deeperZones = z
 // above it, as a zone cut does in DNS. Each handler learns the zones the others serve below its
 // own, and refuses their names (refuseNamesNotServed); with srp.dev.zenr.io. for srp_handler and
 // dev.zenr.io. for update_handler, update_handler refuses every name at or below
-// srp.dev.zenr.io. Two handlers serving one zone leave no closest one, and are an error. The
-// proxy calls it once, after every handler's Setup and before serving.
+// srp.dev.zenr.io. Two handlers serving one zone leave no closest one, and are an error, as is
+// a lease store holding a name its handler does not serve (checkStoredNames). The proxy calls
+// it once, after every handler's Setup and before serving.
 func SeparateZones(hs []ZoneHandler) error {
 	for _, h := range hs {
 		var deeper []servedZone
@@ -115,6 +118,35 @@ func SeparateZones(hs []ZoneHandler) error {
 			}
 		}
 		h.setDeeperZones(deeper)
+	}
+	for _, h := range hs {
+		if err := h.checkStoredNames(); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// checkStoredNames returns an error for the first name in the handler's lease store that the
+// handler does not serve (notServed): every lease owner's name, and every record's. Such a
+// store was written under another configuration -- another upstream_zone, or before another
+// handler took a zone below this one -- and its leases are not this handler's to keep or
+// expire: its UPDATEs name its own zone, and the authoritative server would refuse them, or
+// they would change another handler's names. Called once the zones are known (SeparateZones).
+// A dump does not call it, so such a store can still be read.
+func (b *leaseHandler[C]) checkStoredNames() error {
+	for _, owner := range b.leaseManager.ListOwners() {
+		names := []string{leasepkg.NodeKeyName(owner)}
+		if set := b.leaseManager.GetNonKEYRecordSet(owner); set != nil {
+			for _, rec := range set.Records {
+				names = append(names, rec.RR.Header().Name)
+			}
+		}
+		for _, name := range names {
+			if err := b.notServed(name); err != nil {
+				return fmt.Errorf("the lease store of %s holds %s, which it does not serve (%w): it was written under another configuration", b.Name(), name, err)
+			}
+		}
 	}
 	return nil
 }

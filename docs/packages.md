@@ -1730,8 +1730,9 @@ func SeparateZones(hs []ZoneHandler) error
     names (refuseNamesNotServed); with srp.dev.zenr.io. for srp_handler and
     dev.zenr.io. for update_handler, update_handler refuses every name at or
     below srp.dev.zenr.io. Two handlers serving one zone leave no closest one,
-    and are an error. The proxy calls it once, after every handler's Setup and
-    before serving.
+    and are an error, as is a lease store holding a name its handler does not
+    serve (checkStoredNames). The proxy calls it once, after every handler's
+    Setup and before serving.
 
 
 TYPES
@@ -2085,6 +2086,7 @@ type ZoneHandler interface {
 	Handler
 	// UpstreamZone is the zone the handler serves (upstream_zone), once Setup has read it.
 	UpstreamZone() string
+
 	// Has unexported methods.
 }
     ZoneHandler is an UPDATE handler serving one zone: UpdateHandler and

@@ -245,9 +245,11 @@ Additional rules:
 
 ### Zones Served: the Deepest Zone Wins
 
-A proxy can run both handlers, each with its own zone (`upstream_zone`). The zones may nest: the live deployment has SRP's `srp.dev.zenr.io.` inside this handler's `dev.zenr.io.`. A name belongs to the handler whose zone is closest above it, as a delegated subzone does in DNS (Behavior Specification item 8). After setting the handlers up, `cmd/sig0lease` tells each one the zones the others serve below its own (`handlers.SeparateZones`), and refuses to start when two handlers serve the same zone.
+A proxy can run both handlers, each with its own zone (`upstream_zone`). The zones may nest: `config.yaml` puts SRP's `srp.dev.zenr.io.` inside this handler's `dev.zenr.io.`. A name belongs to the handler whose zone is closest above it, as a delegated subzone does in DNS (Behavior Specification item 8). After setting the handlers up, `cmd/sig0lease` tells each one the zones the others serve below its own (`handlers.SeparateZones`), and refuses to start when two handlers serve the same zone.
 
 Each handler refuses an UPDATE that names anything outside its zone, or inside a zone another handler serves, with `REFUSED` and Extended DNS Error 18 (`leaseHandler.refuseNamesNotServed`). This handler checks before the case dispatch and its node locks; SRP checks after its `default.service.arpa` rewrite has made the names final. Before this check only the authoritative server's update-policy kept the handlers apart. This handler could add a second KEY at a name SRP holds First-Come First-Served, or records SRP's lease store knows nothing about, whenever its signing key was allowed to write below its zone.
+
+The same rule holds for what each lease store already holds. A store written under another configuration -- a handler's zone changed, or another handler's zone nested in it since -- can hold names its handler no longer serves, and the handler's expiry timers would end those leases with its own key and zone, at names another handler, or none, now owns. So `SeparateZones` also checks every name in each handler's store, each lease owner's and each record's, and the proxy refuses to start, naming the first one its handler does not serve (`leaseHandler.checkStoredNames`). End such leases under the configuration that wrote them, or remove the store together with the records it put in the zone (`demo/leftovers.sh` lists them). `--dump` does not check, so such a store can still be read.
 
 ### Queries for the Zones Served
 

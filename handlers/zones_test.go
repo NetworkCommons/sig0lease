@@ -55,6 +55,53 @@ func TestSeparateZones(t *testing.T) {
 	}
 }
 
+// A lease store holding a name its handler does not serve -- outside its zone, or in the zone
+// another handler serves below it, as a lease owner's name or a record's -- stops the proxy:
+// SeparateZones returns an error naming it.
+func TestSeparateZones_RefusesStoredNamesNotServed(t *testing.T) {
+	cases := []struct {
+		name, keyName, recordName string
+		wantErr                   bool
+	}{
+		{name: "KEY and record in the zone", keyName: "a.dev.zenr.io.", recordName: "www.a.dev.zenr.io."},
+		{name: "KEY outside the zone", keyName: "a.example.", wantErr: true},
+		{name: "KEY in the SRP zone below", keyName: "a.srp.dev.zenr.io.", wantErr: true},
+		{name: "record in the SRP zone below", keyName: "a.dev.zenr.io.", recordName: "x.srp.dev.zenr.io.", wantErr: true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			uh := newTestHandler()
+			sh, _ := newSRPTestHandler(t)
+			sh.upstreamZone = "srp.dev.zenr.io."
+			key := testKeyRR(tc.keyName, "AAAATESTKEY111=")
+			if err := uh.leaseManager.Register(key, 60, 120, "dev.zenr.io."); err != nil {
+				t.Fatalf("Register: %v", err)
+			}
+			if tc.recordName != "" {
+				txt := &dns.TXT{Hdr: dns.Header{Name: tc.recordName, Class: dns.ClassINET, TTL: 60}}
+				if err := uh.leaseManager.UpsertNonKEYRecords(leasepkg.NodeKey(key), []dns.RR{txt}, 60, "dev.zenr.io."); err != nil {
+					t.Fatalf("UpsertNonKEYRecords: %v", err)
+				}
+			}
+			err := SeparateZones([]ZoneHandler{uh, sh})
+			if !tc.wantErr {
+				if err != nil {
+					t.Fatalf("SeparateZones: %v", err)
+				}
+				return
+			}
+			want := tc.recordName
+			if want == "" {
+				want = tc.keyName
+			}
+			// A lease owner's name comes from its node key, without the root's dot.
+			if err == nil || !strings.Contains(err.Error(), strings.TrimSuffix(want, ".")) {
+				t.Fatalf("SeparateZones error %v, want one naming %s", err, want)
+			}
+		})
+	}
+}
+
 // With SRP's zone inside its own, the RFC 9664 handler refuses SRP's names, and names outside
 // its zone, before anything goes upstream.
 func TestUpdateHandle_NamesNotServed_Refused(t *testing.T) {

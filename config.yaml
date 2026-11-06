@@ -238,7 +238,10 @@ handlers:
       - "IPN"
 
     # Lease storage backend. Optional; when omitted, leases are kept
-    # in-memory only and are lost on restart.
+    # in-memory only and are lost on restart. Either handler's store stops the proxy at startup
+    # (serving, not --dump) when it holds a name its handler does not serve, as a store written
+    # before the handler's upstream_zone, or a zone nested in it, changed
+    # (docs/siglease_rfc9664.md, "Zones Served").
 
     # storage:
     #   type: memory
