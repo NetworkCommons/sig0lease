@@ -27,7 +27,7 @@ build-client:
 	go build -o $(BUILD_DIR)/$(CLIENT_9665) ./cmd/$(CLIENT_9665)
 	go build -o $(BUILD_DIR)/$(AGENT) ./cmd/$(AGENT)
 
-# Build the demo's browser page (docs/demo.md, E3) into ./bin/web: cmd/sig0lease-web for
+# Build the demo's browser page (docs/demo.md, D6) into ./bin/web: cmd/sig0lease-web for
 # WebAssembly, gzipped (a quarter of the size; the page unzips it), and beside it the page and
 # Go's loader for it. The DNS library does not build for
 # WebAssembly as released, so the program is built against a copy of it patched with
