@@ -16,9 +16,7 @@ registrar_name: '{{ lookup("ansible.builtin.pipe", "ssh -G " ~ inventory_hostnam
 #   dot_port     DNS-over-TLS, in nginx
 #   https_port   the page and /dns-query (DNS-over-HTTPS), in nginx
 #   doh_address  the proxy's DNS-over-HTTPS listener, in plain HTTP, which only nginx reaches
-# Staging's zones lie inside stable's update zone, and nothing in either proxy keeps the two
-# apart: a staging name is registered through staging only (deploy/README.md, "Two instances,
-# one zone").
+# Each instance's zones lie outside the other's (deploy/README.md).
 registrar_instances:
   stable:
     zones:
@@ -30,8 +28,8 @@ registrar_instances:
     doh_address: 127.0.0.1:8443
   staging:
     zones:
-      update: stg.dev.zenr.io.
-      srp_handler: srp.stg.dev.zenr.io.
+      update: stg.zenr.io.
+      srp_handler: srp.stg.zenr.io.
     port: 8054
     dot_port: 8853
     https_port: 8444

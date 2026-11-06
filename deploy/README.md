@@ -11,14 +11,16 @@ the registrar to deploy it, and its name is in no file of this repository.
 
 | | stable | staging |
 |---|---|---|
-| Zones: RFC 9664, SRP | `dev.zenr.io.`, `srp.dev.zenr.io.` | `stg.dev.zenr.io.`, `srp.stg.dev.zenr.io.` |
+| Zones: RFC 9664, SRP | `dev.zenr.io.`, `srp.dev.zenr.io.` | `stg.zenr.io.`, `srp.stg.zenr.io.` |
 | Plain DNS, UDP and TCP | 8053 | 8054 |
 | DNS-over-TLS | 853 | 8853 |
 | The page, and DNS-over-HTTPS at `/dns-query` | `https://<registrar>/` | `https://<registrar>:8444/` |
 
 These, and the proxy's DNS-over-HTTPS listener behind nginx, are each instance's settings in
 `registrar_instances` ([group_vars/all.yml](ansible/group_vars/all.yml)). Every zone the
-registrar serves is set there; none comes from `config.yaml`.
+registrar serves is set there; none comes from `config.yaml`. Each instance's zones lie outside
+the other's: with one inside the other, a name could be registered through both, and each
+instance would delete records the other still renews.
 
 | On the registrar | What it is |
 |---|---|
@@ -49,7 +51,8 @@ overrides or `registrar_instances`, and deploy.
   ```
 
   `ssh registrar true` must work without a password prompt.
-- The zones' key in `keystore/server`, as for the demos.
+- The zones' keys in `keystore/server`: `dev.zenr.io.`'s for stable, as for the demos, and
+  `stg.zenr.io.`'s for staging.
 
 ## Releasing
 
@@ -77,7 +80,7 @@ make promote     # the release staging runs, moved to stable
 (docs/demo.md, "Against a shared registrar"), and its page is at `https://<registrar>:8444/`.
 
 ```bash
-REGISTRAR=<registrar>:8054 ZONE=stg.dev.zenr.io DOMAIN=srp.stg.dev.zenr.io demo/run.sh
+REGISTRAR=<registrar>:8054 ZONE=stg.zenr.io DOMAIN=srp.stg.zenr.io demo/run.sh
 ```
 
 Then `make promote`:
@@ -109,25 +112,6 @@ back to the release before, on the untouched stores. Staging meets such a releas
 its own stores. Such a release cannot be promoted as it is: stable's names are removed from the
 zones first, and stable starts with empty stores, as at the first promote.
 
-## Two instances, one zone
-
-Staging's zones lie inside stable's `dev.zenr.io.`, since the zones' key writes `dev.zenr.io.`
-and the names below it only. Nothing in either proxy keeps the two apart: stable's RFC 9664
-handler serves every name below `dev.zenr.io.` outside `srp.dev.zenr.io.`, `stg.dev.zenr.io.`
-and the names below it included. So:
-
-- A name below `stg.dev.zenr.io.` is registered through staging only, and any other name below
-  `dev.zenr.io.` through stable only. A name registered through both has a lease in each
-  instance, and the instance whose lease ends first deletes records the other still renews.
-- Staging is reached by its address only: no discovery record names it. An SRP client for its
-  zones given no registrar finds stable's record at `dev.zenr.io.` (below), and registers through
-  stable; staging's clients are given its address, as the demos are with `REGISTRAR`.
-- `demo/leftovers.sh` compares the zones with one proxy's lease stores: on stable's, it lists
-  staging's names too, as names no lease store holds.
-
-Zones of its own for staging, outside stable's (`stg.zenr.io.`, if the zone's operators grant
-the key that name), are a change of its `zones` in `registrar_instances`.
-
 ## Discovery records
 
 An SRP client given no registrar finds one in DNS (RFC 9665; docs/siglease_rfc9665.md,
@@ -141,13 +125,16 @@ _dnssd-srp-tls._tcp.dev.zenr.io.     SRV 0 0 853  <registrar>.
 ```
 
 The deploy does not write them: they are written once, with the zones' key, and change only with
-stable's zones or ports. `dig +short _dnssd-srp._tcp.dev.zenr.io SRV` shows one. Staging has none.
+stable's zones or ports. `dig +short _dnssd-srp._tcp.dev.zenr.io SRV` shows one.
+
+Staging has none: it is reached by its address only. A client of its zones is given that
+address, as the demos are with `REGISTRAR`; given none, it finds a registrar only if a record at
+`zenr.io.` names one.
 
 ## The first promote
 
-Until the first promote, the registrar's stable is a proxy started by hand on port 8053, and
-staging runs beside it. That proxy serves `dev.zenr.io.` with both handlers, staging's zones
-included: a staging name is registered through staging only ("Two instances, one zone").
+Until the first promote, the registrar's stable is a proxy started by hand on port 8053, serving
+`dev.zenr.io.` with both handlers, and staging runs beside it.
 
 The first promote stops before switching anything while another process holds port 8053, and
 names it. With that proxy's operators:
