@@ -9,24 +9,12 @@
 
 # set defaults of any required ENV var that isn't set
 
-# BROWSE dig options
-BROWSE_DIG_OPTIONS=${BROWSE_DIG_OPTIONS:-"+noall +answer @ns1.free2air.org"}
-# dig util options
-DIG_OPTIONS=${DIG_OPTIONS:-"+noall +answer +short @ns1.free2air.org"}
-
-
-
 source ./env
 
-# set service domain
-DOMAIN=${DOMAIN:-"dev.zenr.io"}
+clear
 
-
-
-echo "****"
-echo "**** Step 1: ADVERTISE: SERVER advertises a VPN Server with instance name ${SERVER_SERVICE_NAME}.${SERVER_SD_TYPE} over SD"
-echo "****"
-
+# Step 1: ADVERTISE: SERVER advertises a VPN Server with instance name ${SERVER_SERVICE_NAME}.${SERVER_SD_TYPE} over SD"
+#
 CLIENT_KEYSTORE_DIR="${GITDIR}/keystore/client" ${GITDIR}/bin/${DIR}/sig0lease-srp-client \
   -domain="${DOMAIN}" \
   -host="${SERVER_HOSTNAME}" \
@@ -37,23 +25,10 @@ CLIENT_KEYSTORE_DIR="${GITDIR}/keystore/client" ${GITDIR}/bin/${DIR}/sig0lease-s
   -txt="${SERVER_SERVICE_NAME}:net=${SERVER_NETWORK}" \
   -lease=${LEASE} -keylease=${KEYLEASE} \
   -keystore="${GITDIR}/keystore/client" -k=15 -once 
-# \ -once
 
-
-
-# set client request service type for request
-REQ_SERVICE_TYPE=${REQ_SERVICE_TYPE:-"_wgpeer._udp"}
-
-# service name to monitor requests for
-REQ_SERVICE_NAME=${SERVER_SERVICE_NAME:-"myservice"}
-
-# service name to provide config to ...
-ANS_SERVICE_TYPE=${ANS_SERVICE_TYPE:-"_wgcfg._udp"}
-
-
-
-
-echo "2.  The server watches S._sub._wgpeer._udp. For each new request it decides whether to admit the client (policy to be defined). If it admits the client, it allocates an address and adds the peer to its interface. It then registers S-Ci._wgcfg._udp with subtype Ci. A refused client gets the same record with status=refused and no addr or allowed."
+# Step 3: ANSWER: The server watches S._sub._wgpeer._udp. For each new request it decides whether to admit the client (policy to be defined).
+# If it admits the client, it allocates an address and adds the peer to its interface. It then registers S-Ci._wgcfg._udp with subtype Ci. 
+# (not yet implemented) A refused client gets the same record with status=refused and no addr or allowed.
 echo
 
 while true
@@ -68,40 +43,38 @@ do
 
     echo
     echo "=== ACTIVE SERVICE TYPES IN ${DOMAIN}"
-    dig ${DIG_OPTIONS} +short @ns1.free2air.org _services._dns-sd._udp.${DOMAIN}. PTR | grep -v RRSIG | grep -v NSEC
+    dig ${SHORT_DIG_OPTIONS} _services._dns-sd._udp.${DOMAIN}. PTR | grep -v RRSIG | grep -v NSEC
     echo
 
 
     echo "=== ACTIVE Wireguard Service Instances"
-    dig ${DIG_OPTIONS} +short @ns1.free2air.org _wg._udp.${DOMAIN}. PTR | grep -v RRSIG | grep -v NSEC
+    WG_SERVICE_INSTANCES=`dig ${SHORT_DIG_OPTIONS} _wg._udp.${DOMAIN}. PTR | grep -v RRSIG | grep -v NSEC`
+    echo ${WG_SERVICE_INSTANCES}
     echo
 
 
-    CLIENT_REQUESTS=`dig ${DIG_OPTIONS} ${REQ_SERVICE_TYPE}.${DOMAIN} PTR | grep -v RRSIG | grep -v NSEC`
-    echo "*ALL* WIREGUARD SERVICE CLIENT_REQUESTS WITHIN DOMAIN ${DOMAIN}:"
+    CLIENT_REQUESTS=`dig ${SHORT_DIG_OPTIONS} ${REQ_SERVICE_TYPE}.${DOMAIN} PTR | grep -v RRSIG | grep -v NSEC`
+    echo "== *ALL* WIREGUARD SERVICE CLIENT_REQUESTS WITHIN DOMAIN ${DOMAIN}:"
     echo "${CLIENT_REQUESTS}"
     echo
     # 
     
-    echo "SERVICE subtype '${REQ_SERVICE_NAME}' CLIENT_REQUESTS :" 
-    CLIENT_REQUESTS_SUB=`dig ${DIG_OPTIONS} ${REQ_SERVICE_NAME}._sub.${REQ_SERVICE_TYPE}.${DOMAIN} PTR | grep -v RRSIG | grep -v NSEC`
-    
-    # substitute new line for space in list for looping ...
+    echo "** SERVICE subtype '${REQ_SERVICE_NAME}' CLIENT_ANSWERS"
 
-    CLIENT_LOOP="${CLIENT_REQUESTS_SUB//$'\n'/ }"
+    CLIENT_REQUESTS_SUB=`dig ${SHORT_DIG_OPTIONS} ${REQ_SERVICE_NAME}._sub.${REQ_SERVICE_TYPE}.${DOMAIN} PTR | grep -v RRSIG | grep -v NSEC`
+    CLIENT_LOOP="${CLIENT_REQUESTS_SUB//$'\n'/ }" # substitute new line for space in list for looping ...
     
     # loop over client requests and collect those without corresponding _wgcfg entries for ${REQ_SERVICE_NAME}
-
-
     if (( ${#CLIENT_LOOP} > 0 )); then
       for Ci in $(echo ${CLIENT_LOOP})
       do
         Ci_REQ="$(dig ${DIG_OPTIONS} ${REQ_SERVICE_NAME}.${REQ_SERVICE_TYPE}.${DOMAIN} PTR | grep -v RRSIG | grep -v NSEC)"
         Ci_TXT="$(dig ${DIG_OPTIONS} ${Ci} TXT)"
         Ci_SRV="$(dig ${DIG_OPTIONS} ${Ci} SRV)"
-        #Ci_CFG="$(dig ${DIG_OPTIONS} ${REQ_SERVICE_NAME}-${Ci%%.*}.${Ci%%.*}._sub.${ANS_SERVICE_TYPE}.${DOMAIN} TXT | grep -v RRSIG | grep -v NSEC)"
-        Ci_CFG="$(dig ${DIG_OPTIONS} ${REQ_SERVICE_NAME}-${Ci%%.*}.${ANS_SERVICE_TYPE}.${DOMAIN} TXT | grep -v RRSIG | grep -v NSEC)"
-        echo "${Ci}: SRV: ${Ci_SRV} TXT: ${Ci_TXT} (len:${#Ci_TXT}) : CFG: ${Ci_CFG}"
+        # first line with sub - its a pointer
+        # Ci_CFG="$(dig ${DIG_OPTIONS} ${REQ_SERVICE_NAME}-${Ci%%.*}.${Ci%%.*}._sub.${ANS_SERVICE_TYPE}.${DOMAIN} PTR | grep -v RRSIG | grep -v NSEC)"
+        Ci_CFG="$(dig ${SHORT_DIG_OPTIONS} ${REQ_SERVICE_NAME}-${Ci%%.*}.${ANS_SERVICE_TYPE}.${DOMAIN} TXT | grep -v RRSIG | grep -v NSEC)"
+        # echo "** DEBUG: ${Ci}: SRV: ${Ci_SRV} TXT: ${Ci_TXT} (len:${#Ci_TXT}) : CFG: ${Ci_CFG}"
 
         if (( ${#Ci_CFG} == 0 )); then
           echo "${Ci%%.*} needs a config"
@@ -120,20 +93,17 @@ do
             -txt="${SERVER_SERVICE_NAME}-${Ci%%.*}:allowed=${WG_CLIENT_NET}" \
             -lease=${LEASE} -keylease=${KEYLEASE} \
             -keystore="${GITDIR}/keystore/client" -k=15 -once
-        else
-          echo
-          echo "SERVICE subtype '${REQ_SERVICE_NAME}' CLIENT_CONFIG"
-          echo "Ci_CFG: ${Ci_CFG} (len:${#Ci_CFG})"
         fi
+        # echo "** SERVICE subtype '${REQ_SERVICE_NAME}' CLIENT_CONFIG for ${Ci%%.*}"
+        echo "${Ci%%.*}: Ci_CFG: ${Ci_CFG} (len:${#Ci_CFG})"
+        # fi
 
       done
     fi
+
     echo
     echo "====="
-    echo
-    
-    echo "---"
-    sleep 10
+    sleep 5
     clear
     date
 done
