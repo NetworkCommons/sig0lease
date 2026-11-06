@@ -1,0 +1,11 @@
+# nginx keeps its running configuration when the new one fails its test, and the play fails.
+- name: Test the nginx configuration
+  ansible.builtin.command: nginx -t
+  changed_when: false
+  listen: Reload nginx
+
+- name: Reload the nginx configuration
+  ansible.builtin.systemd_service:
+    name: nginx
+    state: reloaded
+  listen: Reload nginx

@@ -1,0 +1,14 @@
+# Checks the release an instance runs (-e registrar_instance=<instance>, make deploy-check
+# INSTANCE=<instance>), as a deploy does, and changes nothing.
+- name: Check an instance's release
+  hosts: registrar
+  tasks:
+    - name: Find the release running now
+      ansible.builtin.include_role:
+        name: sig0lease
+        tasks_from: current.yml
+
+    - name: Check it
+      ansible.builtin.include_role:
+        name: sig0lease
+        tasks_from: check.yml

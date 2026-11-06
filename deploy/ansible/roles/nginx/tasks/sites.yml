@@ -1,0 +1,46 @@
+# The sites, as the certificate allows: port 80 always, for the ACME challenges; once the
+# certificate is there, HTTPS and DNS-over-TLS for each instance that has a release
+# (roles/sig0lease makes one), at its ports. nginx is reloaded before anything goes on, so
+# certbot finds port 80 serving the challenges, and a release's checks find its instance served.
+
+- name: Whether the certificate is there
+  ansible.builtin.stat:
+    path: "{{ nginx_cert_dir }}/fullchain.pem"
+  register: nginx_cert
+
+- name: Find the instances that have a release
+  ansible.builtin.stat:
+    path: "{{ registrar_root }}/{{ item }}/current"
+  loop: "{{ registrar_instances.keys() | list }}"
+  register: nginx_releases
+
+- name: Serve those
+  ansible.builtin.set_fact:
+    nginx_served: >-
+      {{ nginx_releases.results | selectattr('stat.islnk', 'defined') | selectattr('stat.islnk')
+         | map(attribute='item') | list }}
+
+- name: The web server
+  ansible.builtin.template:
+    src: sig0lease.conf.j2
+    dest: /etc/nginx/conf.d/sig0lease.conf
+    mode: "0644"
+  notify: Reload nginx
+
+- name: DNS-over-TLS
+  ansible.builtin.template:
+    src: sig0lease-dot.conf.j2
+    dest: /etc/nginx/stream.d/sig0lease-dot.conf
+    mode: "0644"
+  when: registrar_dot | bool and nginx_cert.stat.exists and nginx_served | length > 0
+  notify: Reload nginx
+
+- name: No DNS-over-TLS
+  ansible.builtin.file:
+    path: /etc/nginx/stream.d/sig0lease-dot.conf
+    state: absent
+  when: not (registrar_dot | bool and nginx_cert.stat.exists and nginx_served | length > 0)
+  notify: Reload nginx
+
+- name: Reload nginx now
+  ansible.builtin.meta: flush_handlers

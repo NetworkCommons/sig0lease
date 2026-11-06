@@ -1,0 +1,18 @@
+# make promote (deploy/README.md): the release staging runs, checked on staging again, made the
+# one stable runs, with stable's config, and checked there; when it fails its checks, stable goes
+# back to the release before. Nothing is built.
+- name: Promote staging's release to stable
+  hosts: registrar
+  vars:
+    registrar_instance: stable
+  pre_tasks:
+    - name: The release goes to stable
+      ansible.builtin.assert:
+        that: registrar_instance == 'stable'
+        fail_msg: "make promote moves staging's release to stable, not to {{ registrar_instance }}."
+        quiet: true
+  tasks:
+    - name: Promote it
+      ansible.builtin.include_role:
+        name: sig0lease
+        tasks_from: promote.yml
