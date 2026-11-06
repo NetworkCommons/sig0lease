@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"codeberg.org/miekg/dns"
+	"github.com/NetworkCommons/sig0lease/config"
 	"github.com/NetworkCommons/sig0lease/handlers"
 	"github.com/NetworkCommons/sig0lease/logging"
 	"github.com/NetworkCommons/sig0lease/pkg/dnsmsg"
@@ -30,7 +31,7 @@ func (s *stubHandler) Shutdown() { *s.shutdownHits++ }
 
 func TestRouter_Shutdown_CallsShutdownOnEveryRegisteredHandler(t *testing.T) {
 	logger := logging.NewLogger("debug")
-	router, err := NewRouter(map[uint8][]string{}, logger, nil, 15*time.Second, false)
+	router, err := NewRouter(map[uint8][]string{}, logger, nil, config.ServerConfig{RequestTimeout: 15 * time.Second})
 	if err != nil {
 		t.Fatalf("NewRouter: %v", err)
 	}
@@ -70,7 +71,7 @@ func (d *deadlineHandler) Handle(ctx context.Context, w dns.ResponseWriter, r *d
 // the caller's own context has none.
 func TestRouter_Route_GivesHandlersTheRequestDeadline(t *testing.T) {
 	const timeout = 7 * time.Second
-	router, err := NewRouter(map[uint8][]string{dns.OpcodeUpdate: {"deadline"}}, logging.NewLogger("debug"), nil, timeout, false)
+	router, err := NewRouter(map[uint8][]string{dns.OpcodeUpdate: {"deadline"}}, logging.NewLogger("debug"), nil, config.ServerConfig{RequestTimeout: timeout})
 	if err != nil {
 		t.Fatalf("NewRouter: %v", err)
 	}
@@ -92,7 +93,7 @@ func TestRouter_Route_GivesHandlersTheRequestDeadline(t *testing.T) {
 }
 
 func TestNewRouter_RejectsNonPositiveRequestTimeout(t *testing.T) {
-	if _, err := NewRouter(map[uint8][]string{}, logging.NewLogger("debug"), nil, 0, false); err == nil {
+	if _, err := NewRouter(map[uint8][]string{}, logging.NewLogger("debug"), nil, config.ServerConfig{}); err == nil {
 		t.Fatal("NewRouter accepted a zero request timeout")
 	}
 }
@@ -127,7 +128,7 @@ func onlyEDE(t *testing.T, resp *dns.Msg) *dns.EDE {
 // dump; with it on it is answered.
 func TestRouter_DumpQueryNeedsDiagnostics(t *testing.T) {
 	for _, diagnostics := range []bool{false, true} {
-		router, err := NewRouter(map[uint8][]string{}, logging.NewLogger("error"), nil, 15*time.Second, diagnostics)
+		router, err := NewRouter(map[uint8][]string{}, logging.NewLogger("error"), nil, config.ServerConfig{RequestTimeout: 15 * time.Second, Diagnostics: diagnostics})
 		if err != nil {
 			t.Fatalf("NewRouter: %v", err)
 		}
@@ -167,7 +168,7 @@ func (errorHandler) Handle(ctx context.Context, w dns.ResponseWriter, r *dns.Msg
 // server.diagnostics on; its code stays either way.
 func TestRouter_HandlerErrorReasonNeedsDiagnostics(t *testing.T) {
 	for _, diagnostics := range []bool{false, true} {
-		router, err := NewRouter(map[uint8][]string{dns.OpcodeUpdate: {"refuser"}}, logging.NewLogger("error"), nil, 15*time.Second, diagnostics)
+		router, err := NewRouter(map[uint8][]string{dns.OpcodeUpdate: {"refuser"}}, logging.NewLogger("error"), nil, config.ServerConfig{RequestTimeout: 15 * time.Second, Diagnostics: diagnostics})
 		if err != nil {
 			t.Fatalf("NewRouter: %v", err)
 		}
@@ -190,7 +191,7 @@ func TestRouter_HandlerErrorReasonNeedsDiagnostics(t *testing.T) {
 func TestRouter_ForwardFailureIsNoReachableAuthority(t *testing.T) {
 	for _, diagnostics := range []bool{false, true} {
 		// No resolver: forwardMessage fails at once.
-		router, err := NewRouter(map[uint8][]string{}, logging.NewLogger("error"), nil, 15*time.Second, diagnostics)
+		router, err := NewRouter(map[uint8][]string{}, logging.NewLogger("error"), nil, config.ServerConfig{RequestTimeout: 15 * time.Second, Diagnostics: diagnostics, Forward: true})
 		if err != nil {
 			t.Fatalf("NewRouter: %v", err)
 		}
@@ -202,6 +203,49 @@ func TestRouter_ForwardFailureIsNoReachableAuthority(t *testing.T) {
 		ede := onlyEDE(t, resp)
 		if ede.InfoCode != dns.ExtendedErrorNoReachableAuthority || (ede.ExtraText != "") != diagnostics {
 			t.Fatalf("diagnostics %v: EDE %s, want 22 (No Reachable Authority), text only with diagnostics", diagnostics, dnsmsg.FormatEDE(ede))
+		}
+	}
+}
+
+// declineHandler declines every request (NotRelevant), as a handler does with one it does not
+// take.
+type declineHandler struct{}
+
+func (declineHandler) Name() string                   { return "decliner" }
+func (declineHandler) CanHandle(opcode uint8) bool    { return opcode == dns.OpcodeUpdate }
+func (declineHandler) Setup(cfg map[string]any) error { return nil }
+func (declineHandler) Start()                         {}
+func (declineHandler) Shutdown()                      {}
+func (declineHandler) Handle(ctx context.Context, w dns.ResponseWriter, r *dns.Msg) *handlers.HandlerResult {
+	return handlers.NewNotRelevantResult("not mine")
+}
+
+// With server.forward off, what no handler takes -- an opcode with no processing rule, or a
+// request every handler of its rule declines -- is answered REFUSED with code 20 (Not
+// Authoritative), echoing the query, its reason only with server.diagnostics on; the upstreams
+// are not asked (there is no resolver here: asking would answer SERVFAIL with code 22).
+func TestRouter_UnhandledRefusedWithoutForward(t *testing.T) {
+	update := ednsQuery(t, "example.", dns.TypeSOA)
+	update.Opcode = dns.OpcodeUpdate
+	requests := map[string]*dns.Msg{
+		"query with no rule":            ednsQuery(t, "example.", dns.TypeA),
+		"update every handler declines": update,
+	}
+	for _, diagnostics := range []bool{false, true} {
+		router, err := NewRouter(map[uint8][]string{dns.OpcodeUpdate: {"decliner"}}, logging.NewLogger("error"), nil, config.ServerConfig{RequestTimeout: 15 * time.Second, Diagnostics: diagnostics})
+		if err != nil {
+			t.Fatalf("NewRouter: %v", err)
+		}
+		router.RegisterHandler(declineHandler{})
+		for name, req := range requests {
+			resp := router.Route(context.Background(), nil, req)
+			if resp.Rcode != dns.RcodeRefused || resp.ID != req.ID || len(resp.Question) != 1 || len(resp.Answer) != 0 {
+				t.Fatalf("%s: rcode %s, ID %d (query %d), %d questions, %d answers; want REFUSED echoing the query", name, dns.RcodeToString[resp.Rcode], resp.ID, req.ID, len(resp.Question), len(resp.Answer))
+			}
+			ede := onlyEDE(t, resp)
+			if ede.InfoCode != dns.ExtendedErrorNotAuthoritative || (ede.ExtraText != "") != diagnostics {
+				t.Fatalf("%s, diagnostics %v: EDE %s, want 20 (Not Authoritative), text only with diagnostics", name, diagnostics, dnsmsg.FormatEDE(ede))
+			}
 		}
 	}
 }

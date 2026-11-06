@@ -33,6 +33,20 @@ fi
 log_step "Building client binaries..."
 go build -o "bin/${OS}/sig0lease-client" ./cmd/sig0lease-client
 
+# set_forward <true|false> -- sets server.forward in the suite's copy of config.yaml.
+set_forward() {
+    sed -i.bak -e "s|^  forward:.*$|  forward: $1|" "$PROXY_CONFIG_FILE"
+    rm -f "$PROXY_CONFIG_FILE.bak"
+    grep -qx "  forward: $1" "$PROXY_CONFIG_FILE" || {
+        log_error "Could not set server.forward in $PROXY_CONFIG_FILE: $CONFIG_FILE no longer has the \"  forward:\" line this edits"
+        return 1
+    }
+}
+
+# Tests 1-8 need the proxy to forward what no handler takes, which config.yaml leaves off.
+prepare_lease_config
+set_forward true
+
 # Start proxy in background
 start_proxy
 
@@ -76,6 +90,30 @@ if echo "$out" | grep -q "status: NXDOMAIN" && ! echo "$out" | grep -qiE "mismat
     log_success "$label"
 else
     log_error "$label: expected an NXDOMAIN reply with the query's ID"
+    FAILED_TESTS="$FAILED_TESTS\n  $label"
+fi
+echo ""
+
+stop_proxy
+
+# Test 9: with server.forward off, as config.yaml has it, a query outside the handlers' zones is
+# refused with Extended DNS Error 20 (Not Authoritative), and one for the zone a handler serves is
+# still answered, from that zone's authoritative server (the opcode 0 rule): its answer has the
+# aa flag, which a recursive resolver's does not. dev.zenr.io. is no zone apex, so the answer
+# has the SOA in its authority section, and none in its answer section.
+set_forward false
+start_proxy
+label="Test 9: forward off: google.com refused, dev.zenr.io. answered by its authoritative server"
+log_step "$label"
+out="$(dig @"${PROXY_ADDR}" -p "${PROXY_PORT}" +time=3 +tries=2 google.com A 2>&1)" || true
+echo "$out" | grep -E "status:|EDE" || true
+zone_out="$(dig @"${PROXY_ADDR}" -p "${PROXY_PORT}" +time=3 +tries=2 dev.zenr.io. SOA 2>&1)" || true
+echo "$zone_out" | grep -E "status:|flags:" || true
+if echo "$out" | grep -q "status: REFUSED" && echo "$out" | grep -q "EDE: 20" \
+    && echo "$zone_out" | grep -q "status: NOERROR" && echo "$zone_out" | grep -qE "flags: qr aa( |;)"; then
+    log_success "$label"
+else
+    log_error "$label: expected REFUSED with EDE 20 for google.com, and dev.zenr.io. SOA answered NOERROR with the aa flag"
     FAILED_TESTS="$FAILED_TESTS\n  $label"
 fi
 echo ""

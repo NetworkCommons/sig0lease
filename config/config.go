@@ -16,7 +16,8 @@ type ProcessingConfig struct {
 	Opcode uint8 `yaml:"opcode"`
 	// Modules is the ordered list of processing module names to try for this opcode:
 	// the router calls each in turn until one returns Processed or Error; if every one
-	// declines (NotRelevant), the opcode falls through to plain upstream forwarding. A
+	// declines (NotRelevant), no handler takes the request: it is refused, or forwarded to the
+	// upstreams with server.forward on (ServerConfig.Forward). A
 	// single-module list (the common case today, e.g. just "update_handler") behaves
 	// exactly as the old single-"module" field did.
 	Modules []string `yaml:"modules"`
@@ -59,6 +60,12 @@ type ServerConfig struct {
 	// production: error replies then carry only the Extended DNS Error's code, and the dump
 	// query is answered REFUSED with code 18 (Prohibited).
 	Diagnostics bool `yaml:"diagnostics"`
+	// Forward passes what no handler takes -- a query for a name outside the handlers' zones,
+	// an UPDATE without the Update Lease option, any other opcode -- to the upstreams, and
+	// relays their answer. Off by default: such a request is then answered REFUSED with code 20
+	// (Not Authoritative), so the proxy is no open resolver on an address the internet reaches.
+	// The upstreams are asked either way for the proxy's own lookups (a zone's SOA).
+	Forward bool `yaml:"forward"`
 }
 
 // TLSConfig holds a listener's own address and certificate: the DNS-over-TLS listener's,

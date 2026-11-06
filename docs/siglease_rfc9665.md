@@ -83,8 +83,9 @@ processing_rules:
 ```
 
 `server/router.go` calls each configured handler for the opcode in turn; the first one to
-return `Processed` or `Error` wins. If every handler returns `NotRelevant`, the request falls
-through to plain upstream forwarding. `SRPHandler.Handle()` returns `NotRelevant` when
+return `Processed` or `Error` wins. If every handler returns `NotRelevant`, no handler takes the
+request: it is refused, or with `server.forward` on forwarded upstream
+(`docs/siglease_rfc9664.md`, "Requests No Handler Takes"). `SRPHandler.Handle()` returns `NotRelevant` when
 `pkg/srp.Classify` decides the message isn't SRP-shaped, or when its host (the Host
 Description's name) is not in the zone this handler serves, nor under `default.service.arpa.`
 with `rewrite_default_service_arpa` on (`SRPHandler.takes`). The Zone Section plays no part in

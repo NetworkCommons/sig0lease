@@ -1599,7 +1599,8 @@ type ProcessingConfig struct {
 	Opcode uint8 `yaml:"opcode"`
 	// Modules is the ordered list of processing module names to try for this opcode:
 	// the router calls each in turn until one returns Processed or Error; if every one
-	// declines (NotRelevant), the opcode falls through to plain upstream forwarding. A
+	// declines (NotRelevant), no handler takes the request: it is refused, or forwarded to the
+	// upstreams with server.forward on (ServerConfig.Forward). A
 	// single-module list (the common case today, e.g. just "update_handler") behaves
 	// exactly as the old single-"module" field did.
 	Modules []string `yaml:"modules"`
@@ -1632,6 +1633,12 @@ type ServerConfig struct {
 	// production: error replies then carry only the Extended DNS Error's code, and the dump
 	// query is answered REFUSED with code 18 (Prohibited).
 	Diagnostics bool `yaml:"diagnostics"`
+	// Forward passes what no handler takes -- a query for a name outside the handlers' zones,
+	// an UPDATE without the Update Lease option, any other opcode -- to the upstreams, and
+	// relays their answer. Off by default: such a request is then answered REFUSED with code 20
+	// (Not Authoritative), so the proxy is no open resolver on an address the internet reaches.
+	// The upstreams are asked either way for the proxy's own lookups (a zone's SOA).
+	Forward bool `yaml:"forward"`
 }
     ServerConfig holds server listening configuration.
 
@@ -3733,8 +3740,9 @@ type Router struct {
     Router routes DNS requests based on opcode to appropriate handlers or
     forwarder.
 
-func NewRouter(opcodeMap map[uint8][]string, logger *logging.Logger, resolver *forward.Resolver, requestTimeout time.Duration, diagnostics bool) (*Router, error)
-    NewRouter creates a new router instance.
+func NewRouter(opcodeMap map[uint8][]string, logger *logging.Logger, resolver *forward.Resolver, srv config.ServerConfig) (*Router, error)
+    NewRouter creates a new router instance, with the settings it reads from
+    srv, the config's server section: request_timeout, diagnostics and forward.
 
 func (r *Router) RegisterHandler(h handlers.Handler)
     RegisterHandler registers a handler with the router.
@@ -3748,7 +3756,8 @@ func (r *Router) Route(ctx context.Context, w dns.ResponseWriter, rMsg *dns.Msg)
         Return response to client, stop - StatusNotRelevant: Try the next
         handler in the list - StatusError: Return error response to client, stop
      4. If no handler is configured, or every handler declined (all
-        NotRelevant), apply default forward
+        NotRelevant), answerUnhandled: forward it, or refuse it with
+        server.forward off
 
 func (r *Router) Shutdown()
     Shutdown calls Shutdown on every registered handler exactly once.

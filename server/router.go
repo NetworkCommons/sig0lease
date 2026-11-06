@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"codeberg.org/miekg/dns"
+	"github.com/NetworkCommons/sig0lease/config"
 	"github.com/NetworkCommons/sig0lease/forward"
 	"github.com/NetworkCommons/sig0lease/handlers"
 	"github.com/NetworkCommons/sig0lease/logging"
@@ -19,7 +20,7 @@ import (
 type Router struct {
 	// opcodeMap holds, per opcode, the ordered list of module names to try:
 	// Route calls each in turn until one returns Processed or Error; if every one
-	// declines (NotRelevant), the opcode falls through to plain upstream forwarding.
+	// declines (NotRelevant), it falls through to answerUnhandled.
 	opcodeMap map[uint8][]string
 	handlers  map[string]handlers.Handler
 	logger    *logging.Logger
@@ -30,20 +31,24 @@ type Router struct {
 	// diagnostics (server.diagnostics) keeps the reason text in the Extended DNS Errors of the
 	// proxy's own error replies, and answers the dump query.
 	diagnostics bool
+	// forward (server.forward) sends what no handler takes to the upstreams; off, it is refused.
+	forward bool
 }
 
-// NewRouter creates a new router instance.
-func NewRouter(opcodeMap map[uint8][]string, logger *logging.Logger, resolver *forward.Resolver, requestTimeout time.Duration, diagnostics bool) (*Router, error) {
-	if requestTimeout <= 0 {
-		return nil, fmt.Errorf("request timeout must be positive, got %s", requestTimeout)
+// NewRouter creates a new router instance, with the settings it reads from srv, the config's
+// server section: request_timeout, diagnostics and forward.
+func NewRouter(opcodeMap map[uint8][]string, logger *logging.Logger, resolver *forward.Resolver, srv config.ServerConfig) (*Router, error) {
+	if srv.RequestTimeout <= 0 {
+		return nil, fmt.Errorf("request timeout must be positive, got %s", srv.RequestTimeout)
 	}
 	return &Router{
 		opcodeMap:      opcodeMap,
 		handlers:       make(map[string]handlers.Handler),
 		logger:         logger,
 		resolver:       resolver,
-		requestTimeout: requestTimeout,
-		diagnostics:    diagnostics,
+		requestTimeout: srv.RequestTimeout,
+		diagnostics:    srv.Diagnostics,
+		forward:        srv.Forward,
 	}, nil
 }
 
@@ -76,7 +81,7 @@ func (r *Router) Shutdown() {
 //     - StatusNotRelevant: Try the next handler in the list
 //     - StatusError: Return error response to client, stop
 //  4. If no handler is configured, or every handler declined (all NotRelevant),
-//     apply default forward
+//     answerUnhandled: forward it, or refuse it with server.forward off
 func (r *Router) Route(ctx context.Context, w dns.ResponseWriter, rMsg *dns.Msg) *dns.Msg {
 	// Check for internal dump query (admin/debug endpoint).
 	if r.isDumpQuery(rMsg) {
@@ -92,8 +97,8 @@ func (r *Router) Route(ctx context.Context, w dns.ResponseWriter, rMsg *dns.Msg)
 	r.logger.Debugf("Route: Opcode=%d, FoundModules=%v, Modules=%v", rMsg.Opcode, found, moduleNames)
 
 	if !found || len(moduleNames) == 0 {
-		r.logger.Debugf("No handler for opcode %d, forwarding to upstream", rMsg.Opcode)
-		return r.forwardToUpstream(rMsg)
+		r.logger.Debugf("No handler for opcode %d", rMsg.Opcode)
+		return r.answerUnhandled(rMsg)
 	}
 
 	// One deadline for the request, whichever handlers it passes through: it bounds their
@@ -146,9 +151,9 @@ func (r *Router) Route(ctx context.Context, w dns.ResponseWriter, rMsg *dns.Msg)
 		}
 	}
 
-	// Every configured handler declined (or was missing/nil) -- default upstream routing.
-	r.logger.Debugf("All handlers declined opcode %d, forwarding to upstream", rMsg.Opcode)
-	return r.forwardToUpstream(rMsg)
+	// Every configured handler declined (or was missing/nil).
+	r.logger.Debugf("All handlers declined opcode %d", rMsg.Opcode)
+	return r.answerUnhandled(rMsg)
 }
 
 // moduleForOpcode returns the ordered module-name list for an opcode if one is configured.
@@ -242,8 +247,17 @@ func (r *Router) handleDumpQuery(m *dns.Msg) *dns.Msg {
 	return resp
 }
 
-// forwardToUpstream forwards a DNS message to the upstream resolver.
-func (r *Router) forwardToUpstream(rMsg *dns.Msg) *dns.Msg {
+// answerUnhandled answers rMsg, which no handler takes. With server.forward on, it goes to the
+// upstream resolvers and their answer is relayed. Off, it is refused with code 20 (Not
+// Authoritative), RFC 8914's code for a server not configured for recursion for a name it is
+// not authoritative for: the proxy answers only for its zones, and no address that reaches it
+// can use it as a resolver.
+func (r *Router) answerUnhandled(rMsg *dns.Msg) *dns.Msg {
+	if !r.forward {
+		r.logger.Debugf("Refusing opcode %d: no handler takes it and server.forward is off", rMsg.Opcode)
+		return r.errorReply(rMsg, dns.RcodeRefused, dns.ExtendedErrorNotAuthoritative,
+			"this proxy answers only for its zones and forwards nothing else (server.forward is off)")
+	}
 	resp, err := r.forwardMessage(rMsg)
 	if err != nil {
 		r.logger.Errorf("Forward error: %v", err)

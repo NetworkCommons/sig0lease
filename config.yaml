@@ -3,13 +3,10 @@
 # This file demonstrates the configuration options for the DNS proxy. The proxy needs a
 # config file (sig0lease [config file], default config.yaml): it has no built-in server
 # address, networks or upstreams. Settings marked optional have defaults.
-# The proxy routes DNS queries based on their opcode to processing modules,
-# and forwards all other opcodes to upstream resolvers.
-#
-# Protocol-Specific Routing:
-# - UPDATE queries WITH UPDATE-LEASE EDNS option (RFC 9664) are handled by the update handler
-# - UPDATE queries WITHOUT UPDATE-LEASE EDNS option are forwarded to the default upstream resolver
-# - Other opcodes are routed according to the configured processing rules or forwarded upstream
+# The proxy routes DNS queries based on their opcode to processing modules (processing_rules).
+# What no module takes -- an UPDATE without the UPDATE-LEASE EDNS option, a query for a name
+# outside the handlers' zones, any other opcode -- is refused, or, with server.forward on,
+# forwarded to the upstream resolvers.
 
 server:
   # Address to listen on; required. Port 8053 is non-privileged;
@@ -26,6 +23,13 @@ server:
   # Off, error replies carry only the Extended DNS Error's code, and the dump query is
   # answered REFUSED. The test suites turn it on in the configs they write.
   diagnostics: false
+
+  # Whether to forward to the upstreams below what no handler takes, and relay their answer.
+  # Optional, default false: such a request is answered REFUSED with Extended DNS Error 20
+  # (Not Authoritative), and the proxy is no open resolver on an address the internet reaches.
+  # The handlers still ask the upstreams for their own lookups (a zone's SOA). On, it is a
+  # resolver for anyone who can reach it. tests/test_forward.sh turns it on.
+  forward: false
 
   # Networks to enable
   networks:
@@ -58,9 +62,8 @@ server:
 
 upstreams:
   # Required: at least one, each with its address, protocol (udp or tcp) and timeout.
-  # Generic upstream resolvers used for non-processed opcodes.
-  # Forwarding for opcodes not listed in processing_rules uses the upstreams list.
-  # UPDATE handlers primarily resolves authoritative server from handlers.<handler>.upstream_zone.
+  # The handlers ask them for a zone's SOA, to find the authoritative server of
+  # handlers.<handler>.upstream_zone; with server.forward on, they also get what no handler takes.
   - address: "8.8.8.8:53"
     protocol: "udp"
     timeout: "5s"
@@ -82,8 +85,8 @@ authoritative:
 # Processing rules map opcodes to an ORDERED list of module names. The router tries
 # each module in turn until one returns "processed" or "error"; if every one declines
 # ("not relevant" -- e.g. an SRP-shaped update handled by srp_handler, or a plain UPDATE
-# without the UPDATE-LEASE option handled by update_handler), the opcode falls through to
-# plain upstream forwarding.
+# without the UPDATE-LEASE option handled by update_handler), it is refused, or forwarded with
+# server.forward on.
 processing_rules:
   # Route opcode 5 (UPDATE) to the update handler module.
   # UPDATE queries are used for dynamic DNS updates (RFC 2136).
@@ -101,8 +104,9 @@ processing_rules:
   # Opcode 0 (QUERY): a query for a name a handler serves gets the answer of that zone's
   # authoritative server, where the handler's UPDATEs go, so that a client reading the zones
   # through the proxy -- the demo's browser page, over DoH -- sees a change as soon as the
-  # server has it, rather than what a recursive resolver cached. Queries for other names go
-  # to the upstreams above. Without this rule, every query goes to the upstreams.
+  # server has it, rather than what a recursive resolver cached. Queries for other names are
+  # refused, or forwarded to the upstreams with server.forward on. Without this rule, every
+  # query is.
   - opcode: 0
     modules: ["srp_handler", "update_handler"]
 

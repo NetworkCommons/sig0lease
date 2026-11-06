@@ -140,6 +140,24 @@ func TestServerRequestTimeout_ReadFromYAML(t *testing.T) {
 	}
 }
 
+// server.forward is off unless the file turns it on.
+func TestServerForward_OffByDefaultAndReadFromYAML(t *testing.T) {
+	if NewDefaultConfig().Server.Forward {
+		t.Fatal("expected server.forward off by default")
+	}
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	if err := os.WriteFile(path, []byte(minimalYAML+"  forward: true\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := LoadConfig(path)
+	if err != nil {
+		t.Fatalf("LoadConfig: %v", err)
+	}
+	if !cfg.Server.Forward {
+		t.Fatal("expected server.forward on from YAML")
+	}
+}
+
 // The config file is mandatory: a missing one is an error, not built-in defaults.
 func TestLoadConfig_MissingFileRejected(t *testing.T) {
 	if _, err := LoadConfig(filepath.Join(t.TempDir(), "config.yaml")); err == nil {

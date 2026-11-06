@@ -19,11 +19,11 @@ The project is intended to provide a light, explicit control point for lease reg
 traffic:
 
 - Receive DNS queries over UDP and TCP.
-- Route the registration opcode to the update handler and forward unrelated traffic upstream.
+- Route the registration opcode to the update handler, and refuse unrelated traffic, or with
+  `server.forward` on forward it upstream (see "Requests No Handler Takes").
 - Process DNS UPDATE requests carrying an UPDATE-LEASE EDNS option.
 - Verify downstream SIG(0) signatures before the proxy accepts the request.
 - Re-sign the upstream UPDATE with the proxy's zone key before forwarding.
-- Forward unhandled opcodes to the configured upstream resolver path.
 
 *(Shared with RFC 9665 SRP: SIG(0) verification/re-signing and upstream forwarding follow the
 same pattern described in "Upstream Forwarding and Write Ordering" below; SRP's message shape
@@ -111,7 +111,7 @@ sig0lease-client list-keys -keystore /path/to/keystore
 The proxy is designed to support two practical scenarios:
 
 - Registration: a client submits an authenticated UPDATE-LEASE request and the proxy forwards a signed UPDATE to the authoritative server.
-- Pass-through routing: non-registration traffic is forwarded according to the configured opcode routing and upstream settings.
+- Pass-through routing, with `server.forward` on: what no handler takes is forwarded to the upstream resolvers. Off, the default, the proxy answers only for its zones (see "Requests No Handler Takes").
 
 ## UPDATE-LEASE Case Matrix
 
@@ -251,7 +251,11 @@ Each handler refuses an UPDATE that names anything outside its zone, or inside a
 
 ### Queries for the Zones Served
 
-With a processing rule for opcode 0 (QUERY) listing the handlers, as `config.yaml` has, a query for a name one of them serves (the zone rule above) gets the answer of that zone's authoritative server, the one its UPDATEs go to (`leaseHandler.answerQuery`, through the coordinator's `QueryAuthoritative`, UDP then TCP, the client's ID and RD bit put back). A client reading the zones through the proxy, as the demo's browser page does over DoH, or `sig0lease-agent` following another name's IPFS site, then sees a change as soon as that server has it; through the upstream resolvers it would see what they cached, for up to the records' TTL, and a name looked up before it existed stays missing for up to the zone's negative TTL. A query for any other name is not the handlers', and goes to the upstream resolvers as before. An authoritative server that does not answer gets the client `SERVFAIL` with Extended DNS Error 22 (No Reachable Authority), never the upstream resolvers' answer instead. Without the rule, every query goes upstream.
+With a processing rule for opcode 0 (QUERY) listing the handlers, as `config.yaml` has, a query for a name one of them serves (the zone rule above) gets the answer of that zone's authoritative server, the one its UPDATEs go to (`leaseHandler.answerQuery`, through the coordinator's `QueryAuthoritative`, UDP then TCP, the client's ID and RD bit put back). A client reading the zones through the proxy, as the demo's browser page does over DoH, or `sig0lease-agent` following another name's IPFS site, then sees a change as soon as that server has it; through the upstream resolvers it would see what they cached, for up to the records' TTL, and a name looked up before it existed stays missing for up to the zone's negative TTL. A query for any other name is not the handlers' (see "Requests No Handler Takes"). An authoritative server that does not answer gets the client `SERVFAIL` with Extended DNS Error 22 (No Reachable Authority), never the upstream resolvers' answer instead. Without the rule, no query is the handlers'.
+
+### Requests No Handler Takes
+
+What no handler takes -- a query for a name outside the handlers' zones, an UPDATE without the Update Lease option, a request with an opcode no processing rule lists -- is refused by default: `REFUSED` with Extended DNS Error 20 (Not Authoritative), RFC 8914's code for a server that is not authoritative for the name and is not configured to recurse (`Router.answerUnhandled`). With `server.forward: true` it goes to the upstream resolvers instead, and their answer is relayed; one that cannot be forwarded gets `SERVFAIL` with Extended DNS Error 22. Forwarding is off by default so that a proxy on an address the internet reaches is no open resolver, which anyone could resolve names through and aim amplified answers at a forged source address with. The handlers ask the upstream resolvers either way for their own lookups: a zone's SOA, when no static `upstream` is set (`bootstrap_resolvers`). `tests/test_forward.sh` checks both settings.
 
 ### The Zone Section
 
@@ -351,8 +355,9 @@ Every error reply either handler sends, like a success reply, copies none of the
 | INFO-CODE | Refusals |
 |---|---|
 | 18 Prohibited | an unauthorized or unproven signer, records outside its subtree, a record held by another key (`REFUSED`), a name held by another key (`YXDOMAIN`: SRP's FCFS, this handler's `fcfs_naming`), a name outside the handler's zone or in another handler's (`REFUSED`), a KEY registering itself other than one label below the zone with `fcfs_naming` (`REFUSED`), a blacklisted type, foreign data at an SRP name |
+| 20 Not Authoritative | a request no handler takes, with `server.forward` off (`REFUSED`, see "Requests No Handler Takes") |
 | 21 Not Supported | a "." in a label, the 4-byte variant while `prefer_4byte_variant` is off, UDP while SRP's `allow_udp` is off |
-| 22 No Reachable Authority | the authoritative server could not be queried or did not accept the UPDATE (`SERVFAIL`); also a query the proxy could not forward |
+| 22 No Reachable Authority | the authoritative server could not be queried or did not accept the UPDATE (`SERVFAIL`); also a request `server.forward` could not forward |
 | 0 Other | anything else: a malformed request, a busy lease store, an internal error |
 
 The reason text can tell a requester about the proxy's state, such as whether a key is in its lease store, so it stays only with `server.diagnostics: true`; otherwise the router removes it and keeps the code (`Router.ownErrorReply`), which RFC 8914 §3 requires every client to accept. `sig0lease-client` and `sig0lease-srp-client` print each Extended DNS Error after the status, and the test suites check refusals by them, with diagnostics on.
@@ -405,7 +410,9 @@ Two backends are selectable via `handlers.update.storage` in `config.yaml` (see 
 - listening address and enabled transport networks;
 - `server.request_timeout` (default 15s, must be positive): how long the handlers may work on one request, including waiting for a lease-store node another request is using (see "Node Locks");
 - `server.diagnostics` (default `false`; keep it off in production): with it on, error replies carry the reason as their Extended DNS Error's text (see "Error Replies"), and the proxy answers the lease-store dump query, `__dump.sig0lease.internal.` TXT for a summary or `__dump.sig0lease.internal.debug.` TXT for every record (`dig @<proxy> -p <port> __dump.sig0lease.internal. TXT`). With it off, error replies carry only the code, and the dump query is answered `REFUSED` with Extended DNS Error 18 (Prohibited). The test suites turn it on in the configs they write;
-- default upstream resolvers;
+- `server.forward` (default `false`): forward what no handler takes to the upstream resolvers,
+  instead of refusing it (see "Requests No Handler Takes");
+- default upstream resolvers, which the handlers also ask for a zone's SOA;
 - handler-specific settings such as the upstream zone, an optional static `upstream` server for it, keystore directory, lease policy bounds, blacklisted RR types, `allow_online_key_registration`, `fcfs_naming` (see "First-Come First-Served Naming"), and the lease storage backend (`storage.type: memory|file`, see "Storage Backends and Expiry" above) for the update handler;
 - opcode-to-module routing (an ordered list per opcode — see `docs/siglease_rfc9665.md` §3 for
   how SRP's handler fits into the same list). Each handler serves its own zone, and the deepest
