@@ -1,6 +1,7 @@
 # demo/lib.sh -- what the demo's scripts (run.sh, chat.sh, web.sh, ipfs.sh) share, sourced by
-# them. They set B, the binaries' directory, log, the directory for the programs' logs, and ns,
-# the server ask() asks, before using these.
+# them. They set B, the binaries' directory, log, the directory for the programs' logs, ns, the
+# server ask() asks, zone, the RFC 9664 zone, and domain, the SRP domain, if they have one, before
+# using these.
 #
 # REGISTRAR, when set, is the registrar the agents send their updates to, in place of the proxy
 # each demo otherwise starts on this machine, at 127.0.0.1:8053: a shared one, as the public
@@ -93,14 +94,18 @@ start_proxy() {
 }
 
 # template <file> <copy> -- copies an agent template for this run (the copy may be the file): a
-# relative keystore made absolute, as the agent takes it relative to the template's directory,
-# and with REGISTRAR each registrar's server, this machine's proxy (127.0.0.1:8053), replaced
-# by REGISTRAR, with TRANSPORT.
+# relative keystore made absolute, as the agent takes it relative to the template's directory;
+# each registrar's zone and domain the demo's (ZONE, DOMAIN); and with REGISTRAR each registrar's
+# server, this machine's proxy (127.0.0.1:8053), replaced by REGISTRAR, with TRANSPORT.
 template() {
     local dir
     dir="$(cd "$(dirname "$1")" && pwd)" || exit 1
-    awk -v dir="$dir" -v server="${REGISTRAR:-}" -v transport="${TRANSPORT:-}" '
+    awk -v dir="$dir" -v server="${REGISTRAR:-}" -v transport="${TRANSPORT:-}" \
+        -v zone="${zone:-}" -v domain="${domain:-}" '
+        BEGIN { sub(/[.]$/, "", zone); sub(/[.]$/, "", domain) }
         /^keystore: [^\/ #]/ { sub(/^keystore: /, "keystore: " dir "/") }
+        zone != "" && /^ *zone: / { sub(/zone: [^ #]*/, "zone: " zone ".") }
+        domain != "" && /^ *domain: / { sub(/domain: [^ #]*/, "domain: " domain ".") }
         server != "" && /^ *server: 127\.0\.0\.1:8053/ {
             indent = $0
             sub(/[^ ].*/, "", indent)

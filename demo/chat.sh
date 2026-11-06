@@ -18,7 +18,7 @@
 #   PROSODY  docker: the prosodyim/prosody:13.0 image (default on macOS); native: Prosody 13
 #            with luaunbound, installed (default elsewhere).
 #   ADDRESS  the address to publish for the servers; default, all of this machine's (auto).
-#   NS, ZONE as for watch.sh.
+#   NS, ZONE as for watch.sh; ZONE is also where the agent registers.
 #   REGISTRAR, TRANSPORT  the registrar the agent uses instead of a proxy this script starts
 #            (demo/lib.sh).
 # Each label's certificate and key stay in demo/chat/servers/<label>.<zone>/ from one run to

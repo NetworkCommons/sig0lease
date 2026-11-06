@@ -7,8 +7,9 @@
 # a temporary directory, printed at the start. On a Mac it writes demo/mac.yaml, D2's template,
 # when there is none. It builds the proxy and the clients first (make build build-client).
 #
-# NS, DOMAIN, ZONE and NAME change what it asks, as for watch.sh. REGISTRAR sends the agents'
-# updates to that registrar instead, and starts no proxy (demo/lib.sh).
+# NS, DOMAIN, ZONE and NAME change what it asks, as for watch.sh; DOMAIN and ZONE are also where
+# the agents register (demo/lib.sh, template). REGISTRAR sends the agents' updates to that
+# registrar instead, and starts no proxy (demo/lib.sh).
 
 cd "$(dirname "$0")/.." || exit 1
 . demo/lib.sh

@@ -15,7 +15,7 @@
 #             from
 #   PORT      the page's port; default 8090 (D3's gateway has 8080)
 #   DOH_PORT  the proxy's DoH port; default 8443
-#   NS, ZONE, DOMAIN, NAME as for watch.sh.
+#   NS, ZONE, DOMAIN, NAME as for watch.sh; ZONE and DOMAIN are also where the agent registers.
 #   REGISTRAR, TRANSPORT  the registrar the agent uses instead of a proxy this script starts
 #             (demo/lib.sh). The page then asks the registrar's web server, over DNS-over-HTTPS:
 #   DOH       the page's DoH server, as a URL with no path; default https://<REGISTRAR's host>,

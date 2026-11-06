@@ -62,7 +62,7 @@ phones reach, unless `ADDRESS` gives the host's and the container publishes the 
 
 ## Against a shared registrar
 
-Every script takes `REGISTRAR`, the address of a registrar that serves the same zones, such as
+Every script takes `REGISTRAR`, the address of a registrar that serves the demo's zones, such as
 the public one: the agents send their updates there, in place of the proxy the script otherwise
 starts on the laptop, and the script starts no proxy and checks no ports for it. Its host name is
 not in this repository; its operators give it.
@@ -74,9 +74,14 @@ REGISTRAR=<registrar>:853 TRANSPORT=tls demo/ipfs.sh member     # over DNS-over-
 
 - `TRANSPORT` is how the agents reach it: `tcp`, their default, `udp`, `tls`, or `doh` with
   `REGISTRAR=https://<registrar>`.
+- The demo's zones are `ZONE`, where the names are, and `DOMAIN`, the SRP domain (`ipfs.sh`
+  takes `srp.<ZONE>`); by default `dev.zenr.io` and `srp.dev.zenr.io`, the ones `config.yaml`
+  gives the laptop's proxy. A registrar that serves other zones takes them:
+  `REGISTRAR=<registrar>:<port> ZONE=<zone> DOMAIN=srp.<zone> demo/run.sh`.
 - The scripts copy each template they run (`demo/demo.yaml`, `demo/conflict.yaml`,
   `demo/mac.yaml`, and the ones `ipfs.sh` and `chat.sh` write) into their log directory, with
-  `server: 127.0.0.1:8053` replaced by `REGISTRAR`; the files in `demo/` stay as they are.
+  each registrar's `zone:` and `domain:` the demo's, and `server: 127.0.0.1:8053` replaced by
+  `REGISTRAR`; the files in `demo/` stay as they are.
 - D6: the page, still served by the laptop, asks the registrar's web server,
   `https://<registrar>/dns-query`, over DNS-over-HTTPS; `DOH=<url>` names another. The phones then
   need the internet, not the laptop's proxy.

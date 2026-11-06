@@ -22,7 +22,8 @@
 #   IPFS_PATH  the node's repository, which holds its swarm key; default ~/.ipfs, IPFS Desktop's
 #   GATEWAY    the community node's gateway port; default 8080
 #   ADDRESS    the community node's address to publish; default, all of this machine's (auto)
-#   NS, ZONE   as for watch.sh.
+#   NS, ZONE   as for watch.sh; ZONE is also where the agent registers, and srp.<ZONE> its SRP
+#              domain.
 #   REGISTRAR, TRANSPORT  the registrar the agent uses instead of a proxy this script starts
 #              (demo/lib.sh).
 # The member starts first: the community node's agent follows a site that is there, and its node
