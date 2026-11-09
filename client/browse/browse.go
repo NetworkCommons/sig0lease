@@ -1,7 +1,8 @@
 // Package browse reads a DNS-SD domain (RFC 6763) with plain queries, as a client that can only
 // ask questions does, such as a browser page over DNS-over-HTTPS: the service types the domain
 // lists (S9), each type's instances (S4), and each instance's SRV and TXT records (S6) and its
-// target's addresses.
+// target's addresses. Names reads, the same way, the names in a zone signed with NSEC, which
+// are typed rather than browsed: those RFC 9664 registers and any other.
 package browse
 
 import (
@@ -220,9 +221,7 @@ func Browse(ctx context.Context, q Query, domain string) (*Domain, error) {
 				return err
 			}
 			for _, rr := range txts {
-				for _, s := range rr.(*dns.TXT).Txt {
-					in.TXT = append(in.TXT, dnsmsg.UnescapeTXT(s))
-				}
+				in.TXT = append(in.TXT, dnsmsg.TXTStrings(rr.(*dns.TXT))...)
 			}
 			srvs, err := q(gctx, name, dns.TypeSRV)
 			if err != nil {

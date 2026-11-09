@@ -32,5 +32,6 @@ registrars:
         addresses: [auto]
         records:
           - '@ TXT "published by sig0lease-agent"'
-          # D1, during the demo: uncomment and save
+          # D1, during the demo: uncomment, with your text if you like, and save (demo/run.sh
+          # asks for the text, and adds the time)
           # - 'hello TXT "added while the agent runs"'

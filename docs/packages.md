@@ -528,7 +528,9 @@ package browse // import "github.com/NetworkCommons/sig0lease/client/browse"
 Package browse reads a DNS-SD domain (RFC 6763) with plain queries, as a client
 that can only ask questions does, such as a browser page over DNS-over-HTTPS:
 the service types the domain lists (S9), each type's instances (S4), and each
-instance's SRV and TXT records (S6) and its target's addresses.
+instance's SRV and TXT records (S6) and its target's addresses. Names reads,
+the same way, the names in a zone signed with NSEC, which are typed rather than
+browsed: those RFC 9664 registers and any other.
 
 TYPES
 
@@ -556,6 +558,37 @@ type Instance struct {
 	Addresses []string `json:"addresses"` // the target's A and AAAA addresses, sorted
 }
     Instance is one service instance found in the domain.
+
+type Name struct {
+	Name string `json:"name"` // fully qualified
+	// Key is whether a KEY record at the name holds it: one registered over RFC 9664, whose
+	// records include those of the names below it that hold no KEY of their own.
+	Key     bool     `json:"key"`
+	Records []Record `json:"records"` // by owner, in the zone's order, then by type
+}
+    Name is a name Names found in a zone, with its records.
+
+func Names(ctx context.Context, q Query, zone, skip string) ([]Name, error)
+    Names lists the names below zone, by walking its NSEC chain (RFC 4034 S4):
+    each name's NSEC record gives the name after it in the zone's canonical
+    order (S6.1) and the types at it, and the names below zone follow one
+    another in that order, from zone's own NSEC record to the first that
+    leads out of zone. Names at or below skip, a DNS-SD domain Browse reads,
+    are left out; "" leaves out none. Each name's records are then asked for,
+    by the types its NSEC record lists.
+
+    A name a KEY holds is listed with the records at it and at the names below
+    it that hold no KEY of their own, as RFC 9664 registers a name and its
+    records; any other name, with the ones at it. KEY, RRSIG and NSEC records
+    are not listed: Key says whether a KEY holds a name.
+
+    A zone with no NSEC record at its name, unsigned or signed with NSEC3,
+    is an error, as is a chain that comes back to a name it went through. A name
+    gone between the NSEC record that named it and its own question, as the
+    zone changes meanwhile, is stepped over: the name before it is asked again,
+    and its NSEC record names what follows it now; one that still names the name
+    gone is an error. A record gone by the time it is asked for is not listed.
+    Any failed question fails the whole.
 
 type Query func(ctx context.Context, name string, qtype uint16) ([]dns.RR, error)
     Query asks one question and returns the answer's records of type qtype
@@ -595,6 +628,15 @@ type RcodeError struct {
     nor NXDOMAIN.
 
 func (e *RcodeError) Error() string
+
+type Record struct {
+	Owner string `json:"owner"` // relative to the Name: "" for the Name itself, "hello" for hello.<Name>
+	Type  string `json:"type"`  // "TXT"
+	// Data is a TXT record's strings, as their octets, or any other record's data in
+	// presentation format, as one string.
+	Data []string `json:"data"`
+}
+    Record is one record of a Name.
 
 ```
 
@@ -1355,17 +1397,18 @@ func (l Labels) Renamed(hostLabel string) bool
 ```
 package web // import "github.com/NetworkCommons/sig0lease/client/web"
 
-Package web is what the demo's browser page does (docs/demo.md, D6), apart from
-showing it: it browses a DNS-SD domain (client/browse), and lets the visitor
-claim a name in a zone with a short message, a TXT record at the name that
-client/rfc9664's Name keeps registered while the page is open. Everything goes
-to the proxy over DNS-over-HTTPS, the one DNS transport a browser has; the proxy
-answers queries for its zones from their authoritative server, so the page
-sees a change as soon as the server has it. A question about any other name,
-which a proxy that forwards none refuses, goes to the Fallback resolver. The
-name's key, what the name holds and the claim are kept in the browser's storage,
-so that a visitor who comes back within the name's KEY-LEASE gets the name back.
-cmd/sig0lease-web makes a Page the page's JavaScript API.
+Package web is what the demo's browser page does (docs/demo.md, D6),
+apart from showing it: it browses a DNS-SD domain and lists the names in a zone
+(client/browse), and lets the visitor claim a name in the zone with a short
+message, a TXT record at the name that client/rfc9664's Name keeps registered
+while the page is open. Everything goes to the proxy over DNS-over-HTTPS, the
+one DNS transport a browser has; the proxy answers queries for its zones from
+their authoritative server, so the page sees a change as soon as the server has
+it. A question about any other name, which a proxy that forwards none refuses,
+goes to the Fallback resolver. The name's key, what the name holds and the claim
+are kept in the browser's storage, so that a visitor who comes back within the
+name's KEY-LEASE gets the name back. cmd/sig0lease-web makes a Page the page's
+JavaScript API.
 
 TYPES
 
@@ -1378,8 +1421,8 @@ type Claim struct {
 
 type Config struct {
 	DoH     string  // the proxy's DNS-over-HTTPS server, "http://host:port"
-	Zone    string  // the zone names are claimed in: the proxy's RFC 9664 handler's
-	Domain  string  // the DNS-SD domain Browse reads
+	Zone    string  // the zone names are claimed in, and Names lists: the proxy's RFC 9664 handler's
+	Domain  string  // the DNS-SD domain Browse reads, which Names leaves out
 	Storage Storage // required
 	// Fallback is the DNS-over-HTTPS server asked the questions DoH refuses as names it does
 	// not serve (browse.Fallback), as a URL with no path, which a page may ask from any
@@ -1418,6 +1461,10 @@ func (p *Page) Claimed() (c Claim, ok bool, err error)
 func (p *Page) Message(ctx context.Context, label string) ([]string, error)
     Message returns the strings of the TXT records at label's name, as their
     octets: none when it has none.
+
+func (p *Page) Names(ctx context.Context) ([]browse.Name, error)
+    Names lists the names in the zone, outside the domain (browse.Names):
+    the zone must be signed with NSEC.
 
 func (p *Page) Release() error
     Release frees the name claimed, deleting its message and its key's hold on
@@ -2286,6 +2333,10 @@ func RecordStrings(records []dns.RR) []string
 func StripEDEText(m *dns.Msg)
     StripEDEText empties the EXTRA-TEXT of every Extended DNS Error in m and
     keeps its INFO-CODE.
+
+func TXTStrings(txt *dns.TXT) []string
+    TXTStrings returns the strings of txt, each as its octets (UnescapeTXT);
+    none, not nil, when it has none.
 
 func UnescapeTXT(s string) string
     UnescapeTXT returns the octets of s, a TXT string in the library's form

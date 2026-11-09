@@ -7,8 +7,9 @@
 <!-- D6 of docs/demo.md: make web builds this page into bin/web, beside sig0lease-web.wasm.gz (cmd/sig0lease-web)
      and Go's wasm_exec.js; demo/web.sh serves it. Query parameters: doh, the proxy's DNS-over-HTTPS server
      (default the page's own origin, as on the registrar, whose web server serves both; demo/web.sh
-     always gives it); zone, where names are claimed (default dev.zenr.io); domain, the DNS-SD
-     domain shown (default srp.dev.zenr.io); ns, a server for the dig commands shown (default none). -->
+     always gives it); zone, where names are claimed, and whose names are listed, by its NSEC chain
+     (default dev.zenr.io); domain, the DNS-SD domain shown, left out of the names (default
+     srp.dev.zenr.io); ns, a server for the dig commands shown (default none). -->
 <style>
   :root { --fg: #222; --bg: #fafafa; --muted: #666; --line: #ddd; --code: #eee; --card: #fff;
           --new: #d7f5dd; --gone: #f9dcdc; --ok: #1a7f37; --wait: #9a6700; --err: #c62828; }
@@ -35,7 +36,7 @@
   .badge { font-size: .8rem; font-weight: 600; padding: .1rem .5rem; border-radius: 99px; border: 1px solid currentColor; }
   .ok { color: var(--ok); } .wait { color: var(--wait); } .err { color: var(--err); }
   ul.types { list-style: none; padding: 0; margin: 0; }
-  ul.types > li { margin: .6rem 0; }
+  ul.types > li { margin: .6rem 0; border-radius: 3px; transition: background-color 2s; }
   ul.instances { list-style: none; padding: 0; margin: .3rem 0 0; }
   ul.instances > li { padding: .4rem .6rem; border-left: 3px solid var(--line); margin: .3rem 0; border-radius: 3px;
                       transition: background-color 2s; }
@@ -77,6 +78,14 @@
 </section>
 
 <section>
+  <h2>Names in <code class="zone"></code></h2>
+  <p class="muted">Typed rather than browsed: each name a key holds, as yours does, with its records, and the
+  zone's other names.</p>
+  <p class="muted" id="names-status"></p>
+  <ul class="types" id="names"></ul>
+</section>
+
+<section>
   <h2>Look up a name</h2>
   <form id="lookup-form">
     <input id="lookup-label" required autocomplete="off" autocapitalize="none" spellcheck="false" placeholder="name">
@@ -101,7 +110,8 @@ const cfg = {
   domain: params.get("domain") || "srp.dev.zenr.io",
 };
 const ns = params.get("ns");
-const every = 3000; // ms between two readings of the zone
+const every = 3000; // ms between two readings of the services, and of the name claimed
+const namesEvery = 10000; // ms between two readings of the names: each asks every name in the zone
 const $ = (id) => document.getElementById(id);
 
 function el(tag, cls, text) {
@@ -122,11 +132,42 @@ function dig(type, name) { return `dig +short ${type} ${name}` + (ns ? ` @${ns}`
 for (const z of document.querySelectorAll(".zone")) z.textContent = cfg.zone;
 $("domain").textContent = cfg.domain;
 
-// The services: every reading is drawn against the one before, new instances lit up and those
-// gone struck through until the next reading.
-let shown = new Map(); // "<type> <name>" -> instance, as last drawn
-let drawn = false; // whether a reading was drawn: the first one lights nothing up
+// board returns the function that draws a list into ul, reading after reading. A reading is a
+// list of groups {key, head, items}, each item {key, li}: head() makes the group's heading, and
+// li(cls) an item's element with that class. Against the reading before, groups and items new
+// since then are lit up, and those gone struck through, until the next reading; the first
+// reading lights nothing up.
+function board(ul, empty) {
+  let shown = new Map(); // group key -> {group, items: Map(item key -> item)}, as last drawn
+  let drawn = false;
+  const byKey = (a, b) => (a < b ? -1 : a > b ? 1 : 0);
+  const cls = (now, before) => (!now ? "gone" : drawn && !before ? "new" : "");
+  return (groups) => {
+    const now = new Map(groups.map((g) => [g.key, { group: g, items: new Map(g.items.map((i) => [i.key, i])) }]));
+    ul.replaceChildren();
+    for (const key of [...new Set([...shown.keys(), ...now.keys()])].sort(byKey)) {
+      const before = shown.get(key), is = now.get(key);
+      const li = el("li", cls(is, before));
+      li.append((is || before).group.head());
+      const items = new Map([...(before ? before.items : []), ...(is ? is.items : [])]);
+      const inner = el("ul", "instances");
+      for (const k of [...items.keys()].sort(byKey)) {
+        inner.append(items.get(k).li(cls(is && is.items.has(k), before && before.items.has(k))));
+      }
+      if (inner.children.length) li.append(inner);
+      ul.append(li);
+    }
+    if (!ul.children.length) ul.append(el("li", "muted", empty));
+    // Lit-up entries fade back once drawn.
+    requestAnimationFrame(() => requestAnimationFrame(() => {
+      for (const li of ul.querySelectorAll("li.new")) li.classList.remove("new");
+    }));
+    shown = now;
+    drawn = true;
+  };
+}
 
+// The services, by type.
 function instanceItem(inst, cls) {
   const li = el("li", cls);
   li.append(el("span", "name", inst.name));
@@ -144,32 +185,15 @@ function instanceItem(inst, cls) {
   return li;
 }
 
+const drawServices = board($("types"), "No services right now.");
+
 function draw(domain) {
-  const now = new Map(domain.instances.map((i) => [`${i.type} ${i.name}`, i]));
-  const all = new Map([...shown, ...now]);
   const byType = new Map();
-  for (const [key, inst] of [...all].sort(([a], [b]) => a.localeCompare(b))) {
-    const cls = !now.has(key) ? "gone" : drawn && !shown.has(key) ? "new" : "";
+  for (const inst of domain.instances) {
     if (!byType.has(inst.type)) byType.set(inst.type, []);
-    byType.get(inst.type).push(instanceItem(inst, cls));
+    byType.get(inst.type).push({ key: inst.name, li: (cls) => instanceItem(inst, cls) });
   }
-  const ul = $("types");
-  ul.replaceChildren();
-  for (const [type, items] of byType) {
-    const li = el("li");
-    li.append(el("code", "", type));
-    const inner = el("ul", "instances");
-    inner.append(...items);
-    li.append(inner);
-    ul.append(li);
-  }
-  if (!byType.size) ul.append(el("li", "muted", "No services right now."));
-  // Lit-up instances fade back once drawn.
-  requestAnimationFrame(() => requestAnimationFrame(() => {
-    for (const li of ul.querySelectorAll("li.new")) li.classList.remove("new");
-  }));
-  shown = now;
-  drawn = true;
+  drawServices([...byType].map(([type, items]) => ({ key: type, head: () => el("code", "", type), items })));
 }
 
 async function browseLoop() {
@@ -182,6 +206,49 @@ async function browseLoop() {
     $("browse-status").className = "err";
   }
   setTimeout(browseLoop, every);
+}
+
+// The names, each with its records.
+const sameName = (a, b) => a.replace(/\.$/, "").toLowerCase() === b.replace(/\.$/, "").toLowerCase();
+
+function nameHead(n) {
+  const d = el("div");
+  d.append(el("span", "name", n.name.replace(/\.$/, "")));
+  if (!n.key) d.append(" ", el("span", "badge muted", "no key"));
+  if (mine && sameName(n.name, `${mine.label}.${cfg.zone}`)) d.append(" ", el("span", "badge ok", "yours"));
+  if (!n.records.length) d.append(el("div", "muted", "no records"));
+  return d;
+}
+
+function recordItem(r, cls) {
+  const li = el("li", cls);
+  if (r.owner) li.append(el("span", "name", r.owner), " ");
+  li.append(el("code", "", r.type), " ");
+  if (r.type === "TXT") {
+    for (const t of r.data) li.append(el("span", "txt", t));
+  } else {
+    li.append(r.data.join(" "));
+  }
+  return li;
+}
+
+const drawNames = board($("names"), "No names right now.");
+
+async function namesLoop() {
+  try {
+    const names = await sig0lease.names();
+    drawNames(names.map((n) => ({
+      key: n.name,
+      head: () => nameHead(n),
+      items: n.records.map((r) => ({ key: [r.owner, r.type, ...r.data].join("\u0000"), li: (cls) => recordItem(r, cls) })),
+    })));
+    $("names-status").textContent = `Read at ${new Date().toLocaleTimeString()}, every ${namesEvery / 1000} s.`;
+    $("names-status").className = "muted";
+  } catch (e) {
+    $("names-status").textContent = `Could not read the names in ${cfg.zone}: ${e.message}`;
+    $("names-status").className = "err";
+  }
+  setTimeout(namesLoop, namesEvery);
 }
 
 // The claim: what the zone has at the name, read as often as the services.
@@ -303,6 +370,7 @@ $("lookup-form").addEventListener("submit", async (ev) => {
     claimError(e);
   }
   browseLoop();
+  namesLoop();
   mineLoop();
 })();
 </script>

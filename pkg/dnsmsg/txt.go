@@ -3,6 +3,8 @@ package dnsmsg
 import (
 	"fmt"
 	"strings"
+
+	"codeberg.org/miekg/dns"
 )
 
 // EscapeTXT turns raw, one TXT string's octets, into the form a TXT record's strings take in
@@ -48,6 +50,16 @@ func UnescapeTXT(s string) string {
 		}
 	}
 	return sb.String()
+}
+
+// TXTStrings returns the strings of txt, each as its octets (UnescapeTXT); none, not nil, when
+// it has none.
+func TXTStrings(txt *dns.TXT) []string {
+	out := []string{}
+	for _, s := range txt.Txt {
+		out = append(out, UnescapeTXT(s))
+	}
+	return out
 }
 
 func isDigit(b byte) bool { return '0' <= b && b <= '9' }

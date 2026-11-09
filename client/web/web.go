@@ -1,8 +1,8 @@
 // Package web is what the demo's browser page does (docs/demo.md, D6), apart from showing it:
-// it browses a DNS-SD domain (client/browse), and lets the visitor claim a name in a zone with
-// a short message, a TXT record at the name that client/rfc9664's Name keeps registered while
-// the page is open. Everything goes to the proxy over DNS-over-HTTPS, the one DNS transport a
-// browser has; the proxy answers queries for its zones from their authoritative server, so the
+// it browses a DNS-SD domain and lists the names in a zone (client/browse), and lets the
+// visitor claim a name in the zone with a short message, a TXT record at the name that
+// client/rfc9664's Name keeps registered while the page is open. Everything goes to the proxy
+// over DNS-over-HTTPS, the one DNS transport a browser has; the proxy answers queries for its zones from their authoritative server, so the
 // page sees a change as soon as the server has it. A question about any other name, which a
 // proxy that forwards none refuses, goes to the Fallback resolver. The name's key, what the
 // name holds and the claim are kept in the browser's storage, so that a visitor who comes back
@@ -40,8 +40,8 @@ type Storage interface {
 // Config configures New.
 type Config struct {
 	DoH     string  // the proxy's DNS-over-HTTPS server, "http://host:port"
-	Zone    string  // the zone names are claimed in: the proxy's RFC 9664 handler's
-	Domain  string  // the DNS-SD domain Browse reads
+	Zone    string  // the zone names are claimed in, and Names lists: the proxy's RFC 9664 handler's
+	Domain  string  // the DNS-SD domain Browse reads, which Names leaves out
 	Storage Storage // required
 	// Fallback is the DNS-over-HTTPS server asked the questions DoH refuses as names it does
 	// not serve (browse.Fallback), as a URL with no path, which a page may ask from any
@@ -122,6 +122,12 @@ func (p *Page) Browse(ctx context.Context) (*browse.Domain, error) {
 	return browse.Browse(ctx, p.query, p.cfg.Domain)
 }
 
+// Names lists the names in the zone, outside the domain (browse.Names): the zone must be
+// signed with NSEC.
+func (p *Page) Names(ctx context.Context) ([]browse.Name, error) {
+	return browse.Names(ctx, p.query, p.cfg.Zone, p.cfg.Domain)
+}
+
 // Message returns the strings of the TXT records at label's name, as their octets: none when
 // it has none.
 func (p *Page) Message(ctx context.Context, label string) ([]string, error) {
@@ -135,9 +141,7 @@ func (p *Page) Message(ctx context.Context, label string) ([]string, error) {
 	}
 	msg := []string{}
 	for _, rr := range rrs {
-		for _, s := range rr.(*dns.TXT).Txt {
-			msg = append(msg, dnsmsg.UnescapeTXT(s))
-		}
+		msg = append(msg, dnsmsg.TXTStrings(rr.(*dns.TXT))...)
 	}
 	return msg, nil
 }

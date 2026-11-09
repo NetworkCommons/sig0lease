@@ -543,11 +543,11 @@ the plain-HTTP listener.
 
 The demo's browser page is such a client ([demo.md](demo.md), D6): `cmd/sig0lease-web`, built
 for `js/wasm` by `make web` (see "The library does not build for WebAssembly"), gives the page
-`client/web`, which reads a DNS-SD domain with plain queries (`client/browse`) and claims a name
-with a message through `client/rfc9664`'s `Name`, the name's key and records kept in the
-browser's `localStorage`. Its queries go to the proxy too, which answers them for its zones from
-their authoritative server ("Queries for the Zones Served"), so the page sees a change as soon
-as that server has it.
+`client/web`, which reads a DNS-SD domain, and the names in the zone by its NSEC chain, with
+plain queries (`client/browse`), and claims a name with a message through `client/rfc9664`'s
+`Name`, the name's key and records kept in the browser's `localStorage`. Its queries go to the
+proxy too, which answers them for its zones from their authoritative server ("Queries for the
+Zones Served"), so the page sees a change as soon as that server has it.
 
 ## Project Layout
 
@@ -559,8 +559,8 @@ as that server has it.
 - `client/` - what the RFC 9664 and SRP requesters share (granted leases, transports, refresh
   clock, `Keeper`); `client/rfc9664` is the RFC 9664 library requester, `client/srp` the SRP
   one, `client/agent` the template agent on both, `client/kubo` asks an IPFS node for the
-  agent's `ipfs` names, `client/browse` reads a DNS-SD domain with plain queries, and
-  `client/web` is the demo's browser page
+  agent's `ipfs` names, `client/browse` reads a DNS-SD domain, and a zone's names by its NSEC
+  chain, with plain queries, and `client/web` is the demo's browser page
 - `config/` - YAML config loading and validation
 - `forward/` - upstream forwarding logic
 - `handlers/` - opcode handlers and result types, including `srp_handler.go` (the RFC 9665

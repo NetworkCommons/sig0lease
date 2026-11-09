@@ -256,11 +256,7 @@ func (n *ipfsNode) followed(ctx context.Context) string {
 	}
 	var links []string
 	for _, rr := range rrs {
-		var b strings.Builder
-		for _, s := range rr.(*dns.TXT).TXT.Txt {
-			b.WriteString(dnsmsg.UnescapeTXT(s))
-		}
-		if v, ok := strings.CutPrefix(b.String(), "dnslink="); ok {
+		if v, ok := strings.CutPrefix(strings.Join(dnsmsg.TXTStrings(rr.(*dns.TXT)), ""), "dnslink="); ok {
 			links = append(links, v)
 		}
 	}

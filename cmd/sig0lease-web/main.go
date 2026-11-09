@@ -8,6 +8,8 @@
 //	                                           DNS-SD domain browsed, and a function that takes
 //	                                           each log line
 //	sig0lease.browse()                          the domain: {domain, types, instances}
+//	sig0lease.names()                           the names in the zone, outside the domain:
+//	                                           [{name, key, records: [{owner, type, data}]}]
 //	sig0lease.message(label)                    the strings of the TXT records at the name
 //	sig0lease.claimed()                         the claim the browser keeps, {label, message},
 //	                                           or null
@@ -39,6 +41,9 @@ func main() {
 		}),
 		"browse": call(func(p *web.Page, _ []js.Value) (any, error) {
 			return p.Browse(context.Background())
+		}),
+		"names": call(func(p *web.Page, _ []js.Value) (any, error) {
+			return p.Names(context.Background())
 		}),
 		"message": call(func(p *web.Page, args []js.Value) (any, error) {
 			return p.Message(context.Background(), arg(args, 0))

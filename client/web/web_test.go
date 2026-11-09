@@ -2,6 +2,7 @@ package web
 
 import (
 	"context"
+	"reflect"
 	"slices"
 	"strings"
 	"sync"
@@ -12,6 +13,7 @@ import (
 	"codeberg.org/miekg/dns/dnsutil"
 
 	"github.com/NetworkCommons/sig0lease/client"
+	"github.com/NetworkCommons/sig0lease/client/browse"
 	"github.com/NetworkCommons/sig0lease/client/clienttest"
 	"github.com/NetworkCommons/sig0lease/pkg/dnsmsg"
 	"github.com/NetworkCommons/sig0lease/pkg/dnsname"
@@ -312,57 +314,108 @@ func TestNew_Refused(t *testing.T) {
 	}
 }
 
+// servers stands in for the proxy at http://proxy:8443 and the resolver at https://dns.google,
+// answering from records, each server's in presentation format: the proxy refuses a name
+// outside dev.zenr.io. as one it does not serve. It keeps the questions each server was asked,
+// as "<name> <type>".
+type servers struct {
+	t       *testing.T
+	records map[string][]string
+	mu      sync.Mutex
+	asked   map[string][]string
+}
+
+func (s *servers) send(ctx context.Context, addr string, network client.Network, msg *dns.Msg) (*dns.Msg, error) {
+	q := msg.Question[0]
+	name, qtype := q.Header().Name, dns.RRToType(q)
+	s.mu.Lock()
+	if s.asked == nil {
+		s.asked = map[string][]string{}
+	}
+	s.asked[addr] = append(s.asked[addr], name+" "+dnsutil.TypeToString(qtype))
+	s.mu.Unlock()
+	resp := &dns.Msg{MsgHeader: dns.MsgHeader{ID: msg.ID, Response: true}, Question: msg.Question}
+	if addr == "http://proxy:8443" && !dnsname.IsAtOrBelow(name, "dev.zenr.io.") {
+		resp.Rcode = dns.RcodeRefused
+		dnsmsg.AddEDE(resp, msg, dns.ExtendedErrorNotAuthoritative, "")
+		return resp, nil
+	}
+	for _, r := range s.records[addr] {
+		rr, err := dns.New(r)
+		if err != nil {
+			s.t.Fatal(err)
+		}
+		if rr.Header().Name == name && dns.RRToType(rr) == qtype {
+			resp.Answer = append(resp.Answer, rr)
+		}
+	}
+	return resp, nil
+}
+
+func (s *servers) page(t *testing.T) *Page {
+	t.Helper()
+	page, err := New(Config{DoH: "http://proxy:8443", Fallback: "https://dns.google", Zone: "dev.zenr.io",
+		Domain: "srp.dev.zenr.io", Storage: newMemStorage(), Send: s.send})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return page
+}
+
 // TestBrowse_Fallback: a question the proxy refuses as a name it does not serve, as the address
 // of an SRV target outside its zones, is asked of Fallback, whose answer Browse shows; every
 // other question goes to the proxy alone.
 func TestBrowse_Fallback(t *testing.T) {
-	records := map[string][]string{
+	s := &servers{t: t, records: map[string][]string{
 		"http://proxy:8443": {
 			"_services._dns-sd._udp.srp.dev.zenr.io. PTR _xmpp-client._tcp.srp.dev.zenr.io.",
 			"_xmpp-client._tcp.srp.dev.zenr.io. PTR chat._xmpp-client._tcp.srp.dev.zenr.io.",
 			"chat._xmpp-client._tcp.srp.dev.zenr.io. SRV 0 5 5222 xmpp.example.org.",
 		},
 		"https://dns.google": {"xmpp.example.org. A 192.0.2.9"},
-	}
-	var mu sync.Mutex
-	asked := map[string][]string{}
-	send := func(ctx context.Context, addr string, network client.Network, msg *dns.Msg) (*dns.Msg, error) {
-		q := msg.Question[0]
-		name, qtype := q.Header().Name, dns.RRToType(q)
-		mu.Lock()
-		asked[addr] = append(asked[addr], name+" "+dnsutil.TypeToString(qtype))
-		mu.Unlock()
-		resp := &dns.Msg{MsgHeader: dns.MsgHeader{ID: msg.ID, Response: true}, Question: msg.Question}
-		if addr == "http://proxy:8443" && !dnsname.IsAtOrBelow(name, "dev.zenr.io.") {
-			resp.Rcode = dns.RcodeRefused
-			dnsmsg.AddEDE(resp, msg, dns.ExtendedErrorNotAuthoritative, "")
-			return resp, nil
-		}
-		for _, s := range records[addr] {
-			rr, err := dns.New(s)
-			if err != nil {
-				t.Fatal(err)
-			}
-			if rr.Header().Name == name && dns.RRToType(rr) == qtype {
-				resp.Answer = append(resp.Answer, rr)
-			}
-		}
-		return resp, nil
-	}
-	page, err := New(Config{DoH: "http://proxy:8443", Fallback: "https://dns.google", Zone: "dev.zenr.io",
-		Domain: "srp.dev.zenr.io", Storage: newMemStorage(), Send: send})
-	if err != nil {
-		t.Fatal(err)
-	}
-	d, err := page.Browse(context.Background())
+	}}
+	d, err := s.page(t).Browse(context.Background())
 	if err != nil {
 		t.Fatalf("Browse: %v", err)
 	}
 	if len(d.Instances) != 1 || d.Instances[0].Target != "xmpp.example.org." || strings.Join(d.Instances[0].Addresses, " ") != "192.0.2.9" {
 		t.Fatalf("Browse = %+v, want chat at xmpp.example.org. with 192.0.2.9", d.Instances)
 	}
-	slices.Sort(asked["https://dns.google"])
-	if got := strings.Join(asked["https://dns.google"], ", "); got != "xmpp.example.org. A, xmpp.example.org. AAAA" {
+	slices.Sort(s.asked["https://dns.google"])
+	if got := strings.Join(s.asked["https://dns.google"], ", "); got != "xmpp.example.org. A, xmpp.example.org. AAAA" {
 		t.Errorf("asked of the fallback: %s, want only the target's addresses", got)
+	}
+}
+
+// TestNames: the names in the zone, read from the proxy alone, without the SRP domain's.
+func TestNames(t *testing.T) {
+	s := &servers{t: t, records: map[string][]string{
+		"http://proxy:8443": {
+			"dev.zenr.io. NSEC demo.dev.zenr.io. KEY RRSIG NSEC",
+			"demo.dev.zenr.io. NSEC hello.demo.dev.zenr.io. TXT KEY RRSIG NSEC",
+			`demo.dev.zenr.io. TXT "published by sig0lease-agent"`,
+			"hello.demo.dev.zenr.io. NSEC demo.srp.dev.zenr.io. TXT RRSIG NSEC",
+			`hello.demo.dev.zenr.io. TXT "hi (2026-11-09 14:03:12 CET)"`,
+			"demo.srp.dev.zenr.io. NSEC note.dev.zenr.io. A KEY RRSIG NSEC",
+			"note.dev.zenr.io. NSEC elsewhere.zenr.io. TXT RRSIG NSEC",
+			`note.dev.zenr.io. TXT "by hand"`,
+		},
+	}}
+	got, err := s.page(t).Names(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []browse.Name{
+		{Name: "demo.dev.zenr.io.", Key: true, Records: []browse.Record{
+			{Type: "TXT", Data: []string{"published by sig0lease-agent"}},
+			{Owner: "hello", Type: "TXT", Data: []string{"hi (2026-11-09 14:03:12 CET)"}},
+		}},
+		{Name: "note.dev.zenr.io.", Records: []browse.Record{{Type: "TXT", Data: []string{"by hand"}}}},
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("Names:\n got %+v\nwant %+v", got, want)
+	}
+	if len(s.asked["https://dns.google"]) != 0 {
+		t.Errorf("asked of the fallback: %q, want nothing", s.asked["https://dns.google"])
 	}
 }

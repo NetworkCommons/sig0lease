@@ -2,6 +2,7 @@ package dnsmsg
 
 import (
 	"bytes"
+	"slices"
 	"testing"
 
 	"codeberg.org/miekg/dns"
@@ -56,5 +57,20 @@ func TestUnescapeTXT(t *testing.T) {
 		if got := UnescapeTXT(s); got != want {
 			t.Errorf("UnescapeTXT(%q) = %q, want %q", s, got, want)
 		}
+	}
+}
+
+// TestTXTStrings: each string's octets, in order; an empty list, not nil, for none.
+func TestTXTStrings(t *testing.T) {
+	rr, err := dns.New(`x. TXT "caf\195\169" "\"hi\"" ""`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := TXTStrings(rr.(*dns.TXT))
+	if want := []string{"café", `"hi"`, ""}; !slices.Equal(got, want) {
+		t.Fatalf("TXTStrings = %q, want %q", got, want)
+	}
+	if got := TXTStrings(&dns.TXT{}); got == nil || len(got) != 0 {
+		t.Fatalf("TXTStrings of no strings = %#v, want empty, not nil", got)
 	}
 }

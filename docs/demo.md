@@ -18,7 +18,7 @@ shared registrar").
 | D3: a community folder over IPFS | phones open a member's folder by name from the community node, which pins each version before publishing it, and keeps serving it once the member leaves; the two nodes find each other by DNS alone, in a private swarm | two machines with IPFS Desktop or kubo; phones |
 | D4: native discovery | an audience Mac lists the laptop's services beside its `local.` ones | a Mac in the audience |
 | D5: two communities meet in one chat room | phones log in as guests of two laptops' XMPP servers and talk in one room; the servers find each other by SRV records and trust each other's self-signed certificates by TLSA records (DANE) | two machines, each with Docker (a Mac) or Prosody 13 (Linux); phones |
-| D6: the zone in a browser | phones watch the services come and go, and claim a name with a message, held by a key their browser makes; `dig` shows it within seconds | the laptop; phones |
+| D6: the zone in a browser | phones watch the services come and go, and the zone's names with their records; they claim a name with a message, held by a key their browser makes, and every phone lists it; `dig` shows it within seconds | the laptop; phones |
 
 The demos use this repository's programs and tools that come with the system, except IPFS
 Desktop or kubo for D3, and Prosody for D5, whose page loads Converse.js from `cdn.jsdelivr.net`.
@@ -136,7 +136,8 @@ gives the current answer.
    leaves the browse results; about 30 s on a Mac whose firewall is in stealth mode, where a
    stopped site's port does not refuse connections, so each probe waits its 5 s out. Start it
    again: it is back within about 10 s.
-3. In `demo/demo.yaml`, uncomment the `hello` record and save. Within 15 s (the agent reads the
+3. In `demo/demo.yaml`, uncomment the `hello` record, change its text if you like, and save
+   (`demo/run.sh` asks for the text, and adds the time to it). Within 15 s (the agent reads the
    template every 10 s):
 
    ```bash
@@ -365,7 +366,9 @@ DNS-over-HTTPS, the one DNS transport a browser has, and the proxy answers the q
 its zones from the zone's own server: the page sees a change as soon as `ns1.free2air.org` has
 it, not what a resolver cached. A question about a name outside the zones, such as the address
 of a service's host elsewhere, the proxy refuses, as it is no resolver, and the page asks
-Google's DNS-over-HTTPS resolver instead, over the internet.
+Google's DNS-over-HTTPS resolver instead, over the internet. The names in the zone, which are
+typed rather than browsed, the page finds by the zone's NSEC records (the zone is signed with
+NSEC): each one names the next name in the zone, and the types of records at its own.
 
 **Needs**: the laptop, with `qrencode`, as for D3, and D1's names free; phones on the same
 network, with a browser from 2023 or later, which reach the laptop's ports 8090 and 8443 (with
@@ -380,9 +383,11 @@ the address it prints.
    the service `demo http`, as in D1 (`demo/demo.yaml`); and the page, on port 8090. It prints
    the page's address and its QR code.
 2. Phones scan the code. The page lists the services in `srp.dev.zenr.io`, read every 3
-   seconds. At the next Enter, `web.sh` stops the site, and after three failed probes, about
-   15 s, the phones show `demo http` leave, struck through; at the one after, it starts the site
-   again, and `demo http` comes back, lit up.
+   seconds, and the names in `dev.zenr.io` outside it, read every 10: each name a key holds,
+   such as `demo.dev.zenr.io`, with its records and those of the names below it, and the
+   zone's other names, marked `no key`. At the next Enter, `web.sh` stops the site, and after
+   three failed probes, about 15 s, the phones show `demo http` leave, struck through; at the
+   one after, it starts the site again, and `demo http` comes back, lit up.
 3. Someone picks a name and writes a message. The browser makes a key and keeps it, and the page
    claims `<name>.dev.zenr.io` with the message as its TXT record. The badge turns `published`
    once the zone's server has it, within a few seconds, and anyone can check:
@@ -391,8 +396,9 @@ the address it prints.
    dig +short TXT <name>.dev.zenr.io @ns1.free2air.org
    ```
 
-   A second phone that claims the same name stays `waiting`, and shows the first one's message:
-   another key holds the name.
+   Within 10 s every phone lists the name, marked `yours` on the phone that holds it. A second
+   phone that claims the same name stays `waiting`, and shows the first one's message: another
+   key holds the name.
 4. "Release the name" deletes the message and frees the name. The last Enter, or Ctrl-C, in
    `web.sh` stops the agent, which frees `demo`, then the page, the site and the proxy.
 
@@ -448,3 +454,6 @@ nobody can forge one, but anyone there can read them.
   not reach port 8443. On a Mac, allow `sig0lease`'s incoming connections when asked. If
   `web.sh` printed a Docker or VPN address, give the venue's with `ADDRESS=<address>`.
 - D6: a claim stays `waiting` with no other message shown: the log under the page says why.
+- D6: the page cannot read the names, as the zone "has no NSEC record": it is not signed with
+  NSEC, as `ZONE` may not be ("Against a shared registrar"). The services and the claims still
+  work.

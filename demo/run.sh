@@ -3,8 +3,9 @@
 # site and the agent (demo/demo.yaml), runs the steps, each after Enter, and after each one waits
 # until the zone's authoritative server answers with the change, printing how long that took.
 # The last Enter, or Ctrl-C, stops the agents first, so they deregister what they published, then
-# the site and the proxy. The logs, and the agent's copy of the template that step 3 edits, go to
-# a temporary directory, printed at the start. On a Mac it writes demo/mac.yaml, D2's template,
+# the site and the proxy. Step 3 asks for the text of the record it adds, and adds the time to it.
+# The logs, and the agent's copy of the template that step 3 edits, go to a temporary directory,
+# printed at the start. On a Mac it writes demo/mac.yaml, D2's template,
 # when there is none. It builds the proxy and the clients first (make build build-client).
 #
 # NS, DOMAIN, ZONE and NAME change what it asks, as for watch.sh; DOMAIN and ZONE are also where
@@ -109,14 +110,35 @@ step "   Start the site again: once a probe passes, \"$name http\" is back."
 start_site
 wait_until "\"$name http\" is listed" listed "$instance"
 
-step "3. Add a record to the template, hello.$name TXT: the agent reads it every 10 s."
-sed "s|# - 'hello TXT|- 'hello TXT|" "$log/demo.yaml" > "$log/demo.yaml.new"
-if cmp -s "$log/demo.yaml" "$log/demo.yaml.new"; then
-    echo "demo/demo.yaml has no commented hello record to add" >&2
+# Step 3's record: the template's commented-out hello record, its text the one typed (by
+# default its own, taken as typed), with the time.
+default="$(sed -n "s|^ *# - 'hello TXT \"\(.*\)\"'\$|\1|p" "$log/demo.yaml")"
+if [ -z "$default" ]; then
+    echo "demo/demo.yaml has no commented-out hello record to add" >&2
     exit 1
 fi
-mv "$log/demo.yaml.new" "$log/demo.yaml"
-wait_until "hello.$name.$zone has its TXT" answers TXT "hello.$name.$zone"
+printf '\n%s\n' "3. Add a record to the template, hello.$name TXT, with your text and the time: the agent reads it every 10 s."
+while :; do
+    printf '[Its text, or Enter for "%s"] ' "$default"
+    IFS= read -r text || echo
+    stamp="$(date '+%F %T %Z')"
+    record="${text:-$default} ($stamp)"
+    bytes="$(printf %s "$record" | wc -c)"
+    [ "$bytes" -gt 255 ] || break
+    echo "  With the time, that is $bytes bytes; a TXT string holds 255 at most."
+done
+# The template's line: the text in the record's presentation format, \ and " escaped, in YAML
+# single quotes, ' doubled, in place of the commented-out record.
+txt="${record//\\/\\\\}"
+txt="${txt//\"/\\\"}"
+spec="hello TXT \"$txt\""
+line="- '${spec//\'/\'\'}'"
+L="$line" awk '
+    !done && /^ *# - '\''hello TXT / { sub(/# - .*/, ""); print $0 ENVIRON["L"]; done = 1; next }
+    { print }' "$log/demo.yaml" > "$log/demo.yaml.new" && mv "$log/demo.yaml.new" "$log/demo.yaml" || exit 1
+echo "  $line"
+stamped() { ask TXT "hello.$name.$zone" | grep -qF "($stamp)"; }
+wait_until "hello.$name.$zone has your text" stamped
 echo "  dig +short TXT hello.$name.$zone: $(ask TXT "hello.$name.$zone")"
 
 step "4. A second key wants the same names (demo/conflict.yaml)."
