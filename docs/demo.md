@@ -78,6 +78,8 @@ REGISTRAR=<registrar>:853 TRANSPORT=tls demo/ipfs.sh member     # over DNS-over-
   takes `srp.<ZONE>`); by default `dev.zenr.io` and `srp.dev.zenr.io`, the ones `config.yaml`
   gives the laptop's proxy. A registrar that serves other zones takes them:
   `REGISTRAR=<registrar>:<port> ZONE=<zone> DOMAIN=srp.<zone> demo/run.sh`.
+- D3: each node's peer list names the other's name in `ZONE`:
+  `/dnsaddr/site.<zone>/p2p/<B's ID>` on A, `/dnsaddr/a.<zone>/p2p/<A's ID>` on B.
 - The scripts copy each template they run (`demo/demo.yaml`, `demo/conflict.yaml`,
   `demo/mac.yaml`, and the ones `ipfs.sh` and `chat.sh` write) into their log directory, with
   each srp registrar's `domain:` the demo's, each rfc9664 name's first label in the demo's
@@ -228,7 +230,7 @@ and put a first file in it: without an `index.html`, gateways show it as a list 
 **Rehearsal**: on the two machines, `demo/ipfs.sh member` on A, then `demo/ipfs.sh community` on
 B. On one machine, B's node is a second one beside A's, with a repository of its own and other
 ports, and the two scripts share a proxy started by hand: each script otherwise starts its own,
-and refuses to start beside another. This has not been tried yet. In B's terminal:
+and refuses to start beside another. In B's terminal:
 
 ```bash
 export IPFS_PATH=~/.ipfs-b                         # B's node, in this terminal only

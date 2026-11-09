@@ -123,7 +123,10 @@ template() {
             next
         }
         { print }' "$1" > "$2.new" && mv "$2.new" "$2" || exit 1
-    if ! grep -q '^keystore: /' "$2" || { remote && grep -q '127\.0\.0\.1:8053' "$2"; }; then
+    # With REGISTRAR, every server in the copy has to be it: REGISTRAR replaces only this
+    # machine's proxy, and may be that very address (a proxy started by hand, docs/demo.md D3).
+    if ! grep -q '^keystore: /' "$2" ||
+        { remote && awk -v s="$REGISTRAR" '/^ *server:/ && $2 != s { bad = 1 } END { exit !bad }' "$2"; }; then
         echo "Could not copy $1 to $2 for this run: a template needs a keystore line, and each registrar the server: 127.0.0.1:8053 that REGISTRAR replaces" >&2
         exit 1
     fi

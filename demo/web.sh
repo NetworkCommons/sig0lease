@@ -144,7 +144,7 @@ cat << EOF
 What anyone can run, for a name claimed on the page:
   dig +short TXT <name>.$zone @$ns
 and for the services it shows:
-  demo/watch.sh
+  NS=$ns ZONE=$zone DOMAIN=$domain NAME=$name demo/watch.sh
 EOF
 
 step "2. Stop the site: after three failed probes the agent withdraws \"$name http\", and the phones show it leave."
@@ -154,6 +154,8 @@ step "   Start the site again: once a probe passes, \"$name http\" is back on th
 start_site
 wait_until "\"$name http\" is listed" listed "$instance"
 
-step "Last, stop the agent, which frees its names (on_stop: release), then the page, the site${our_proxy:+ and the proxy}."
+last="the page, the site and the proxy"
+remote && last="the page and the site"
+step "Last, stop the agent, which frees its names (on_stop: release), then $last."
 stop agent
 wait_until "\"$name http\" is gone" not listed "$instance"
