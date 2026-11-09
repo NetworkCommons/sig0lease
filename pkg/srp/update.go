@@ -11,6 +11,7 @@ import (
 
 	"codeberg.org/miekg/dns"
 	"codeberg.org/miekg/dns/rdata"
+	"github.com/NetworkCommons/sig0lease/pkg/dnsmsg"
 	leasepkg "github.com/NetworkCommons/sig0lease/pkg/lease"
 )
 
@@ -89,6 +90,11 @@ func BuildUpdate(spec UpdateSpec) (*dns.Msg, error) {
 	if spec.Lease > spec.KeyLease {
 		return nil, fmt.Errorf("srp: BuildUpdate: lease (%d) must not exceed key-lease (%d)", spec.Lease, spec.KeyLease)
 	}
+	// S3.3.1.3: the Host Description has addresses when it creates or updates a
+	// registration, none when it deletes one, which is a LEASE of 0 (S3.2.5.5.1).
+	if (spec.Lease == 0) != (len(spec.Addresses) == 0) {
+		return nil, fmt.Errorf("srp: BuildUpdate: %d addresses with lease %d: a registration needs an address, a removal (lease 0) has none", len(spec.Addresses), spec.Lease)
+	}
 
 	msg := dns.NewMsg(spec.Zone, dns.TypeSOA)
 	if msg == nil {
@@ -98,11 +104,7 @@ func BuildUpdate(spec UpdateSpec) (*dns.Msg, error) {
 
 	msg.Ns = append(msg.Ns, deleteAllRR(spec.Host))
 	for _, addr := range spec.Addresses {
-		if addr.Is4() {
-			msg.Ns = append(msg.Ns, &dns.A{Hdr: dns.Header{Name: spec.Host, Class: dns.ClassINET, TTL: spec.TTL}, A: rdata.A{Addr: addr}})
-		} else {
-			msg.Ns = append(msg.Ns, &dns.AAAA{Hdr: dns.Header{Name: spec.Host, Class: dns.ClassINET, TTL: spec.TTL}, AAAA: rdata.AAAA{Addr: addr}})
-		}
+		msg.Ns = append(msg.Ns, dnsmsg.AddressRR(spec.Host, addr, spec.TTL))
 	}
 	msg.Ns = append(msg.Ns, hostKeyRR(spec.Key, spec.Host, spec.TTL))
 

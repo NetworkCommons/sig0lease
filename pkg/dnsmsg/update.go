@@ -68,3 +68,15 @@ func ParseAdditionalRRSpec(spec string) (dns.RR, error) {
 
 	return rr, nil
 }
+
+// AsDelete returns a copy of rr rewritten as an RFC 2136 S2.5.4 "Delete An RR From An
+// RRset" instruction: class NONE, TTL 0, NAME, TYPE and RDATA unchanged, which say which RR
+// it deletes. A requester sends it to delete a record it registered, and the proxy sends it
+// upstream.
+func AsDelete(rr dns.RR) dns.RR {
+	cpy := rr.Clone()
+	hdr := cpy.Header()
+	hdr.Class = dns.ClassNONE
+	hdr.TTL = 0
+	return cpy
+}

@@ -30,11 +30,11 @@ const (
 // package depends on a two-line interface it can trivially fake in tests, not on the
 // store's full read/write surface.
 type StoreView interface {
-	// KeyAtName returns the live (non-expired) KEY record the lease store currently
-	// manages at name, and whether one was found. A name the store has never seen, or
-	// whose only record there has expired, reports ok=false -- Evaluate then falls back
-	// to a live authoritative query, exactly as S3.3.3 describes.
-	KeyAtName(name string) (key *dns.KEY, ok bool)
+	// KeysAtName returns every live (non-expired) KEY record the lease store currently
+	// manages at name. None for a name the store has never seen, or whose records there
+	// have all expired -- Evaluate then falls back to a live authoritative query, exactly
+	// as S3.3.3 describes.
+	KeysAtName(name string) []*dns.KEY
 }
 
 // FCFSResult is the outcome of evaluating one name under S3.3.3's First-Come-First-Served
@@ -73,12 +73,23 @@ func (r FCFSResult) String() string {
 //
 // Per RFC 9665 S3.3.3's FCFS table:
 //
-//	lease store has a KEY at name, matches updateKey        -> FCFSProceed  (refresh)
-//	lease store has a KEY at name, does NOT match           -> FCFSConflict (YXDOMAIN)
-//	no local record; live query: NXDOMAIN                   -> FCFSProceed  (first come)
-//	no local record; live query: NOERROR, no KEY             -> refuseOnForeignData ? FCFSForeignData : FCFSProceed
-//	no local record; live query: NOERROR, KEY matches        -> FCFSProceed
-//	no local record; live query: NOERROR, KEY doesn't match  -> FCFSConflict (YXDOMAIN)
+//	lease store has KEYs at name, all match updateKey         -> FCFSProceed  (refresh)
+//	lease store has KEYs at name, any does NOT match          -> FCFSConflict (YXDOMAIN)
+//	no local record; live query: NXDOMAIN                     -> FCFSProceed  (first come)
+//	no local record; live query: NOERROR, no KEY               -> refuseOnForeignData ? FCFSForeignData : FCFSProceed
+//	no local record; live query: NOERROR, every KEY matches    -> FCFSProceed
+//	no local record; live query: NOERROR, any KEY doesn't match -> FCFSConflict (YXDOMAIN)
+//
+// "Any" is S3.3.3's own wording: "If any existing KEY record corresponding to a KEY record in
+// the SRP Update does not match ... the SRP registrar MUST reject the SRP Update". A name
+// holding the update's key next to someone else's is held by both, so neither may take it
+// over. SRP itself never leaves two KEYs at a name; such a name was written by something
+// else (handlers.SeparateZones keeps this proxy's other handler out of SRP's zone).
+//
+// The RFC 9664 handler's fcfs_naming option uses this same rule for its new KEYs, calling
+// Evaluate with refuseOnForeignData false for the new KEY's name and each name above it that
+// the KEY's signer does not already hold (handlers.UpdateHandler.fcfsNewKey). There a holder
+// may put further KEYs at its own name, so a name with several KEYs is normal.
 //
 // The lease store is checked first and trusted over a live query when both are available:
 // it is the source of truth for what this proxy already manages (see
@@ -112,8 +123,8 @@ func Evaluate(ctx context.Context, view StoreView, query AuthoritativeKeyQuery, 
 		return 0, nil, fmt.Errorf("srp: FCFS Evaluate called with a nil updateKey")
 	}
 
-	if key, ok := view.KeyAtName(name); ok {
-		if keysIdentical(key, updateKey) {
+	if keys := view.KeysAtName(name); len(keys) > 0 {
+		if KeysAllMatch(keys, updateKey) {
 			return FCFSProceed, nil, nil
 		}
 		return FCFSConflict, nil, nil
@@ -141,16 +152,26 @@ func Evaluate(ctx context.Context, view StoreView, query AuthoritativeKeyQuery, 
 		return FCFSProceed, keyRRsetDoesNotExistPrerequisite(name), nil
 
 	case AuthKeyPresent:
-		for _, k := range keys {
-			if keysIdentical(k, updateKey) {
-				return FCFSProceed, nil, nil
-			}
+		if KeysAllMatch(keys, updateKey) {
+			return FCFSProceed, nil, nil
 		}
 		return FCFSConflict, nil, nil
 
 	default:
 		return 0, nil, fmt.Errorf("srp: FCFS authoritative query for %s returned unknown state %d", name, state)
 	}
+}
+
+// KeysAllMatch reports whether every KEY in keys is key's (same algorithm, protocol and
+// public key): whether a name holding keys is free for key, by the rule Evaluate applies. A
+// requester uses it too, to find which of its names a conflict is about (client/srp).
+func KeysAllMatch(keys []*dns.KEY, key *dns.KEY) bool {
+	for _, k := range keys {
+		if !keysIdentical(k, key) {
+			return false
+		}
+	}
+	return true
 }
 
 // nameNotInUsePrerequisite builds an RFC 2136 S2.4.4 "Name is not in use" prerequisite RR

@@ -148,3 +148,55 @@ func TestResolveOrCreateKey_SeveralMatchesWarnsAndPicksFirst(t *testing.T) {
 		t.Fatalf("want a warning naming %s and %s, got log output:\n%s", names[0], names[1], out)
 	}
 }
+
+// TestKeyText_RoundTrip: a key's texts parse back to the same key, which signs alike, and are
+// what SaveToFile writes and LoadKeyFromFile reads.
+func TestKeyText_RoundTrip(t *testing.T) {
+	for _, alg := range []uint8{dns.ED25519, dns.ECDSAP256SHA256} {
+		k, err := GenerateKey("visitor.dev.zenr.io.", alg, 512, 256)
+		if err != nil {
+			t.Fatal(err)
+		}
+		pub, priv := k.KeyText()
+		back, err := ParseKey(k.Name, pub, priv)
+		if err != nil {
+			t.Fatalf("algorithm %d: ParseKey: %v", alg, err)
+		}
+		if back.PublicKey.String() != k.PublicKey.String() || back.KeyTag() != k.KeyTag() {
+			t.Fatalf("algorithm %d: parsed %s, want %s", alg, back.PublicKey, k.PublicKey)
+		}
+		if p2, v2 := back.KeyText(); p2 != pub || v2 != priv {
+			t.Fatalf("algorithm %d: the parsed key's texts differ", alg)
+		}
+
+		dir := t.TempDir()
+		if err := k.SaveToFile(dir); err != nil {
+			t.Fatal(err)
+		}
+		onDisk, err := os.ReadFile(filepath.Join(dir, k.Name+".private"))
+		if err != nil || string(onDisk) != priv {
+			t.Fatalf("algorithm %d: the .private file is not KeyText's (%v)", alg, err)
+		}
+		loaded, err := LoadKeyFromFile(dir, k.Name)
+		if err != nil || loaded.PublicKey.String() != k.PublicKey.String() {
+			t.Fatalf("algorithm %d: LoadKeyFromFile: %v, %v", alg, loaded, err)
+		}
+	}
+}
+
+func TestParseKey_Errors(t *testing.T) {
+	k, err := GenerateKey("visitor.dev.zenr.io.", dns.ED25519, 512, 256)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pub, priv := k.KeyText()
+	for name, tc := range map[string][2]string{
+		"no KEY RR":       {"visitor.dev.zenr.io. 300 IN TXT \"x\"\n", priv},
+		"garbage KEY":     {"not a record\n", priv},
+		"garbage private": {pub, "Private-key-format: v1.3\n"},
+	} {
+		if _, err := ParseKey(k.Name, tc[0], tc[1]); err == nil {
+			t.Errorf("%s: ParseKey succeeded", name)
+		}
+	}
+}

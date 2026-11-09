@@ -38,7 +38,6 @@ pkg/srp/            pure logic, no network, no DNS I/O
                      AuthoritativeKeyQuery, no network I/O of its own), plus
                      Names()/KeyFor() helpers over a ClassifiedUpdate
   update.go          SRP-update builder, used by the client
-  response.go        RCODE mapping + granted-lease echo
 
 pkg/updatecore/       shared forwarding plumbing (RFC 9664 handler and SRP handler alike)
   coordinator.go      SOA-based discovery, static-upstream override,
@@ -50,15 +49,24 @@ pkg/dnssd/            RFC 6763 §9/§11 record logic (pure), separate from RFC 9
 
 handlers/
   srp_handler.go       implements handlers.Handler for opcode 5 (SRP path)
-  srp_setup.go         config parsing for the srp_handler block
+  srp_setup.go         the srp_handler block's own options, then leaseHandler.setup
+  lease_handler.go     what both handlers share: the config they read the same way
+                       (setup), upstream, and the lease runtime
+  lease_runtime.go     lease store, timers, locks, reconciliation pass and Shutdown,
+                       embedded by leaseHandler
 
 server/
   router.go            opcode -> ordered list of handlers, tried in turn
 
 cmd/sig0lease-srp-client/main.go   thin SRP requester CLI (dev/test tool, not a shipped
-                                   product — the library is the deliverable)
-client/srp/                        discovery, refresh scheduler, conflict-retry loop,
-                                   Register/Deregister/Run
+                                   product — the library is the deliverable); its flags are
+                                   spelled as sig0lease-client's (cmd/internal/cli)
+client/                            what both requesters share: lease_response.go (the granted
+                                   LEASE/KEY-LEASE, outcomes), network.go (transports),
+                                   lifecycle.go (refresh clock, backoff), keeper.go (Keeper:
+                                   one registration kept as its wanted state changes)
+client/srp/                        discovery, conflict-retry loop, Register/Deregister/Run;
+                                   Host, a Keeper
 ```
 
 `pkg/lease`, `pkg/sig0`, `pkg/keyrec`, `pkg/dnscompat`, `forward`, `config`, `logging` carry
@@ -75,13 +83,28 @@ processing_rules:
 ```
 
 `server/router.go` calls each configured handler for the opcode in turn; the first one to
-return `Processed` or `Error` wins. If every handler returns `NotRelevant`, the request falls
-through to plain upstream forwarding. `SRPHandler.Handle()` returns `NotRelevant` when
-`pkg/srp.Classify` decides the message isn't SRP-shaped, or when the request's zone isn't one
-this handler instance is configured to serve — each `srp_handler` instance serves exactly one
-zone, and `{srp_handler, update_handler}` are never both enabled for the same zone at once
-(same-zone cross-protocol manipulation is prevented by keeping the two protocols on disjoint
-zones, not by extra runtime checks).
+return `Processed` or `Error` wins. If every handler returns `NotRelevant`, no handler takes the
+request: it is refused, or with `server.forward` on forwarded upstream
+(`docs/siglease_rfc9664.md`, "Requests No Handler Takes"). `SRPHandler.Handle()` returns `NotRelevant` when
+`pkg/srp.Classify` decides the message isn't SRP-shaped, or when its host (the Host
+Description's name) is not in the zone this handler serves, nor under `default.service.arpa.`
+with `rewrite_default_service_arpa` on (`SRPHandler.takes`). The Zone Section plays no part in
+that: both handlers only require it to enclose every name in the update, answering `NOTZONE`
+otherwise (RFC 2136 §3.4.1.3; `docs/siglease_rfc9664.md`, "The Zone Section").
+
+Listed for opcode 0 as well (`config.yaml` does), both handlers answer a query for a name in
+their zone with the answer of the zone's authoritative server, as their shared base does it
+(`leaseHandler.answerQuery`), so that browsing the SRP domain through the proxy sees a
+registration or a removal as soon as that server has it; `docs/siglease_rfc9664.md`, "Queries
+for the Zones Served".
+
+Each handler serves exactly one zone, and the proxy refuses to start when `srp_handler` and
+`update_handler` serve the same one (`handlers.SeparateZones`). The zones may nest; the live
+`config.yaml` has `srp.dev.zenr.io.` inside the RFC 9664 handler's `dev.zenr.io.`. A name then
+belongs to the handler whose zone is closest above it, and each handler refuses names outside
+its zone or in the other's (`REFUSED`, Extended DNS Error 18). So neither protocol writes the
+other's names, whatever the authoritative server's update-policy allows; see
+`docs/siglease_rfc9664.md`, "Zones Served".
 
 ## 4. The SRP Update message
 
@@ -90,7 +113,7 @@ A single DNS UPDATE containing **only** the following, grouped into "instruction
 
 | Instruction | Contents | Notes |
 |---|---|---|
-| **Host Description** (exactly 1) | `Delete All RRsets` on the hostname · exactly 1 `KEY` add · 0..n `A`/`AAAA` adds | 0 address adds = delete registration. The hostname's KEY is the FCFS anchor. |
+| **Host Description** (exactly 1) | `Delete All RRsets` on the hostname · exactly 1 `KEY` add · 0..n `A`/`AAAA` adds | 0 address adds only "in the case of deleting a registration" (§3.3.1.3), which is a `LEASE` of 0. The hostname's KEY is the FCFS anchor. |
 | **Service Description** (0..n) | `Delete All RRsets` on the service-instance name · 0..1 `KEY` add · 0..1 `SRV` add · 1..n `TXT` adds (if SRV present) | KEY may be omitted → inherits the Host Description KEY. SRV target **must** equal the Host Description hostname. |
 | **Service Discovery** (0..n) | exactly 1 `PTR` add **or** exactly 1 `PTR` delete, target = a service-instance name that has a Service Description in the same update | One instruction per subtype. |
 
@@ -100,6 +123,14 @@ Hard requirements the handler enforces:
 - **No prerequisites** (any prerequisite ⇒ not an SRP update).
 - **Must** carry an 8-byte Update-Lease option with `LEASE ≤ KEY-LEASE` (missing, or
   `KEY-LEASE < LEASE` ⇒ not an SRP update).
+- **An address in the Host Description unless the `LEASE` is 0.** §3.3.1.3 allows a Host
+  Description without an address only "in the case of deleting a registration", and deleting
+  is a `LEASE` of 0 (§3.2.5.5.1). A `LEASE` with no address is neither a registration nor a
+  removal, so not an SRP update, which §3.3.2 has the registrar refuse: `REFUSED`
+  (`pkg/srp`'s `validateHostAddresses`), as OpenThread's registrar does ("There MUST be at
+  least one valid address if we have nonzero lease"). `srp-mdns-proxy` accepts it, keeping the
+  host's KEY and its instances. The other mismatch, a `LEASE` of 0 with addresses, is a
+  removal (§7).
 - **All KEY RRs identical** and equal to the SIG(0) signing key (§3.2.5.1). KEY `flags` are
   never checked by the registrar — RFC 9665 §3.3.3 is explicit that flags must be stored
   exactly as received, without checking or modifying them; this is one-directional (a
@@ -138,16 +169,25 @@ Compressed SRV target names (§3.2.5.4) are accepted, matching real client behav
 3. **SIG(0) verify** against the KEY in the Host Description (§3.3.3) — always present in the
    request, so no three-stage signer resolution (as used by the base handler) is needed. Fail
    ⇒ `REFUSED`.
-4. **FCFS name check** (`pkg/srp.Evaluate`, RFC 9665 §3.3.3) — for the hostname and each
-   service-instance name, look up the lease store; if the store has no entry, issue one live
-   `KEY`-at-name query. The result is tri-state:
+4. **FCFS name check** (`pkg/srp.Evaluate`, RFC 9665 §3.3.3) — first, once the
+   `default.service.arpa.` rewrite (§9) has made the names final, a name outside this handler's
+   zone or in a zone the RFC 9664 handler serves below it is `REFUSED` (§3). Then, for the
+   hostname and each service-instance name, look up the lease store (`StoreView.KeysAtName`):
+   KEYs there must all match the update's KEY, or the name is held (`YXDOMAIN`). If the store
+   has none, issue one live `KEY`-at-name query. The result is tri-state:
 
    | query result | meaning | action |
    |---|---|---|
    | `NXDOMAIN` | name does not exist | proceed (first come) |
    | `NOERROR`, no KEY in the answer | name exists, has RRsets, no KEY — foreign/orphaned data | `srp_handler.refuse_on_foreign_data` (default `true`): `REFUSED`; `false`: proceed (delete-all-then-add replaces it) |
-   | `NOERROR`, KEY present, RDATA matches the update's KEY (explicit or inherited) | same owner | proceed |
-   | `NOERROR`, KEY present, RDATA differs | different owner | `YXDOMAIN` |
+   | `NOERROR`, KEYs present, every one's RDATA matches the update's KEY (explicit or inherited) | same owner | proceed |
+   | `NOERROR`, KEYs present, any one's RDATA differs | another owner | `YXDOMAIN` |
+
+   "Any" is §3.3.3's wording ("If any existing KEY record ... does not match"): a name holding
+   the update's KEY next to another is held by both, so neither may take it over. SRP never
+   leaves two KEYs at a name, so such a name was written by something else. The RFC 9664
+   handler's `fcfs_naming` applies the same check to its new KEYs
+   (`docs/siglease_rfc9664.md`, "First-Come First-Served Naming").
 
    This is the same query used for the pre-forward cost described in `docs/siglease_rfc9664.md`
    — reading its RCODE is free. A write can land between this check and the forwarded UPDATE;
@@ -157,7 +197,8 @@ Compressed SRV target names (§3.2.5.4) are accepted, matching real client behav
    Description KEY (see §7 below — the registrar synthesizes this when a client omits it).
 6. Response RCODE ∈ `{NOERROR, SERVFAIL, REFUSED, YXDOMAIN}`; a NOERROR response carries the
    granted `LEASE`/`KEY-LEASE` and nothing else: no Zone, Prerequisite or Update section
-   (RFC 2136 §3.8), and one OPT RR. mDNSResponder's `srp-client` reads the granted lease only
+   (RFC 2136 §3.8), and one OPT RR. An error response has the same shape, its OPT RR carrying
+   an Extended DNS Error with the reason (`docs/siglease_rfc9664.md`, "Error Replies"). mDNSResponder's `srp-client` reads the granted lease only
    from that exact shape, and otherwise refreshes on the lease it asked for.
 
 **Closing the check-to-write window.** Between the FCFS check and the forwarded UPDATE,
@@ -204,6 +245,12 @@ another request could claim the same name. Two mechanisms close that window.
   lost FCFS race, answered `YXDOMAIN` like a conflict found in step 4: `YXDOMAIN` only when
   "Name is not in use" was sent, `YXRRSET` only when the KEY prerequisite was. Anything else,
   including either rcode without its prerequisite, is `SERVFAIL`.
+
+**The local apply cannot fail.** FCFS is also what lets the store writes after the forward
+(`applyLocalMutations`) succeed: every record SRP stores sits at a name the check covered, or
+names one (a Service Discovery PTR names its instance), so no other node holds it. A store write
+failing after the forward is a bug, and the handler panics
+(`docs/siglease_rfc9664.md`, "Upstream Forwarding and Write Ordering").
 
 **Authorization for SRP is steps 2 and 4, nothing more.** Once structural validation confirms
 every KEY in the update equals the signing key, per-name FCFS is the entire ownership check —
@@ -279,7 +326,9 @@ handler uses the same setting (`docs/siglease_rfc9664.md`).
 data record's `LEASE` or its own `KEY-LEASE`, whichever comes first. Both handlers run lease
 events through the same engine (`leaseExpirer`), with the same timer table and retry policy
 (`expiryTimers`) and timer arithmetic (`nextLeaseEvent`), so they age the lease store the same
-way. One lease event is one UPDATE, which deletes every record it ends one by one, each with
+way. Both also embed the same `leaseRuntime` (`handlers/lease_runtime.go`, through `leaseHandler`), which owns the store,
+timers and locks, the reconciliation pass and `Shutdown`; SRP adds its enumeration reconcile
+(§10) after each expiry and on each pass. One lease event is one UPDATE, which deletes every record it ends one by one, each with
 an individual `Delete An RR From An RRSet`:
 - A `LEASE` event deletes the node's due data. For a host, that includes the data of every
   service instance under it (`dataCascade`, the only difference from the RFC 9664 handler: the
@@ -306,7 +355,8 @@ takes the instances' data along, and their retries find nothing due. Each expiry
 10s deadline (`expiryTimeout`). A node found refreshed after its expiry's upstream delete would
 mean the locks had failed, and that the refresh's add and the expiry's delete raced upstream
 with no way to tell which one landed last: the engine panics instead of deleting the node
-locally. The 30-second reconciliation pass only re-arms a node that has no timer at all. A
+locally. The 30-second reconciliation pass only arms a node that has no timer at all, which is
+a bug it logs as an error (`docs/siglease_rfc9664.md`, "Start and the reconciliation backstop"). A
 handler without its upstream coordinator or signing key (a state `Setup` refuses to produce)
 panics rather than expiring anything (`requireUpstream`).
 
@@ -327,14 +377,56 @@ A requester is allowed to omit the per-instance KEY in its own request (§3.2.5.
 omitted for brevity") — `client/srp` always does this — but the resulting authoritative zone
 state must still carry it regardless of whether the requester sent it explicitly.
 
-The handler's upstream forward step synthesizes this KEY for every live (SRV-present) instance
-whose own Service Description omitted one (`synthesizeOmittedInstanceKeys`, derived via the same
+The handler's upstream forward step synthesizes this KEY for every instance whose own Service
+Description omitted one (`synthesizeOmittedInstanceKeys`, derived via the same
 `pkg/srp.KeyFor` logic already used for the local lease store's own bookkeeping), before
-building the outgoing UPDATE. Without this, a service instance's KEY would only ever exist in
+building the outgoing UPDATE: every live (SRV-present) instance, and every instance an update
+removes with a non-zero `KEY-LEASE`, as the registrar MUST NOT delete the instance KEYs then
+(§3.2.5.5.1); only a removal with `KEY-LEASE=0` frees the names, and gets none. Without this, a service instance's KEY would only ever exist in
 this process's own lease store, never at the authoritative server — so a registrar restart
 (losing local lease-store state) would make the very next refresh of that instance fail FCFS's
 live-query fallback with `REFUSED`, since the query would find SRV/TXT data with no KEY at that
 name at all.
+
+A host removal removes the host's service instances with it, listed or not: "an SRP registrar
+MUST remove all service instances pointing to that hostname and all Service Discovery PTR
+records pointing to those service instances, even if the SRP requester doesn't list them
+explicitly" (§3.2.5.5.1). A host removal is an update with a `LEASE` of 0 (§3.2.5.5.1), which
+the handler takes as one whatever else it carries (`removeHost`), as `srp-mdns-proxy`
+(`host_lease == 0`) and OpenThread's registrar (`Host::IsDeleted`) do. The requesters send
+it in three shapes:
+
+| Requester | Host Description | Instances listed | `KEY-LEASE` |
+|---|---|---|---|
+| `client/srp` `Deregister` (below) | no address | every configured one, as removals | kept or 0 |
+| `client/srp` `Release`, mDNSResponder's `srp-client` | no address | none | kept (`srp-client`), 0 (`Release`) |
+| OpenThread's client | its addresses (`AppendHostDescriptionInstruction` always adds them) | none | kept or 0 |
+
+§3.2.5.5.1 has the requester send "no 'Add to an RRSet' instructions for that hostname", so the
+handler drops any adds a removal carries (`pkg/srp.RemoveHost`, logged): the host's addresses,
+a listed instance's SRV and TXT, which leaves it a removal, and Service Discovery adds. The
+KEY adds stay while the `KEY-LEASE` is not 0, holding the names. Then, for each live instance of
+the host's in the lease store that the update does not list, the handler (under the host's
+node locks, which cover its instances) adds to the classified update the removal its requester
+would have sent (`pkg/srp.Removal`, a bare Delete All RRsets), and to the upstream UPDATE its
+delete. From there every instance is a listed removal: FCFS, its PTR deletes, its KEY kept
+while `KEY-LEASE` is not 0, the lease store. Before this, a removal with addresses was
+written as a registration with a `LEASE` of 0: the addresses were deleted by their immediate
+expiry, but the instances it did not list stayed until their own lease ended, so an OpenThread
+device removing itself and keeping its name left its services published. The interop suite
+did not catch it: OpenThread is not in it, and mDNSResponder's `srp-client` never removes there
+(§12).
+
+A removal with a `KEY-LEASE` of 0 frees the names, and is done before it is answered, as an
+RFC 9664 KEY delete is: the handler drops the KEY adds too, and the same UPDATE deletes,
+record by record, every KEY and record the lease store holds at and below the host
+(`subtreeDeletes`), also an instance no longer advertised that still holds its name, which no
+Delete All RRsets reaches. Once the authoritative server confirms it, the store forgets the
+host's subtree (`forgetSubtree`), and the requester is answered; if not, nothing changes and the
+request fails. Before, the KEYs were added back and stored with a `KEY-LEASE` of 0, and their
+expiry timers deleted them after the answer: a proxy stopped in between, as the demo script
+stopped it right after the agent, left them in the zone until it started again with the same
+store, so the names stayed held.
 
 ## 8. Transport and crypto
 
@@ -348,12 +440,17 @@ name at all.
   transport-level listener that benefits this handler along with every other one — see
   `docs/siglease_rfc9664.md`. RFC 9665 §7 says a registrar MUST offer TLS; here it is a
   configuration choice (`server.networks` plus `server.tls`), off in the example `config.yaml`.
-  `client/srp` can use it (`Config.Network = NetworkTLS`, `-tls` on the CLI): it then discovers
+  `client/srp` can use it (`Config.Network = NetworkTLS`, `-transport tls` on the CLI): it then discovers
   the registrar through `_dnssd-srp-tls._tcp` (§13) and never falls back to plain TCP (§7: a
   requester able to use TLS SHOULD NOT). As §7 specifies, TLS gives Opportunistic Privacy only
   (RFC 7858 §4.1): the client does not check the registrar's certificate, so the connection is
   encrypted but the registrar is not authenticated. RFC 9665 §6.5 mentions out-of-band key
   pinning (RFC 7858 §4.2) and leaves it out of scope; it is not implemented.
+- The server can offer DNS-over-HTTPS (RFC 8484) too, the one DNS transport a browser has, also
+  transport-level (`server.networks` plus `server.doh`; see `docs/siglease_rfc9664.md`,
+  "DNS-over-HTTPS"). `client/srp` can use it (`Config.Network = NetworkDoH`, `-transport doh`),
+  with the registrar's URL as `RegistrarAddr`: RFC 9665 names no DoH service, so `Discover`
+  refuses `NetworkDoH` instead of returning a plain-DNS registrar's `host:port`.
 - Source-address filtering (RFC 9665 §3.1.3's SHOULD) is a wired but dormant stub:
   `srp_handler.allowed_source_prefixes` is parsed and the check point exists, but an empty list
   (the only value currently supported end-to-end) allows every source. See §11 below.
@@ -401,41 +498,56 @@ silently overwrote the first at the authoritative server.
 RFC 9665 itself never populates two kinds of DNS-SD "browse" record — an SRP client's Service
 Description only ever restates its own host/instance data. `pkg/dnssd` (pure logic, kept
 separate from RFC 9665 protocol logic in `pkg/srp` since it's a distinct RFC) plus
-`SRPHandler.reconcileServiceEnumeration` maintain both, unconditionally, for every `srp_handler`
-instance:
+`SRPHandler.reconcileServiceEnumeration` (§9) and `SRPHandler.reconcileDomainEnumeration` (§11)
+maintain both for every `srp_handler` instance. `docs/dns-sd-records.md` lists every DNS-SD
+discovery record, this registrar's and the operator's, and where each belongs:
 
 - **RFC 6763 §9 Service Type Enumeration** — a PTR at `_services._dns-sd._udp.<zone>`, one per
   distinct two-label service type actually registered (e.g. `_http._tcp.<zone>`). Without it,
   individually-registered services are still resolvable by a targeted per-type browse, but
   "browse everything on this zone" tools — which query this name first — find nothing.
 - **RFC 6763 §11 Domain Enumeration** — the `b`/`db`/`lb` (browsing) and `r`/`dr`
-  (registration) prefixes under `_dns-sd._udp.<zone>`. `b`/`db`/`lb` are always published, once
-  at least one service type is live, as trivial self-pointing PTRs — some browse tools query one
-  of these *before* the §9 record, so without it their browse tree dead-ends at the first step
-  and never reaches a query the §9 record would otherwise answer correctly. `r`/`dr` are
-  opt-in only, via `srp_handler.advertise_registration_domain` (default `false`): unlike
-  browsing, these tell a domain-enumeration client "you may attempt direct RFC 2136 registration
-  here," which is a deployment policy choice, not something implied by SRP already working on
-  the zone.
+  (registration) prefixes under `_dns-sd._udp.<zone>`, each a PTR naming the zone itself. Some
+  browse tools query one of these *before* the §9 record, so without it their browse tree
+  dead-ends at the first step and never reaches a query the §9 record would otherwise answer
+  correctly. They follow the config alone: `b`/`db`/`lb` while
+  `srp_handler.advertise_browse_domain` is set (default `true`), `r`/`dr` while
+  `srp_handler.advertise_registration_domain` is (default `false`: these tell a
+  domain-enumeration client "you may attempt direct RFC 2136 registration here," which is a
+  deployment policy choice, not something implied by SRP already working on the zone). Whether
+  to browse or register in a zone is the operator's choice, not a fact about what is registered
+  right now, so neither depends on the lease store. Until 2026-11 `b`/`db`/`lb` were published
+  only while a service type was live, which made them come and go with the zone's occupancy.
 
-**Safety on a real, shared, multi-process zone.** Both mechanisms track their own
-process-local view of "what's currently live" (reset on every process start, never seeded from
-a live upstream read) and only ever delete a record after a live `QueryPTRExists` check at the
-real per-type browsing name confirms it's gone everywhere, not just gone from this process's own
-view. A naive delete-all-then-reinsert design was tried first and found actively destructive
-against the real, shared `dev.zenr.io.` zone: a second proxy process (or a restart of the same
-one) has an empty local view, and reconciling from that empty view deleted another, independently
-registered instance's still-live entry for a type this process didn't yet know about locally. The
-fixed design means a fresh process's first-ever reconcile can only ever *add*, never destroy
+**§9: safety on a real, shared, multi-process zone.** The §9 record is diffed against this
+process's own view of "what's currently live" (reset on every process start, never seeded from
+a live upstream read), and a type is only ever deleted after a live PTR query at its per-type
+browsing name confirms it's gone everywhere, not just gone from this process's own view. A
+naive delete-all-then-reinsert design was tried first and found actively destructive against
+the real, shared `dev.zenr.io.` zone: a second proxy process (or a restart of the same one) has
+an empty local view, and reconciling from that empty view deleted another, independently
+registered instance's still-live entry for a type this process didn't yet know about locally.
+The fixed design means a fresh process's first-ever reconcile can only ever *add*, never destroy
 another process's or another run's still-valid data. A no-op diff sends no upstream UPDATE at
-all.
+all. It reconciles from three call sites: synchronously after a successful registration or
+removal, synchronously after an expiry, and once per tick from the same periodic reconciliation
+pass the lease store's own expiry-timer bookkeeping already uses (a self-heal after a restart or
+a missed/raced write).
 
-Both mechanisms reconcile from three call sites: synchronously after a successful registration
-or removal, synchronously after an expiry, and once per tick from the same periodic
-reconciliation pass the lease store's own expiry-timer bookkeeping already uses (a self-heal
-after a restart or a missed/raced write). Scope is `srp_handler` only — the base RFC 9664
-`UpdateHandler` accepts arbitrary RRs and has no concept of a "service description" to key this
-off of.
+**§11: compared with the zone.** Each reconciliation pass (every 30 s, the first one 30 s after
+start) queries the PTRs at the five names, one query each, and adds or deletes the
+self-pointing record where the zone differs from the config; a PTR there naming another domain
+is left alone. Comparing with the zone, not with what the process remembers writing, is what
+lets a setting turned off delete what an earlier run published: until 2026-11 the comparison was
+with memory, which is empty after a restart, so `r`/`dr` stayed for good once published. A
+query that fails leaves its name for the next pass. Requests and expiries don't touch these
+records. Stopping the proxy leaves them, as it leaves the records registered through it and the
+zone's `_dnssd-srp._tcp` SRV: a stop is not a decommissioning, and a crash would skip any
+removal anyway. Two proxies on one zone with different settings would undo each other's records
+on every pass, but several proxies on one zone are not supported (§11 below).
+
+Scope is `srp_handler` only — the base RFC 9664 `UpdateHandler` accepts arbitrary RRs and has
+no concept of a "service description" to key this off of.
 
 ## 11. Known limitations and possible future work
 
@@ -449,6 +561,25 @@ off of.
   hashing bug described in §8, unlike ED25519/ECDSAP256SHA256/ECDSAP384SHA384. Extending the fix
   would need a real RSA key and, ideally, an independent implementation's signature to validate
   against, neither of which exists in this codebase today.
+- **Host names the authoritative server refuses.** The proxy forwards a host label as the
+  requester sent it. BIND, by default (`check-names primary fail`), refuses a dynamic update in
+  which an A or AAAA owner, or an SRV target, is not a valid host name: letters, digits and
+  hyphens (RFC 952, RFC 1123). Instance names are free text (RFC 6763 §4.1.1) and are not
+  checked. BIND logs the refusal once, as `general: error: zone <zone>/IN: <name>/A: bad owner
+  name (check-names)`, and the proxy answers SERVFAIL with Extended DNS Error 22. Apple's
+  `srp-client` runs into this after a conflict: on `YXDOMAIN` it renames host and instance by
+  appending " 1", then " 2", then a random number (`conflict_print` in `srp-client.c`), where
+  the example in RFC 9665 §3.2.5.2 appends "-1"; it then keeps retrying the refused name.
+  Checked on 2026-10-20 against the interop zone: refused with BIND's default, registered with
+  `check-names ignore;` on the zone. `ns1.free2air.org` runs BIND too, so on `srp.dev.zenr.io.`
+  expect a renamed `srp-client` to stay unregistered: keep its key file (run it from the same
+  directory every time), or restart it with a `--host-name` and an `--instance-name` no other
+  key holds, since FCFS checks both (§5). The proxy does not check host names itself: the
+  authoritative server's policy decides. Nor does anything here depend on a server's
+  administrator relaxing `check-names`: the proxy has to work with whatever server it forwards
+  to, BIND's defaults included. Our client renames
+  with a hyphen (`demo-2`, `client/srp`), so it meets this only with a `-host` that is not a
+  valid host name, which it does not check.
 - **A prohibited-name dictionary, a pre-registered-keys-only mode, and reverse-PTR
   auto-population** (all optional registrar features RFC 9665 permits but doesn't require) are
   not implemented.
@@ -475,15 +606,17 @@ off of.
 
 ## 12. Testing and interop
 
-- `make test-srp` runs a full register → refresh → conflict → remove-one → remove-all → expiry → discovery
-  → concurrent claims → foreign-data takeover suite against a disposable local BIND 9, with no
+- `make test-srp` runs a full register → refresh → conflict → remove-one → host removal keeping its name → expiry → discovery
+  → concurrent claims → foreign-data takeover → domain enumeration suite against a disposable local BIND 9, with no
   external dependency — this is the CI gate. Every update in it is sent by
   `cmd/sig0lease-srp-client`, the same requester users run. The discovery tests find the
   registrar through `_dnssd-srp._tcp` and `_dnssd-srp-tls._tcp`, the latter registering over
   DNS-over-TLS against the proxy's DoT listener with a throwaway certificate generated for the
   run. Two identities then claim one new name at once (one `NOERROR`, one `YXDOMAIN`), and
   the proxy, restarted with `refuse_on_foreign_data: false`, takes over a name holding non-SRP
-  data with the KEY prerequisite, which BIND must accept.
+  data with the KEY prerequisite, which BIND must accept. Last, the §11 domain-enumeration
+  records follow the config, and a proxy restarted with `advertise_browse_domain: false` deletes
+  the `b`/`db`/`lb` the earlier run published (§10).
 - The unit tests for the window in §5 hold one operation inside its upstream send while a
   second runs against the same names (`handlers/node_locks_test.go`): two keys claiming one
   name get one `NOERROR` and one `YXDOMAIN`, leaving one KEY node, which NodeKey-keyed locks
@@ -491,12 +624,16 @@ off of.
   timer. `handlers/srp_handler_test.go` pins the prerequisite rcode mapping, and
   `pkg/srp/fcfs_test.go` the prerequisite for each state and policy and both prerequisites'
   wire encoding.
+- `make test-agent` runs `sig0lease-agent` against the same registrar and BIND 9: probes, template
+  reloads, a rename lasting until a restart, which frees it and asks for the name again, and
+  deregistration on stop (`tests/test_agent.sh`).
 - `make test-mdnsresponder-interop` runs the same registrar, plus `client/srp`, against the
   real, unmodified Apple `mDNSResponder/ServiceRegistration` binaries (a sibling checkout, not
   vendored — see `tests/README.md` for setup and the exact pinned commit). It covers plain
   registration, host-only registration, and all three subtype variants in the direction of a real
   `srp-client` against this project's registrar; and Register plus Deregister in the direction of
-  `client/srp` against the real `srp-mdns-proxy` registrar. (`srp-client`'s own
+  `client/srp` against the real `srp-mdns-proxy` registrar; and, from the mDNS daemon,
+  `sig0lease-agent`'s `mdns` mirror into this project's registrar. (`srp-client`'s own
   `--remove-added-service`/`--delete-registrations` flags were found to hang indefinitely — a
   confirmed bug in that binary's own reconnect logic, unrelated to this project, and not
   exercised by the test as a result.)
@@ -508,14 +645,15 @@ off of.
 
 `client/srp` is the actual client-side deliverable. `cmd/sig0lease-srp-client` is a thin,
 non-shipped CLI over it for development and testing — there's deliberately no `make
-build-srp-client` target.
+build-srp-client` target. The client a machine runs to keep its services registered is
+`sig0lease-agent` (`docs/sig0lease-agent.md`), on `client/srp`'s `Host`.
 
 Capabilities:
 
 - **Discovery** — SOA queries find the apex of the zone enclosing the domain (RFC 8765 §6.1,
   as RFC 9665 §3.1.1 specifies). SRV lookups for `_dnssd-srp._tcp.<name>.` then find the
   registrar, and an A (or AAAA) lookup gives its address. A client using DNS-over-TLS
-  (`NetworkTLS`, `-tls`) looks up `_dnssd-srp-tls._tcp.<name>.` instead and never falls back to
+  (`NetworkTLS`, `-transport tls`) looks up `_dnssd-srp-tls._tcp.<name>.` instead and never falls back to
   `_dnssd-srp._tcp` (§7); the same rules below apply to it. All of these queries go to the same
   resolvers (`-resolver`), so a registrar that only a lab DNS or the local BIND 9 test zone knows
   is still found. Used whenever no explicit registrar address is configured. Which names the SRV
@@ -542,34 +680,51 @@ Capabilities:
   per instance, and DNS-SD subtypes per instance. An instance marked for removal (`-remove`)
   goes out as a bare Delete All RRsets in the same update, withdrawing just that instance
   while the host and the other instances stay registered (RFC 9665 §3.2.5.5.2).
-- **Zone Section: a deviation from RFC 9665 §3.3** — every update names the registration
-  domain (`Config.Domain`, `-domain`) in its Zone Section. §3.3, like RFC 2136, wants the zone
-  being updated there, which is the apex discovery finds with its SOA queries: for
-  `srp.dev.zenr.io.` that is `zenr.io.`, not `srp.dev.zenr.io.`. The two only coincide when the
-  domain is itself a zone apex, as `srp.test.` is in the test suite. It stays this way on
-  purpose: the registrar accepts an update only when its Zone Section is the zone it serves
-  (`upstream_zone`) or `default.service.arpa.`, so naming the apex would stop the proxy from
-  matching it, and with `-server` the client never looks the apex up at all. Nothing upstream
-  sees the requester's Zone Section: the proxy builds a new UPDATE for the authoritative server,
-  with the real zone it resolved for `upstream_zone` ("Authoritative Forwarding" in
-  `docs/siglease_rfc9664.md`), so the updates the authoritative server receives follow RFC 2136. Real requesters use the field the same way:
-  `mDNSResponder`'s and OpenThread's clients send `default.service.arpa.`, which is not a zone
-  apex either.
+- **Zone Section** — every update names the registration domain (`Config.Domain`, `-domain`)
+  in its Zone Section. §3.3, like RFC 2136, wants the zone being updated there, which is the
+  apex discovery finds with its SOA queries: for `srp.dev.zenr.io.` that is `zenr.io.`, not
+  `srp.dev.zenr.io.`. The registrar takes either, since it only requires the Zone Section to
+  enclose every name in the update (§3); the domain is what the client knows without discovery,
+  as with `-server`, where it never looks the apex up. Nothing upstream sees the requester's
+  Zone Section: the proxy builds a new UPDATE for the authoritative server, with the real zone
+  it resolved for `upstream_zone` ("Authoritative Forwarding" in `docs/siglease_rfc9664.md`), so
+  the updates the authoritative server receives follow RFC 2136. Real requesters use the field
+  the same way: `mDNSResponder`'s and OpenThread's clients send `default.service.arpa.`, which is
+  not a zone apex either.
 - **TTL** — every record the client adds, KEYs included, carries `Config.TTL` (`-ttl`, default
   300), never a lease: a lease is not a TTL (§5.1). It is only a suggestion; a registrar may
   override it (§4), and this proxy does (§6, "TTLs").
 - **Deregister** — withdraws the host and every configured instance in one message, requesting
-  `LEASE=0`. RFC 9665's own removal signal is structural (zero address adds in the Host
-  Description); some real-world registrars (`srp-mdns-proxy`) additionally require
-  `LEASE=0`/`host_lease==0` before recognizing a zero-address host update as a removal at all, so
-  `client/srp` sends both — fully RFC 9665-conformant either way.
+  `LEASE=0`, with the configured `KEY-LEASE` to keep the names for the key or `KEY-LEASE=0` to
+  free them (§3.2.5.5.1); `client/srp`'s `Host` keeps them on `Stop` when told to
+  (`HostConfig.KeepNames`, the agent's `on_stop`), and always while it runs: on a `Set` with no
+  addresses, and on `StopKeepingNames`, for a restart; a `Stop` freeing them after such a
+  `Set` frees them as `Release` does; `Release` frees them for a host that is not
+  running, deregistering the host alone, as the registrar removes its instances with it
+  (§3.2.5.5.1: "even if the SRP requester doesn't list them"); `sig0lease-srp-client
+  -deregister` frees them, or keeps them with `-keep-names`. §3.2.5.5.1's removal is a `LEASE`
+  of 0 with no address in the Host Description, which §3.3.1.3 allows only "in the case of
+  deleting a registration"; `client/srp` sends both (`pkg/srp.BuildUpdate` refuses to build
+  either mismatch). Registrars go by the `LEASE`: this proxy, `srp-mdns-proxy` (`host_lease ==
+  0`) and OpenThread's (`Host::IsDeleted`) take any `LEASE` of 0 as a removal (§7), and this
+  proxy and OpenThread's refuse a non-zero `LEASE` without an address (§4).
+  `sig0lease-srp-client` therefore requires `-addr` unless `-deregister`.
 - **Full lifecycle (`Run`)** — an initial 0–3s random startup delay, register-with-rename-retry
-  on conflict (a `YXDOMAIN` renames both the host label and every instance label together with
-  the same incrementing suffix, since the RCODE alone never says which name conflicted), then
+  on conflict, then
   sleeps for the RFC 9664 §5.2 refresh clock (80% of the *granted*, not requested, lease plus
   0–5% jitter) and repeats, unattended, until canceled. A transient send/network error retries
   with exponential backoff (5s up to 5m, reset on success) rather than terminating the client
   permanently, reported via an injectable error hook.
+- **Renames** — a `YXDOMAIN` does not say which name conflicted, so the client looks up the KEY
+  at the host name and at each instance name (`Config.Query`, through `Config.Resolvers`) and
+  renames only the names another key holds, by the rule the registrar applies (§5,
+  `pkg/srp.KeysAllMatch`): each from its own requested label, to `<label>-2`, then `-3`, and so
+  on. A conflict with no name held (the registrar and the resolvers disagree) is an error, and
+  `Run` retries with backoff rather than guess. `Config.Labels` starts a client from earlier
+  renames and `Config.OnRenamed` reports each. `Host` keeps a rename while it runs, and records
+  the names it holds (`HostStore`), so that the next start frees a rename's before asking for
+  the requested names again: every start asks for them, as mDNSResponder's `srp-client` does
+  (`docs/sig0lease-agent.md`).
 - **Identity/keystore** — `-keystore=<dir>` with a `CLIENT_KEYSTORE_DIR` environment-variable
   fallback (the same convention as `cmd/sig0lease-client`); a missing key is an error unless
   `-k=13` (ECDSAP256SHA256) or `-k=15` (ED25519) is given, in which case one is generated for

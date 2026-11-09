@@ -54,7 +54,7 @@ func GenerateKey(name string, algorithm uint8, flags uint16, bits int) (*LoadedK
 // created reports whether a new key was generated, so callers can tell
 // the user which happened. createAlgorithm == 0 means "never create" -- a missing key is then
 // an error, not silently generated, matching this package's existing strict-by-default
-// convention (see cmd/sig0lease-client's historical behavior, which this generalizes).
+// convention (cmd/sig0lease-client's, which this generalizes).
 //
 // This is shared, rather than reimplemented per caller, because both of this project's CLI
 // clients (cmd/sig0lease-client, cmd/sig0lease-srp-client) need the identical "find any existing
@@ -108,12 +108,13 @@ func ResolveOrCreateKey(dir, owner string, createAlgorithm uint8, logger *loggin
 // SaveToFile writes lk to <dir>/<lk.Name>.key and <dir>/<lk.Name>.private, in the same
 // format LoadKeyFromFile reads. dir must already exist.
 func (lk *LoadedKey) SaveToFile(dir string) error {
+	pubText, privText := lk.KeyText()
 	keyPath := filepath.Join(dir, lk.Name+".key")
-	if err := os.WriteFile(keyPath, []byte(lk.PublicKey.String()+"\n"), 0o644); err != nil {
+	if err := os.WriteFile(keyPath, []byte(pubText), 0o644); err != nil {
 		return fmt.Errorf("keyrec: write %s: %w", keyPath, err)
 	}
 	privPath := filepath.Join(dir, lk.Name+".private")
-	if err := os.WriteFile(privPath, []byte(lk.PublicKey.PrivateKeyString(lk.PrivateKey)), 0o600); err != nil {
+	if err := os.WriteFile(privPath, []byte(privText), 0o600); err != nil {
 		return fmt.Errorf("keyrec: write %s: %w", privPath, err)
 	}
 	return nil

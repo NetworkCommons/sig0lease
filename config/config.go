@@ -16,7 +16,8 @@ type ProcessingConfig struct {
 	Opcode uint8 `yaml:"opcode"`
 	// Modules is the ordered list of processing module names to try for this opcode:
 	// the router calls each in turn until one returns Processed or Error; if every one
-	// declines (NotRelevant), the opcode falls through to plain upstream forwarding. A
+	// declines (NotRelevant), no handler takes the request: it is refused, or forwarded to the
+	// upstreams with server.forward on (ServerConfig.Forward). A
 	// single-module list (the common case today, e.g. just "update_handler") behaves
 	// exactly as the old single-"module" field did.
 	Modules []string `yaml:"modules"`
@@ -26,7 +27,7 @@ type ProcessingConfig struct {
 type UpstreamConfig struct {
 	// Address is the upstream DNS server address (e.g., "8.8.8.8:53")
 	Address string `yaml:"address"`
-	// Protocol is the protocol to use ("udp", "tcp", "tls", "https")
+	// Protocol is the protocol to use ("udp" or "tcp")
 	Protocol string `yaml:"protocol"`
 	// Timeout for upstream queries
 	Timeout time.Duration `yaml:"timeout"`
@@ -36,30 +37,68 @@ type UpstreamConfig struct {
 type ServerConfig struct {
 	// Address is the address to listen on (e.g., ":53")
 	Address string `yaml:"address"`
-	// Networks are the network protocols to enable ("udp", "tcp", "tls")
+	// Networks are the network protocols to enable ("udp", "tcp", "tls", "doh")
 	Networks []string `yaml:"networks"`
 	// TLS configures the "tls" network (DNS-over-TLS, RFC 7858):
 	// opportunistic only, no client-certificate/key-pinning auth -- transport-level, so it
 	// benefits every handler (base RFC 9664, SRP, plain forwarding alike), not just one
 	// protocol. Required when "tls" appears in Networks; ignored otherwise.
 	TLS *TLSConfig `yaml:"tls,omitempty"`
+	// DoH configures the "doh" network (DNS-over-HTTPS, RFC 8484), the one DNS transport a
+	// web browser has. Transport-level, like TLS. Its certificate is optional: without one
+	// it serves plain HTTP, which a page on a plain-HTTP origin (a laptop on the LAN) can
+	// reach, as browsers refuse a self-signed certificate. Required when "doh" appears in
+	// Networks; ignored otherwise.
+	DoH *TLSConfig `yaml:"doh,omitempty"`
 	// RequestTimeout bounds how long the handlers may work on one request, including any
 	// wait for a lease-store node another request holds (docs/siglease_rfc9664.md, "Node
 	// Locks"). Must be positive: without a bound, a waiter could wait forever.
 	RequestTimeout time.Duration `yaml:"request_timeout"`
+	// Diagnostics lets clients see the proxy's internals, for testing and debugging: the
+	// reason text in the Extended DNS Error (RFC 8914) of each error reply, and the lease-store
+	// dump query (__dump.sig0lease.internal[.debug]. TXT). Off by default, as it should be in
+	// production: error replies then carry only the Extended DNS Error's code, and the dump
+	// query is answered REFUSED with code 18 (Prohibited).
+	Diagnostics bool `yaml:"diagnostics"`
+	// Forward passes what no handler takes -- a query for a name outside the handlers' zones,
+	// an UPDATE without the Update Lease option, any other opcode -- to the upstreams, and
+	// relays their answer. Off by default: such a request is then answered REFUSED with code 20
+	// (Not Authoritative), so the proxy is no open resolver on an address the internet reaches.
+	// The upstreams are asked either way for the proxy's own lookups (a zone's SOA).
+	Forward bool `yaml:"forward"`
 }
 
-// TLSConfig holds the DNS-over-TLS listener's own address and certificate. A separate
-// Address (rather than reusing ServerConfig.Address) because DoT conventionally listens on
-// its own port (853, RFC 7858) alongside plain DNS on 53 -- binding both to one address
-// would collide, since they're two independent net.Listeners either way.
+// TLSConfig holds a listener's own address and certificate: the DNS-over-TLS listener's,
+// and the DNS-over-HTTPS one's. A separate Address (rather than reusing
+// ServerConfig.Address) because DoT conventionally listens on its own port (853, RFC 7858)
+// alongside plain DNS on 53, and DoH on an HTTP port -- binding both to one address would
+// collide, since they're independent net.Listeners either way.
 type TLSConfig struct {
-	// Address is the DoT listener's own address (e.g., ":853").
+	// Address is the listener's own address (e.g., ":853" for DoT, ":8443" for DoH).
 	Address string `yaml:"address"`
 	// Cert is the path to a PEM-encoded certificate (or certificate chain).
 	Cert string `yaml:"cert"`
 	// Key is the path to the PEM-encoded private key matching Cert.
 	Key string `yaml:"key"`
+}
+
+// validate checks the server.<network> block of a network that is enabled: it must be
+// there, with an address; certRequired says whether it needs a certificate, which comes
+// with its key either way.
+func (t *TLSConfig) validate(network string, certRequired bool) error {
+	if t == nil {
+		return fmt.Errorf(`server.networks includes %q but server.%s is not configured`, network, network)
+	}
+	if t.Address == "" {
+		return fmt.Errorf("server.%s.address cannot be empty", network)
+	}
+	if _, _, err := net.SplitHostPort(t.Address); err != nil {
+		return fmt.Errorf("invalid server.%s.address %q: %w", network, t.Address, err)
+	}
+	if (t.Cert == "") != (t.Key == "") || (certRequired && t.Cert == "") {
+		return fmt.Errorf("server.%s.cert and server.%s.key are both required", network, network)
+	}
+	return nil
 }
 
 // AuthoritativeConfig holds limits on the UPDATEs this proxy sends to authoritative servers.
@@ -89,30 +128,18 @@ type Config struct {
 	Authoritative AuthoritativeConfig `yaml:"authoritative"`
 }
 
-// NewDefaultConfig returns a configuration with sensible defaults.
+// NewDefaultConfig returns the defaults of the optional settings, which LoadConfig reads the
+// config file over. The rest -- the server's address and networks, and the upstreams -- the
+// file gives.
 func NewDefaultConfig() *Config {
 	return &Config{
 		Server: ServerConfig{
-			Address:  ":8053", // Use non-privileged port by default
-			Networks: []string{"udp", "tcp"},
 			// Above the worst case of one authoritative UPDATE: a UDP attempt, then a TCP
 			// fallback, at the dns library's default timeouts (about 11s).
 			RequestTimeout: 15 * time.Second,
 		},
 		ProcessingRules: []ProcessingConfig{},
-		Upstreams: []UpstreamConfig{
-			{
-				Address:  "8.8.8.8:53",
-				Protocol: "udp",
-				Timeout:  5 * time.Second,
-			},
-			{
-				Address:  "1.1.1.1:53",
-				Protocol: "udp",
-				Timeout:  5 * time.Second,
-			},
-		},
-		Handlers: make(map[string]map[string]interface{}),
+		Handlers:        make(map[string]map[string]interface{}),
 		// BIND 9.20's default sig0checks-quota.
 		Authoritative: AuthoritativeConfig{MaxInflightUpdates: 1},
 	}
@@ -127,6 +154,10 @@ func (c *Config) Validate() error {
 		return fmt.Errorf("invalid server address %q: %w", c.Server.Address, err)
 	}
 
+	if len(c.Server.Networks) == 0 {
+		return fmt.Errorf("server.networks must list at least one network")
+	}
+
 	if len(c.Upstreams) == 0 {
 		return fmt.Errorf("at least one upstream must be configured")
 	}
@@ -136,22 +167,16 @@ func (c *Config) Validate() error {
 	}
 
 	for _, network := range c.Server.Networks {
-		if network != "tls" {
-			continue
+		switch network {
+		case "tls":
+			if err := c.Server.TLS.validate("tls", true); err != nil {
+				return err
+			}
+		case "doh":
+			if err := c.Server.DoH.validate("doh", false); err != nil {
+				return err
+			}
 		}
-		if c.Server.TLS == nil {
-			return fmt.Errorf(`server.networks includes "tls" but server.tls is not configured`)
-		}
-		if c.Server.TLS.Address == "" {
-			return fmt.Errorf("server.tls.address cannot be empty")
-		}
-		if _, _, err := net.SplitHostPort(c.Server.TLS.Address); err != nil {
-			return fmt.Errorf("invalid server.tls.address %q: %w", c.Server.TLS.Address, err)
-		}
-		if c.Server.TLS.Cert == "" || c.Server.TLS.Key == "" {
-			return fmt.Errorf("server.tls.cert and server.tls.key are both required")
-		}
-		break
 	}
 
 	for i, rule := range c.ProcessingRules {
@@ -169,11 +194,14 @@ func (c *Config) Validate() error {
 	}
 
 	for i, upstream := range c.Upstreams {
-		if upstream.Address == "" {
-			return fmt.Errorf("upstream %d: address cannot be empty", i)
+		if _, _, err := net.SplitHostPort(upstream.Address); err != nil {
+			return fmt.Errorf("upstream %d: invalid address %q: %w", i, upstream.Address, err)
+		}
+		if upstream.Protocol != "udp" && upstream.Protocol != "tcp" {
+			return fmt.Errorf("upstream %d: protocol must be udp or tcp, got %q", i, upstream.Protocol)
 		}
 		if upstream.Timeout <= 0 {
-			c.Upstreams[i].Timeout = 5 * time.Second
+			return fmt.Errorf("upstream %d: timeout must be positive, got %s", i, upstream.Timeout)
 		}
 	}
 
@@ -184,17 +212,10 @@ func (c *Config) Validate() error {
 	return nil
 }
 
-// LoadConfig reads configuration from a file.
+// LoadConfig reads the configuration from the file at path, which must exist.
 func LoadConfig(path string) (*Config, error) {
 	cfg := NewDefaultConfig()
 
-	// Check if config file exists
-	if _, err := os.Stat(path); err != nil {
-		// File doesn't exist - use defaults
-		return cfg, cfg.Validate()
-	}
-
-	// Read and parse the YAML config file
 	data, err := os.ReadFile(path)
 	if err != nil {
 		return nil, fmt.Errorf("read config: %w", err)

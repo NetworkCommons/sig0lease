@@ -168,6 +168,34 @@ func TestDomainEnumerationOwnerName(t *testing.T) {
 	}
 }
 
+// TestHasSelfPointingRecord: only a PTR naming the zone itself counts, in any letter case; a
+// PTR at the same name naming another domain, or another type, does not.
+func TestHasSelfPointingRecord(t *testing.T) {
+	const zone = "test.dev.zenr.io."
+	ptr := func(target string) dns.RR {
+		rr := &dns.PTR{Hdr: dns.Header{Name: "b._dns-sd._udp." + zone, Class: dns.ClassINET}}
+		rr.Ptr = target
+		return rr
+	}
+	cases := []struct {
+		name string
+		rrs  []dns.RR
+		want bool
+	}{
+		{"none", nil, false},
+		{"self", []dns.RR{ptr(zone)}, true},
+		{"self, other case", []dns.RR{ptr("TEST.Dev.zenr.io.")}, true},
+		{"another domain only", []dns.RR{ptr("other.example.")}, false},
+		{"another domain and self", []dns.RR{ptr("other.example."), ptr(zone)}, true},
+		{"not a PTR", []dns.RR{&dns.TXT{Hdr: dns.Header{Name: "b._dns-sd._udp." + zone, Class: dns.ClassINET}}}, false},
+	}
+	for _, tc := range cases {
+		if got := HasSelfPointingRecord(tc.rrs, zone); got != tc.want {
+			t.Errorf("%s: HasSelfPointingRecord = %v, want %v", tc.name, got, tc.want)
+		}
+	}
+}
+
 func TestDiffSelfPointingDomainRecord_NoChangeIsNil(t *testing.T) {
 	if got := DiffSelfPointingDomainRecord(BrowseDomainPrefix, "test.dev.zenr.io.", false, false, 3600); got != nil {
 		t.Fatalf("false->false: expected nil, got %+v", got)

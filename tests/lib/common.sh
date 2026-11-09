@@ -30,20 +30,32 @@ SCRIPT_DIR="$TESTS_DIR"
 OS=$(uname -s | tr '[:upper:]' '[:lower:]')
 PROXY_BIN="${TESTS_DIR}/../bin/${OS}/sig0lease"
 CONFIG_FILE="${TESTS_DIR}/../config.yaml"
-LOG_FILE="/tmp/sig0lease_proxy.log"
 CLIENT_LOG_FILE="/tmp/sig0lease_client.log"
+
+# Who starts the proxy a suite tests (lib/proxy.sh's proxy_launch): auto, the default, starts
+# it from PROXY_BIN; manual waits up to PROXY_LAUNCH_TIMEOUT seconds for one you start
+# yourself, e.g. in a debugger, with the config the suite wrote. Every suite writes its
+# proxy's config, DoT certificate, lease files and log into its own fixed directory under
+# PROXY_RUN_ROOT, emptied at the start of each run and kept after it, so a debugger launch
+# configuration can name the config (tests/README.md lists one per suite).
+PROXY_LAUNCH="${PROXY_LAUNCH:-auto}"
+PROXY_LAUNCH_TIMEOUT="${PROXY_LAUNCH_TIMEOUT:-600}"
+PROXY_RUN_ROOT="/tmp/sig0lease-debug"
 
 PROXY_ADDR="${PROXY_ADDR:-127.0.0.1}"
 PROXY_PORT="${PROXY_PORT:-8053}"
 PROXY_URL="$PROXY_ADDR:$PROXY_PORT"
 # Transport run_client (tests/lib/client.sh) uses to reach the proxy.
 # Defaults to udp; set PROXY_PROTOCOL=tcp to run the whole suite over TCP
-# instead (passes --tcp through to sig0lease-client), or PROXY_PROTOCOL=tls
-# for DNS-over-TLS (--tls), sent to PROXY_TLS_URL: the proxy's DoT listener,
-# which prepare_lease_config turns on in the scratch config it writes.
+# instead (passes -transport tcp to sig0lease-client), PROXY_PROTOCOL=tls
+# for DNS-over-TLS (-transport tls), sent to PROXY_TLS_URL: the proxy's DoT listener,
+# or PROXY_PROTOCOL=doh for DNS-over-HTTPS (-transport doh), sent to PROXY_DOH_URL: the
+# proxy's DoH listener. prepare_lease_config turns either on in the scratch config it writes.
 PROXY_PROTOCOL="${PROXY_PROTOCOL:-udp}"
 PROXY_TLS_PORT="${PROXY_TLS_PORT:-8853}"
 PROXY_TLS_URL="$PROXY_ADDR:$PROXY_TLS_PORT"
+PROXY_DOH_PORT="${PROXY_DOH_PORT:-8443}"
+PROXY_DOH_URL="https://$PROXY_ADDR:$PROXY_DOH_PORT"
 
 AUTH_SERVER="${AUTH_SERVER:-ns1.free2air.org}"
 # The zone AUTH_SERVER is authoritative for, which lib/dns.sh's direct nsupdate changes
@@ -53,12 +65,12 @@ AUTH_ZONE="zenr.io."
 PROXY_KEYSTORE_DIR="./keystore/server"
 PROXY_KEY_NAME="${PROXY_KEYSTORE_DIR}/Kdev.zenr.io.+015+35317.key"
 
-# Configuration
-TMP_CONFIG_FILE=""
-TMP_TLS_DIR="" # holds the DoT listener's throwaway certificate when PROXY_PROTOCOL=tls
-LEASE_CONFIG_FILE="$CONFIG_FILE"
+# Configuration: prepare_lease_config's copy of config.yaml, and its log, in PROXY_RUN_DIR --
+# PROXY_RUN_ROOT/<suite>, which the orchestration script sets.
+PROXY_RUN_DIR=""
+PROXY_CONFIG_FILE=""
+PROXY_LOG_FILE=""
 LEASE_CONFIG_PREPARED=false
-REUSED_PROXY=false
 # Floor used for min_key_lease_sec/min_rr_lease_sec in the scratch config
 # prepare_lease_config() writes, so lease-cycle tests don't wait out the
 # real (production) policy minimums.
@@ -131,6 +143,87 @@ require_command() {
         log_error "Required command not found: $1"
         return 1
     fi
+}
+
+# listening_ports <tcp|udp> [<pid>] -- prints, one per line, the ports of every listening TCP
+# socket or bound UDP socket, or only of process <pid>'s. lsof on macOS; on Linux ss or, in
+# containers without it, /proc/net.
+listening_ports() {
+    local proto="$1" pid="${2:-}"
+    if [ "${OS}" = "darwin" ]; then
+        local args=(-nP -Fn -i"$(echo "$proto" | tr '[:lower:]' '[:upper:]')")
+        [ "$proto" = tcp ] && args+=(-sTCP:LISTEN)
+        [ -n "$pid" ] && args+=(-a -p "$pid")
+        # Name lines are n<address>:<port>; a connected socket's also names its peer (->).
+        { lsof "${args[@]}" 2>/dev/null || true; } | sed -n -e '/->/d' -e 's/^n.*:\([0-9][0-9]*\)$/\1/p'
+    elif command -v ss >/dev/null 2>&1; then
+        # The local address is the first field that ends in :<port>; the peer's is *:* or similar.
+        { ss -ln"${proto:0:1}"p 2>/dev/null || true; } \
+            | { if [ -n "$pid" ]; then grep "pid=${pid}," || true; else cat; fi; } \
+            | awk '{ for (i = 1; i <= NF; i++) if ($i ~ /:[0-9]+$/) { sub(/.*:/, "", $i); print $i; next } }'
+    elif [ -d /proc/net ]; then
+        # Columns: sl, local address (hex address:hex port), remote address, state (0A is TCP
+        # LISTEN, 07 an unconnected UDP socket), ..., socket inode (10th), matched against
+        # <pid>'s file descriptors.
+        local files state inodes=""
+        if [ "$proto" = tcp ]; then files="/proc/net/tcp /proc/net/tcp6"; state=0A; else files="/proc/net/udp /proc/net/udp6"; state=07; fi
+        [ -n "$pid" ] && inodes=" $(ls -l "/proc/$pid/fd" 2>/dev/null | sed -n 's/.*socket:\[\([0-9]*\)\].*/\1/p' | tr '\n' ' ')"
+        # shellcheck disable=SC2086 # files is a list
+        cat $files 2>/dev/null \
+            | awk -v st="$state" -v pid="$pid" -v inodes="$inodes" \
+                '$4 == st && (pid == "" || index(inodes, " " $10 " ")) { sub(/.*:/, "", $2); print $2 }' \
+            | while read -r hex; do printf '%d\n' "0x$hex"; done
+    else
+        log_error "Cannot list listening ports: no lsof, ss or /proc/net"
+        return 1
+    fi
+}
+
+# listening_pid <port> -- the PID of the process listening on <port> over UDP, or else TCP, or
+# nothing: lsof on macOS; on Linux ss or, in containers without it, /proc (the socket's inode
+# in /proc/net, then the process holding it).
+listening_pid() {
+    local port="$1"
+    if [ "${OS}" = "darwin" ]; then
+        { lsof -nP -t -iUDP:"$port" 2>/dev/null; lsof -nP -t -iTCP:"$port" -sTCP:LISTEN 2>/dev/null; } | head -n 1
+    elif command -v ss >/dev/null 2>&1; then
+        # The local address is the field that ends in :<port>; ss -p names the owner pid=<pid>.
+        { ss -lnup 2>/dev/null; ss -lntp 2>/dev/null; } | awk -v want=":${port}\$" '
+            { for (i = 1; i <= NF; i++) if ($i ~ want && match($0, /pid=[0-9]+/)) { print substr($0, RSTART + 4, RLENGTH - 4); exit } }'
+    elif [ -d /proc/net ]; then
+        local inode fd
+        inode="$(cat /proc/net/udp /proc/net/udp6 2>/dev/null \
+            | awk -v hex="$(printf ':%04X' "$port")" '$4 == "07" && substr($2, length($2) - 4) == hex { print $10; exit }')"
+        [ -n "$inode" ] || return 0
+        for fd in /proc/[0-9]*/fd/*; do
+            if [ "$(readlink "$fd" 2>/dev/null)" = "socket:[$inode]" ]; then
+                fd="${fd#/proc/}"
+                echo "${fd%%/*}"
+                return 0
+            fi
+        done
+    else
+        log_error "Cannot find the process listening on port $port: no lsof, ss or /proc/net"
+        return 1
+    fi
+}
+
+# is_listening <port> [<pid>] -- whether anything, or process <pid>, listens on <port> over TCP
+# or UDP.
+is_listening() {
+    local port="$1" pid="${2:-}" ports
+    ports="$(listening_ports tcp "$pid" && listening_ports udp "$pid")" || return 1
+    grep -qx "$port" <<< "$ports"
+}
+
+# stop_process <pid> [<signal>] -- sends <signal> (default TERM) to <pid>, a background job of
+# this shell, waits for it to exit and returns its exit status (128+n when signal n ended it).
+# The wait, with stderr off, is also what keeps bash from printing its own notice for a job a
+# signal ended ("line N: <pid> Killed: 9 ..."), which it otherwise does at whatever line it is
+# on when it notices.
+stop_process() {
+    local pid="$1" signal="${2:-TERM}"
+    { kill -s "$signal" "$pid"; wait "$pid"; } 2>/dev/null
 }
 
 # make_tls_cert <dir> -- writes a fresh self-signed ECDSA P-256 certificate (cert.pem) and its

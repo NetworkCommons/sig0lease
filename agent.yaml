@@ -1,0 +1,89 @@
+# sig0lease-agent template: what this machine keeps registered, through SRP registrars (RFC
+# 9665) and the sig0lease proxy's RFC 9664 handler. See docs/sig0lease-agent.md.
+#
+#   sig0lease-agent validate agent.yaml   lists every problem, or says it is valid
+#   sig0lease-agent plan agent.yaml       shows what run would register, changing nothing
+#   sig0lease-agent run agent.yaml        registers it, and follows this file's changes
+#   sig0lease-agent types                 lists the presets and complex types
+
+keystore: keys                        # one key per host and name, and the agent's state; relative to
+                                      # this file; left out: $CLIENT_KEYSTORE_DIR, as for the other clients
+
+# The template's own data types, used like the presets: a service names one with type:.
+types:
+  gemini:
+    service: _gemini._tcp
+    port: 1965
+    probe: {tcp: true}
+
+registrars:
+  # An srp registrar registers hosts and their services, found by browsing (DNS-SD).
+  - protocol: srp
+    domain: srp.dev.zenr.io.
+    server: ""                          # "host:port" (a URL with doh); empty: discover the registrar (_dnssd-srp._tcp SRV)
+    transport: tcp                      # tcp, udp, tls or doh
+    resolvers: [8.8.8.8:53, 8.8.4.4:53] # for discovery, and to find who holds a name after a conflict
+    lease: 1h                           # how long the records last unless refreshed
+    key_lease: 336h                     # how long each host's name stays reserved for its key
+    on_stop: keep                       # on stopping, keep the names for the keys; release: free them
+
+    # Each host is one SRP identity: one key, one name, its addresses and its services.
+    hosts:
+      - name: myhost
+        addresses: [auto]               # this machine's addresses, followed as they change
+        services:
+          - type: ssh                   # instance "myhost ssh", port 22, probed over TCP
+          - type: ssh
+            instance: myhost admin ssh
+            port: 2222                  # any field of the type can be overridden
+          - type: http
+            port: 8080
+            txt: {path: /}
+            probe: {http: /}            # registered while GET / answers 2xx or 3xx
+          - type: gemini
+      - name: printer
+        addresses: [192.0.2.50]
+        on_stop: release                # any of lease, key_lease, on_stop, for this host only
+        services:
+          - type: ipp
+            txt: {ty: Office Printer}   # added to the preset's txtvers and rp
+            probe: none                 # always registered
+
+    # Complex types make their own hosts. mdns mirrors what a running mDNSResponder sees: each
+    # mDNS host it selects becomes a host here, with its own key.
+    mirrors:
+      - type: mdns
+        hosts: [mymac.local.]           # or all_hosts: true
+        services: [_ssh._tcp, _rfb._tcp] # default: every type the daemon sees
+
+  # An rfc9664 registrar registers names, typed or linked rather than browsed: each given in
+  # full, held by its own key, with its addresses and records. The proxy decides which names it
+  # takes: the demo's, one label right below its zone (docs/siglease_rfc9664.md).
+  - protocol: rfc9664
+    server: 127.0.0.1:8053              # the proxy, run here (docs/srp-live-demo.md); required:
+                                        # RFC 9664 has no registrar discovery
+    transport: tcp
+    lease: 1h
+    key_lease: 336h
+    on_stop: keep
+    names:
+      - name: mysite.dev.zenr.io.       # held by another key, it is tried again
+        addresses: [auto]               # A/AAAA at the name, as for a host
+        records:                        # "<owner> <type> <data>", the owner @ or relative to the name
+          - '_dnslink TXT "dnslink=/ipns/k51qzi5uqu5dlvj2baxnqndepeb86cbk3ng7n3i46uzyxzyqj2xjonzllnv0v8"'
+          - "www CNAME mysite.dev.zenr.io."
+      - name: chat.dev.zenr.io.         # an XMPP server's domain
+        addresses: [auto]
+        services:                       # found by SRV records at the name, pointing at it
+          - type: xmpp-client           # _xmpp-client._tcp.chat, port 5222, probed over TCP
+          - type: xmpp-server           # _xmpp-server._tcp.chat, port 5269
+            subdomains: [rooms]         # and _xmpp-server._tcp.rooms.chat: its group chat service
+            tlsa: certs/chat.crt        # a TLSA record for this certificate's key (DANE); relative
+                                        # to this file, read at every poll
+      - name: files.dev.zenr.io.        # an IPFS node's folder (docs/demo.md, D3)
+        ipfs:
+          api: http://127.0.0.1:5001    # the node's RPC API: the default, IPFS Desktop's too
+          publish: {mfs: /community}    # _dnslink.files: the folder's CID as it changes; and
+                                        # _dnsaddr.files: the node's addresses
+          # follow: a.dev.zenr.io       # instead of publish: another name's site, given once the
+                                        # node has pinned all of it

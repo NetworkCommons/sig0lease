@@ -1,0 +1,51 @@
+From 5f6d0a9defde370dfc1e22cb7aa77fd2a7694c42 Mon Sep 17 00:00:00 2001
+From: Stefano Bocconi <Stefano.Bocconi@gmail.com>
+Date: Thu, 22 Oct 2026 10:50:20 +0000
+Subject: [PATCH] Build the plain UDP loop on every platform that is not unix
+
+server.go calls srv.listenUDP, which only server_recvmmsg.go (unix) and
+server_no_recvmmsg.go (windows) define. On any other platform the package
+does not compile, js/wasm (a browser) and wasip1/wasm among them:
+
+  ./server.go:202:7: srv.listenUDP undefined (type *Server has no field or method listenUDP)
+
+So a program that only builds, signs and sends messages cannot be built
+for WebAssembly either, although it never starts a server.
+
+server_no_recvmmsg.go reads one message at a time through net.PacketConn
+and needs nothing from Windows. Build it on every platform that is not
+unix, as listen_no_socket_options.go already does for listenTCP on the
+platforms without socket options.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+
+Notes (not part of the commit message; git am drops them):
+
+Base: codeberg.org/miekg/dns v0.6.117, the latest release when this was
+written. It also applies to v0.6.82, which has the same file. Apply in a
+copy of that release with "git am" or "git apply".
+
+Tested with Go 1.27.0 on v0.6.117: without the change, "GOOS=js
+GOARCH=wasm go build ./" fails as above; with it, the package and dnshttp
+build for js/wasm, wasip1/wasm, windows/amd64, linux/amd64 and
+darwin/arm64, and "go vet" is clean for windows. With Go 1.26.4 on
+v0.6.82: the same, and plan9/amd64 builds too. Builds for unix do not
+change, as the file stays excluded there.
+
+ server_no_recvmmsg.go | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/server_no_recvmmsg.go b/server_no_recvmmsg.go
+index 7b7b646..ae82288 100644
+--- a/server_no_recvmmsg.go
++++ b/server_no_recvmmsg.go
+@@ -1,4 +1,4 @@
+-//go:build windows
++//go:build !unix
+ 
+ package dns
+ 
+-- 
+2.47.3
+

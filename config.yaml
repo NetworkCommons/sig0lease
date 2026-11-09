@@ -1,28 +1,42 @@
 # DNS Proxy Configuration Example
 #
-# This file demonstrates the configuration options for the DNS proxy.
-# The proxy routes DNS queries based on their opcode to processing modules,
-# and forwards all other opcodes to upstream resolvers.
-#
-# Protocol-Specific Routing:
-# - UPDATE queries WITH UPDATE-LEASE EDNS option (RFC 9664) are handled by the update handler
-# - UPDATE queries WITHOUT UPDATE-LEASE EDNS option are forwarded to the default upstream resolver
-# - Other opcodes are routed according to the configured processing rules or forwarded upstream
+# This file demonstrates the configuration options for the DNS proxy. The proxy needs a
+# config file (sig0lease [config file], default config.yaml): it has no built-in server
+# address, networks or upstreams. Settings marked optional have defaults.
+# The proxy routes DNS queries based on their opcode to processing modules (processing_rules).
+# What no module takes -- an UPDATE without the UPDATE-LEASE EDNS option, a query for a name
+# outside the handlers' zones, any other opcode -- is refused, or, with server.forward on,
+# forwarded to the upstream resolvers.
 
 server:
-  # Address to listen on (port 8053 by default - non-privileged)
-  # For standard DNS, use :53 but requires root privileges
+  # Address to listen on; required. Port 8053 is non-privileged;
+  # for standard DNS, use :53, which requires root privileges
   address: ":8053"
 
   # How long the handlers may work on one request, including waiting for a lease-store
   # node another request is using. Optional, default "15s"; must be positive.
   # request_timeout: "15s"
 
+  # Diagnostics, for testing and debugging; keep it off in production. On, every error reply
+  # carries the reason for the refusal as the text of its Extended DNS Error (RFC 8914), and
+  # the proxy answers the lease-store dump query (__dump.sig0lease.internal[.debug]. TXT).
+  # Off, error replies carry only the Extended DNS Error's code, and the dump query is
+  # answered REFUSED. The test suites turn it on in the configs they write.
+  diagnostics: false
+
+  # Whether to forward to the upstreams below what no handler takes, and relay their answer.
+  # Optional, default false: such a request is answered REFUSED with Extended DNS Error 20
+  # (Not Authoritative), and the proxy is no open resolver on an address the internet reaches.
+  # The handlers still ask the upstreams for their own lookups (a zone's SOA). On, it is a
+  # resolver for anyone who can reach it. tests/test_forward.sh turns it on.
+  forward: false
+
   # Networks to enable
   networks:
     - udp
     - tcp
     # - tls   # DNS-over-TLS (RFC 7858); requires the "tls:" block below
+    # - doh   # DNS-over-HTTPS (RFC 8484); requires the "doh:" block below
 
   # DNS-over-TLS listener config -- only read if "tls" appears in networks above.
   # Its own address (conventionally 853, separate from plain DNS on the address above);
@@ -35,15 +49,27 @@ server:
   #   cert: "/path/to/cert.pem"
   #   key: "/path/to/key.pem"
 
+  # DNS-over-HTTPS listener config -- only read if "doh" appears in networks above.
+  # Serves RFC 8484's "/dns-query", the one DNS transport a web browser has, on its own
+  # address; transport-level, like DoT. With cert and key it serves HTTPS; without both, plain
+  # HTTP, which a page served over plain HTTP on the LAN can reach (a browser refuses a
+  # self-signed certificate). Every answer allows any origin (CORS), so a page served from
+  # elsewhere can use it. See docs/siglease_rfc9664.md, "DNS-over-HTTPS".
+  # doh:
+  #   address: ":8443"
+  #   cert: "/path/to/cert.pem"
+  #   key: "/path/to/key.pem"
+
 upstreams:
-  # Generic upstream resolvers used for non-processed opcodes.
-  # Forwarding for opcodes not listed in processing_rules uses the upstreams list.
-  # UPDATE handlers primarily resolves authoritative server from handlers.<handler>.upstream_zone.
+  # Required: at least one, each with its address, protocol (udp or tcp) and timeout.
+  # The handlers ask them for a zone's SOA, to find the authoritative server of
+  # handlers.<handler>.upstream_zone; with server.forward on, they also get what no handler takes.
   - address: "8.8.8.8:53"
     protocol: "udp"
     timeout: "5s"
 
-  # Secondary upstream resolver (used as fallback)
+  # A second upstream resolver: a forwarded query goes to all of them at once, and the first
+  # answer is used
   - address: "8.8.4.4:53"
     protocol: "udp"
     timeout: "5s"
@@ -59,19 +85,29 @@ authoritative:
 # Processing rules map opcodes to an ORDERED list of module names. The router tries
 # each module in turn until one returns "processed" or "error"; if every one declines
 # ("not relevant" -- e.g. an SRP-shaped update handled by srp_handler, or a plain UPDATE
-# without the UPDATE-LEASE option handled by update_handler), the opcode falls through to
-# plain upstream forwarding.
+# without the UPDATE-LEASE option handled by update_handler), it is refused, or forwarded with
+# server.forward on.
 processing_rules:
   # Route opcode 5 (UPDATE) to the update handler module.
   # UPDATE queries are used for dynamic DNS updates (RFC 2136).
   #
-  # To also enable RFC 9665 SRP on a *different* zone from the same proxy process, add
-  # srp_handler ahead of update_handler and configure handlers.srp_handler below (one
-  # zone, one protocol -- don't point both handlers' upstream_zone at the same
-  # zone):
+  # To also enable RFC 9665 SRP from the same proxy process, add srp_handler ahead of
+  # update_handler and configure handlers.srp_handler below, on a zone of its own:
   #   modules: ["srp_handler", "update_handler"]
+  # Every name belongs to one handler, the one whose zone is the closest above it, as at a
+  # zone cut: here srp.dev.zenr.io. and every name below it are srp_handler's, and
+  # update_handler refuses them although they are below its dev.zenr.io. Each handler also
+  # refuses names outside its own zone. Two handlers on one zone stop the proxy at startup.
   - opcode: 5
     # modules: ["update_handler"]
+    modules: ["srp_handler", "update_handler"]
+  # Opcode 0 (QUERY): a query for a name a handler serves gets the answer of that zone's
+  # authoritative server, where the handler's UPDATEs go, so that a client reading the zones
+  # through the proxy -- the demo's browser page, over DoH -- sees a change as soon as the
+  # server has it, rather than what a recursive resolver cached. Queries for other names are
+  # refused, or forwarded to the upstreams with server.forward on. Without this rule, every
+  # query is.
+  - opcode: 0
     modules: ["srp_handler", "update_handler"]
 
 
@@ -87,14 +123,16 @@ handlers:
   #                                 hardcodes it, having no other way to discover a zone) as
   #                                 an alias for upstream_zone, rewriting every name in the
   #                                 update before anything else sees it (default false)
-  #   advertise_registration_domain: also publish the RFC 6763 S11 "r"/"dr" registration-
-  #                                 domain records (self-pointing at upstream_zone), independent
-  #                                 of whether any service type is currently live -- unlike the
-  #                                 always-on "b"/"db"/"lb" browsing-domain records, which only
-  #                                 appear once at least one service type is live. Off by
-  #                                 default -- advertising this zone as an open target for
-  #                                 direct RFC 2136 registration (not just SRP) is a deployment
-  #                                 choice.
+  #   advertise_browse_domain:      publish the RFC 6763 S11 "b"/"db"/"lb" browsing-domain
+  #                                 records, self-pointing at upstream_zone, whether or not
+  #                                 anything is registered (default true). false deletes them,
+  #                                 also when an earlier run published them: every
+  #                                 reconciliation pass (30 s) compares this with the zone.
+  #   advertise_registration_domain: the same for the S11 "r"/"dr" registration-domain
+  #                                 records. Off by default -- advertising this zone as an open
+  #                                 target for direct RFC 2136 registration (not just SRP) is a
+  #                                 deployment choice. docs/dns-sd-records.md lists the
+  #                                 discovery records and where each belongs.
   srp_handler:
     upstream_zone: "srp.dev.zenr.io."
     # Optional static "host:port" of the authoritative server, as for handlers.update below.
@@ -103,6 +141,7 @@ handlers:
     rewrite_default_service_arpa: true
     # mDNSResponder's srp-client sends SRP over UDP only (docs/srp-live-demo.md).
     allow_udp: true
+    # advertise_browse_domain: true
     # advertise_registration_domain: false
     lease_policy:
       min_key_lease_sec: 30
@@ -164,14 +203,29 @@ handlers:
 
     # TTL of every record this handler writes upstream, in place of the one the requester
     # sent, cut to the granted LEASE (KEY-LEASE for KEYs) when that is shorter. Same setting
-    # as handlers.srp_handler's record_ttl_sec. Optional, default 300.
-    record_ttl_sec: 300
+    # as handlers.srp_handler's record_ttl_sec. Optional, default 300. 30 here: a resolver,
+    # or an IPFS gateway reading a name's site (docs/demo.md, D3), sees a change of a name's
+    # records within half a minute.
+    record_ttl_sec: 30
 
-    # Whether to use 4-byte variant for lease requests (backward compatibility).
-    # Default is false: 8-byte variant is always used for ALL lease requests.
-    # When true, refresh requests use 4-byte variant (no KEY-LEASE).
-    # When false, all requests use 8-byte variant (KEY-LEASE=0 for refresh/no second RR).
+    # Whether to accept requests whose Update Lease option is the 4-byte variant (RFC 9664 S4):
+    # one LEASE for every record in the update, KEYs included. macOS's mDNSResponder sends it.
+    # When true, such a request is handled as its records say -- KEYs and other records: LEASE
+    # and KEY-LEASE alike; other records only: the LEASE; KEYs only: the KEY-LEASE -- and the
+    # reply grants one value, in the 4-byte variant. lease_policy must then leave
+    # min_key_lease_sec at or below max_rr_lease_sec, or the proxy refuses to start.
+    # When false (default), such a request is REFUSED. 8-byte requests are always accepted.
     prefer_4byte_variant: false
+
+    # First-Come First-Served naming, as RFC 9665 S3.2.4.1 gives SRP. A KEY holds its name and
+    # every name below it: a new KEY is refused (YXDOMAIN) where a different KEY holds its name
+    # or a name above it, unless the KEY holding that name registers it. A KEY may register
+    # itself only one label below the zone (REFUSED elsewhere, the zone itself included);
+    # deeper names are registered by the KEY holding the name above. Without it (default
+    # false) any new key may register at any name next to another key's, including the
+    # _acme-challenge name that Let's Encrypt's DNS-01 check reads. On here because this zone
+    # is shared.
+    fcfs_naming: true
 
     # Blacklisted RR types that are not allowed for registration.
     # These types will be rejected with a format error if attempted.
@@ -184,7 +238,10 @@ handlers:
       - "IPN"
 
     # Lease storage backend. Optional; when omitted, leases are kept
-    # in-memory only and are lost on restart.
+    # in-memory only and are lost on restart. Either handler's store stops the proxy at startup
+    # (serving, not --dump) when it holds a name its handler does not serve, as a store written
+    # before the handler's upstream_zone, or a zone nested in it, changed
+    # (docs/siglease_rfc9664.md, "Zones Served").
 
     # storage:
     #   type: memory

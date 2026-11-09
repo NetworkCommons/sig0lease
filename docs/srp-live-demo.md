@@ -23,7 +23,7 @@ make build build-client
 ## 1. Start the proxy
 
 ```bash
-./bin/$(uname)/sig0lease
+./bin/$(uname -s | tr A-Z a-z)/sig0lease
 ```
 
 Leave this running in its own terminal. It listens on `:8053` and logs both `srp_handler`
@@ -34,14 +34,14 @@ and `update_handler` registering for opcode 5 (UPDATE).
 In another terminal, from `./main`:
 
 ```bash
-./bin/$(uname)/sig0lease-srp-client \
+./bin/$(uname -s | tr A-Z a-z)/sig0lease-srp-client \
   -domain=srp.dev.zenr.io. \
   -host=demo \
   -addr=192.0.2.42 \
   -instance=DemoWidget:_http._tcp:8080 \
   -txt=DemoWidget:path=/demo \
   -server=127.0.0.1:8053 \
-  -lease=60 -keylease=120 \
+  -lease=60 -key-lease=120 \
   -keystore=./keystore/client -k=15 \
   -once
 ```
@@ -56,7 +56,7 @@ In another terminal, from `./main`:
   gitignored — so it's local, persistent-across-runs on whichever machine runs the demo.
   If a key for the domain (`demo.srp.dev.zenr.io.` in this case) already exists, no matter 
   the type (13 or 15), **no new key** is generated and the existing key is used. 
-- `-lease`/`-keylease` are short on purpose for a demo (1/2 minutes) so a stale record
+- `-lease`/`-key-lease` are short on purpose for a demo (1/2 minutes) so a stale record
   cleans itself up if you forget to deregister (step 6).
 - A real device would normally omit `-server` and let the client discover the registrar via
   SRV lookups for `_dnssd-srp._tcp.<name>.`, trying `-domain` first and then each parent name up
@@ -77,13 +77,13 @@ narrower and wider shapes too, all against the same running proxy:
 
 ```bash
 # Host-only: no service instance at all, just an address record for the host
-./bin/$(uname)/sig0lease-srp-client -domain=srp.dev.zenr.io. -host=demo-host-only \
-  -addr=192.0.2.43 -server=127.0.0.1:8053 -lease=60 -keylease=120 -keystore=./keystore/client -k=13 -once
+./bin/$(uname -s | tr A-Z a-z)/sig0lease-srp-client -domain=srp.dev.zenr.io. -host=demo-host-only \
+  -addr=192.0.2.43 -server=127.0.0.1:8053 -lease=60 -key-lease=120 -keystore=./keystore/client -k=13 -once
 
 # A DNS-SD subtype on the same instance (repeatable -subtype/-txt/-instance, matched by label)
-./bin/$(uname)/sig0lease-srp-client -domain=srp.dev.zenr.io. -host=demo \
+./bin/$(uname -s | tr A-Z a-z)/sig0lease-srp-client -domain=srp.dev.zenr.io. -host=demo \
   -addr=192.0.2.42 -instance=DemoWidget:_http._tcp:8080 \
-  -subtype=DemoWidget:_printer -server=127.0.0.1:8053 -lease=60 -keylease=120 -keystore=./keystore/client -once
+  -subtype=DemoWidget:_printer -server=127.0.0.1:8053 -lease=60 -key-lease=120 -keystore=./keystore/client -once
 ```
 
 Expected output ends with:
@@ -119,8 +119,10 @@ dig +noall +answer PTR "_services._dns-sd._udp.srp.dev.zenr.io." @ns1.free2air.o
 
 # RFC 6763 S11: domain enumeration -- some browse tools query this ("is there a browsable
 # domain here at all") before ever trying the S9 query above. db/lb are the same
-# self-pointing answer under a different prefix; r/dr (registration-domain) are omitted
-# here since they're opt-in (advertise_registration_domain) and off by default.
+# self-pointing answer under a different prefix, all three there whenever
+# advertise_browse_domain is on (the default), registered services or not; r/dr
+# (registration-domain) are omitted here since they're opt-in (advertise_registration_domain)
+# and off by default. docs/dns-sd-records.md lists every discovery record.
 dig +noall +answer PTR "b._dns-sd._udp.srp.dev.zenr.io." @ns1.free2air.org
 ```
 
@@ -171,9 +173,9 @@ Drop `-once` to watch the client run unattended: initial delay, then automatic r
 ~80% of the granted lease (RFC 9664 §5.2), forever, until you `Ctrl-C`:
 
 ```bash
-./bin/$(uname)/sig0lease-srp-client -domain=srp.dev.zenr.io. -host=demo -addr=192.0.2.42 \
+./bin/$(uname -s | tr A-Z a-z)/sig0lease-srp-client -domain=srp.dev.zenr.io. -host=demo -addr=192.0.2.42 \
   -instance=DemoWidget:_http._tcp:8080 -server=127.0.0.1:8053 \
-  -lease=60 -keylease=120 -keystore=./keystore/client
+  -lease=60 -key-lease=120 -keystore=./keystore/client
 ```
 
 ## 5. Try a conflict (optional)
@@ -184,14 +186,16 @@ key). It fails -- FCFS rejects a second identity trying to claim a name the firs
 already holds:
 
 ```bash
-./bin/$(uname)/sig0lease-srp-client -domain=srp.dev.zenr.io. -host=demo -addr=192.0.2.99 \
-  -server=127.0.0.1:8053 -lease=60 -keylease=120 -keystore=$(mktemp -d) -k=13 -once
+./bin/$(uname -s | tr A-Z a-z)/sig0lease-srp-client -domain=srp.dev.zenr.io. -host=demo -addr=192.0.2.99 \
+  -server=127.0.0.1:8053 -lease=60 -key-lease=120 -keystore=$(mktemp -d) -k=13 -once
 ```
 
 Drop `-once` from that same command to see the other side of a conflict instead: the client
 notices the `YXDOMAIN`, renames itself (`demo-2`, then `demo-3`, ...) and retries
 automatically until a free name is found — the same unattended recovery a real device
-relies on after a collision, rather than a hard failure.
+relies on after a collision, rather than a hard failure. Apple's `srp-client` renames with a
+space instead (`demo 1`), which the zone's BIND is likely to refuse as a host name: see
+`docs/siglease_rfc9665.md` §11.
 
 ## 6. Clean up
 
@@ -199,7 +203,7 @@ Explicitly withdraw the host and every instance in one message (`LEASE=0`), rath
 waiting for the short demo lease to expire:
 
 ```bash
-./bin/$(uname)/sig0lease-srp-client \
+./bin/$(uname -s | tr A-Z a-z)/sig0lease-srp-client \
   -domain=srp.dev.zenr.io. -host=demo \
   -instance=DemoWidget:_http._tcp:8080 \
   -server=127.0.0.1:8053 -keystore=./keystore/client \
@@ -208,6 +212,76 @@ waiting for the short demo lease to expire:
 
 Then confirm it's gone (the `dig`s from step 3 should return no answer), and `Ctrl-C` the
 proxy.
+
+## 7. Publish a Mac's own services (optional)
+
+Here macOS supplies the services. `sig0lease-agent` (`docs/sig0lease-agent.md`), with an `mdns`
+mirror in its template, asks the Mac's running mDNSResponder what is advertised on the local
+link, through the same socket every Bonjour application uses, and registers the chosen host
+and its instances through the proxy, one SRP key per host. Turn a sharing service on or off in
+System Settings and it enters or leaves the public zone.
+
+On the Mac, from `./main`, with the proxy from step 1 running on the same Mac:
+
+```bash
+make build build-client
+cat > mac-agent.yaml <<EOF
+keystore: mdns-identities
+registrars:
+  - protocol: srp
+    domain: srp.dev.zenr.io.
+    server: 127.0.0.1:8053
+    on_stop: release
+    mirrors:
+      - type: mdns
+        hosts: [$(scutil --get LocalHostName).local.]
+        services: [_ssh._tcp, _smb._tcp, _rfb._tcp]
+EOF
+# What the daemon sees; * marks what would be published. Registers nothing.
+./bin/darwin/sig0lease-agent mdns-list mac-agent.yaml
+
+./bin/darwin/sig0lease-agent run mac-agent.yaml
+```
+
+Then, in System Settings > General > Sharing, turn on Remote Login (`_ssh._tcp`), File
+Sharing (`_smb._tcp`) or Screen Sharing (`_rfb._tcp`). A few seconds later the agent logs
+`registered`, and from any machine:
+
+```bash
+dig @ns1.free2air.org PTR _ssh._tcp.srp.dev.zenr.io. +short
+dns-sd -B _ssh._tcp srp.dev.zenr.io
+```
+
+Turn the service off and the agent withdraws it; `Ctrl-C` deregisters everything it
+registered. The mirror does not follow subtypes, nor address or TXT changes after an instance
+first appears.
+
+- On first use macOS may ask whether Terminal may find devices on the local network. If that
+  is refused, the daemon answers `PolicyDenied`; the agent logs it and tries again every 10
+  seconds.
+- The records carry the Mac's LAN addresses and computer name, in a public zone. Keep
+  `services:` to what you mean to show. `all_hosts: true` publishes every device on the
+  network: not on a shared network.
+- An instance name containing `.` is skipped with a log line: codeberg.org/miekg/dns cannot
+  carry such a label (see `pkg/dnsname/labels.go`).
+- The Mac's own services can also be listed under `hosts:` in the same template, with a probe
+  each, instead of mirrored; `agent.yaml` at the top of the repository shows both.
+
+A second Mac can also list these instances among its ordinary Bonjour results, without being
+told the domain. The proxy publishes `lb._dns-sd._udp.srp.dev.zenr.io. PTR srp.dev.zenr.io.`
+(`advertise_browse_domain`, on by default, within 30 s of starting), and mDNSResponder looks
+for that record in each DNS search domain (`mDNSCore/uDNS.c`, RFC 6763 §11) and browses what it
+names. On macOS 26.7, `dns-sd -F` then lists `srp.dev.zenr.io` as a recommended and default
+browsing domain, and a browse without a domain returns its instances beside the `local.` ones.
+The search domain must be the registration domain itself, where those records are. Without
+changing the Mac's settings, the pointer would have to be at a domain the Mac already starts
+from, which needs the zone's operator or a resolver on the network: `docs/dns-sd-records.md`,
+"Browsing".
+
+```bash
+sudo networksetup -setsearchdomains Wi-Fi srp.dev.zenr.io   # undo: ... Wi-Fi Empty
+dns-sd -B _ssh._tcp      # no domain: local. and srp.dev.zenr.io. instances together
+```
 
 ## Background
 

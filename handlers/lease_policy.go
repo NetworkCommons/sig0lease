@@ -68,8 +68,8 @@ func (p LeasePolicy) validate() error {
 
 // clamp applies the policy to a requested LEASE and KEY-LEASE, returning the durations to
 // grant. A value of exactly 0 is left alone rather than raised to the minimum: 0 means
-// "delete" (RFC 9664 Cases B-D; RFC 9665 S3.2.5.5.1's removal), not "the shortest allowed
-// duration". With a policy validate accepts, LEASE <= KEY-LEASE in the request stays true
+// "nothing of this kind added" (RFC 9664) or a removal (RFC 9665 S3.2.5.5.1), not "the
+// shortest allowed duration". With a policy validate accepts, LEASE <= KEY-LEASE in the request stays true
 // after clamping; the final check keeps it true for a request that broke it.
 func (p LeasePolicy) clamp(lease, keyLease uint32) (uint32, uint32) {
 	if lease != 0 {

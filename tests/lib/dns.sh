@@ -95,11 +95,11 @@ add_rr(){
 ################################
 # DNS inquiry functions
 ################################
-dig_query_short() {
+# dig_at <endpoint> <dig arguments...> -- runs dig against <endpoint>, "host[:port]" (port 53
+# if none), logging the command to CLIENT_LOG_FILE.
+dig_at() {
     local endpoint="$1"
-    local name="$2"
-    local rr_type="$3"
-
+    shift
     local host="$endpoint"
     local port="53"
     if [[ "$endpoint" == *:* ]]; then
@@ -107,8 +107,29 @@ dig_query_short() {
         port="${endpoint##*:}"
     fi
 
-    log_file dig_query_short "dig +short +time=5 @\"$host\" -p \"$port\" \"$name\" \"$rr_type\" 2>/dev/null"
-    dig +short +time=5 @"$host" -p "$port" "$name" "$rr_type" 2>/dev/null
+    log_file dig_at "dig @\"$host\" -p \"$port\" $*"
+    dig @"$host" -p "$port" "$@"
+}
+
+dig_query_short() {
+    dig_at "$1" +short +time=5 "$2" "$3" 2>/dev/null
+}
+
+# dig_query_checked <endpoint> <name> <rr_type> -- like dig_query_short, but fails unless the
+# reply is NOERROR, printing to stderr its status and Extended DNS Errors (RFC 8914). Prints
+# each answer RR's RDATA on its own line, as dig +short does.
+dig_query_checked() {
+    local endpoint="$1" name="$2" rr_type="$3" out status
+    out="$(dig_at "$endpoint" +noall +comments +answer +time=5 "$name" "$rr_type" 2>&1)"
+    status="$(sed -n 's/.*status: \([A-Z]*\),.*/\1/p' <<< "$out" | head -n 1)"
+    if [ "$status" != NOERROR ]; then
+        log_error "$name $rr_type at $endpoint: ${status:-no reply}" >&2
+        grep 'EDE' <<< "$out" >&2
+        return 1
+    fi
+    # Answer RRs: <name> <TTL> <class> <type> <RDATA>.
+    grep -v '^;' <<< "$out" | grep -v '^$' \
+        | sed -E 's/^[^[:space:]]+[[:space:]]+[^[:space:]]+[[:space:]]+[^[:space:]]+[[:space:]]+[^[:space:]]+[[:space:]]+//'
 }
 
 # rr_at_auth_contains <name> <rr_type> <needle>
@@ -202,6 +223,12 @@ wait_for_rr_state() {
     proxy_consistent_with_authoritative $rr_type "$rdata" "$state" $auth_present
 }
 
+# as_delete <rr-spec> -- the rr-spec ("<owner> [<ttl>] IN <type> <rdata>") as an RFC 2136
+# S2.5.4 delete of that record: TTL 0, class NONE.
+as_delete() {
+    sed -E 's/^([^[:space:]]+)([[:space:]]+[0-9]+)?[[:space:]]+IN[[:space:]]+/\1 0 NONE /' <<< "$1"
+}
+
 ensure_rr_absent() {
     local rr_type="$1"
     local rr_rdata="$2"
@@ -215,8 +242,8 @@ ensure_rr_absent() {
 
     log_step "Cleanup: rr $rr_type - $rr_rdata is present, deleting"
 
-    # Refresh with 0 lease.
-    if ! run_client refresh $CLIENT_KEY_NAME 0 0 "$rr_rdata"; then
+    # Delete it: nothing added, so both leases 0.
+    if ! run_client refresh $CLIENT_KEY_NAME 0 0 "$(as_delete "$rr_rdata")"; then
         log_error "Cleanup failed for $rr_type - $rr_rdata"
         return 1
     fi

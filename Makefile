@@ -4,6 +4,7 @@
 BINARY_NAME=sig0lease
 CLIENT_9664=sig0lease-client
 CLIENT_9665=sig0lease-srp-client
+AGENT=sig0lease-agent
 
 OS := $(shell uname -s | tr '[:upper:]' '[:lower:]')
 VERSION ?= 0.1.0
@@ -12,7 +13,7 @@ BUILD_DIR := ./bin/$(OS)
 RELEASE_DIR := ./bin/release
 CLIENT_KEYSTORE_DIR ?=
 
-.PHONY: all build build-all build-client build-client-all clean clean-binary deps docs fmt lint release run-server test-unit test-register test-update test-update-local test-srp test-mdnsresponder-interop vet
+.PHONY: all build build-all build-client build-client-all clean clean-binary deps docs fmt lint release run-server test-unit test-register test-update test-update-local test-srp test-agent test-mdnsresponder-interop vet web
 
 all: build build-client test
 
@@ -20,10 +21,33 @@ all: build build-client test
 build:
 	go build -o $(BUILD_DIR)/$(BINARY_NAME) ./cmd/sig0lease
 
-# Build the client binary for current OS/architecture
+# Build the client binaries for current OS/architecture
 build-client:
 	go build -o $(BUILD_DIR)/$(CLIENT_9664) ./cmd/$(CLIENT_9664)
 	go build -o $(BUILD_DIR)/$(CLIENT_9665) ./cmd/$(CLIENT_9665)
+	go build -o $(BUILD_DIR)/$(AGENT) ./cmd/$(AGENT)
+
+# Build the demo's browser page (docs/demo.md, D6) into ./bin/web: cmd/sig0lease-web for
+# WebAssembly, gzipped (a quarter of the size; the page unzips it), and beside it the page and
+# Go's loader for it. The DNS library does not build for
+# WebAssembly as released, so the program is built against a copy of it patched with
+# docs/miekg-dns-wasm-build.patch, in ./bin/web-dns while it builds, with go.mod and go.sum left
+# as they are (docs/siglease_rfc9664.md, "The library does not build for WebAssembly"). The same
+# code and Go build the same page, byte for byte: the program records the copy's path, the same
+# relative one on every build, and neither the commit nor where it was built; gzip records no
+# time.
+web:
+	@set -e; W=$$(mktemp -d); D=bin/web-dns; trap 'rm -rf "$$W" "$$D"' EXIT; \
+	go mod download codeberg.org/miekg/dns; \
+	rm -rf "$$D"; mkdir -p bin; \
+	cp -R "$$(go list -m -f '{{.Dir}}' codeberg.org/miekg/dns)" "$$D"; chmod -R u+w "$$D"; \
+	git apply --directory="$$D" docs/miekg-dns-wasm-build.patch; \
+	cp go.mod go.sum "$$W/"; \
+	go mod edit -modfile="$$W/go.mod" -replace codeberg.org/miekg/dns="./$$D"; \
+	GOOS=js GOARCH=wasm go build -trimpath -buildvcs=false -modfile="$$W/go.mod" -ldflags="-s -w" -o "$$W/sig0lease-web.wasm" ./cmd/sig0lease-web; \
+	mkdir -p ./bin/web; \
+	gzip -9 -n -c "$$W/sig0lease-web.wasm" > ./bin/web/sig0lease-web.wasm.gz; \
+	cp "$$(go env GOROOT)/lib/wasm/wasm_exec.js" demo/web/index.html ./bin/web/
 
 # Cross-compile server for multiple platforms. The macOS builds need cgo for syslog
 # (logging/syslog_darwin.go), and cgo can only target macOS from a Mac -- for both Mac
@@ -58,6 +82,12 @@ build-client-all:
 	GOOS=darwin GOARCH=arm64 CGO_ENABLED=0 go build -o $(RELEASE_DIR)/darwin/$(CLIENT_9665)-darwin-arm64 ./cmd/$(CLIENT_9665)
 	GOOS=windows GOARCH=amd64 CGO_ENABLED=0 go build -o $(RELEASE_DIR)/windows/$(CLIENT_9665)-windows-amd64.exe ./cmd/$(CLIENT_9665)
 	GOOS=windows GOARCH=arm64 CGO_ENABLED=0 go build -o $(RELEASE_DIR)/windows/$(CLIENT_9665)-windows-arm64.exe ./cmd/$(CLIENT_9665)
+	GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build -o $(RELEASE_DIR)/linux/$(AGENT)-linux-amd64 ./cmd/$(AGENT)
+	GOOS=linux GOARCH=arm64 CGO_ENABLED=0 go build -o $(RELEASE_DIR)/linux/$(AGENT)-linux-arm64 ./cmd/$(AGENT)
+	GOOS=darwin GOARCH=amd64 CGO_ENABLED=0 go build -o $(RELEASE_DIR)/darwin/$(AGENT)-darwin-amd64 ./cmd/$(AGENT)
+	GOOS=darwin GOARCH=arm64 CGO_ENABLED=0 go build -o $(RELEASE_DIR)/darwin/$(AGENT)-darwin-arm64 ./cmd/$(AGENT)
+	GOOS=windows GOARCH=amd64 CGO_ENABLED=0 go build -o $(RELEASE_DIR)/windows/$(AGENT)-windows-amd64.exe ./cmd/$(AGENT)
+	GOOS=windows GOARCH=arm64 CGO_ENABLED=0 go build -o $(RELEASE_DIR)/windows/$(AGENT)-windows-arm64.exe ./cmd/$(AGENT)
 
 # Create release archive from a fresh $(RELEASE_DIR), so it holds exactly what build-all
 # and build-client-all build -- never development builds or test tools left in ./bin.
@@ -78,6 +108,7 @@ clean-binary:
 	rm -f $(BUILD_DIR)/$(BINARY_NAME)*
 	rm -f $(BUILD_DIR)/$(CLIENT_9664)*
 	rm -f $(BUILD_DIR)/$(CLIENT_9665)*
+	rm -f $(BUILD_DIR)/$(AGENT)*
 
 # Clean all build artifacts
 clean-all:
@@ -135,6 +166,10 @@ test-cover:
 	CLIENT_KEYSTORE_DIR=$(CLIENT_KEYSTORE_DIR) go test -race ./... -coverprofile=coverage.out
 	go tool cover -func=coverage.out
 
+# Every end-to-end suite below writes its proxy's config to /tmp/sig0lease-debug/<suite>/ and,
+# with PROXY_LAUNCH=manual, waits for you to start the proxy with it, e.g. in a debugger
+# (tests/README.md), instead of starting it itself.
+
 # Run full end-to-end update workflow via test script.
 # Requires CLIENT_KEYSTORE_DIR for the client key, ex. CLIENT_KEYSTORE_DIR=${PWD}/keystore/client make test-update
 test-update: build build-client
@@ -153,10 +188,18 @@ test-update-local: build build-client
 test-srp:
 	./tests/test_srp.sh run
 
+# Run the sig0lease-agent end-to-end suite (template -> registrations, probes withdrawing and
+# re-adding a service, template reloads, renames kept across restarts, and with Prosody installed
+# two XMPP servers federating through the names' SRV records) against the real proxy and a real,
+# disposable local BIND 9; the probed service is python3's http.server.
+test-agent:
+	./tests/test_agent.sh run
+
 # Run the SRP interop suite against the real, unmodified mDNSResponder/ServiceRegistration
-# srp-client/srp-mdns-proxy binaries (a sibling checkout -- see tests/README.md for setup).
-# Both directions: real srp-client against our registrar, and our own client/srp against the
-# real srp-mdns-proxy.
+# srp-client/srp-mdns-proxy binaries (a sibling checkout -- see tests/README.md for setup):
+# real srp-client against our registrar, our own client/srp against the real srp-mdns-proxy,
+# and sig0lease-agent's mdns mirror reading the mDNS daemon. On Linux it starts mDNSResponder's mdnsd and
+# needs root; on macOS it uses the system's daemon.
 test-mdnsresponder-interop:
 	./tests/test_mdnsresponder_interop.sh run
 

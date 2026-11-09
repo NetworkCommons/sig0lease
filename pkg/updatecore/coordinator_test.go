@@ -10,6 +10,7 @@ import (
 
 	"codeberg.org/miekg/dns"
 	"github.com/NetworkCommons/sig0lease/logging"
+	"github.com/NetworkCommons/sig0lease/pkg/dnsmsg"
 )
 
 // TestDescribeUpdateChange covers each RFC 2136 S2.5 Update-section shape the proxy sends.
@@ -24,9 +25,9 @@ func TestDescribeUpdateChange(t *testing.T) {
 			"added host.zenr.io. 3600 IN A 192.0.2.1"},
 		{"add TXT keeps its strings", mustRR(t, `inst._http._tcp.zenr.io. 120 IN TXT "path=/a b" "v=1"`),
 			`added inst._http._tcp.zenr.io. 120 IN TXT "path=/a b" "v=1"`},
-		{"delete one RR", AsDelete(mustRR(t, "host.zenr.io. 3600 IN A 192.0.2.1")),
+		{"delete one RR", dnsmsg.AsDelete(mustRR(t, "host.zenr.io. 3600 IN A 192.0.2.1")),
 			"deleted host.zenr.io. A 192.0.2.1"},
-		{"delete one KEY", AsDelete(mustRR(t, "host.zenr.io. 3600 IN KEY "+keyData)),
+		{"delete one KEY", dnsmsg.AsDelete(mustRR(t, "host.zenr.io. 3600 IN KEY "+keyData)),
 			"deleted host.zenr.io. KEY " + keyData},
 		{"delete RRset", &dns.TXT{Hdr: dns.Header{Name: "host.zenr.io.", Class: dns.ClassANY}},
 			"deleted RRset host.zenr.io. TXT"},

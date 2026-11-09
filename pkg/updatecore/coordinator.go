@@ -41,25 +41,15 @@ type StaticUpstream struct {
 	Addr string // "host:port"
 }
 
-// defaultBootstrapResolvers is used only when no bootstrap resolver list was configured
-// at all -- the same pair config.NewDefaultConfig uses for generic upstreams, so
-// out-of-the-box behavior for a caller that sets nothing is unchanged from before this
-// extraction.
-var defaultBootstrapResolvers = []string{"8.8.8.8:53", "8.8.4.4:53"}
-
-// NewCoordinator creates a Coordinator. bootstrapResolvers falls back to
-// defaultBootstrapResolvers when empty. static may be nil (discovery for every name).
+// NewCoordinator creates a Coordinator. static may be nil (discovery for every name). With
+// no bootstrapResolvers, discovery fails: only names at or below static's zone can be served.
 func NewCoordinator(logger *logging.Logger, bootstrapResolvers []string, static *StaticUpstream) *Coordinator {
-	resolvers := bootstrapResolvers
-	if len(resolvers) == 0 {
-		resolvers = defaultBootstrapResolvers
-	}
 	if static != nil && !strings.HasSuffix(static.Zone, ".") {
 		static = &StaticUpstream{Zone: static.Zone + ".", Addr: static.Addr}
 	}
 	return &Coordinator{
 		logger:             logger,
-		bootstrapResolvers: resolvers,
+		bootstrapResolvers: bootstrapResolvers,
 		static:             static,
 	}
 }
@@ -232,14 +222,14 @@ func describeUpdateChange(rr dns.RR) string {
 	}
 }
 
-// queryAuthoritative sends req to zoneHint's authoritative server (ResolveSOAMasterServer,
-// honoring a static override) over UDP, falling back to TCP on a UDP failure or a truncated
-// answer. A truncated UDP answer must not be trusted as-is: its empty (or partial) Answer
+// QueryAuthoritative sends req, with its RD bit cleared, to zoneHint's authoritative server
+// (ResolveSOAMasterServer, honoring a static override) over UDP, falling back to TCP on a UDP
+// failure or a truncated answer. A truncated UDP answer must not be trusted as-is: its empty (or partial) Answer
 // section would otherwise read as "no such records" -- letting FCFS treat an already-owned
 // name as free, say -- even though the name really has more data than fit in the UDP
 // response. This fork's dns.Exchange neither retries nor falls back to TCP on truncation on
 // its own (see its doc comment), so it has to happen here. what names the query in errors.
-func (c *Coordinator) queryAuthoritative(ctx context.Context, zoneHint string, req *dns.Msg, what string) (*dns.Msg, error) {
+func (c *Coordinator) QueryAuthoritative(ctx context.Context, zoneHint string, req *dns.Msg, what string) (*dns.Msg, error) {
 	soaServer, _, err := c.ResolveSOAMasterServer(ctx, zoneHint)
 	if err != nil {
 		return nil, fmt.Errorf("failed to resolve authoritative server for %s: %w", zoneHint, err)
@@ -271,7 +261,7 @@ func (c *Coordinator) QueryKeyAtName(ctx context.Context, zoneHint, name string)
 	if req == nil {
 		return 0, nil, fmt.Errorf("failed to build KEY query for %s", name)
 	}
-	resp, err := c.queryAuthoritative(ctx, zoneHint, req, "KEY query for "+name)
+	resp, err := c.QueryAuthoritative(ctx, zoneHint, req, "KEY query for "+name)
 	if err != nil {
 		return 0, nil, err
 	}
@@ -297,50 +287,18 @@ func (c *Coordinator) QueryKeyAtName(ctx context.Context, zoneHint, name string)
 	}
 }
 
-// QueryPTRExists reports whether at least one PTR record currently exists live at name
-// (typically a per-type browsing name "<type>.<zone>", RFC 6763 S4.1) against zoneHint's
-// resolved authoritative server -- same query/fallback shape as QueryKeyAtName, but a
-// simple presence check rather than a tri-state result, since the only question here is
-// "does anything else still provide this type." Used by
-// handlers.SRPHandler.reconcileServiceEnumeration immediately before removing a type from
-// the RFC 6763 S9 enumeration record, to confirm no OTHER registrant this process's own
-// local lease store doesn't know about still provides it -- see that function's doc comment
-// for why a local-only view can't safely decide this alone.
-func (c *Coordinator) QueryPTRExists(ctx context.Context, zoneHint, name string) (bool, error) {
-	req := dns.NewMsg(name, dns.TypePTR)
-	if req == nil {
-		return false, fmt.Errorf("failed to build PTR query for %s", name)
-	}
-	resp, err := c.queryAuthoritative(ctx, zoneHint, req, "PTR query for "+name)
-	if err != nil {
-		return false, err
-	}
-
-	switch resp.Rcode {
-	case dns.RcodeNameError:
-		return false, nil
-	case dns.RcodeSuccess:
-		for _, rr := range resp.Answer {
-			if _, ok := rr.(*dns.PTR); ok {
-				return true, nil
-			}
-		}
-		return false, nil
-	default:
-		return false, fmt.Errorf("PTR query for %s returned unexpected rcode %d (%s)", name, resp.Rcode, dns.RcodeToString[resp.Rcode])
-	}
-}
-
 // QueryRRs returns the rrType records at name from zoneHint's authoritative server -- none
 // for NXDOMAIN -- with the same query/fallback shape as QueryKeyAtName. Used by the RFC 9664
-// handler's checks of what is already published (signer KEYs, duplicate registrations).
+// handler's checks of what is already published (signer KEYs, duplicate registrations), and by
+// the SRP handler's RFC 6763 S9 and S11 reconciliation (the PTRs at a browsing or
+// domain-enumeration name).
 func (c *Coordinator) QueryRRs(ctx context.Context, zoneHint, name string, rrType uint16) ([]dns.RR, error) {
 	what := fmt.Sprintf("%s query for %s", dns.TypeToString[rrType], name)
 	req := dns.NewMsg(name, rrType)
 	if req == nil {
 		return nil, fmt.Errorf("failed to build %s", what)
 	}
-	resp, err := c.queryAuthoritative(ctx, zoneHint, req, what)
+	resp, err := c.QueryAuthoritative(ctx, zoneHint, req, what)
 	if err != nil {
 		return nil, err
 	}

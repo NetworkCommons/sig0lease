@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"slices"
 	"strconv"
+	"strings"
 
 	"codeberg.org/miekg/dns"
 	"github.com/NetworkCommons/sig0lease/config"
@@ -64,11 +65,9 @@ func applyUpdateHandlerEnvOverrides(cfg map[string]any) map[string]any {
 
 // withBootstrapResolvers fills in "bootstrap_resolvers" for the update
 // handler from the top-level "upstreams" config, unless the handler config
-// already sets its own. Without this, the handler's own SOA-based zone-
-// authority resolution (used to find where to forward signed UPDATEs, and
-// to check for pre-existing records upstream) has no configured resolver of
-// its own and falls back to a hardcoded default -- silently independent of
-// whatever the operator configured under "upstreams" for generic traffic.
+// already sets its own: the resolvers the handler's SOA-based discovery of a
+// name's zone and primary server asks (to find where to forward signed
+// UPDATEs, and to check for pre-existing records upstream).
 func withBootstrapResolvers(handlerCfg map[string]any, appCfg *config.Config) map[string]any {
 	out := make(map[string]any, len(handlerCfg)+1)
 	for k, v := range handlerCfg {
@@ -79,13 +78,9 @@ func withBootstrapResolvers(handlerCfg map[string]any, appCfg *config.Config) ma
 	}
 	addrs := make([]string, 0, len(appCfg.Upstreams))
 	for _, u := range appCfg.Upstreams {
-		if u.Address != "" {
-			addrs = append(addrs, u.Address)
-		}
+		addrs = append(addrs, u.Address)
 	}
-	if len(addrs) > 0 {
-		out["bootstrap_resolvers"] = addrs
-	}
+	out["bootstrap_resolvers"] = addrs
 	return out
 }
 
@@ -170,9 +165,10 @@ func enabledModules(cfg *config.Config) []string {
 	return slices.Compact(names)
 }
 
-// proxyHandler is a handler module as cmd/sig0lease uses it: served, and dumped by --dump.
+// proxyHandler is a handler module as cmd/sig0lease uses it: served, kept to its own zone
+// (handlers.SeparateZones), and dumped by --dump.
 type proxyHandler interface {
-	handlers.Handler
+	handlers.ZoneHandler
 	DumpLeasesLevel(level string) string
 }
 
@@ -200,8 +196,9 @@ func newHandler(moduleName string, cfg *config.Config, logger *logging.Logger) (
 // build from a "storage" section creates the snapshot's directory, writes the snapshot straight
 // back and keeps saving it, so each handler is Setup with its store read once instead
 // (handlers.LeaseStoreFromConfig, read-only), passed as "lease_manager". A dump never changes
-// the snapshot of a proxy running beside it. Setup's other effect is a reconciliation ticker
-// whose first tick, 30s away, a dump never reaches.
+// the snapshot of a proxy running beside it. Setup arms no expiry timer and starts no ticker:
+// lease expiry begins with Start, which only serving calls, so nothing in a dumped store expires
+// or is written upstream.
 func dumpLeases(w io.Writer, cfg *config.Config, level string, logger *logging.Logger) error {
 	printed := false
 	for _, moduleName := range enabledModules(cfg) {
@@ -245,6 +242,10 @@ func main() {
 			dumpMode = true
 			dumpLevel = "debug"
 		default:
+			if strings.HasPrefix(os.Args[i], "-") {
+				fmt.Fprintf(os.Stderr, "Usage: %s [--dump | --dump-debug] [config file, default config.yaml]\n", os.Args[0])
+				os.Exit(2)
+			}
 			cfgPath = os.Args[i]
 		}
 	}
@@ -314,6 +315,7 @@ func main() {
 	// Prepare handler configuration with upstream resolver for SIG(0) signing
 	opcodeMap := cfg.GetOpcodeMap()
 	registered := make(map[string]bool)
+	var setUp []handlers.ZoneHandler
 	for opcode, moduleNames := range opcodeMap {
 		for _, moduleName := range moduleNames {
 			if registered[moduleName] {
@@ -336,9 +338,14 @@ func main() {
 
 			srv.RegisterHandler(h)
 			registered[moduleName] = true
+			setUp = append(setUp, h)
 			logger.Infof("Registered %s for opcode %d (%s)",
 				moduleName, opcode, dns.OpcodeToString[opcode])
 		}
+	}
+	if err := handlers.SeparateZones(setUp); err != nil {
+		logger.Errorf("Error in handler zones: %v", err)
+		os.Exit(1)
 	}
 
 	// Start server

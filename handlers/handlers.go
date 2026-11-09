@@ -10,6 +10,7 @@ import (
 
 	"codeberg.org/miekg/dns"
 	"github.com/NetworkCommons/sig0lease/logging"
+	"github.com/NetworkCommons/sig0lease/pkg/dnsmsg"
 	"github.com/NetworkCommons/sig0lease/pkg/dnsname"
 	"github.com/NetworkCommons/sig0lease/pkg/keyrec"
 	leasepkg "github.com/NetworkCommons/sig0lease/pkg/lease"
@@ -33,6 +34,10 @@ type Handler interface {
 
 	// Setup initializes the handler with configuration
 	Setup(cfg map[string]any) error
+
+	// Start begins the handler's background work, such as lease expiry. The server calls it
+	// once, after Setup and before it serves; a dump never calls it.
+	Start()
 
 	// Shutdown releases any resources this handler owns (background
 	// goroutines, open files). Called exactly once during server shutdown.
@@ -66,10 +71,6 @@ func (b *BaseHandler) CanHandle(opcode uint8) bool {
 	return false
 }
 
-// Shutdown is a no-op default; handlers that own no resources needing
-// release on shutdown do not need to override it.
-func (b *BaseHandler) Shutdown() {}
-
 // updateResponse starts the reply to the UPDATE request req: req's header (so its ID and
 // Opcode) with QR and rcode set, and no sections. RFC 2136 S3.8 lets a reply either copy
 // every section of the request or carry none; every reply UpdateHandler and SRPHandler send
@@ -85,22 +86,26 @@ func updateResponse(req *dns.Msg, rcode uint16) *dns.Msg {
 }
 
 // leaseResponse is the NOERROR reply to a lease update: updateResponse plus the Update Lease
-// option carrying the LEASE and KEY-LEASE actually granted (RFC 9664 S4), so the requester
-// refreshes on those rather than on what it asked for.
+// option granted, carrying the LEASE and KEY-LEASE actually granted (RFC 9664 S4), so the
+// requester refreshes on those rather than on what it asked for. granted is in the variant the
+// request used: RFC 9664 S4 answers a 4-byte request with a 4-byte option, and mDNSResponder,
+// which sends one, reads no other.
 //
 // The option goes in resp.Pseudo, from which the dns library builds the reply's one OPT RR,
 // together with the EDNS fields of the header copied from req. An OPT RR added to resp.Extra
 // instead, as this code once did, became a second OPT RR whenever req used EDNS -- which every
 // lease update does -- and RFC 6891 S6.1.1 allows one. mDNSResponder's srp-client then ignored
 // the granted lease, since it reads it only from a reply whose one record is the OPT RR.
-func leaseResponse(req *dns.Msg, lease, keyLease uint32, logger *logging.Logger) *dns.Msg {
+func leaseResponse(req *dns.Msg, granted *leasepkg.LeaseOption) *dns.Msg {
 	resp := updateResponse(req, dns.RcodeSuccess)
 	resp.Authoritative = true
 	resp.UDPSize = uint16(dns.DefaultMsgSize)
 
 	opt := &dns.OPT{}
-	if err := leasepkg.Encode8Byte(lease, keyLease).Encode(opt); err != nil {
-		logger.Debugf("failed to encode response lease option: %v", err)
+	if err := granted.Encode(opt); err != nil {
+		// Encode only refuses LEASE above KEY-LEASE, which LeasePolicy.clamp rules out for
+		// every lease a handler grants.
+		panic(fmt.Sprintf("leaseResponse: granted lease %+v: %v", granted, err))
 	}
 	for _, option := range opt.Options {
 		resp.Pseudo = append(resp.Pseudo, option)
@@ -108,15 +113,26 @@ func leaseResponse(req *dns.Msg, lease, keyLease uint32, logger *logging.Logger)
 	return resp
 }
 
-// makeErrorResponse builds the error reply to req (updateResponse with rcode). msg is
-// currently unused (kept as a parameter for call-site readability -- see the "Note" below);
-// shared by UpdateHandler and SRPHandler.
+// makeErrorResponse builds the error reply to req, shared by UpdateHandler and SRPHandler:
+// updateResponse with rcode, plus an Extended DNS Error (RFC 8914) with infoCode and text,
+// the reason for the requester. infoCode follows the RFC 8914 definitions, one per kind of
+// refusal, whatever the rcode:
+//   - ExtendedErrorProhibited (18): refused for authorization or local policy -- an
+//     unauthorized or unproven signer, records outside its reach, a name or record held by
+//     another key, a blacklisted type, foreign data;
+//   - ExtendedErrorNotSupported (21): a request this proxy or its configuration cannot
+//     serve -- a "." in a label, the 4-byte lease variant while prefer_4byte_variant is
+//     off, UDP while allow_udp is off;
+//   - ExtendedErrorNoReachableAuthority (22): the authoritative server could not be reached
+//     or did not accept what the proxy sent it;
+//   - ExtendedErrorOther (0): anything else -- a malformed request, a busy lease store, an
+//     internal error.
 //
-// Note: we don't include detailed error messages in the response. Errors are logged
-// locally but responses use standard DNS rcodes. In future versions, we can add extended
-// error EDNS options.
-func makeErrorResponse(req *dns.Msg, rcode uint16, _ string) *dns.Msg {
-	return updateResponse(req, rcode)
+// The router removes text unless server.diagnostics is on (dnsmsg.StripEDEText).
+func makeErrorResponse(req *dns.Msg, rcode, infoCode uint16, text string) *dns.Msg {
+	resp := updateResponse(req, rcode)
+	dnsmsg.AddEDE(resp, req, infoCode, text)
+	return resp
 }
 
 // refuseDottedLabels returns an error result -- REFUSED -- if the request r, as it arrived on
@@ -135,14 +151,14 @@ func refuseDottedLabels(r *dns.Msg) *HandlerResult {
 	}
 	label, found, err := dnsname.DottedWireLabel(r.Data)
 	if err != nil {
-		msg := makeErrorResponse(r, dns.RcodeFormatError, err.Error())
+		msg := makeErrorResponse(r, dns.RcodeFormatError, dns.ExtendedErrorOther, err.Error())
 		return NewErrorResult(msg, err.Error(), err)
 	}
 	if !found {
 		return nil
 	}
 	err = fmt.Errorf("label %q contains \".\", which this proxy cannot carry: its DNS library would send it on as several labels", label)
-	msg := makeErrorResponse(r, dns.RcodeRefused, err.Error())
+	msg := makeErrorResponse(r, dns.RcodeRefused, dns.ExtendedErrorNotSupported, err.Error())
 	return NewErrorResult(msg, err.Error(), err)
 }
 
@@ -162,11 +178,11 @@ type updateSender interface {
 }
 
 // asDeletes returns rrs as RFC 2136 "Delete An RR From An RRset" instructions
-// (updatecore.AsDelete), for updatecore.BuildAndSign.
+// (dnsmsg.AsDelete), for updatecore.BuildAndSign.
 func asDeletes[RR dns.RR](rrs ...RR) []dns.RR {
 	deletes := make([]dns.RR, 0, len(rrs))
 	for _, rr := range rrs {
-		deletes = append(deletes, updatecore.AsDelete(rr))
+		deletes = append(deletes, dnsmsg.AsDelete(rr))
 	}
 	return deletes
 }
@@ -198,9 +214,16 @@ type upstreamClient interface {
 	ResolveAuthoritativeZone(ctx context.Context, zone string) (string, error)
 }
 
+// zoneCoordinator is what leaseHandler needs of a handler's coordinator: upstreamTarget's part,
+// and the queries answerQuery passes to the zone's authoritative server.
+type zoneCoordinator interface {
+	upstreamClient
+	QueryAuthoritative(ctx context.Context, zoneHint string, req *dns.Msg, what string) (*dns.Msg, error)
+}
+
 // upstreamTarget is where one handler's UPDATEs go and what signs them: its coordinator, the
 // proxy's signing key that Setup loaded once (a rotated key on disk needs a restart), and the
-// handler's configured upstream zone. Each handler builds one from its own fields.
+// handler's configured upstream zone. leaseHandler.upstream builds one from the handler's fields.
 type upstreamTarget struct {
 	handler     string
 	coordinator upstreamClient
@@ -243,7 +266,7 @@ func (t upstreamTarget) send(ctx context.Context, prereqs, records []dns.RR) (*d
 // "bootstrap_resolvers", the resolvers discovery asks for a name's SOA, and "upstream", an
 // optional static "host:port" of upstreamZone's authoritative server, used in place of
 // discovery for upstreamZone and every name at or below it (updatecore.StaticUpstream).
-// Shared by UpdateHandler.Setup and SRPHandler.Setup. An "upstream" that is not a
+// leaseHandler.setup reads it for both handlers. An "upstream" that is not a
 // "host:port" string is an error, not ignored: a proxy silently sending to the discovered
 // server instead of the configured one would update a different zone than intended.
 func buildCoordinatorFromConfig(cfg map[string]any, upstreamZone string, logger *logging.Logger) (*updatecore.Coordinator, error) {
@@ -369,7 +392,7 @@ func selectLeaseStore(cfg map[string]any) (given LeaseManager, storage *leaseSto
 // saving it (leasepkg.NewFileLeaseStore); logger receives its save errors. With readOnly, a
 // "file" store is instead its snapshot as it is now, read into an in-memory store that never
 // saves, and nothing is created or written: cmd/sig0lease's dump mode hands that to Setup as
-// "lease_manager". Both handlers' Setup use it with readOnly false.
+// "lease_manager". leaseHandler.setup uses it with readOnly false, for both handlers.
 func LeaseStoreFromConfig(cfg map[string]any, logger *logging.Logger, readOnly bool) (LeaseManager, error) {
 	given, storage, err := selectLeaseStore(cfg)
 	switch {

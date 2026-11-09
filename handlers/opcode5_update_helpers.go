@@ -2,13 +2,17 @@ package handlers
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"slices"
 	"sort"
 	"strings"
 
 	"codeberg.org/miekg/dns"
 	"github.com/NetworkCommons/sig0lease/pkg/dnsname"
+	leasepkg "github.com/NetworkCommons/sig0lease/pkg/lease"
 	"github.com/NetworkCommons/sig0lease/pkg/sig0"
+	"github.com/NetworkCommons/sig0lease/pkg/srp"
 )
 
 // summarizeRRTypes builds a compact, deterministic "TYPE:count" summary of
@@ -45,33 +49,125 @@ func summarizeRRTypes(keyRRs []*dns.KEY, otherRRs []dns.RR) string {
 	return strings.Join(parts, " ")
 }
 
-func extractUpdateRecords(msg *dns.Msg, blacklistedTypes map[uint16]struct{}) ([]*dns.KEY, []dns.RR, error) {
-	var keyRRs []*dns.KEY
-	other := make([]dns.RR, 0, len(msg.Ns))
+// blacklistedTypeError is extractUpdateRecords' error for a record of a type the handler's
+// blacklisted_types names: a well-formed request refused by local policy, so REFUSED (RFC 2136
+// S2.2), not FORMERR like the other errors extractUpdateRecords returns.
+type blacklistedTypeError struct {
+	rrType uint16
+}
 
+func (e *blacklistedTypeError) Error() string {
+	return fmt.Sprintf("RR type %s (code %d) is blacklisted for registration", dns.TypeToString[e.rrType], e.rrType)
+}
+
+// rrsetDeleteError is extractUpdateRecords' error for an RFC 2136 delete of a whole RRset, or of
+// every RRset at a name (class ANY, S2.5.2 and S2.5.3): a valid instruction this handler does
+// not carry out, as it could take records other keys registered, so REFUSED.
+type rrsetDeleteError struct {
+	rr dns.RR
+}
+
+func (e *rrsetDeleteError) Error() string {
+	return fmt.Sprintf("%s %s: deleting an RRset (class ANY) is not supported; delete each record (class NONE, RFC 2136 S2.5.4)",
+		e.rr.Header().Name, dns.TypeToString[dns.RRToType(e.rr)])
+}
+
+// updateRecords is a request's Update section read as RFC 2136 S2.5 instructions: the records
+// it adds, of the zone's class, IN, and those it deletes, "Delete An RR From An RRset" (class
+// NONE, TTL 0). Each delete is kept as the record it deletes, of class IN and TTL 0, the form
+// the lease store and the lock table know it by (lease.RecordKey has the class).
+type updateRecords struct {
+	keyAdds      []*dns.KEY
+	otherAdds    []dns.RR
+	keyDeletes   []*dns.KEY
+	otherDeletes []dns.RR
+}
+
+// adds reports whether the request adds or refreshes anything.
+func (u updateRecords) adds() bool { return len(u.keyAdds) > 0 || len(u.otherAdds) > 0 }
+
+// extractUpdateRecords reads msg's Update section (updateRecords). It refuses, as RFC 2136
+// S3.4.1.3's prescan does, a record of another class, a delete with a TTL, and type ANY, AXFR,
+// MAILA or MAILB; a KEY without its full RDATA, which is what names the KEY a delete or a
+// refresh is for; and an add of a type blacklisted_types names (blacklistedTypeError) or an
+// RRset delete (rrsetDeleteError), both REFUSED, the others FORMERR.
+func extractUpdateRecords(msg *dns.Msg, blacklistedTypes map[uint16]struct{}) (updateRecords, error) {
+	var u updateRecords
 	for _, rr := range msg.Ns {
 		if rr == nil || rr.Header() == nil {
-			return nil, nil, fmt.Errorf("nil RR encountered in UPDATE section")
+			return updateRecords{}, fmt.Errorf("nil RR encountered in UPDATE section")
 		}
-		switch v := rr.(type) {
-		case *dns.KEY:
-			if v.Algorithm == 0 || v.Protocol == 0 || strings.TrimSpace(v.PublicKey) == "" {
-				return nil, nil, fmt.Errorf("incomplete KEY RR in update records: full KEY RDATA is required")
+		hdr := rr.Header()
+		switch rrType := dns.RRToType(rr); rrType {
+		case dns.TypeANY, dns.TypeAXFR, dns.TypeMAILA, dns.TypeMAILB:
+			if hdr.Class == dns.ClassANY {
+				return updateRecords{}, &rrsetDeleteError{rr: rr}
 			}
-			keyRRs = append(keyRRs, v)
+			return updateRecords{}, fmt.Errorf("%s: type %s cannot be added or deleted", hdr.Name, dns.TypeToString[rrType])
+		}
+		var deleting bool
+		switch hdr.Class {
+		case dns.ClassINET:
+		case dns.ClassNONE:
+			if hdr.TTL != 0 {
+				return updateRecords{}, fmt.Errorf("delete of %s has TTL %d: a delete (class NONE) has TTL 0 (RFC 2136 S2.5.4)", hdr.Name, hdr.TTL)
+			}
+			deleting = true
+			rr = copyRR(rr)
+			rr.Header().Class = dns.ClassINET
+		case dns.ClassANY:
+			return updateRecords{}, &rrsetDeleteError{rr: rr}
 		default:
-			// Check blacklist: reject blacklisted RR types.
-			if blacklistedTypes != nil {
-				if _, blacklisted := blacklistedTypes[dns.RRToType(rr)]; blacklisted {
-					return nil, nil, fmt.Errorf("RR type %s (code %d) is blacklisted for registration",
-						dns.TypeToString[dns.RRToType(rr)], dns.RRToType(rr))
-				}
+			return updateRecords{}, fmt.Errorf("%s has class %s: a record is added with class IN and deleted with class NONE (RFC 2136 S2.5)",
+				hdr.Name, dns.ClassToString[hdr.Class])
+		}
+		if keyRR, ok := rr.(*dns.KEY); ok {
+			if keyRR.Algorithm == 0 || keyRR.Protocol == 0 || strings.TrimSpace(keyRR.PublicKey) == "" {
+				return updateRecords{}, fmt.Errorf("incomplete KEY RR in update records: full KEY RDATA is required")
 			}
-			other = append(other, rr)
+			if deleting {
+				u.keyDeletes = append(u.keyDeletes, keyRR)
+			} else {
+				u.keyAdds = append(u.keyAdds, keyRR)
+			}
+			continue
+		}
+		if deleting {
+			u.otherDeletes = append(u.otherDeletes, rr)
+			continue
+		}
+		if _, blacklisted := blacklistedTypes[dns.RRToType(rr)]; blacklisted {
+			return updateRecords{}, &blacklistedTypeError{rrType: dns.RRToType(rr)}
+		}
+		u.otherAdds = append(u.otherAdds, rr)
+	}
+	return u, nil
+}
+
+// checkUpdateRecords returns an error for an Update section that is not a lease request: one
+// with no records, one that adds a record it also deletes, or one that adds a kind of record on
+// a lease of 0, which would end as it starts. The lease applies to the records added (RFC 9664
+// S4), and a record is deleted with RFC 2136's delete (class NONE, TTL 0).
+func checkUpdateRecords(u updateRecords, lease, keyLease uint32) error {
+	switch {
+	case !u.adds() && len(u.keyDeletes) == 0 && len(u.otherDeletes) == 0:
+		return fmt.Errorf("the Update section has no records")
+	case len(u.keyAdds) > 0 && keyLease == 0:
+		return fmt.Errorf("KEY-LEASE=0 with a KEY RR to add: a KEY is deleted with class NONE and TTL 0 (RFC 2136 S2.5.4)")
+	case len(u.otherAdds) > 0 && lease == 0:
+		return fmt.Errorf("LEASE=0 with records to add: a record is deleted with class NONE and TTL 0 (RFC 2136 S2.5.4)")
+	}
+	for _, del := range u.keyDeletes {
+		if slices.ContainsFunc(u.keyAdds, func(add *dns.KEY) bool { return leasepkg.NodeKey(add) == leasepkg.NodeKey(del) }) {
+			return fmt.Errorf("KEY %s is both added and deleted", del.Hdr.Name)
 		}
 	}
-
-	return keyRRs, other, nil
+	for _, del := range u.otherDeletes {
+		if slices.ContainsFunc(u.otherAdds, func(add dns.RR) bool { return leasepkg.RecordKey(add) == leasepkg.RecordKey(del) }) {
+			return fmt.Errorf("%s %s %s is both added and deleted", del.Header().Name, dns.TypeToString[dns.RRToType(del)], del.Data())
+		}
+	}
+	return nil
 }
 
 func extractAdditionalSigningKeys(msg *dns.Msg) ([]*dns.KEY, error) {
@@ -337,11 +433,11 @@ func rrEqual(a, b dns.RR) bool {
 	}
 }
 
-func (h *UpdateHandler) authoritativeHasRR(ctx context.Context, zoneHint string, rr dns.RR) (bool, error) {
+func (h *UpdateHandler) authoritativeHasRR(ctx context.Context, rr dns.RR) (bool, error) {
 	if rr == nil || rr.Header() == nil {
 		return false, fmt.Errorf("rr is nil")
 	}
-	rrs, err := h.upstreamCoordinator.QueryRRs(ctx, zoneHint, rr.Header().Name, dns.RRToType(rr))
+	rrs, err := h.upstreamCoordinator.QueryRRs(ctx, h.upstreamZone, rr.Header().Name, dns.RRToType(rr))
 	if err != nil {
 		return false, err
 	}
@@ -353,8 +449,121 @@ func (h *UpdateHandler) authoritativeHasRR(ctx context.Context, zoneHint string,
 	return false, nil
 }
 
-func (h *UpdateHandler) authoritativeHasKeyAtName(ctx context.Context, zoneHint string, fqdn string) (bool, error) {
-	rrs, err := h.upstreamCoordinator.QueryRRs(ctx, zoneHint, fqdn, dns.TypeKEY)
+// authoritativeLookupError is a failed query to the authoritative server, returned by a check
+// that otherwise refuses the request: the request itself may be fine, so refusalResult answers
+// it SERVFAIL, like every other failed authoritative lookup, not REFUSED.
+type authoritativeLookupError struct {
+	err error
+}
+
+func (e *authoritativeLookupError) Error() string { return e.err.Error() }
+func (e *authoritativeLookupError) Unwrap() error { return e.err }
+
+// refusalResult answers err, the error of a check that refuses the request: SERVFAIL with
+// Extended DNS Error 22 (No Reachable Authority) if the check could not query the
+// authoritative server (authoritativeLookupError), else REFUSED with 18 (Prohibited) and
+// reason.
+func refusalResult(r *dns.Msg, reason string, err error) *HandlerResult {
+	var lookup *authoritativeLookupError
+	if errors.As(err, &lookup) {
+		msg := makeErrorResponse(r, dns.RcodeServerFailure, dns.ExtendedErrorNoReachableAuthority, err.Error())
+		return NewErrorResult(msg, "authoritative lookup failed", err)
+	}
+	msg := makeErrorResponse(r, dns.RcodeRefused, dns.ExtendedErrorProhibited, err.Error())
+	return NewErrorResult(msg, reason, err)
+}
+
+// refuseAuthoritativeDuplicate returns an error if the authoritative server already holds rr
+// -- data outside this proxy's management, not the requester's to claim -- or, as an
+// authoritativeLookupError, if the server could not be asked.
+func (h *UpdateHandler) refuseAuthoritativeDuplicate(ctx context.Context, rr dns.RR) error {
+	exists, err := h.authoritativeHasRR(ctx, rr)
+	if err != nil {
+		return &authoritativeLookupError{err: fmt.Errorf("authoritative duplicate check failed: %w", err)}
+	}
+	if exists {
+		return fmt.Errorf("duplicate registration rejected: authoritative RR already exists for %s", rr.String())
+	}
+	return nil
+}
+
+// refuseNewKey runs the checks a KEY the request registers anew must pass: no
+// identical KEY already published (refuseAuthoritativeDuplicate), and, with fcfs_naming, a
+// self-registration one label below the zone and no other key holding its name (fcfsNewKey).
+// It returns the prerequisites the upstream UPDATE must carry, or the reply refusing the
+// request.
+//
+// A KEY registers itself only one label below the zone so that every name deeper down is
+// registered by the key holding the name above it, and goes when that key goes (its subtree's
+// cascade). A KEY registering itself deeper could have a free name above it, and a newcomer
+// taking that name would be a signer above it (validateSignerHierarchyForUpdateRecords), able
+// to write records at its names. Checking below the newcomer cannot stop that: no DNS query
+// lists the names below a name.
+func (h *UpdateHandler) refuseNewKey(ctx context.Context, r *dns.Msg, keyRR *dns.KEY, signerID keyID, signerName string) ([]dns.RR, *HandlerResult) {
+	if err := h.refuseAuthoritativeDuplicate(ctx, keyRR); err != nil {
+		return nil, refusalResult(r, "duplicate registration rejected", err)
+	}
+	if !h.fcfsNaming {
+		return nil, nil
+	}
+	// The name keyRR's holder already holds: the zone's apex, the operator's, for a KEY
+	// registering itself, else its signer's name.
+	top := signerName
+	if keyIDFromKEY(keyRR) == signerID {
+		if _, parent, _ := dnsname.CutFirstLabel(keyRR.Hdr.Name); dnsname.Normalize(parent) != dnsname.Normalize(h.upstreamZone) {
+			err := fmt.Errorf("KEY %s registers itself, which fcfs_naming allows only one label below zone %s: a deeper name is registered by the key holding the name above it", keyRR.Hdr.Name, h.upstreamZone)
+			return nil, refusalResult(r, "FCFS self-registration below the zone's first level", err)
+		}
+		top = h.upstreamZone
+	}
+	prereqs, heldAt, err := h.fcfsNewKey(ctx, keyRR, top)
+	if err != nil {
+		return nil, refusalResult(r, "FCFS evaluation failed", err)
+	}
+	if heldAt != "" {
+		h.logger.Infof("FCFS conflict for KEY %s: %s is held by a different key", keyRR.Hdr.Name, heldAt)
+		return nil, fcfsConflictResult(r, fmt.Sprintf("FCFS conflict for %s at %s", keyRR.Hdr.Name, heldAt))
+	}
+	return prereqs, nil
+}
+
+// fcfsNewKey is fcfs_naming for keyRR, a KEY registered anew: RFC 9665's FCFS Naming
+// (S3.2.4.1), widened from a name to the names below it, since an RFC 9664 key writes records
+// at and below its own name (validateSignerHierarchyForUpdateRecords). keyRR is refused --
+// heldAt names where -- when a different key holds its name or a name above it, up to but not
+// including top, the name its holder holds. Each name is checked as SRP checks its own
+// (srp.Evaluate), and returns the prerequisite that has the authoritative server check it
+// again when it applies the UPDATE.
+func (h *UpdateHandler) fcfsNewKey(ctx context.Context, keyRR *dns.KEY, top string) (prereqs []dns.RR, heldAt string, err error) {
+	// refuseNamesNotServed keeps every name inside the zone, refuseNewKey a KEY registering
+	// itself one label below the apex, and validateSignerHierarchyForUpdateRecords every KEY at
+	// or below its signer.
+	if !dnsname.IsAtOrBelow(keyRR.Hdr.Name, top) {
+		panic(fmt.Sprintf("fcfs_naming: KEY %s is not at or below %s", keyRR.Hdr.Name, top))
+	}
+	view := leaseStoreView{store: h.leaseManager}
+	for name := keyRR.Hdr.Name; dnsname.IsAtOrBelow(name, top) && dnsname.Normalize(name) != dnsname.Normalize(top); {
+		result, prereq, err := srp.Evaluate(ctx, view, h.upstreamCoordinator.QueryKeyAtName, h.upstreamZone, name, keyRR, false)
+		if err != nil {
+			return nil, "", &authoritativeLookupError{err: fmt.Errorf("FCFS evaluation failed: %w", err)}
+		}
+		switch result {
+		case srp.FCFSProceed:
+			if prereq != nil {
+				prereqs = append(prereqs, prereq)
+			}
+		case srp.FCFSConflict:
+			return nil, name, nil
+		default:
+			panic(fmt.Sprintf("fcfs_naming: srp.Evaluate returned %s for %s, which it cannot without refuse_on_foreign_data", result, name))
+		}
+		_, name, _ = dnsname.CutFirstLabel(name)
+	}
+	return prereqs, "", nil
+}
+
+func (h *UpdateHandler) authoritativeHasKeyAtName(ctx context.Context, fqdn string) (bool, error) {
+	rrs, err := h.upstreamCoordinator.QueryRRs(ctx, h.upstreamZone, fqdn, dns.TypeKEY)
 	if err != nil {
 		return false, err
 	}
@@ -371,7 +580,7 @@ func (h *UpdateHandler) authoritativeHasKeyAtName(ctx context.Context, zoneHint 
 // falls through to a live authoritative-DNS check, to catch data that
 // exists outside our management (registered before this proxy existed, or
 // by some other process) rather than ours to claim.
-func (h *UpdateHandler) filterDuplicateRegistrations(ctx context.Context, keyName, zoneHint string, records []dns.RR) ([]dns.RR, []string, error) {
+func (h *UpdateHandler) filterDuplicateRegistrations(ctx context.Context, keyName string, records []dns.RR) ([]dns.RR, []string, error) {
 	accepted := make([]dns.RR, 0, len(records))
 	notes := make([]string, 0)
 
@@ -389,14 +598,9 @@ func (h *UpdateHandler) filterDuplicateRegistrations(ctx context.Context, keyNam
 		}
 
 		// Not under our control locally: fail the whole request if the
-		// authoritative zone already contains an identical RR anyway (data
-		// outside this proxy's management, not ours to claim).
-		exists, err := h.authoritativeHasRR(ctx, zoneHint, rr)
-		if err != nil {
+		// authoritative zone already contains an identical RR anyway.
+		if err := h.refuseAuthoritativeDuplicate(ctx, rr); err != nil {
 			return nil, nil, err
-		}
-		if exists {
-			return nil, nil, fmt.Errorf("duplicate registration rejected: authoritative RR already exists for %s", rr.String())
 		}
 		accepted = append(accepted, rr)
 	}
@@ -424,21 +628,20 @@ const (
 //
 // Resolution follows the three-stage fallback: request-provided KEY RRs
 // (Additional or Update), then the lease store, then authoritative DNS.
-func (h *UpdateHandler) extractAndValidateSig0(ctx context.Context, msg *dns.Msg, downstreamZone string, additionalSigningKeys []*dns.KEY, updateKeys []*dns.KEY) (*dns.SIG, *dns.KEY, signerKeySource, error) {
+func (h *UpdateHandler) extractAndValidateSig0(ctx context.Context, msg *dns.Msg, additionalSigningKeys []*dns.KEY, updateKeys []*dns.KEY) (*dns.SIG, *dns.KEY, signerKeySource, error) {
 	sigRR, err := extractSig0(msg)
 	if err != nil {
 		return nil, nil, signerKeySourceUnknown, err
-	}
-	downstreamZoneCanon := dnsname.Normalize(downstreamZone)
-	if downstreamZoneCanon == "" {
-		return nil, nil, signerKeySourceUnknown, fmt.Errorf("empty downstream zone")
 	}
 	signerCanon := dnsname.Normalize(sigRR.SignerName)
 	if signerCanon == "" {
 		return nil, nil, signerKeySourceUnknown, fmt.Errorf("SIG(0) signer name is empty")
 	}
-	if !dnsname.IsAtOrBelow(downstreamZoneCanon, signerCanon) {
-		return nil, nil, signerKeySourceUnknown, fmt.Errorf("SIG(0) signer %q is outside allowed hierarchy for downstream zone %q", sigRR.SignerName, downstreamZone)
+	// A signer writes only at and below its own name (validateSignerHierarchyForUpdateRecords),
+	// and only names this handler serves: it must be one of them, as an SRP signer, the host,
+	// must (SRPHandler.takes).
+	if err := h.notServed(sigRR.SignerName); err != nil {
+		return nil, nil, signerKeySourceUnknown, fmt.Errorf("SIG(0) signer: %w", err)
 	}
 
 	verifyFromCandidates := func(candidates []*dns.KEY) (*dns.KEY, error) {
@@ -498,9 +701,9 @@ func (h *UpdateHandler) extractAndValidateSig0(ctx context.Context, msg *dns.Msg
 	}
 
 	// Check if the key is present online
-	authRRS, err := h.upstreamCoordinator.QueryRRs(ctx, downstreamZone, sigRR.SignerName, dns.TypeKEY)
+	authRRS, err := h.upstreamCoordinator.QueryRRs(ctx, h.upstreamZone, sigRR.SignerName, dns.TypeKEY)
 	if err != nil {
-		return nil, nil, signerKeySourceUnknown, fmt.Errorf("failed to resolve signer KEY from authoritative DNS: %w", err)
+		return nil, nil, signerKeySourceUnknown, &authoritativeLookupError{err: fmt.Errorf("failed to resolve signer KEY from authoritative DNS: %w", err)}
 	}
 	authCandidates := make([]*dns.KEY, 0, len(authRRS))
 	for _, rr := range authRRS {
@@ -526,19 +729,15 @@ func (h *UpdateHandler) extractAndValidateSig0(ctx context.Context, msg *dns.Msg
 	return nil, nil, signerKeySourceUnknown, fmt.Errorf("no matching KEY candidate found for signer %q in request, lease store, or authoritative DNS", sigRR.SignerName)
 }
 
-// upstreamUpdateRecords returns the Update section of the UPDATE Cases A, B and D forward:
-// the KEYs and non-KEY records to add, carrying the TTLs Handle already set (record_ttl_sec),
-// then as RFC 2136 deletes (class NONE, TTL 0) the non-KEY records Case D asked to remove.
-// Combining both into a single signed UPDATE means one round trip is either fully confirmed or
-// not, so there is no window where the accompanying delete could succeed upstream while the
-// KEY add/refresh it was staged alongside never gets sent, or vice versa.
-func upstreamUpdateRecords(keyRRs []*dns.KEY, otherRecords []dns.RR, recordsToDelete []dns.RR) []dns.RR {
-	records := make([]dns.RR, 0, len(keyRRs)+len(otherRecords)+len(recordsToDelete))
+// upstreamUpdateRecords returns the Update section of the UPDATE Handle forwards: deletes, the
+// RFC 2136 instructions that delete what the request deletes, then the KEYs and non-KEY records
+// to add, carrying the TTLs Handle already set (record_ttl_sec).
+func upstreamUpdateRecords(deletes []dns.RR, keyRRs []*dns.KEY, otherRecords []dns.RR) []dns.RR {
+	records := slices.Clone(deletes)
 	for _, keyRR := range keyRRs {
 		records = append(records, keyRR)
 	}
-	records = append(records, otherRecords...)
-	return append(records, asDeletes(recordsToDelete...)...)
+	return append(records, otherRecords...)
 }
 
 // makeErrorResponse creates a properly formatted error response.
