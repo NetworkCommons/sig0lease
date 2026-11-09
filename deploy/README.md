@@ -102,7 +102,12 @@ neither, nor `config.yaml`, deploys nothing. Neither records the commit: the rel
 
 ```bash
 REGISTRAR=<registrar>:8054 ZONE=stg.zenr.io DOMAIN=srp.stg.zenr.io demo/run.sh
+REGISTRAR=<registrar>:8054 ZONE=stg.zenr.io DOMAIN=srp.stg.zenr.io DOH=https://<registrar>:8444 demo/web.sh
+REGISTRAR=<registrar>:8054 ZONE=stg.zenr.io demo/ipfs.sh member     # community on B
 ```
+
+`demo/web.sh` takes staging's DNS-over-HTTPS with `DOH`: without it, the page asks
+`https://<registrar>/`, which is stable's.
 
 Then `make promote`:
 
