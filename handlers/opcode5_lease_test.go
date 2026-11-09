@@ -499,9 +499,9 @@ func TestLeaseExpiry_KEYTakesSubtreeInOneUpdate(t *testing.T) {
 	}
 }
 
-// A Case C delete of a KEY takes its whole subtree along in the request's one UPDATE, as the
+// A KEY's delete takes its whole subtree along in the request's one UPDATE, as the
 // KEY's expiry does; refused, the request fails and nothing is forgotten.
-func TestCaseCDelete_TakesSubtreeInOneUpdate(t *testing.T) {
+func TestKeyDelete_TakesSubtreeInOneUpdate(t *testing.T) {
 	signer := loadClientKey(t, "Ktest.dev.zenr.io.+015+05044")
 	h, stub := lockTestHandler(t, signer)
 	var mu sync.Mutex
@@ -526,7 +526,7 @@ func TestCaseCDelete_TakesSubtreeInOneUpdate(t *testing.T) {
 		t.Fatal(err)
 	}
 	del := func() *HandlerResult {
-		return h.Handle(context.Background(), stubResponseWriter{}, buildSignedCaseCDeleteForHandleTest(t, signer, signer.PublicKey.Clone().(*dns.KEY)))
+		return h.Handle(context.Background(), stubResponseWriter{}, buildSignedKeyDeleteForHandleTest(t, signer, signer.PublicKey.Clone().(*dns.KEY)))
 	}
 
 	if res := del(); rcodeOf(res) != dns.RcodeServerFailure {

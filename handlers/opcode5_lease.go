@@ -10,9 +10,9 @@ import (
 	"time"
 
 	"codeberg.org/miekg/dns"
+	"github.com/NetworkCommons/sig0lease/pkg/dnsmsg"
 	"github.com/NetworkCommons/sig0lease/pkg/dnsname"
 	leasepkg "github.com/NetworkCommons/sig0lease/pkg/lease"
-	"github.com/NetworkCommons/sig0lease/pkg/updatecore"
 )
 
 // authorizeKeyRefresh verifies that signerID may refresh the already
@@ -55,8 +55,8 @@ func (h *UpdateHandler) authorizeKeyRefresh(clientKeyRR *dns.KEY, signerID keyID
 }
 
 // effectiveRefreshKeyLease determines the key-lease duration to actually
-// grant a refresh (Case A and Case D share this once ownership has already
-// been authorized via authorizeKeyRefresh): the full requestedKeyLease when
+// grant a refresh of a KEY the request adds, once ownership has already
+// been authorized via authorizeKeyRefresh: the full requestedKeyLease when
 // the key is still published at its authoritative FQDN, or whatever lease
 // time remains locally (floored at 1s so a near-expiry key isn't handed a
 // zero-length lease) when it has disappeared from authoritative DNS and
@@ -156,15 +156,15 @@ type dueRecord struct {
 }
 
 // subtreeDeletes returns the UPDATE instructions that delete, record by record, every KEY and
-// non-KEY record at and below nodeKey (subtreeLeases): what a KEY's delete sends, an RFC 9664
-// Case C or an SRP removal with a KEY-LEASE of 0.
+// non-KEY record at and below nodeKey (subtreeLeases): what a KEY's delete sends, by an RFC 9664
+// requester or an SRP removal with a KEY-LEASE of 0.
 func subtreeDeletes(store LeaseManager, nodeKey string) []dns.RR {
 	keys, records := subtreeLeases(store, nodeKey)
 	return append(asDeletes(keys...), recordDeletes(records)...)
 }
 
 // forgetSubtree forgets nodeKey and every node below it, and disarms their timers, once the
-// authoritative server has confirmed the UPDATE that deleted them: a KEY's expiry, its Case C
+// authoritative server has confirmed the UPDATE that deleted them: a KEY's expiry, its
 // delete, or an SRP removal with a KEY-LEASE of 0. DNS has already changed, so a store write
 // that fails panics; event names the deletion in that panic.
 func forgetSubtree(store LeaseManager, timers *expiryTimers, nodeKey, event string) {
@@ -211,7 +211,7 @@ func ownRecords(store LeaseManager, owner string, due time.Time) []dueRecord {
 func recordDeletes(records []dueRecord) []dns.RR {
 	deletes := make([]dns.RR, 0, len(records))
 	for _, r := range records {
-		deletes = append(deletes, updatecore.AsDelete(r.rr))
+		deletes = append(deletes, dnsmsg.AsDelete(r.rr))
 	}
 	return deletes
 }

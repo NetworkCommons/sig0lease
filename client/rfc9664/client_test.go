@@ -19,12 +19,16 @@ import (
 
 // sent is what an update asks for: its zone, the KEYs and other records in its Update
 // section, and its leases.
+// sent is an update as the proxy reads it: the KEYs and records it adds (class IN) and those
+// it deletes (class NONE), and its leases.
 type sent struct {
-	zone     string
-	keys     []string
-	records  []string
-	lease    uint32
-	keyLease uint32
+	zone        string
+	keys        []string
+	keysDeleted []string
+	records     []string
+	deleted     []string
+	lease       uint32
+	keyLease    uint32
 }
 
 func summarize(t *testing.T, m *dns.Msg) sent {
@@ -36,13 +40,28 @@ func summarize(t *testing.T, m *dns.Msg) sent {
 	}
 	s.lease, s.keyLease = lo.Lease, *lo.KeyLease
 	for _, rr := range m.Ns {
+		deleting := rr.Header().Class == dns.ClassNONE
 		if k, ok := rr.(*dns.KEY); ok {
-			s.keys = append(s.keys, k.Hdr.Name)
+			if deleting {
+				s.keysDeleted = append(s.keysDeleted, k.Hdr.Name)
+			} else {
+				s.keys = append(s.keys, k.Hdr.Name)
+			}
 			continue
 		}
-		s.records = append(s.records, describe([]dns.RR{rr}))
+		if deleting {
+			s.deleted = append(s.deleted, describe([]dns.RR{rr}))
+		} else {
+			s.records = append(s.records, describe([]dns.RR{rr}))
+		}
 	}
 	return s
+}
+
+// equal reports whether a and b are the same update.
+func (a sent) equal(b sent) bool {
+	return a.zone == b.zone && slices.Equal(a.keys, b.keys) && slices.Equal(a.keysDeleted, b.keysDeleted) &&
+		slices.Equal(a.records, b.records) && slices.Equal(a.deleted, b.deleted) && a.lease == b.lease && a.keyLease == b.keyLease
 }
 
 func mustRR(t *testing.T, s string) dns.RR {
@@ -133,26 +152,27 @@ func TestNewClient_Refuses(t *testing.T) {
 }
 
 // Every request carries the name's KEY, signed with it, and the zone in its Zone Section; the
-// cases differ in their records and leases (Behavior Specification item 5).
-func TestClient_Cases(t *testing.T) {
+// requests differ in what they add and delete, and their leases are those of what they add.
+func TestClient_Requests(t *testing.T) {
 	www := "www.site.example. CNAME site.example."
+	key := []string{"site.example."}
 	for _, tt := range []struct {
 		name string
 		call func(*Client) (*dns.Msg, baseclient.Outcome, error)
 		want sent
 	}{
-		{"register (Case A)", func(c *Client) (*dns.Msg, baseclient.Outcome, error) {
+		{"register", func(c *Client) (*dns.Msg, baseclient.Outcome, error) {
 			return c.Register(context.Background())
-		}, sent{records: []string{"site.example. A 192.0.2.1", "www.site.example. CNAME site.example."}, lease: 30, keyLease: 600}},
-		{"withdraw (Case D)", func(c *Client) (*dns.Msg, baseclient.Outcome, error) {
+		}, sent{keys: key, records: []string{"site.example. A 192.0.2.1", "www.site.example. CNAME site.example."}, lease: 30, keyLease: 600}},
+		{"withdraw", func(c *Client) (*dns.Msg, baseclient.Outcome, error) {
 			return c.Withdraw(context.Background(), []dns.RR{mustRR(t, www)})
-		}, sent{records: []string{"www.site.example. CNAME site.example."}, lease: 0, keyLease: 600}},
-		{"deregister keeping the name (Case D)", func(c *Client) (*dns.Msg, baseclient.Outcome, error) {
+		}, sent{keys: key, deleted: []string{"www.site.example. CNAME site.example."}, lease: 0, keyLease: 600}},
+		{"deregister keeping the name", func(c *Client) (*dns.Msg, baseclient.Outcome, error) {
 			return c.Deregister(context.Background(), true)
-		}, sent{records: []string{"site.example. A 192.0.2.1", "www.site.example. CNAME site.example."}, lease: 0, keyLease: 600}},
-		{"deregister freeing the name (Case C)", func(c *Client) (*dns.Msg, baseclient.Outcome, error) {
+		}, sent{keys: key, deleted: []string{"site.example. A 192.0.2.1", "www.site.example. CNAME site.example."}, lease: 0, keyLease: 600}},
+		{"deregister freeing the name", func(c *Client) (*dns.Msg, baseclient.Outcome, error) {
 			return c.Deregister(context.Background(), false)
-		}, sent{lease: 0, keyLease: 0}},
+		}, sent{keysDeleted: key, lease: 0, keyLease: 0}},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			tr := &answering{answers: []*dns.Msg{clienttest.Granted(30, 600)}}
@@ -170,16 +190,43 @@ func TestClient_Cases(t *testing.T) {
 				t.Fatalf("update does not verify against the name's key: %v", err)
 			}
 			got := summarize(t, tr.sent[0])
-			tt.want.zone, tt.want.keys = "example.", []string{"site.example."}
-			if got.zone != tt.want.zone || !slices.Equal(got.keys, tt.want.keys) || !slices.Equal(got.records, tt.want.records) || got.lease != tt.want.lease || got.keyLease != tt.want.keyLease {
+			tt.want.zone = "example."
+			if !got.equal(tt.want) {
 				t.Fatalf("sent %+v, want %+v", got, tt.want)
 			}
 			for _, rr := range tr.sent[0].Ns {
-				if rr.Header().TTL != 300 {
-					t.Errorf("%s: TTL %d, want the configured 300", rr.Header().Name, rr.Header().TTL)
+				want := uint32(300)
+				if rr.Header().Class == dns.ClassNONE {
+					want = 0 // RFC 2136 S2.5.4
+				}
+				if rr.Header().TTL != want {
+					t.Errorf("%s: TTL %d, want %d", rr.Header().Name, rr.Header().TTL, want)
 				}
 			}
 		})
+	}
+}
+
+// A registration deletes Config.Gone in the same request until one succeeds; the next ones no
+// longer name them.
+func TestClient_RegisterDeletesGoneUntilItSucceeds(t *testing.T) {
+	tr := &answering{answers: []*dns.Msg{clienttest.Answer(dns.RcodeServerFailure), clienttest.Granted(30, 600)}}
+	cfg := testConfig(t, tr.Send, "site.example. 300 IN TXT \"new\"")
+	cfg.Gone = []dns.RR{mustRR(t, "site.example. 300 IN TXT \"old\"")}
+	c, err := NewClient(cfg)
+	if err != nil {
+		t.Fatalf("NewClient: %v", err)
+	}
+	replacing := sent{zone: "example.", keys: []string{"site.example."}, records: []string{`site.example. TXT "new"`}, deleted: []string{`site.example. TXT "old"`}, lease: 30, keyLease: 600}
+	refreshing := replacing
+	refreshing.deleted = nil
+	for i, want := range []sent{replacing, replacing, refreshing} {
+		if _, _, err := c.Register(context.Background()); err != nil {
+			t.Fatalf("Register %d: %v", i+1, err)
+		}
+		if got := summarize(t, tr.sent[i]); !got.equal(want) {
+			t.Fatalf("registration %d: sent %+v, want %+v", i+1, got, want)
+		}
 	}
 }
 

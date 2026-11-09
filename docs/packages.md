@@ -146,9 +146,9 @@ func (l Lifecycle) Run(ctx context.Context, register func(context.Context) (*dns
     stop a long-running daemon's registration.
 
 type Moves[S any] struct {
-	// To moves to next, from what the previous call registered: it sends whatever withdraws
-	// what next lacks, and returns the registration to keep (run until its ctx ends), nil for
-	// none. An error is one no later state can cure: the Keeper reports it to OnFatal and
+	// To moves to next, from what the previous call registered: it withdraws what next lacks,
+	// sending that itself or with the registration it returns, and returns the registration to
+	// keep (run until its ctx ends), nil for none. An error is one no later state can cure: the Keeper reports it to OnFatal and
 	// waits to be stopped.
 	To func(next S) (keep func(context.Context), err error)
 	// Kept, if set, is called once a registration To returned has stopped, before the next
@@ -900,14 +900,16 @@ fcfs_naming (docs/siglease_rfc9664.md, "First-Come First-Served Naming") -- and
 a requester cannot look that zone up. The Zone Section names the name's parent,
 which encloses every name a request writes (docs/siglease_rfc9664.md,
 "The Zone Section"). Every request carries the name's KEY in its Update section,
-so the proxy verifies it with the key it registers, and is one of the handler's
-lease cases (Behavior Specification item 5):
+so the proxy verifies it with the key it registers, and says of each record
+whether it is added or deleted (RFC 2136 S2.5; docs/siglease_rfc9664.md, "Adds
+and Deletes"), on a LEASE and KEY-LEASE that are those of the records added:
 
-  - Register: Case A, the KEY and the records, both leases non-zero;
-  - Withdraw, and Deregister keeping the name: Case D, the KEY and the records
-    to delete, a LEASE of 0 and the KEY-LEASE, which keeps the name for the key;
-  - Deregister freeing the name: Case C, the KEY alone, both leases 0, which
-    deletes the KEY and everything it registered.
+  - Register: the KEY and the records added, on both leases, and the records
+    Config.Gone names deleted in the same request, until one succeeds;
+  - Withdraw, and Deregister keeping the name: the KEY added, which refreshes it
+    and keeps the name for the key, on the KEY-LEASE, and the records deleted;
+  - Deregister freeing the name: the KEY alone, deleted, which deletes
+    everything it registered.
 
 A name another key holds is answered YXDOMAIN. An SRP requester renames
 (client/srp), as its names are found by browsing; an RFC 9664 name is typed or
@@ -953,8 +955,8 @@ func ParseRecords(name string, specs []string, bad func(i int, err error)) []dns
 func Release(cfg NameConfig) error
     Release frees a name that has nothing registered and may still be held:
     one not running, from an earlier run, or a Name's that stops after a Set
-    with no records kept it. It sends one deregistration of the KEY alone with
-    both leases 0 (Case C), which deletes every record the key registered
+    with no records kept it. It sends one deregistration deleting the KEY alone
+    (class NONE, both leases 0), which deletes every record the key registered
     with it, bounded by cfg.StopTimeout. cfg.Store records the name as freed
     once the proxy confirms it, or answers that another key holds it now.
     Release returns an error only for a client configuration NewClient refuses;
@@ -978,18 +980,18 @@ func NewClient(cfg Config) (*Client, error)
 
 func (c *Client) Deregister(ctx context.Context, keepName bool) (*dns.Msg, baseclient.Outcome, error)
     Deregister deletes the name's records. With keepName it deletes
-    Config.Records and keeps the KEY for RequestedKeyLease (Case D), so that no
-    other key takes the name meanwhile; without it, it deletes the KEY (Case C),
-    which takes every record the key registered with it, and the name is free.
+    Config.Records and refreshes the KEY for RequestedKeyLease, so that no other
+    key takes the name meanwhile; without it, it deletes the KEY, which takes
+    every record the key registered with it, and the name is free.
 
 func (c *Client) Name() string
     Name returns the name the client registers, fully qualified.
 
 func (c *Client) Register(ctx context.Context) (*dns.Msg, baseclient.Outcome, error)
     Register registers the name's KEY and Config.Records, on the requested
-    leases (Case A). The handler needs a record besides the KEY in a
-    registration: with no records, Register fails, and Deregister keeping the
-    name holds it alone.
+    leases, and deletes Config.Gone in the same request, until a registration
+    succeeds. A registration needs a record besides the KEY: with no records,
+    Register fails, and Deregister keeping the name holds it alone.
 
 func (c *Client) Run(ctx context.Context) error
     Run keeps the name registered (client.Lifecycle.Run): it registers,
@@ -999,7 +1001,7 @@ func (c *Client) Run(ctx context.Context) error
 
 func (c *Client) Withdraw(ctx context.Context, records []dns.RR) (*dns.Msg, baseclient.Outcome, error)
     Withdraw deletes records, registered earlier, from the name, and refreshes
-    its KEY (Case D).
+    its KEY.
 
 type Config struct {
 	// Name is the name, fully qualified (trailing dot optional), at least two labels: CheckName.
@@ -1010,6 +1012,11 @@ type Config struct {
 	// qualified, of class IN. No KEY, the name's own being Key's, and no SIG. Their TTLs are
 	// replaced with TTL.
 	Records []dns.RR
+	// Gone are records registered earlier that Records no longer has, as Records are: the
+	// next registration deletes them in the same request, so a record replaced by another is
+	// never absent from the zone, nor there twice. Once a registration succeeds, the next
+	// ones no longer name them.
+	Gone []dns.RR
 
 	RequestedLease    uint32 // default 3600 (1h)
 	RequestedKeyLease uint32 // default 1209600 (14d)
@@ -1038,13 +1045,14 @@ type Name struct {
 	// Has unexported fields.
 }
     Name keeps one name registered as its records change: each Set restates
-    the records, and the Name registers them (Client.Run, refreshing on the
-    lease clock), first withdrawing those that are gone, those Store kept from
-    an earlier run included. No records means no registration: the name is
-    deregistered and kept for its key, as the Name still runs. When the Name
-    stops (the Keeper's Stop and Wait), it is deregistered and kept or freed, as
-    KeepNames says. While the registrar answers that another key holds the name,
-    nothing at it is this key's: no withdrawal or deregistration is sent.
+    the records, and the Name registers them (Client.Run, refreshing on
+    the lease clock), deleting those that are gone in the same request
+    (Config.Gone), those Store kept from an earlier run included. No records
+    means no registration: the name is deregistered and kept for its key,
+    as the Name still runs. When the Name stops (the Keeper's Stop and Wait),
+    it is deregistered and kept or freed, as KeepNames says. While the registrar
+    answers that another key holds the name, nothing at it is this key's:
+    no record is deleted, and no deregistration is sent.
 
 func StartName(cfg NameConfig) (*Name, error)
     StartName starts keeping cfg.Client's name registered. It registers nothing
@@ -2293,6 +2301,12 @@ func AddEDE(resp, req *dns.Msg, infoCode uint16, text string)
 func AddressRR(owner string, addr netip.Addr, ttl uint32) dns.RR
     AddressRR returns owner's address record for addr, class IN: an A for an
     IPv4 address, an AAAA for an IPv6 one.
+
+func AsDelete(rr dns.RR) dns.RR
+    AsDelete returns a copy of rr rewritten as an RFC 2136 S2.5.4 "Delete An
+    RR From An RRset" instruction: class NONE, TTL 0, NAME, TYPE and RDATA
+    unchanged, which say which RR it deletes. A requester sends it to delete a
+    record it registered, and the proxy sends it upstream.
 
 func EDEs(m *dns.Msg) []*dns.EDE
     EDEs returns the Extended DNS Errors in m, in order.
@@ -3674,12 +3688,6 @@ const DefaultMaxInflightUpdates = 1
 
 
 FUNCTIONS
-
-func AsDelete(rr dns.RR) dns.RR
-    AsDelete returns a copy of rr rewritten as an RFC 2136 S2.5.4 "Delete An RR
-    From An RRSet" instruction: class NONE, TTL 0, RDATA unchanged (which RR the
-    delete targets is carried by NAME+TYPE+RDATA, same as any other RR identity
-    in this codebase -- pkg/lease.RecordKey uses the identical convention).
 
 func BuildAndSign(upstreamZone string, prereqs, records []dns.RR, signingKey *keyrec.LoadedKey) (*dns.Msg, error)
     BuildAndSign constructs a new UPDATE message for upstreamZone containing

@@ -6,13 +6,15 @@
 // requester cannot look that zone up. The Zone Section names the name's parent, which encloses
 // every name a request writes (docs/siglease_rfc9664.md, "The Zone Section"). Every request carries the
 // name's KEY in its Update section, so the proxy verifies it with the key it registers, and
-// is one of the handler's lease cases (Behavior Specification item 5):
+// says of each record whether it is added or deleted (RFC 2136 S2.5; docs/siglease_rfc9664.md,
+// "Adds and Deletes"), on a LEASE and KEY-LEASE that are those of the records added:
 //
-//   - Register: Case A, the KEY and the records, both leases non-zero;
-//   - Withdraw, and Deregister keeping the name: Case D, the KEY and the records to delete,
-//     a LEASE of 0 and the KEY-LEASE, which keeps the name for the key;
-//   - Deregister freeing the name: Case C, the KEY alone, both leases 0, which deletes the KEY
-//     and everything it registered.
+//   - Register: the KEY and the records added, on both leases, and the records Config.Gone
+//     names deleted in the same request, until one succeeds;
+//   - Withdraw, and Deregister keeping the name: the KEY added, which refreshes it and keeps
+//     the name for the key, on the KEY-LEASE, and the records deleted;
+//   - Deregister freeing the name: the KEY alone, deleted, which deletes everything it
+//     registered.
 //
 // A name another key holds is answered YXDOMAIN. An SRP requester renames (client/srp), as
 // its names are found by browsing; an RFC 9664 name is typed or linked (a URL, a DNSLink path,
@@ -29,6 +31,7 @@ import (
 	"fmt"
 	"math/rand"
 	"slices"
+	"sync"
 	"time"
 
 	"codeberg.org/miekg/dns"
@@ -52,6 +55,11 @@ type Config struct {
 	// qualified, of class IN. No KEY, the name's own being Key's, and no SIG. Their TTLs are
 	// replaced with TTL.
 	Records []dns.RR
+	// Gone are records registered earlier that Records no longer has, as Records are: the
+	// next registration deletes them in the same request, so a record replaced by another is
+	// never absent from the zone, nor there twice. Once a registration succeeds, the next
+	// ones no longer name them.
+	Gone []dns.RR
 
 	RequestedLease    uint32 // default 3600 (1h)
 	RequestedKeyLease uint32 // default 1209600 (14d)
@@ -78,6 +86,9 @@ type Client struct {
 	cfg  Config
 	name string // fully qualified
 	zone string // the Zone Section: the name's parent
+
+	mu   sync.Mutex
+	gone []dns.RR // Config.Gone, until a registration deletes them
 }
 
 // NewClient validates cfg and applies its defaults.
@@ -98,6 +109,9 @@ func NewClient(cfg Config) (*Client, error) {
 	}
 	if err := CheckRecords(name, cfg.Records); err != nil {
 		return nil, fmt.Errorf("rfc9664/client: %w", err)
+	}
+	if err := CheckRecords(name, cfg.Gone); err != nil {
+		return nil, fmt.Errorf("rfc9664/client: Gone: %w", err)
 	}
 	if cfg.RequestedLease == 0 {
 		cfg.RequestedLease = 3600
@@ -123,7 +137,7 @@ func NewClient(cfg Config) (*Client, error) {
 	if cfg.Sleep == nil {
 		cfg.Sleep = baseclient.SleepContext
 	}
-	return &Client{cfg: cfg, name: name, zone: zone}, nil
+	return &Client{cfg: cfg, name: name, zone: zone, gone: cfg.Gone}, nil
 }
 
 // name is the name cfg registers, fully qualified.
@@ -168,33 +182,43 @@ func CheckRecords(name string, records []dns.RR) error {
 // Name returns the name the client registers, fully qualified.
 func (c *Client) Name() string { return c.name }
 
-// Register registers the name's KEY and Config.Records, on the requested leases (Case A).
-// The handler needs a record besides the KEY in a registration: with no records, Register
-// fails, and Deregister keeping the name holds it alone.
+// Register registers the name's KEY and Config.Records, on the requested leases, and deletes
+// Config.Gone in the same request, until a registration succeeds. A registration needs a
+// record besides the KEY: with no records, Register fails, and Deregister keeping the name
+// holds it alone.
 func (c *Client) Register(ctx context.Context) (*dns.Msg, baseclient.Outcome, error) {
 	if len(c.cfg.Records) == 0 {
 		return nil, 0, fmt.Errorf("rfc9664/client: %s: a registration needs a record besides the KEY", c.name)
 	}
-	return c.send(ctx, c.cfg.Records, c.cfg.RequestedLease, c.cfg.RequestedKeyLease)
+	c.mu.Lock()
+	gone := c.gone
+	c.mu.Unlock()
+	resp, outcome, err := c.send(ctx, false, c.cfg.Records, gone, c.cfg.RequestedLease, c.cfg.RequestedKeyLease)
+	if err == nil && outcome == baseclient.OutcomeSuccess && len(gone) > 0 {
+		c.mu.Lock()
+		c.gone = nil
+		c.mu.Unlock()
+	}
+	return resp, outcome, err
 }
 
-// Withdraw deletes records, registered earlier, from the name, and refreshes its KEY (Case D).
+// Withdraw deletes records, registered earlier, from the name, and refreshes its KEY.
 func (c *Client) Withdraw(ctx context.Context, records []dns.RR) (*dns.Msg, baseclient.Outcome, error) {
 	if err := CheckRecords(c.name, records); err != nil {
 		return nil, 0, fmt.Errorf("rfc9664/client: %w", err)
 	}
-	return c.send(ctx, records, 0, c.cfg.RequestedKeyLease)
+	return c.send(ctx, false, nil, records, 0, c.cfg.RequestedKeyLease)
 }
 
-// Deregister deletes the name's records. With keepName it deletes Config.Records and keeps the
-// KEY for RequestedKeyLease (Case D), so that no other key takes the name meanwhile;
-// without it, it deletes the KEY (Case C), which takes every record the key registered with
-// it, and the name is free.
+// Deregister deletes the name's records. With keepName it deletes Config.Records and
+// refreshes the KEY for RequestedKeyLease, so that no other key takes the name meanwhile;
+// without it, it deletes the KEY, which takes every record the key registered with it, and
+// the name is free.
 func (c *Client) Deregister(ctx context.Context, keepName bool) (*dns.Msg, baseclient.Outcome, error) {
 	if keepName {
-		return c.send(ctx, c.cfg.Records, 0, c.cfg.RequestedKeyLease)
+		return c.send(ctx, false, nil, c.cfg.Records, 0, c.cfg.RequestedKeyLease)
 	}
-	return c.send(ctx, nil, 0, 0)
+	return c.send(ctx, true, nil, nil, 0, 0)
 }
 
 // Run keeps the name registered (client.Lifecycle.Run): it registers, then again on the RFC
@@ -227,17 +251,27 @@ func (c *Client) register(ctx context.Context) (*dns.Msg, error) {
 	return resp, nil
 }
 
-// send signs and sends an update of the name's KEY and records on lease and keyLease, and
-// classifies the answer.
-func (c *Client) send(ctx context.Context, records []dns.RR, lease, keyLease uint32) (*dns.Msg, baseclient.Outcome, error) {
+// send signs and sends an update of the name: its KEY, added (registered or refreshed) on
+// keyLease, or deleted with deleteKey, the records adds on lease, and the records deletes,
+// as RFC 2136 deletes (class NONE). The leases are those of what is added, 0 for a kind
+// added none of. It classifies the answer.
+func (c *Client) send(ctx context.Context, deleteKey bool, adds, deletes []dns.RR, lease, keyLease uint32) (*dns.Msg, baseclient.Outcome, error) {
 	key := c.cfg.Key.PublicKey.Clone().(*dns.KEY)
 	key.Hdr = dns.Header{Name: c.name, Class: dns.ClassINET, TTL: c.cfg.TTL}
-	update := make([]dns.RR, len(records))
-	for i, rr := range records {
-		update[i] = rr.Clone()
-		update[i].Header().TTL = c.cfg.TTL
+	updateKey := key
+	if deleteKey {
+		updateKey = dnsmsg.AsDelete(key).(*dns.KEY)
 	}
-	msg, err := dnsmsg.NewLeaseUpdate(c.zone, []*dns.KEY{key}, update, lease, keyLease)
+	update := make([]dns.RR, 0, len(adds)+len(deletes))
+	for _, rr := range adds {
+		add := rr.Clone()
+		add.Header().TTL = c.cfg.TTL
+		update = append(update, add)
+	}
+	for _, rr := range deletes {
+		update = append(update, dnsmsg.AsDelete(rr))
+	}
+	msg, err := dnsmsg.NewLeaseUpdate(c.zone, []*dns.KEY{updateKey}, update, lease, keyLease)
 	if err != nil {
 		return nil, 0, fmt.Errorf("rfc9664/client: %w", err)
 	}

@@ -496,7 +496,7 @@ func TestHandle_ReRegistersManagedKeyWhenAuthoritativeFQDNIsMissing(t *testing.T
 }
 
 // TestHandle_RefreshPreservesOriginalRegisteredAt exercises the "normal
-// refresh" branch of Case A (key still present at its authoritative FQDN)
+// refresh" of a KEY the request adds (key still present at its authoritative FQDN)
 // end to end through Handle(), confirming the RenewLease wiring: a refresh
 // must extend the lease timers without resetting RegisteredAt, unlike the
 // old design where every refresh silently re-created the node with
@@ -645,10 +645,9 @@ func TestHandle_NonKeyOnlyLeaseRejectsUpdateKeyRR(t *testing.T) {
 	if res == nil || res.Message == nil {
 		t.Fatalf("expected response message")
 	}
-	// Malformed for its lease case, like a Case A, C or D request missing the records its case
-	// needs: FORMERR with Extended DNS Error 0 (Other).
+	// A KEY added on a KEY-LEASE of 0 is malformed: FORMERR with Extended DNS Error 0 (Other).
 	if res.Message.Rcode != dns.RcodeFormatError {
-		t.Fatalf("expected FORMERR for non-KEY-only update containing KEY RR, got rcode=%d", res.Message.Rcode)
+		t.Fatalf("expected FORMERR for a KEY added on a KEY-LEASE of 0, got rcode=%d", res.Message.Rcode)
 	}
 	if edes := dnsmsg.EDEs(res.Message); len(edes) != 1 || edes[0].InfoCode != dns.ExtendedErrorOther {
 		t.Fatalf("expected one Extended DNS Error 0 (Other), got %v", edes)
@@ -841,9 +840,9 @@ func TestGroupOtherRecordsByTargetKey_HierarchyRejectsUnmappedOwner(t *testing.T
 	}
 }
 
-// buildSignedCaseCDeleteForHandleTest builds a Case C delete request
-// (LEASE=0, KEY-LEASE=0) naming a single KEY RR, signed by signerKey.
-func buildSignedCaseCDeleteForHandleTest(t *testing.T, signerKey *keyrec.LoadedKey, keyRRToDelete *dns.KEY) *dns.Msg {
+// buildSignedKeyDeleteForHandleTest builds a request deleting a single KEY RR (class NONE,
+// TTL 0; LEASE=0, KEY-LEASE=0, as nothing is added), signed by signerKey.
+func buildSignedKeyDeleteForHandleTest(t *testing.T, signerKey *keyrec.LoadedKey, keyRRToDelete *dns.KEY) *dns.Msg {
 	t.Helper()
 
 	// The signer's name in the Zone section, as cmd/sig0lease-client sends it by default.
@@ -852,7 +851,7 @@ func buildSignedCaseCDeleteForHandleTest(t *testing.T, signerKey *keyrec.LoadedK
 		t.Fatalf("expected message")
 	}
 	msg.Opcode = dns.OpcodeUpdate
-	msg.Ns = append(msg.Ns, keyRRToDelete)
+	msg.Ns = append(msg.Ns, dnsmsg.AsDelete(keyRRToDelete))
 
 	opt := &dns.OPT{Hdr: dns.Header{Name: "."}}
 	opt.SetUDPSize(uint16(dns.DefaultMsgSize))
@@ -869,13 +868,13 @@ func buildSignedCaseCDeleteForHandleTest(t *testing.T, signerKey *keyrec.LoadedK
 	return signed
 }
 
-// setupCaseCDeleteHandler registers a parent key (test.dev.zenr.io.) and a
+// setupKeyDeleteHandler registers a parent key (test.dev.zenr.io.) and a
 // child key it registered (client.test.dev.zenr.io., ParentKeyName pointing
 // at the parent), and returns a handler plus the parent, child, and an
 // "unrelated" key (dev.zenr.io.) that is hierarchically above the child by
 // DNS name but is not the child's immediate parent -- used to prove that
-// hierarchy alone is no longer sufficient to authorize a Case C KEY delete.
-func setupCaseCDeleteHandler(t *testing.T) (h *UpdateHandler, parent, child, unrelated *keyrec.LoadedKey) {
+// hierarchy alone is no longer sufficient to authorize a KEY delete.
+func setupKeyDeleteHandler(t *testing.T) (h *UpdateHandler, parent, child, unrelated *keyrec.LoadedKey) {
 	t.Helper()
 
 	serverKeystoreDir, err := createTestKeystore(t)
@@ -926,11 +925,11 @@ func setupCaseCDeleteHandler(t *testing.T) (h *UpdateHandler, parent, child, unr
 	return h, parent, child, unrelated
 }
 
-func TestHandle_CaseCDelete_ImmediateParentCanDeleteChildKey(t *testing.T) {
-	h, parent, child, _ := setupCaseCDeleteHandler(t)
+func TestHandle_KeyDelete_ImmediateParentCanDeleteChildKey(t *testing.T) {
+	h, parent, child, _ := setupKeyDeleteHandler(t)
 
 	childRR := child.PublicKey.Clone().(*dns.KEY)
-	req := buildSignedCaseCDeleteForHandleTest(t, parent, childRR)
+	req := buildSignedKeyDeleteForHandleTest(t, parent, childRR)
 
 	res := h.Handle(context.Background(), stubResponseWriter{}, req)
 	if res == nil || res.Message == nil {
@@ -944,11 +943,11 @@ func TestHandle_CaseCDelete_ImmediateParentCanDeleteChildKey(t *testing.T) {
 	}
 }
 
-func TestHandle_CaseCDelete_UnrelatedHierarchicalAncestorCannotDeleteChildKey(t *testing.T) {
-	h, _, child, unrelated := setupCaseCDeleteHandler(t)
+func TestHandle_KeyDelete_UnrelatedHierarchicalAncestorCannotDeleteChildKey(t *testing.T) {
+	h, _, child, unrelated := setupKeyDeleteHandler(t)
 
 	childRR := child.PublicKey.Clone().(*dns.KEY)
-	req := buildSignedCaseCDeleteForHandleTest(t, unrelated, childRR)
+	req := buildSignedKeyDeleteForHandleTest(t, unrelated, childRR)
 
 	res := h.Handle(context.Background(), stubResponseWriter{}, req)
 	if res == nil || res.Message == nil {
@@ -971,11 +970,11 @@ func TestHandle_CaseCDelete_UnrelatedHierarchicalAncestorCannotDeleteChildKey(t 
 	}
 }
 
-func TestHandle_CaseCDelete_SelfRegisteredKeyCanDeleteItself(t *testing.T) {
-	h, parent, _, _ := setupCaseCDeleteHandler(t)
+func TestHandle_KeyDelete_SelfRegisteredKeyCanDeleteItself(t *testing.T) {
+	h, parent, _, _ := setupKeyDeleteHandler(t)
 
 	parentRR := parent.PublicKey.Clone().(*dns.KEY)
-	req := buildSignedCaseCDeleteForHandleTest(t, parent, parentRR)
+	req := buildSignedKeyDeleteForHandleTest(t, parent, parentRR)
 
 	res := h.Handle(context.Background(), stubResponseWriter{}, req)
 	if res == nil || res.Message == nil {
@@ -989,11 +988,11 @@ func TestHandle_CaseCDelete_SelfRegisteredKeyCanDeleteItself(t *testing.T) {
 	}
 }
 
-func TestHandle_CaseCDelete_ChildKeyCanDeleteItself(t *testing.T) {
-	h, parent, child, _ := setupCaseCDeleteHandler(t)
+func TestHandle_KeyDelete_ChildKeyCanDeleteItself(t *testing.T) {
+	h, parent, child, _ := setupKeyDeleteHandler(t)
 
 	childRR := child.PublicKey.Clone().(*dns.KEY)
-	req := buildSignedCaseCDeleteForHandleTest(t, child, childRR)
+	req := buildSignedKeyDeleteForHandleTest(t, child, childRR)
 
 	res := h.Handle(context.Background(), stubResponseWriter{}, req)
 	if res == nil || res.Message == nil {
@@ -1028,7 +1027,7 @@ func TestHandle_CaseCDelete_ChildKeyCanDeleteItself(t *testing.T) {
 // algorithm/keytag/pubkey differ) -- mirroring the case these tests
 // reproduce.
 
-func TestHandle_CaseARefresh_ForeignSignerWithOwnRegistrationCannotHijackExistingKey(t *testing.T) {
+func TestHandle_KeyRefresh_ForeignSignerWithOwnRegistrationCannotHijackExistingKey(t *testing.T) {
 	keystoreDir, err := createTestKeystore(t)
 	if err != nil {
 		t.Fatalf("setup test keystore: %v", err)
@@ -1124,7 +1123,7 @@ func TestHandle_CaseARefresh_ForeignSignerWithOwnRegistrationCannotHijackExistin
 	}
 }
 
-func TestHandle_CaseARefresh_OnlineAuthorizedSignerCannotHijackExistingKey(t *testing.T) {
+func TestHandle_KeyRefresh_OnlineAuthorizedSignerCannotHijackExistingKey(t *testing.T) {
 	keystoreDir, err := createTestKeystore(t)
 	if err != nil {
 		t.Fatalf("setup test keystore: %v", err)

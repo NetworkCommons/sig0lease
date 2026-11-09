@@ -4,11 +4,13 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"slices"
 	"sort"
 	"strings"
 
 	"codeberg.org/miekg/dns"
 	"github.com/NetworkCommons/sig0lease/pkg/dnsname"
+	leasepkg "github.com/NetworkCommons/sig0lease/pkg/lease"
 	"github.com/NetworkCommons/sig0lease/pkg/sig0"
 	"github.com/NetworkCommons/sig0lease/pkg/srp"
 )
@@ -58,32 +60,114 @@ func (e *blacklistedTypeError) Error() string {
 	return fmt.Sprintf("RR type %s (code %d) is blacklisted for registration", dns.TypeToString[e.rrType], e.rrType)
 }
 
-func extractUpdateRecords(msg *dns.Msg, blacklistedTypes map[uint16]struct{}) ([]*dns.KEY, []dns.RR, error) {
-	var keyRRs []*dns.KEY
-	other := make([]dns.RR, 0, len(msg.Ns))
+// rrsetDeleteError is extractUpdateRecords' error for an RFC 2136 delete of a whole RRset, or of
+// every RRset at a name (class ANY, S2.5.2 and S2.5.3): a valid instruction this handler does
+// not carry out, as it could take records other keys registered, so REFUSED.
+type rrsetDeleteError struct {
+	rr dns.RR
+}
 
+func (e *rrsetDeleteError) Error() string {
+	return fmt.Sprintf("%s %s: deleting an RRset (class ANY) is not supported; delete each record (class NONE, RFC 2136 S2.5.4)",
+		e.rr.Header().Name, dns.TypeToString[dns.RRToType(e.rr)])
+}
+
+// updateRecords is a request's Update section read as RFC 2136 S2.5 instructions: the records
+// it adds, of the zone's class, IN, and those it deletes, "Delete An RR From An RRset" (class
+// NONE, TTL 0). Each delete is kept as the record it deletes, of class IN and TTL 0, the form
+// the lease store and the lock table know it by (lease.RecordKey has the class).
+type updateRecords struct {
+	keyAdds      []*dns.KEY
+	otherAdds    []dns.RR
+	keyDeletes   []*dns.KEY
+	otherDeletes []dns.RR
+}
+
+// adds reports whether the request adds or refreshes anything.
+func (u updateRecords) adds() bool { return len(u.keyAdds) > 0 || len(u.otherAdds) > 0 }
+
+// extractUpdateRecords reads msg's Update section (updateRecords). It refuses, as RFC 2136
+// S3.4.1.3's prescan does, a record of another class, a delete with a TTL, and type ANY, AXFR,
+// MAILA or MAILB; a KEY without its full RDATA, which is what names the KEY a delete or a
+// refresh is for; and an add of a type blacklisted_types names (blacklistedTypeError) or an
+// RRset delete (rrsetDeleteError), both REFUSED, the others FORMERR.
+func extractUpdateRecords(msg *dns.Msg, blacklistedTypes map[uint16]struct{}) (updateRecords, error) {
+	var u updateRecords
 	for _, rr := range msg.Ns {
 		if rr == nil || rr.Header() == nil {
-			return nil, nil, fmt.Errorf("nil RR encountered in UPDATE section")
+			return updateRecords{}, fmt.Errorf("nil RR encountered in UPDATE section")
 		}
-		switch v := rr.(type) {
-		case *dns.KEY:
-			if v.Algorithm == 0 || v.Protocol == 0 || strings.TrimSpace(v.PublicKey) == "" {
-				return nil, nil, fmt.Errorf("incomplete KEY RR in update records: full KEY RDATA is required")
+		hdr := rr.Header()
+		switch rrType := dns.RRToType(rr); rrType {
+		case dns.TypeANY, dns.TypeAXFR, dns.TypeMAILA, dns.TypeMAILB:
+			if hdr.Class == dns.ClassANY {
+				return updateRecords{}, &rrsetDeleteError{rr: rr}
 			}
-			keyRRs = append(keyRRs, v)
+			return updateRecords{}, fmt.Errorf("%s: type %s cannot be added or deleted", hdr.Name, dns.TypeToString[rrType])
+		}
+		var deleting bool
+		switch hdr.Class {
+		case dns.ClassINET:
+		case dns.ClassNONE:
+			if hdr.TTL != 0 {
+				return updateRecords{}, fmt.Errorf("delete of %s has TTL %d: a delete (class NONE) has TTL 0 (RFC 2136 S2.5.4)", hdr.Name, hdr.TTL)
+			}
+			deleting = true
+			rr = copyRR(rr)
+			rr.Header().Class = dns.ClassINET
+		case dns.ClassANY:
+			return updateRecords{}, &rrsetDeleteError{rr: rr}
 		default:
-			// Check blacklist: reject blacklisted RR types.
-			if blacklistedTypes != nil {
-				if _, blacklisted := blacklistedTypes[dns.RRToType(rr)]; blacklisted {
-					return nil, nil, &blacklistedTypeError{rrType: dns.RRToType(rr)}
-				}
+			return updateRecords{}, fmt.Errorf("%s has class %s: a record is added with class IN and deleted with class NONE (RFC 2136 S2.5)",
+				hdr.Name, dns.ClassToString[hdr.Class])
+		}
+		if keyRR, ok := rr.(*dns.KEY); ok {
+			if keyRR.Algorithm == 0 || keyRR.Protocol == 0 || strings.TrimSpace(keyRR.PublicKey) == "" {
+				return updateRecords{}, fmt.Errorf("incomplete KEY RR in update records: full KEY RDATA is required")
 			}
-			other = append(other, rr)
+			if deleting {
+				u.keyDeletes = append(u.keyDeletes, keyRR)
+			} else {
+				u.keyAdds = append(u.keyAdds, keyRR)
+			}
+			continue
+		}
+		if deleting {
+			u.otherDeletes = append(u.otherDeletes, rr)
+			continue
+		}
+		if _, blacklisted := blacklistedTypes[dns.RRToType(rr)]; blacklisted {
+			return updateRecords{}, &blacklistedTypeError{rrType: dns.RRToType(rr)}
+		}
+		u.otherAdds = append(u.otherAdds, rr)
+	}
+	return u, nil
+}
+
+// checkUpdateRecords returns an error for an Update section that is not a lease request: one
+// with no records, one that adds a record it also deletes, or one that adds a kind of record on
+// a lease of 0, which would end as it starts. The lease applies to the records added (RFC 9664
+// S4), and a record is deleted with RFC 2136's delete (class NONE, TTL 0).
+func checkUpdateRecords(u updateRecords, lease, keyLease uint32) error {
+	switch {
+	case !u.adds() && len(u.keyDeletes) == 0 && len(u.otherDeletes) == 0:
+		return fmt.Errorf("the Update section has no records")
+	case len(u.keyAdds) > 0 && keyLease == 0:
+		return fmt.Errorf("KEY-LEASE=0 with a KEY RR to add: a KEY is deleted with class NONE and TTL 0 (RFC 2136 S2.5.4)")
+	case len(u.otherAdds) > 0 && lease == 0:
+		return fmt.Errorf("LEASE=0 with records to add: a record is deleted with class NONE and TTL 0 (RFC 2136 S2.5.4)")
+	}
+	for _, del := range u.keyDeletes {
+		if slices.ContainsFunc(u.keyAdds, func(add *dns.KEY) bool { return leasepkg.NodeKey(add) == leasepkg.NodeKey(del) }) {
+			return fmt.Errorf("KEY %s is both added and deleted", del.Hdr.Name)
 		}
 	}
-
-	return keyRRs, other, nil
+	for _, del := range u.otherDeletes {
+		if slices.ContainsFunc(u.otherAdds, func(add dns.RR) bool { return leasepkg.RecordKey(add) == leasepkg.RecordKey(del) }) {
+			return fmt.Errorf("%s %s %s is both added and deleted", del.Header().Name, dns.TypeToString[dns.RRToType(del)], del.Data())
+		}
+	}
+	return nil
 }
 
 func extractAdditionalSigningKeys(msg *dns.Msg) ([]*dns.KEY, error) {
@@ -403,7 +487,7 @@ func (h *UpdateHandler) refuseAuthoritativeDuplicate(ctx context.Context, rr dns
 	return nil
 }
 
-// refuseNewKey runs the checks a KEY the request registers anew (Case A or D) must pass: no
+// refuseNewKey runs the checks a KEY the request registers anew must pass: no
 // identical KEY already published (refuseAuthoritativeDuplicate), and, with fcfs_naming, a
 // self-registration one label below the zone and no other key holding its name (fcfsNewKey).
 // It returns the prerequisites the upstream UPDATE must carry, or the reply refusing the
@@ -645,19 +729,15 @@ func (h *UpdateHandler) extractAndValidateSig0(ctx context.Context, msg *dns.Msg
 	return nil, nil, signerKeySourceUnknown, fmt.Errorf("no matching KEY candidate found for signer %q in request, lease store, or authoritative DNS", sigRR.SignerName)
 }
 
-// upstreamUpdateRecords returns the Update section of the UPDATE Cases A, B and D forward:
-// the KEYs and non-KEY records to add, carrying the TTLs Handle already set (record_ttl_sec),
-// then as RFC 2136 deletes (class NONE, TTL 0) the non-KEY records Case D asked to remove.
-// Combining both into a single signed UPDATE means one round trip is either fully confirmed or
-// not, so there is no window where the accompanying delete could succeed upstream while the
-// KEY add/refresh it was staged alongside never gets sent, or vice versa.
-func upstreamUpdateRecords(keyRRs []*dns.KEY, otherRecords []dns.RR, recordsToDelete []dns.RR) []dns.RR {
-	records := make([]dns.RR, 0, len(keyRRs)+len(otherRecords)+len(recordsToDelete))
+// upstreamUpdateRecords returns the Update section of the UPDATE Handle forwards: deletes, the
+// RFC 2136 instructions that delete what the request deletes, then the KEYs and non-KEY records
+// to add, carrying the TTLs Handle already set (record_ttl_sec).
+func upstreamUpdateRecords(deletes []dns.RR, keyRRs []*dns.KEY, otherRecords []dns.RR) []dns.RR {
+	records := slices.Clone(deletes)
 	for _, keyRR := range keyRRs {
 		records = append(records, keyRR)
 	}
-	records = append(records, otherRecords...)
-	return append(records, asDeletes(recordsToDelete...)...)
+	return append(records, otherRecords...)
 }
 
 // makeErrorResponse creates a properly formatted error response.

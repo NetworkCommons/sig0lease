@@ -194,10 +194,10 @@ func TestHandle_WritesRecordTTL(t *testing.T) {
 	}
 }
 
-// TestHandle_CaseB_ReRegisteredKEYGetsRecordTTL: Case B re-sends the lease store's KEY (the
-// request has no KEY and KEY-LEASE 0). Its TTL is cut to the remaining lease it is
+// TestHandle_RecordsAlone_ReRegisteredKEYGetsRecordTTL: records added alone (no KEY, KEY-LEASE 0)
+// re-send the lease store's KEY when it is missing. Its TTL is cut to the remaining lease it is
 // re-registered with, on the forwarded copy only; the store's record keeps its own.
-func TestHandle_CaseB_ReRegisteredKEYGetsRecordTTL(t *testing.T) {
+func TestHandle_RecordsAlone_ReRegisteredKEYGetsRecordTTL(t *testing.T) {
 	h, loaded := newRecordTTLUpdateHandler(t)
 
 	signerKey := loaded.PublicKey.Clone().(*dns.KEY)
@@ -206,7 +206,7 @@ func TestHandle_CaseB_ReRegisteredKEYGetsRecordTTL(t *testing.T) {
 		t.Fatalf("register signer key in lease store: %v", err)
 	}
 	stub := &stubUpstreamCoordinator{
-		// No KEY at the signer's name: Case B puts the stored one back.
+		// No KEY at the signer's name: the stored one is put back.
 		query: func(ctx context.Context, zoneHint, fqdn string, rrType uint16) ([]dns.RR, error) {
 			return []dns.RR{}, nil
 		},

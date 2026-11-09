@@ -45,21 +45,19 @@ func (h *UpdateHandler) decodeLease(msg *dns.Msg) (*leasepkg.LeaseOption, uint16
 	return lo, dns.RcodeSuccess, nil
 }
 
-// requestedLeases is the LEASE and KEY-LEASE that lo asks for, as this handler's case matrix
-// reads them. The 8-byte variant carries both. The 4-byte variant carries one value for every
-// record in the Update section (RFC 9664 S4: the KEYs and the other records expire together),
-// so it is the KEY-LEASE when the section has KEY RRs and the LEASE when it has other records,
-// and 0 for the kind it has none of: Case A with both kinds, B with non-KEY records only, D
-// with KEYs only, and C for a value of 0. A section with no records at all keeps it as the
-// LEASE, so it is refused as Case B refuses one.
-func requestedLeases(lo *leasepkg.LeaseOption, hasKeyRRs, hasOtherRRs bool) (lease, keyLease uint32) {
+// requestedLeases is the LEASE and KEY-LEASE that lo asks for: the leases of the KEYs and the
+// other records the request adds. The 8-byte variant carries both. The 4-byte variant carries
+// one value for every record added (RFC 9664 S4: the KEYs and the other records expire
+// together), so it is the KEY-LEASE when the request adds KEY RRs and the LEASE when it adds
+// other records, and 0 for a kind it adds none of.
+func requestedLeases(lo *leasepkg.LeaseOption, addsKeyRRs, addsOtherRRs bool) (lease, keyLease uint32) {
 	if lo.KeyLease != nil {
 		return lo.Lease, *lo.KeyLease
 	}
-	if hasKeyRRs {
+	if addsKeyRRs {
 		keyLease = lo.Lease
 	}
-	if hasOtherRRs || !hasKeyRRs {
+	if addsOtherRRs {
 		lease = lo.Lease
 	}
 	return lease, keyLease
@@ -67,7 +65,8 @@ func requestedLeases(lo *leasepkg.LeaseOption, hasKeyRRs, hasOtherRRs bool) (lea
 
 // grantedLeaseOption is the Update Lease option of the success reply: the granted LEASE and
 // KEY-LEASE in the variant the request used (RFC 9664 S4). For a 4-byte request its one value
-// is whichever of the two is set -- Handle makes them equal when both are -- or 0 for a delete.
+// is whichever of the two is set -- Handle makes them equal when both are -- or 0 when the
+// request adds nothing.
 func grantedLeaseOption(requested *leasepkg.LeaseOption, lease, keyLease uint32) *leasepkg.LeaseOption {
 	if requested.KeyLease == nil {
 		return leasepkg.Encode4Byte(max(lease, keyLease))

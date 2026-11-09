@@ -489,7 +489,7 @@ func TestSRPHandle_HostRemovalRemovesEveryInstance(t *testing.T) {
 }
 
 // A removal with a KEY-LEASE of 0 frees the names (RFC 9665 S3.2.5.5.1) before it is answered,
-// as an RFC 9664 Case C delete does: its one UPDATE deletes every KEY the store holds at and
+// as an RFC 9664 KEY delete does: its one UPDATE deletes every KEY the store holds at and
 // below the host -- also that of an instance no longer advertised that still holds its name,
 // which no Delete All RRsets reaches -- and adds none back, and the store forgets them, leaving
 // no timer to delete anything after the answer. If the authoritative server refuses that

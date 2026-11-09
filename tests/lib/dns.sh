@@ -223,6 +223,12 @@ wait_for_rr_state() {
     proxy_consistent_with_authoritative $rr_type "$rdata" "$state" $auth_present
 }
 
+# as_delete <rr-spec> -- the rr-spec ("<owner> [<ttl>] IN <type> <rdata>") as an RFC 2136
+# S2.5.4 delete of that record: TTL 0, class NONE.
+as_delete() {
+    sed -E 's/^([^[:space:]]+)([[:space:]]+[0-9]+)?[[:space:]]+IN[[:space:]]+/\1 0 NONE /' <<< "$1"
+}
+
 ensure_rr_absent() {
     local rr_type="$1"
     local rr_rdata="$2"
@@ -236,8 +242,8 @@ ensure_rr_absent() {
 
     log_step "Cleanup: rr $rr_type - $rr_rdata is present, deleting"
 
-    # Refresh with 0 lease.
-    if ! run_client refresh $CLIENT_KEY_NAME 0 0 "$rr_rdata"; then
+    # Delete it: nothing added, so both leases 0.
+    if ! run_client refresh $CLIENT_KEY_NAME 0 0 "$(as_delete "$rr_rdata")"; then
         log_error "Cleanup failed for $rr_type - $rr_rdata"
         return 1
     fi

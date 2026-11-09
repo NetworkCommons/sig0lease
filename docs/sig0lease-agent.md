@@ -82,7 +82,7 @@ A list, each entry with a `protocol`: `srp` registers hosts, their services and 
 | `transport` | `tcp` | `tcp`, `udp`, `tls` (DNS over TLS) or `doh` (DNS over HTTPS, or plain HTTP), the last two opportunistic: the certificate is not checked. |
 | `lease` | `1h` | How long the records last unless refreshed. A Go duration, in whole seconds. |
 | `key_lease` | `336h` | How long each host's or name's names stay reserved for its key (RFC 9665 §3.4). At least `lease`. |
-| `on_stop` | `keep` | What stopping does to the names. `keep`: the records go, the KEYs stay, so the names remain reserved for the agent's keys for `key_lease` (RFC 9665 §3.2.5.5.1; RFC 9664's Case D). `release`: the KEYs go too, and the names are free at once. Only stopping: while the agent runs, what it deregisters but still registers keeps its names (see "Running"). |
+| `on_stop` | `keep` | What stopping does to the names. `keep`: the records go, the KEYs stay, so the names remain reserved for the agent's keys for `key_lease` (RFC 9665 §3.2.5.5.1; for an RFC 9664 name, its records deleted and its KEY refreshed). `release`: the KEYs go too, and the names are free at once. Only stopping: while the agent runs, what it deregisters but still registers keeps its names (see "Running"). |
 
 An `srp` registrar also takes:
 
@@ -208,7 +208,7 @@ every poll; the failure is logged once.
 
 Under an `rfc9664` registrar. A name is given in full, held by its own key, with its addresses
 and records, registered in one RFC 9664 update signed with that key: the
-KEY and the records, on the registrar's leases (the handler's Case A).
+KEY and the records added, on the registrar's leases.
 
 | Field | Meaning |
 |---|---|
@@ -221,8 +221,8 @@ KEY and the records, on the registrar's leases (the handler's Case A).
 
 A name needs an address, a record or `ipfs:`. With only `auto` and no address to publish, the
 agent registers nothing for it until the machine has one. A name's records the template or the
-machine no longer has are withdrawn (Case D: LEASE 0 with them listed, the KEY refreshed) before
-the rest is registered again; a record's TTL is the client's 300 seconds, which the proxy may
+machine no longer has are deleted (class NONE, RFC 2136 §2.5.4) in the update that registers
+the rest again, so a record replaced by another is never absent from the zone, nor there twice; a record's TTL is the client's 300 seconds, which the proxy may
 override (`record_ttl_sec`).
 
 A name's service is the SRV records that find it at the name (RFC 2782), as an XMPP server's
@@ -366,9 +366,9 @@ name's with the name.
 
 Ctrl-C or SIGTERM deregisters every host and name, the mirror's hosts included, and exits 0.
 With `on_stop: keep`, the default, the deregistration asks for the `key_lease`: the records go
-but the KEYs stay (RFC 9665 §3.2.5.5.1; for a name, Case D with its records), so no other key
+but the KEYs stay (RFC 9665 §3.2.5.5.1; for a name, its records deleted and its KEY refreshed), so no other key
 can take the names, and the next start gets them back. With `release` it asks for a KEY lease
-of 0, a permanent removal (for a name, Case C: the KEY alone, which takes its records): the
+of 0, a permanent removal (for a name, its KEY deleted alone, which takes its records): the
 names are free, first come, first served. A host name another key takes in the meantime is
 renamed on the next start; a name is tried again (below). The mirror's hosts follow their
 registrar's `on_stop`. With `release`, stopping also frees what the state file still records
@@ -415,9 +415,9 @@ if a rename changed them, which ones, and a name's records. It is written
 atomically and checksummed, with the same code as the proxy's lease snapshots
 (`pkg/sealedfile`): a file edited by hand stops the agent at start.
 
-A name's records let a start withdraw those the template lost while the agent was not running
-cleanly, such as after a crash, when the stop did not delete them: they are withdrawn before the
-name is registered again.
+A name's records let a start delete those the template lost while the agent was not running
+cleanly, such as after a crash, when the stop did not delete them: they are deleted in the update
+that registers the name again.
 
 At every start, and after every template change, the agent frees the names of the hosts and
 names the file records that the template no longer registers, then forgets them: hosts and
@@ -425,7 +425,7 @@ names removed while it was stopped as well as while it ran, hosts a mirror no lo
 hosts registered in another domain, and hosts and names registered through another registrar
 or from another keystore. A host gets one deregistration of the host alone with a KEY lease of 0; the
 registrar removes the host's service instances with it (RFC 9665 §3.2.5.5.1, "even if the SRP
-requester doesn't list them"). A name gets its KEY alone with both leases 0 (Case C), which
+requester doesn't list them"). A name gets its KEY deleted alone, with both leases 0, which
 deletes every record the key registered. `plan` lists them. A release that fails is logged and
 tried again at the next start or template change; until then the names stay held until their
 key lease ends. A mirrored host that only stopped being advertised keeps its names until the

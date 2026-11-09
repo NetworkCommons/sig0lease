@@ -89,7 +89,7 @@ filename, and any existing key for that name is reused regardless of its algorit
 
 The client binary supports these commands:
 
-- `name` - keep one name registered through the `client/rfc9664` library, as `sig0lease-srp-client` keeps a host through `client/srp`: the name, with its own key, its addresses (`-addr`) and records (`-record`, written as in a `sig0lease-agent` template), refreshed on the lease clock until stopped. `-once`, `-withdraw` and `-deregister [-keep-names]` send one request instead (Cases A, D, and C or D).
+- `name` - keep one name registered through the `client/rfc9664` library, as `sig0lease-srp-client` keeps a host through `client/srp`: the name, with its own key, its addresses (`-addr`) and records (`-record`, written as in a `sig0lease-agent` template), refreshed on the lease clock until stopped. `-once`, `-withdraw` and `-deregister [-keep-names]` send one request instead: the name's records added, deleted, or deleted with the KEY refreshed or deleted itself (see "Adds and Deletes").
   - The name is given in full (`-name mysite.dev.zenr.io.`). Which names a key may register for itself is the proxy's to decide: with `fcfs_naming`, one label below its zone (see "First-Come First-Served Naming"). The client cannot look that zone up: a handler's zone need not be a DNS zone of its own, and when it is not, an SOA lookup finds the enclosing zone's apex instead (`dig SOA dev.zenr.io.` shows which). So it neither asks for the zone nor checks the name against it; a single label is refused before anything is sent. The name after its first label goes in the Zone Section (see "The Zone Section").
   - `name` signs with the name's own key, so a deeper name given to it is that key registering itself, which `fcfs_naming` refuses. A KEY below a name is registered with `register`, signed by the key holding the name; records below it go in the name's own `-record` entries, the owner relative to the name (`-name alice.dev.zenr.io. -record 'bob TXT "hello"'` writes at `bob.alice.dev.zenr.io.`).
 - `register`, `refresh` - send exactly the signed UPDATE-LEASE request described: the KEY and other records given (`rr-spec`), the signer's KEY where `-signer` puts it, the Zone Section `-zone` names (default: the signing key's name). The test suite uses them for shapes `client/rfc9664` never builds, the ones the proxy must refuse included: the signer's KEY in the Additional section or left out, a key signing records it does not hold. The library's requests always carry the name's own KEY in the Update section, with records at or below the name.
@@ -116,32 +116,47 @@ The proxy is designed to support two practical scenarios:
 - Registration: a client submits an authenticated UPDATE-LEASE request and the proxy forwards a signed UPDATE to the authoritative server.
 - Pass-through routing, with `server.forward` on: what no handler takes is forwarded to the upstream resolvers. Off, the default, the proxy answers only for its zones (see "Requests No Handler Takes").
 
-## UPDATE-LEASE Case Matrix
+## Adds and Deletes
 
 Clients include an UPDATE-LEASE option (EDNS option code 2) in their UPDATE packets. Two
 encodings are supported:
 
 - **8-byte variant (default):** 4 bytes encode the LEASE value (lease duration for non-KEY RRs), followed by 4 bytes encoding the KEY-LEASE value (lease duration for KEY RRs). Both are big-endian `uint32` values.
-- **4-byte variant (legacy):** 4 bytes encode a single LEASE value used for both KEY and non-KEY RRs. macOS's mDNSResponder sends it. Accepted only with `prefer_4byte_variant: true` on the handler, and `REFUSED` otherwise. When accepted, the one value is the KEY-LEASE if the Update section has KEY RRs, and the LEASE if it has other records, and 0 for a kind it lacks: Case A with both kinds, B with non-KEY records only, D with KEYs only, C for 0 (`requestedLeases`). After clamping, the KEYs get the granted LEASE, since RFC 9664 S4 has them expire together. The reply carries that one value in the 4-byte variant, the only one mDNSResponder reads (`grantedLeaseOption`). The proxy refuses to start with `prefer_4byte_variant: true` and `min_key_lease_sec` above `max_rr_lease_sec`, since no single lease would then fit both bounds.
+- **4-byte variant (legacy):** 4 bytes encode a single LEASE value used for both KEY and non-KEY RRs. macOS's mDNSResponder sends it. Accepted only with `prefer_4byte_variant: true` on the handler, and `REFUSED` otherwise. When accepted, the one value is the KEY-LEASE if the Update section adds KEY RRs, and the LEASE if it adds other records, and 0 for a kind it adds none of, as the 8-byte variant would have them (`requestedLeases`). After clamping, the KEYs get the granted LEASE, since RFC 9664 S4 has them expire together. The reply carries that one value in the 4-byte variant, the only one mDNSResponder reads (`grantedLeaseOption`). The proxy refuses to start with `prefer_4byte_variant: true` and `min_key_lease_sec` above `max_rr_lease_sec`, since no single lease would then fit both bounds.
 
 A bad option is answered with a header RCODE: `FORMERR` for a length other than 4 or 8 or a LEASE above the KEY-LEASE, `REFUSED` for a 4-byte option without `prefer_4byte_variant`. A duration outside the lease policy is not an error: it is raised to the minimum or cut to the maximum ("Lease Clamping, TTLs and Response Echo" below). Extended RCODEs (16 and up, their high bits carried in the OPT RR) are avoided because a requester that reads only the header, as mDNSResponder does, takes them for NOERROR.
 
-LEASE and KEY-LEASE together select one of four behavioral cases, detailed rule-by-rule in
-"Behavior Specification" below:
+Each record in the Update section is an RFC 2136 instruction (§2.5), told apart by its class,
+as detailed rule-by-rule in "Behavior Specification" below (item 5):
 
-| Case | KEY-LEASE | LEASE | Behavior |
-|---|---|---|---|
-| A | Non-zero | Non-zero | Full registration/refresh of a KEY RR and its non-KEY RRs together. |
-| B | 0 | Non-zero | Non-KEY-only registration/refresh; the signing KEY must already be managed. |
-| C | 0 | 0 | Delete: removes whichever of the named KEY/non-KEY RRs are actually locally managed. |
-| D | Non-zero | 0 | KEY-only registration/refresh, with optional deletion of accompanying non-KEY RRs. |
+| Class | TTL | Instruction |
+|---|---|---|
+| IN | any (the proxy sets its own, see "Lease Clamping, TTLs and Response Echo") | add the record: a registration, or a refresh of one the lease store holds |
+| NONE | 0 | delete the record (§2.5.4) |
+| ANY | 0 | delete an RRset, or every RRset at a name (§2.5.2, §2.5.3): `REFUSED` with Extended DNS Error 21 (Not Supported) |
+
+LEASE and KEY-LEASE are the leases of what the request adds, the other records and the KEYs
+(RFC 9664 §4): not 0 for a kind it adds, 0 for a kind it adds none of. No lease value deletes
+anything. RFC 9664 gives a lease of 0 no meaning and says that removed records are removed
+permanently (§4), so a record goes only by its delete, its lease running out, or the delete or
+expiry of the KEY that registered it. One request may add and delete, as mDNSResponder's does
+when it changes a record (the old one deleted and the new one added, `mDNSCore/uDNS.c`): the
+proxy forwards it as one UPDATE, which the authoritative server applies whole or not at all
+(RFC 2136 §3.7), deletes first. A request that only deletes still carries the option, with
+both values 0: the router hands an UPDATE to this handler by that option (see "Requests No
+Handler Takes").
+
+A request is malformed, `FORMERR` with Extended DNS Error 0, when it has no records, adds a
+kind of record on a lease of 0, adds and deletes the same record, deletes its signer's KEY while
+adding anything, or has a record RFC 2136 §3.4.1.3's prescan rejects: a class other than IN,
+NONE or ANY, a delete with a TTL other than 0, or type ANY, AXFR, MAILA or MAILB.
 
 Both the request-side decoding (`handlers/opcode5_lease_option.go`) and the response/client-side decoding (`client/lease_response.go`) share one low-level decoder (`pkg/lease.FindOption` + `pkg/lease.DecodeOption`/`FindAndDecode`) so there is a single place that knows how to locate and parse the option, whether it appears as a bare `ERFC3597` RR or nested inside an `OPT` record's options.
 
 ## Behavior Specification
 
 This is the exact rule set the update handler implements — the numbered items below are cited
-by number elsewhere in this codebase (e.g. a code comment reading "item 6" or "5.1.4" refers to
+by number elsewhere in this codebase (e.g. a code comment reading "item 6" or "5.2.3" refers to
 the corresponding entry here), so the numbering is kept stable.
 
 ### Behavior Specifications
@@ -154,36 +169,32 @@ the corresponding entry here), so the numbering is kept stable.
    5. If lease-store does not contain the key, verification uses authoritative DNS as the last source for signer key resolution.
    6. If authoritative DNS is reachable but returns no matching signer KEY, the request fails.
       6.a. If the authoritative DNS cannot be reached for signer-key lookup, the request fails. This is because we are modifying records for a DNS that does not respond.
-   7. According to RFC 2136, the Update Section contains RRs to be added to or deleted from the zone. Thus if a KEY RR is not been registered or refreshed, it should not be in the Authority/Update section of a signed lease-update request.
+   7. According to RFC 2136, the Update Section contains RRs to be added to or deleted from the zone. Thus a KEY RR is in the Authority/Update section of a signed lease-update request only to be registered, refreshed or deleted.
    8. Multiple KEY RRs can be present in a request in the Update section.
 2. When a signed registration comes in, the proxy first needs to verify the signature. This can be done either because the signing RR KEY is in the message (either in the Update or Additional section), or because the KEY is online (its name is already present at the FQDN or above of the records contained in the lease update request), or because the KEY is in the LeaseStore. Any of this can be used to verify the signature.
-3. You can sign a lease-update request with a key, but the request is to register or refresh a different RR KEY (which is not a signing KEY in this context). In this case only the latter is in the Update section.
+3. You can sign a lease-update request with a key, but the request is to register, refresh or delete a different RR KEY (which is not a signing KEY in this context). In this case only the latter is in the Update section.
 4. If verification is passed, it means that we could find the signing key. We found it either:
    1. In-LeaseStore AND at-FQDN -> this is a key we are managing
    2. In-LeaseStore AND NOT at-FQDN -> we assume the key has been removed externally from our proxy, so we need to register it with the remaining lease time from the lease-store. This implies that we need to add this KEY RR to the RRs to be registered.
    3. NOT In-LeaseStore AND at-FQDN -> the key is already registered, but we assume this has happened outside the lease mechanism (permanent update) and not under our control
    4. NOT In-LeaseStore AND NOT at-FQDN -> the key must be in the request (either Update or Additional section), otherwise we would never get here since we would not have had any KEY to verify the signature.
-5. From now on we look at the Update section and the RR records it contains. If the Update section contains a KEY RR, this does not need to be the key that signed the request. Looking at the request lease-times:
-   1. KEY-LEASE != 0, LEASE != 0: This is a registration or a refresh of KEY and non-KEY RRs.
-      1. The KEY RR and non-KEY RRs (at least one) must be present in the request, otherwise this is an error
-      2. If the KEY RR is already present in the LeaseStore, this is a refresh of the KEY, otherwise a registration
-      3. For any of the non-KEY RRs that is present in the LeaseStore, this is a refresh
-      4. If a non-KEY RRs is not present in the LeaseStore, it needs to be recorded together with the key that registers it, because we need to remove it when that key expires. In this case, the key that registers it is the key that signed the request.
-      5. This key must either be in the LeaseStore, or if not in the LeaseStore it must be in the Update section. It cannot be only in the Additional section, because the user intention must be to register a key, and not just use it to sign a request, so it must be part of the Update section.
-      6. There might be more than one KEY RRs in the Update section, so it is important to determine which KEY RR is the signing key.
-   2. KEY-LEASE == 0, LEASE != 0: this is a registration/refresh of non-KEY RRs
-      1. non-KEY RRs (at least one) must be present in the request, otherwise this is an error
-      2. For any of the non-KEY RRs that are not present in the LeaseStore, this is a registration, otherwise a refresh
-      3. Signing KEY must already exist in the LeaseStore, and must not be present in the Update section (given KEY-LEASE == 0, this is not a registration of the key, the key must already be registered). If it is not already at the FQDN at the authoritative DNS, it needs to be registered again (see 4.2).
-   3. KEY-LEASE == 0, LEASE == 0:
-      1. If KEY RR present -> delete KEY
-      2. If non-KEY RRs present -> delete non-KEY RRs
-      3. Both present -> delete both
-      4. Neither present -> error
-      5. Authorization for delete is ownership, not just at-FQDN: a KEY or non-KEY RR may only be deleted by its immediate parent (the KEY that registered it), or, for a KEY RR, by itself, whether it registered itself or another KEY registered it; the delete takes along everything it registered. A signer that is at-FQDN but not the immediate parent cannot delete the record directly, even though it could sign the request; the record is treated the same as if it did not exist, and no error results.
-   4. KEY-LEASE != 0, LEASE == 0:
-      1. KEY RR must be present -> register or refresh KEY
-      2. If non-KEY RRs present -> delete non-KEY RRs
+5. From now on we look at the Update section and the RR records it contains. Each is an add (class IN) or a delete (class NONE, TTL 0), RFC 2136 §2.5. A KEY RR in the Update section does not need to be the key that signed the request. LEASE is the lease of the non-KEY RRs added, KEY-LEASE that of the KEY RRs added (RFC 9664 §4).
+   1. The request is an error when:
+      1. it has no records;
+      2. it adds a non-KEY RR on a LEASE of 0, or a KEY RR on a KEY-LEASE of 0;
+      3. it adds and deletes the same record;
+      4. it deletes the signer's KEY and adds anything: that delete takes everything the KEY registered (5.3.2), what the request adds with it included;
+      5. it deletes an RRset, or every RRset at a name (class ANY): this is not supported.
+   2. Adds:
+      1. If the KEY RR is already present in the LeaseStore, this is a refresh of the KEY, otherwise a registration. A refresh is its owner's: the KEY itself, or the KEY that registered it.
+      2. For any of the non-KEY RRs that is present in the LeaseStore, this is a refresh, otherwise a registration.
+      3. A non-KEY RR needs to be recorded together with the key that registers it, because we need to remove it when that key expires. The key that registers it is the key that signed the request.
+      4. A request that adds non-KEY RRs, or a KEY RR not in the LeaseStore, requires the signing key to be in the LeaseStore, or else in the Update section, as one of the KEY RRs added. It cannot be only in the Additional section, because the user intention must be to register a key, and not just use it to sign a request. With `allow_online_key_registration`, an online-only signer may as well. A signing key in the LeaseStore that is not at the FQDN at the authoritative DNS is registered again (see 4.2).
+      5. There might be more than one KEY RRs in the Update section, so it is important to determine which KEY RR is the signing key.
+   3. Deletes:
+      1. Authorization for delete is ownership, not just at-FQDN: a KEY or non-KEY RR may only be deleted by its immediate parent (the KEY that registered it), or, for a KEY RR, by itself, whether it registered itself or another KEY registered it. A signer that is at-FQDN but not the immediate parent cannot delete the record directly, even though it could sign the request; the record is treated the same as if it did not exist, and no error results.
+      2. The delete of a KEY takes along everything it registered, as its expiry does.
+   4. What the request adds and deletes goes to the authoritative DNS in one UPDATE: the deletes first, then the KEY RRs, then the non-KEY RRs.
 6. If the proxy attemps to register a record that already exists at the DNS server, the request must fail also in the parts that would be successful if performed alone, because the consistency of the LeaseStore cannot be guaranteed, especially in case of already existing KEY RR.
    1. This implies that the proxy needs to verify whether in case of a registration, an identical record is already at the FQDN.
 7. For all attempts of deleting records, if the record does not exist in the lease-store, we assume the record is either outside our control, or it has been removed after expiry. The request does not fail but the user needs to be informed about this. If the record exists in the lease-store but not at the DNS, do not fail the request but signal the situation. Missing local records do not force whole-request failure.
@@ -215,7 +226,7 @@ deferred-mutation write ordering) that goes beyond the rule statement itself.
 
 ### Signer Resolution (Three-Stage Fallback)
 
-Before processing the case matrix, the proxy validates the SIG(0) signature on the UPDATE packet (`UpdateHandler.extractAndValidateSig0`). The signer's name must be one the handler serves (Behavior Specification item 8), and the signer key must be at or above the FQDN of every record in the Update section. Candidate signer key material is tried in order:
+Before looking at what the request adds and deletes, the proxy validates the SIG(0) signature on the UPDATE packet (`UpdateHandler.extractAndValidateSig0`). The signer's name must be one the handler serves (Behavior Specification item 8), and the signer key must be at or above the FQDN of every record in the Update section. Candidate signer key material is tried in order:
 
 1. **Request-provided:** a KEY RR matching the SIG(0) signer identity (name, algorithm, key tag) present in the Update or Additional section.
 2. **Lease store:** a KEY previously registered under that identity.
@@ -230,21 +241,21 @@ Description KEY, always present in the request. See `docs/siglease_rfc9665.md` �
 
 An online-only signer can always be used to authenticate a request — SIG(0) verification does not depend on the flag. What the signer is subsequently *allowed to do* does:
 
-- **Deletes (Case C)** are ownership-based, independent of this flag (see Behavior Specification item 5.3.5 above). Such a signer can still remove the data, but only indirectly, by deleting the record's true parent, which cascades (see "Upstream Forwarding and Write Ordering" below).
-- **Authoring new lease-store state** — a new KEY RR, or non-KEY RRs owned by the signer — requires the signer to be either already lease-managed, itself present in the Update section (a normal self-registration), or, if `allow_online_key_registration: true` is configured for the handler, an online-only signer. This is one policy (`UpdateHandler.signerAuthorizedForNewRegistration`) applied identically to KEY and non-KEY registration in Case A and Case D; it is not KEY-RR-specific. Default is `false` (fail closed).
+- **Deletes** are ownership-based, independent of this flag (see Behavior Specification item 5.3.1 above). Such a signer can still remove the data, but only indirectly, by deleting the record's true parent, which cascades (see "Upstream Forwarding and Write Ordering" below).
+- **Authoring new lease-store state** — a new KEY RR, or non-KEY RRs owned by the signer — requires the signer to be either already lease-managed, itself present in the Update section (a normal self-registration), or, if `allow_online_key_registration: true` is configured for the handler, an online-only signer. This is one policy (`UpdateHandler.signerAuthorizedForNewRegistration`, Behavior Specification item 5.2.4) applied identically to every request that adds non-KEY RRs or a new KEY RR; it is not KEY-RR-specific. Default is `false` (fail closed).
 
 When an online-only signer registers a *different* KEY RR than itself (e.g. delegating a new child key it will never itself be lease-managed under), any non-KEY RRs in the same request are still attached to the **signer's own node** per the rule below — including when that node has no backing KEY record (a signer that is deliberately never self-registered). The lease store permits this "phantom owner" for non-KEY records the same way it already permits a KEY RR's `ParentKeyName` to reference a node that has no record of its own.
 
 ### Non-KEY RR Ownership
 
-Non-KEY RRs registered in Case A always belong to the signer of the request (Behavior Specification item 5.1.4) — never to some other KEY RR that happens to be registered in the same packet — regardless of whether the signer is itself present in the Update section. If the signer is present, this happens naturally as part of that KEY's own registration/refresh; if not (the signer is only authorizing a different KEY's registration), the data is attached to the signer's node in a separate step after the per-KEY loop.
+Non-KEY RRs a request adds always belong to the signer of the request (Behavior Specification item 5.2.3) — never to some other KEY RR that happens to be registered in the same packet — regardless of whether the signer is itself present in the Update section. If the signer is present, this happens naturally as part of that KEY's own registration/refresh; if not (the signer is only authorizing a different KEY's registration), the data is attached to the signer's node in a separate step after the per-KEY loop.
 
 Additional rules:
 
 - The signer KEY used for SIG(0) verification and a KEY RR being registered/refreshed in the Update section can be different keys.
 - Multiple KEY RRs can be present in the Update section; each is dispatched independently.
-- A KEY used only for signing should be in the Additional section; a KEY in the Update section is interpreted as intended for lease register/refresh/delete.
-- **Key lease ownership:** when a KEY RR is registered (Case A or D), its public key becomes the "owner" for the non-KEY RRs registered alongside it and for other KEY RRs registered under it. This is tracked via `ParentKeyName` in the lease tree.
+- A KEY used only for signing should be in the Additional section; a KEY in the Update section is interpreted as intended for lease register/refresh (class IN) or delete (class NONE).
+- **Key lease ownership:** when a KEY RR is registered, its public key becomes the "owner" for the non-KEY RRs registered alongside it and for other KEY RRs registered under it. This is tracked via `ParentKeyName` in the lease tree.
 
 ### Zones Served: the Deepest Zone Wins
 
@@ -272,7 +283,7 @@ A requester may therefore send the zone apex, as RFC 2136 asks and as `nsupdate`
 
 ### First-Come First-Served Naming (`fcfs_naming`)
 
-Without this option, the handler follows RFC 9664 alone: a signer writes at and below its own name (Behavior Specification item 1.2), and a new key may register itself at any name, including at or below another key's name. That suits a zone whose names one operator hands out. A zone that unrelated requesters share, such as the live `dev.zenr.io.`, needs a name to stay with the key that took it first. With `fcfs_naming: true` (default `false`; on in this repo's `config.yaml`) the handler applies RFC 9665's First-Come First-Served Naming (§3.2.4.1) to KEYs (Behavior Specification item 9). The check runs on every KEY a request registers anew in Case A or D (`UpdateHandler.refuseNewKey`, `fcfsNewKey`):
+Without this option, the handler follows RFC 9664 alone: a signer writes at and below its own name (Behavior Specification item 1.2), and a new key may register itself at any name, including at or below another key's name. That suits a zone whose names one operator hands out. A zone that unrelated requesters share, such as the live `dev.zenr.io.`, needs a name to stay with the key that took it first. With `fcfs_naming: true` (default `false`; on in this repo's `config.yaml`) the handler applies RFC 9665's First-Come First-Served Naming (§3.2.4.1) to KEYs (Behavior Specification item 9). The check runs on every KEY a request registers anew (`UpdateHandler.refuseNewKey`, `fcfsNewKey`):
 
 - **One label below the zone.** A KEY may register itself only directly below the zone (`alice.dev.zenr.io.`), not at the apex, which is the zone operator's (the proxy's own KEY is there), nor deeper (`bob.alice.dev.zenr.io.`). Anything else is refused with `REFUSED` and Extended DNS Error 18, before any name is checked. A deeper name is registered by the key holding the name above it, so every held name has its holder above it, and goes with it: deleting or expiring a KEY takes along every KEY it registered. Without this rule, bob could register himself at `bob.alice.dev.zenr.io.` while `alice.dev.zenr.io.` is free. A newcomer could then take `alice.dev.zenr.io.` and, as a signer above bob's name, add records at bob's names (Behavior Specification item 1.2). Checking below the newcomer's name cannot stop that: no DNS query lists the names below a name, so only keys in this proxy's lease store would be found.
 - **Names checked.** For a KEY registering itself: its own name. For a KEY its signer registers: the names from the KEY's name up to but not including the signer's name, which the signer holds. A holder may therefore register further KEYs at its own name and below it, which is how a second key gets a name another key holds. A KEY below a name a different key holds is refused, even when the signer is above that key: only the holder registers below its name.
@@ -284,9 +295,9 @@ Without this option, the handler follows RFC 9664 alone: a signer writes at and 
 ### Registration and Refresh Details
 
 - **Refresh ownership check:** before treating a KEY RR as a refresh of an existing lease, `UpdateHandler.validateRefreshOwnership` compares the *actual* stored KEY RDATA (flags, protocol, algorithm, public key) against the one in the request. The lease store's node key is a composite of name + algorithm + key tag, which is not collision-free (the key tag is a 16-bit checksum); this check is what makes ownership verification exact rather than relying on the composite key alone.
-- **Missing-at-FQDN recovery:** if a signer's managed KEY is found to be missing at the authoritative DNS (Cases A, B, D), the proxy re-registers it with whatever lease time remains in the local store, rather than granting a fresh full-duration lease or failing the request outright.
-- **Duplicate registration rejection** (Behavior Specification item 6): applies uniformly to every case that can register something new — Cases A and D for KEY RRs, Cases A and B for non-KEY RRs. In Case A it applies to a refresh's non-KEY RRs too, since a refresh may add records new to its key (`filterDuplicateRegistrations`, run for every KEY in the request before the forward).
-- **Delete semantics** (Behavior Specification items 5.3.5 and 7): a delete attempt deliberately doesn't distinguish "doesn't exist" from "exists but you don't own it," so it cannot be used to probe for the existence of records outside the signer's own subtree. Only records the signer is actually authorized to delete are included in the upstream delete request.
+- **Missing-at-FQDN recovery:** if a signer's managed KEY is found to be missing at the authoritative DNS by a request that adds anything, the proxy re-registers it with whatever lease time remains in the local store, rather than granting a fresh full-duration lease or failing the request outright.
+- **Duplicate registration rejection** (Behavior Specification item 6): applies uniformly to everything a request registers anew, KEY and non-KEY RRs alike, and to the non-KEY RRs added with a KEY's refresh too, since a refresh may add records new to its key (`filterDuplicateRegistrations`, run before the forward for the records of every KEY the request adds, and for the signer's records when its KEY is not among them).
+- **Delete semantics** (Behavior Specification items 5.3.1 and 7): a delete attempt deliberately doesn't distinguish "doesn't exist" from "exists but you don't own it," so it cannot be used to probe for the existence of records outside the signer's own subtree. Only records the signer is actually authorized to delete are included in the upstream delete request.
 
 ### Upstream Forwarding and Write Ordering
 
@@ -295,13 +306,13 @@ Without this option, the handler follows RFC 9664 alone: a signer writes at and 
 
 The proxy never mutates the local lease store before the corresponding upstream UPDATE has been confirmed successful:
 
-1. All case-matrix outcomes are staged as deferred mutations.
-2. The proxy signs and forwards the resulting change to the authoritative server (add-style for Cases A/B/D, a combined RFC 2136 delete for Case C).
+1. Everything the request adds and deletes is staged as deferred mutations.
+2. The proxy signs and forwards the resulting change to the authoritative server, as one UPDATE: the RFC 2136 deletes first, then the adds (Behavior Specification item 5.4).
 3. Only if the upstream server returns `NOERROR` are the staged local mutations applied.
 4. If the upstream server rejects the update (or is unreachable), the proxy returns an error to the client and the local lease store is left exactly as it was before the request — there is nothing to roll back, because nothing was written yet.
 5. Once the upstream server has applied the update, a staged mutation must not fail. Every check that could refuse one — a record the store holds under another key (`filterDuplicateRegistrations`; SRP's FCFS), a node to renew that is not in the store — runs before the forward, while the request holds its node locks. A failure is therefore a bug, and both handlers panic, as a lease expiry does when its store write fails after its upstream delete: DNS has changed, so answering an error would leave published records that no lease ends, and answering success would hide the bug.
 
-This means the local lease store's view of the world and the authoritative DNS server's view can never diverge as a direct result of a single request's outcome. Case C's delete additionally cascades: deleting a KEY takes its whole subtree along, as its expiry and an SRP removal freeing its names do (`subtreeDeletes`, then `forgetSubtree` once confirmed; see "Storage Backends and Expiry"). The request's one UPDATE deletes the named records and, record by record, every KEY and record at and below each named KEY; nothing is forgotten locally before it is confirmed, and if it is not, the request fails with nothing changed. Every UPDATE either handler sends is built, signed and read the same way (`upstreamTarget.send`): a transport error, no answer, or any RCODE but NOERROR is a failure.
+This means the local lease store's view of the world and the authoritative DNS server's view can never diverge as a direct result of a single request's outcome. A KEY's delete additionally cascades: it takes the KEY's whole subtree along, as its expiry and an SRP removal freeing its names do (`subtreeDeletes`, then `forgetSubtree` once confirmed; see "Storage Backends and Expiry"). The request's one UPDATE deletes the named records and, record by record, every KEY and record at and below each KEY deleted; nothing is forgotten locally before it is confirmed, and if it is not, the request fails with nothing changed. Every UPDATE either handler sends is built, signed and read the same way (`upstreamTarget.send`): a transport error, no answer, or any RCODE but NOERROR is a failure.
 
 Two operations on the same lease-store nodes never interleave across that upstream round trip: see "Node Locks" below.
 
@@ -312,21 +323,21 @@ Two operations on the same lease-store nodes never interleave across that upstre
 
 Every operation that changes the lease store checks local and often remote state, sends one UPDATE upstream, and only then changes the store. The store's own mutex makes each single store call atomic, not that sequence, so without more two operations on the same nodes would interleave across the network round trips:
 
-- two signers registering one RR would both pass the "already registered under another owner" check and both be accepted upstream; the loser would get `SERVFAIL` after its write landed, in Case A with its KEY left registered;
-- a Case C delete would read a KEY's subtree before a registration under that KEY attached its record, and miss it: the record would stay published after the delete that should have taken it, under a KEY that no longer exists, until its own LEASE ran out;
+- two signers registering one RR would both pass the "already registered under another owner" check and both be accepted upstream; the loser would get `SERVFAIL` after its write landed, with the KEY it added left registered;
+- a KEY's delete would read the KEY's subtree before a registration under that KEY attached its record, and miss it: the record would stay published after the delete that should have taken it, under a KEY that no longer exists, until its own LEASE ran out;
 - a lease expiry's upstream delete and a refresh's upstream add would race, with no way to know which one the authoritative server applied last.
 
 So each handler has a lock table, `pkg/lease.NodeLocks` (`pkg/lease/nodelock.go`). An operation takes the locks of every node it may touch, all of them at once or none, holds them from its first check to its local apply, and releases them. Lock ids are the store's own keys: `NodeKey` for a KEY node, `RecordKey` for a non-KEY record.
 
 | Operation | Locks |
 |---|---|
-| Case A, B, D (may register) | the signer's node, each named KEY, each named non-KEY record |
-| Case C (delete) | each named KEY with its whole current subtree, each named non-KEY record |
+| A request's adds (may register) | the signer's node, each KEY added, each non-KEY record added |
+| A request's deletes | each KEY deleted with its whole current subtree, each non-KEY record deleted |
 | Expiry of a node | the node and its whole current subtree |
 
-A refresh needs only the node it refreshes, a registration also the node it attaches to (its parent), and a delete the node with its subtree. Whether an RR in Cases A, B and D is a refresh or a registration is only learned from the checks the lock protects, so these cases always lock the registration-shaped set. Its parent is always the signer's node: a new KEY is registered under its signer (`registerKeyLease`), and non-KEY records always belong to the signer ("Non-KEY RR Ownership" above). Holding the signer's node is what keeps a delete or an expiry of the signer, which locks the signer's subtree, from running while something is being attached under it. Case C is known from `LEASE=0, KEY-LEASE=0` before any check, so its set is delete-shaped from the start (`UpdateHandler.requestLockSet`).
+A refresh needs only the node it refreshes, a registration also the node it attaches to (its parent), and a delete the node with its subtree. Whether an RR added is a refresh or a registration is only learned from the checks the lock protects, so adds always lock the registration-shaped set. Its parent is always the signer's node: a new KEY is registered under its signer (`registerKeyLease`), and non-KEY records always belong to the signer ("Non-KEY RR Ownership" above). Holding the signer's node is what keeps a delete or an expiry of the signer, which locks the signer's subtree, from running while something is being attached under it. A delete is known from its class before any check, so its set is delete-shaped from the start. A request that adds and deletes takes the union of both, all at once (`UpdateHandler.requestLockSet`).
 
-- **When a request locks.** In `Handle`, right after SIG(0) verification and before the case dispatch, so an unverified request never holds a lock; the locks are released on every return path, after the local apply. Signer resolution reads the store before that, and the checks that decide anything run under the locks.
+- **When a request locks.** In `Handle`, right after SIG(0) verification and before the adds and deletes are checked, so an unverified request never holds a lock; the locks are released on every return path, after the local apply. Signer resolution reads the store before that, and the checks that decide anything run under the locks.
 - **One pass reads a whole subtree.** `Acquire` and `TryAcquire` take the lock set as a callback and call it with the table's mutex held, on every attempt; a delete-shaped set reads the subtree there (`ListSubtreeKeys`). Nothing can attach a node under a subtree member meanwhile, because attaching takes the parent's lock, which is either the subtree's root or a member just read, and no lock is taken or released while the table's mutex is held. So the subtree read is exact, with no repeated expansion. A waiting request calls the callback again after every release, so it takes the subtree as it is then, including children attached while it waited. Lock order is always the table's mutex, then the store's; the store never calls the table.
 - **No deadlock.** A set is taken whole under one mutex, so nobody ever holds part of a set, and nobody waits while holding a node lock: a waiting request holds nothing, and expiries never wait. The upstream in-flight limit (`authoritative.max_inflight_updates`) is a wait inside `SendUpdate`, after the node locks: requests holding node locks may wait in it, but nothing holding one of its slots waits for a node lock, so the two cannot form a cycle.
 - **Requests wait, up to their deadline.** A request whose locks are not all free waits, holding nothing, and tries again whenever a lock is released. It does not fail fast because of retransmissions: a client that times out resends its request with the same message ID and takes the first reply with that ID, so an immediate `SERVFAIL` to the resent request would beat the original's `NOERROR`, and the client would report a failure for a registration that happened. Waiting, the resent request runs after the original, as a refresh of what it just did. The wait is bounded by the request's deadline, which the router sets around the handlers: `server.request_timeout`, default 15s, must be positive (`Router.Route`). The deadline bounds the upstream exchanges too, so a request holds its locks at most that long, and a request waiting behind it does not give up before it has answered. 15s is above the worst case of one authoritative UPDATE, a UDP attempt and then TCP at the dns library's default timeouts (about 11s). A request still waiting at its deadline gets `SERVFAIL`, and the proxy logs the contended ids (`lease-store node lock contention on …`). Resent requests are not dropped as duplicates of one in flight: that is only possible over UDP (over TCP, the original's reply goes on a connection the resending client has abandoned), and waiting covers both transports.
@@ -334,11 +345,11 @@ A refresh needs only the node it refreshes, a registration also the node it atta
 - **The table.** A lock is an id in a set, not a mutex per id: nothing outlives its holder, so the table doesn't grow with every id ever seen (every A/AAAA address, including rotating IPv6 privacy addresses, and every TXT revision). Ids are deduplicated and sorted, so errors and `IDs()` are deterministic. Releasing a set twice panics: it would free ids another operation may have taken since.
 - **One lease store per handler.** The RFC 9664 and SRP handlers each have their own store and lock table, and must never share a store. Each handler's `Start` and reconciliation pass arm expiry timers for nodes in its store, so with one store each would expire the other's nodes, by the wrong rules and with the wrong signing key; and SRP allows one KEY per name, while RFC 9664 allows several. `cmd/sig0lease` (`checkSeparateLeaseStores`) refuses to start, before any `Setup`, when the two handlers' `storage.path` name one file, also through a symlink, a hard link or a different letter case once the file exists. A Go program embedding the handlers and passing one `lease_manager` object to both is not checked.
 - **Limits.** The table is in memory, so nothing here makes several proxy processes sharing state safe; the FCFS prerequisites, SRP's and this handler's with `fcfs_naming`, are the only protection across processes. The deadline can cut an upstream UPDATE short: if the authoritative server applied it but its reply did not arrive in time, the request answers `SERVFAIL` and applies nothing locally, as for any upstream timeout.
-- **Tests.** `pkg/lease/nodelock_test.go` covers the table: mutual exclusion, all or none, waiting and the deadline, re-reading a subtree that grew while waiting, releasing twice. `handlers/node_locks_test.go` holds one operation inside its upstream send while a second runs against the same nodes: two signers registering one TXT get one `NOERROR` and one duplicate `REFUSED`, with one UPDATE sent; a Case C delete during a registration under its KEY cascades into the new record; an expiry while a request holds its node sends nothing and re-arms its timer. Each fails with the locks disabled.
+- **Tests.** `pkg/lease/nodelock_test.go` covers the table: mutual exclusion, all or none, waiting and the deadline, re-reading a subtree that grew while waiting, releasing twice. `handlers/node_locks_test.go` holds one operation inside its upstream send while a second runs against the same nodes: two signers registering one TXT get one `NOERROR` and one duplicate `REFUSED`, with one UPDATE sent; a KEY's delete during a registration under that KEY cascades into the new record; an expiry while a request holds its node sends nothing and re-arms its timer. Each fails with the locks disabled.
 
 ### Lease Clamping, TTLs and Response Echo
 
-Before forwarding, the proxy clamps LEASE and KEY-LEASE to `LeasePolicy` bounds (`min_key_lease_sec`/`max_key_lease_sec`/`min_rr_lease_sec`/`max_rr_lease_sec`): a duration below its minimum is raised to it and one above its maximum cut to it, and 0, a delete, is left alone. Both handlers parse and clamp with the same code (`handlers/lease_policy.go`), so neither refuses a request for its duration; the proxy refuses to start with a policy whose non-KEY bounds are looser than its KEY bounds (`min_rr_lease_sec` above `min_key_lease_sec`, or `max_rr_lease_sec` unset or above a set `max_key_lease_sec`): clamping the two values separately would then grant a LEASE longer than the KEY-LEASE. The *actual* durations used after clamping — not the client's originally-requested values — are echoed back to the client in the response's UPDATE-LEASE option, so the client can detect when the proxy granted less than what was requested. Both handlers build that response with `handlers.leaseResponse`: it copies none of the request's sections (RFC 2136 §3.8) and carries exactly one OPT RR (RFC 6891 §6.1.1). Copying the request's header used to add a second OPT RR beside the one holding the lease, which strict parsers such as mDNSResponder's `srp-client` reject. `client.EffectiveLeaseDuration(resp, requestedLease, requestedKeyLease)` returns both the effective LEASE and KEY-LEASE from a response.
+Before forwarding, the proxy clamps LEASE and KEY-LEASE to `LeasePolicy` bounds (`min_key_lease_sec`/`max_key_lease_sec`/`min_rr_lease_sec`/`max_rr_lease_sec`): a duration below its minimum is raised to it and one above its maximum cut to it, and 0, nothing of that kind added, is left alone. Both handlers parse and clamp with the same code (`handlers/lease_policy.go`), so neither refuses a request for its duration; the proxy refuses to start with a policy whose non-KEY bounds are looser than its KEY bounds (`min_rr_lease_sec` above `min_key_lease_sec`, or `max_rr_lease_sec` unset or above a set `max_key_lease_sec`): clamping the two values separately would then grant a LEASE longer than the KEY-LEASE. The *actual* durations used after clamping — not the client's originally-requested values — are echoed back to the client in the response's UPDATE-LEASE option, so the client can detect when the proxy granted less than what was requested. Both handlers build that response with `handlers.leaseResponse`: it copies none of the request's sections (RFC 2136 §3.8) and carries exactly one OPT RR (RFC 6891 §6.1.1). Copying the request's header used to add a second OPT RR beside the one holding the lease, which strict parsers such as mDNSResponder's `srp-client` reject. `client.EffectiveLeaseDuration(resp, requestedLease, requestedKeyLease)` returns both the effective LEASE and KEY-LEASE from a response.
 
 This handler's status notes (for example `record not found for delete: ...`) travel in that same OPT RR, one Extended DNS Error option (RFC 8914, INFO-CODE 0 "Other") per note, with the note as EXTRA-TEXT; `dnsmsg.EDEs(resp)` returns them and `sig0lease-client` prints them under "Extended DNS Errors", as it does an error reply's (see "Error Replies" below). They used to be TXT records in the answer slot, next to an echo of the KEY RRs processed, but in an UPDATE reply that slot is the Prerequisite section, which a reply may only copy from the request. The KEY echo is gone; to see a registered KEY, query it (`sig0lease-client verify`) or `dig` it at the authoritative server.
 
@@ -350,8 +361,8 @@ SIG(0) verification passes, both handlers set every record they write upstream t
 `record_ttl_sec` (default 300, `handlers/record_ttl.go`), cut to the granted KEY-LEASE on KEYs
 and to the granted LEASE on everything else. The records are changed in place, so the lease
 store keeps the TTLs the zone gets, and every RRset in a request leaves with one TTL (RFC 2181
-§5.2) whatever the requester sent. A KEY re-registered from the lease store in Case B, where the
-request carries no KEY-LEASE, is cut to the remaining lease it is re-registered with. RFC 9664
+§5.2) whatever the requester sent. A KEY re-registered from the lease store for a request that adds records alone, with no
+KEY-LEASE, is cut to the remaining lease it is re-registered with. RFC 9664
 says nothing about TTLs; the rule follows RFC 9665 §4 and §5.1, where the SRP handler applies
 the same setting (see `docs/siglease_rfc9665.md` §6).
 
@@ -363,13 +374,13 @@ Every error reply either handler sends, like a success reply, copies none of the
 |---|---|
 | 18 Prohibited | an unauthorized or unproven signer, records outside its subtree, a record held by another key (`REFUSED`), a name held by another key (`YXDOMAIN`: SRP's FCFS, this handler's `fcfs_naming`), a name outside the handler's zone or in another handler's (`REFUSED`), a KEY registering itself other than one label below the zone with `fcfs_naming` (`REFUSED`), a blacklisted type, foreign data at an SRP name |
 | 20 Not Authoritative | a request no handler takes, with `server.forward` off (`REFUSED`, see "Requests No Handler Takes") |
-| 21 Not Supported | a "." in a label, the 4-byte variant while `prefer_4byte_variant` is off, UDP while SRP's `allow_udp` is off |
+| 21 Not Supported | an RRset delete (class ANY) in an RFC 9664 request, a "." in a label, the 4-byte variant while `prefer_4byte_variant` is off, UDP while SRP's `allow_udp` is off |
 | 22 No Reachable Authority | the authoritative server could not be queried or did not accept the UPDATE (`SERVFAIL`); also a request `server.forward` could not forward |
 | 0 Other | anything else: a malformed request, a busy lease store, an internal error |
 
 The reason text can tell a requester about the proxy's state, such as whether a key is in its lease store, so it stays only with `server.diagnostics: true`; otherwise the router removes it and keeps the code (`Router.ownErrorReply`), which RFC 8914 §3 requires every client to accept. `sig0lease-client` and `sig0lease-srp-client` print each Extended DNS Error after the status, and the test suites check refusals by them, with diagnostics on.
 
-The RCODE tells the requester whether to retry: `FORMERR` for a request that is not a valid lease request -- a bad option, or records that don't fit the lease case it asks for, in every case alike; `REFUSED` for a valid one this proxy won't do; `SERVFAIL` when it could not finish, including a failed authoritative lookup inside a check that would otherwise refuse (the signer's KEY, a duplicate check: `authoritativeLookupError`), since the request itself may be fine. The SRP handler answers only the RCODEs RFC 9665 §3.3.5 allows, so a malformed SRP update is `REFUSED`.
+The RCODE tells the requester whether to retry: `FORMERR` for a request that is not a valid lease request -- a bad option, or records that don't fit the leases it asks for or RFC 2136's instructions (see "Adds and Deletes"); `REFUSED` for a valid one this proxy won't do; `SERVFAIL` when it could not finish, including a failed authoritative lookup inside a check that would otherwise refuse (the signer's KEY, a duplicate check: `authoritativeLookupError`), since the request itself may be fine. The SRP handler answers only the RCODEs RFC 9665 §3.3.5 allows, so a malformed SRP update is `REFUSED`.
 
 ### Blacklisted RR Types
 
@@ -394,7 +405,7 @@ Two backends are selectable via `handlers.update.storage` in `config.yaml` (see 
 
 ### Reference to Source Files
 
-- `handlers/opcode5_handle.go` — `Handle()`, the full case dispatch, `buildSuccessResponse`.
+- `handlers/opcode5_handle.go` — `Handle()`: the adds and deletes, `requestLockSet`, `buildSuccessResponse`. `handlers/opcode5_update_helpers.go` reads the Update section into them (`extractUpdateRecords`, `checkUpdateRecords`).
 - `handlers/lease_handler.go` — `leaseHandler`, the part both handlers are made of alike: the handler basics, the `leaseRuntime`, the configuration both read the same way (`setup`: upstream zone, keystore and signing key, coordinator, lease policy, record TTL, lease store), `Start`, which arms the timers of the leases `setup` loaded and starts the reconciliation pass, `upstream`, where both send their UPDATEs, `SeparateZones` and `refuseNamesNotServed` ("Zones Served"), and `fcfsConflictResult`, the `YXDOMAIN` reply both handlers' FCFS checks send. Each handler's `Setup` reads only its own options and then calls `setup`.
 - `handlers/lease_runtime.go` — `leaseRuntime`, which `leaseHandler` embeds: the lease store, expiry timers and node locks, `scheduleLeaseExpiry`, the timer callback, the 30-second reconciliation pass, and `Shutdown`. Each handler supplies only how its lease event runs and what its pass adds (SRP's service enumeration).
 - `handlers/opcode5_lease.go` — lease-store read/write helpers, `authorizeKeyRefresh`, and the expiry machinery shared with `SRPHandler`: `leaseExpirer`, `subtreeLeases`, `subtreeDeletes`, `forgetSubtree`, `expiryTimers`, `expiryRetryDelay`, `nextLeaseEvent`.
@@ -407,8 +418,8 @@ Two backends are selectable via `handlers.update.storage` in `config.yaml` (see 
 - `pkg/lease/nodelock.go` — `NodeLocks`, the lock table both handlers use so that operations on the same lease-store nodes never interleave ("Node Locks").
 - `pkg/lease/lease.go` — `LeaseOption` encode/decode and the shared `FindOption`/`DecodeOption`/`FindAndDecode` helpers.
 - `client/lease_response.go` — client-side decoding of the server's granted LEASE/KEY-LEASE.
-- `client/rfc9664/client.go` — the library requester: `Register` (Case A), `Withdraw` (Case D with the records listed), `Deregister` (Case D keeping the name, Case C freeing it) and `Run`, which keeps the name registered on the lease clock (`client/lifecycle.go`). A `YXDOMAIN` (`fcfs_naming`: another key holds the name) is an error `Run` tries again with backoff; it never renames.
-- `client/rfc9664/name.go` — `Name`, one name kept registered as its records change, on `client.Keeper` (`client/keeper.go`, which `client/srp`'s `Host` uses too): it withdraws the records it no longer has, those an earlier run's `NameStore` kept included, before registering the rest. `Release` frees a name that is not running. `sig0lease-agent` registers its `names:` with it (`docs/sig0lease-agent.md`), and so does the demo's browser page (`client/web`, "DNS-over-HTTPS").
+- `client/rfc9664/client.go` — the library requester: `Register` (the KEY and the records added, and those of `Config.Gone` deleted, in one update), `Withdraw` (the records listed deleted, the KEY refreshed), `Deregister` (the records deleted and the KEY refreshed, keeping the name; or the KEY deleted, freeing it) and `Run`, which keeps the name registered on the lease clock (`client/lifecycle.go`). A `YXDOMAIN` (`fcfs_naming`: another key holds the name) is an error `Run` tries again with backoff; it never renames.
+- `client/rfc9664/name.go` — `Name`, one name kept registered as its records change, on `client.Keeper` (`client/keeper.go`, which `client/srp`'s `Host` uses too): it deletes the records it no longer has, those an earlier run's `NameStore` kept included, in the update that registers the rest. `Release` frees a name that is not running. `sig0lease-agent` registers its `names:` with it (`docs/sig0lease-agent.md`), and so does the demo's browser page (`client/web`, "DNS-over-HTTPS").
 
 ## Configuration
 

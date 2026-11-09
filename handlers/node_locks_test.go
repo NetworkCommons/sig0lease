@@ -153,7 +153,7 @@ func TestNodeLocks_UpdateHandler_SameRecordFromTwoSigners(t *testing.T) {
 	}
 }
 
-// A KEY's delete (Case C) while a registration under that KEY is in flight: the delete must
+// A KEY's delete while a registration under that KEY is in flight: the delete must
 // wait, then cascade into the record the registration just attached -- not delete the KEY
 // alone and leave the new record owned by a KEY that no longer exists, still published.
 func TestNodeLocks_UpdateHandler_DeleteWaitsForRegistrationUnderIt(t *testing.T) {
@@ -164,7 +164,7 @@ func TestNodeLocks_UpdateHandler_DeleteWaitsForRegistrationUnderIt(t *testing.T)
 	const owner = "host.test.dev.zenr.io."
 	register := buildSignedLeaseUpdateForHandleTest(t, p, owner, leasepkg.Encode8Byte(120, 0), false)
 	txt := register.Ns[0]
-	del := buildSignedCaseCDeleteForHandleTest(t, p, p.PublicKey.Clone().(*dns.KEY))
+	del := buildSignedKeyDeleteForHandleTest(t, p, p.PublicKey.Clone().(*dns.KEY))
 	resReg, resDel := raceSecondAgainstFirst(t, h, stubResponseWriter{}, started, release, register, del)
 
 	if rcodeOf(resReg) != dns.RcodeSuccess || rcodeOf(resDel) != dns.RcodeSuccess {

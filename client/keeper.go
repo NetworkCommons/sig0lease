@@ -49,9 +49,9 @@ func (cfg *KeeperConfig) Defaults() {
 
 // Moves are what a Keeper does, each called from its goroutine alone.
 type Moves[S any] struct {
-	// To moves to next, from what the previous call registered: it sends whatever withdraws
-	// what next lacks, and returns the registration to keep (run until its ctx ends), nil for
-	// none. An error is one no later state can cure: the Keeper reports it to OnFatal and
+	// To moves to next, from what the previous call registered: it withdraws what next lacks,
+	// sending that itself or with the registration it returns, and returns the registration to
+	// keep (run until its ctx ends), nil for none. An error is one no later state can cure: the Keeper reports it to OnFatal and
 	// waits to be stopped.
 	To func(next S) (keep func(context.Context), err error)
 	// Kept, if set, is called once a registration To returned has stopped, before the next

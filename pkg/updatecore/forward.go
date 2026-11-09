@@ -49,15 +49,3 @@ func BuildAndSign(upstreamZone string, prereqs, records []dns.RR, signingKey *ke
 	}
 	return signed, nil
 }
-
-// AsDelete returns a copy of rr rewritten as an RFC 2136 S2.5.4 "Delete An RR From An
-// RRSet" instruction: class NONE, TTL 0, RDATA unchanged (which RR the delete targets is
-// carried by NAME+TYPE+RDATA, same as any other RR identity in this codebase --
-// pkg/lease.RecordKey uses the identical convention).
-func AsDelete(rr dns.RR) dns.RR {
-	cpy := rr.Clone()
-	hdr := cpy.Header()
-	hdr.Class = dns.ClassNONE
-	hdr.TTL = 0
-	return cpy
-}

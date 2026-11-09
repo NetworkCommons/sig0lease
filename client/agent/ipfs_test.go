@@ -151,11 +151,8 @@ func TestRun_IPFSPublish(t *testing.T) {
 	h.logs.waitFor(t, "a.dev.test.: /community in its node's files is QmOne; the name gives it")
 
 	k.set(func(k *fakeKubo) { k.mfs["/community"] = "QmTwo" })
-	if u := h.until(t, "withdrawing the old site", func(u update) bool { return u.lease == 0 }); !slices.Equal(u.records, []string{link("QmOne")}) {
-		t.Fatalf("withdrawal %+v, want the old site alone", u)
-	}
-	if u := h.until(t, "registering the new site", func(u update) bool { return u.lease != 0 }); !slices.Contains(u.records, link("QmTwo")) {
-		t.Fatalf("registration %+v, want the new site", u)
+	if u := h.until(t, "registering the new site", func(update) bool { return true }); u.lease == 0 || !slices.Contains(u.records, link("QmTwo")) || !slices.Equal(u.deleted.records, []string{link("QmOne")}) {
+		t.Fatalf("registration %+v, want the new site, the old one deleted", u)
 	}
 
 	k.set(func(k *fakeKubo) { delete(k.mfs, "/community") })
@@ -163,8 +160,8 @@ func TestRun_IPFSPublish(t *testing.T) {
 	h.none(t, 100*time.Millisecond)
 
 	k.set(func(k *fakeKubo) { k.down = true })
-	if u := h.until(t, "withdrawing the addresses", func(u update) bool { return u.lease == 0 }); !slices.Equal(sorted(u.records), sorted(addrs)) {
-		t.Fatalf("withdrawal while the node is down %+v, want its addresses alone", u)
+	if u := h.until(t, "deleting the addresses", func(update) bool { return true }); u.lease == 0 || !slices.Equal(u.records, []string{link("QmTwo")}) || !slices.Equal(sorted(u.deleted.records), sorted(addrs)) {
+		t.Fatalf("registration while the node is down %+v, want the site, its addresses deleted", u)
 	}
 	h.logs.waitFor(t, "a.dev.test.: its node does not answer: kubo id: down; its addresses withdrawn until it does")
 
@@ -203,11 +200,8 @@ func TestRun_IPFSFollow(t *testing.T) {
 	h.none(t, 100*time.Millisecond) // the site stays QmOne while QmTwo is pinned
 
 	h.reg.setTXT("_dnslink.a.dev.test.", "dnslink=/ipfs/QmThree")
-	if u := h.until(t, "withdrawing the first site", func(u update) bool { return u.lease == 0 }); !slices.Equal(u.records, []string{link("QmOne")}) {
-		t.Fatalf("withdrawal %+v, want the first site alone", u)
-	}
-	if u := h.until(t, "registering the newest site", func(u update) bool { return u.lease != 0 }); !slices.Contains(u.records, link("QmThree")) {
-		t.Fatalf("registration %+v, want QmThree, which replaced QmTwo's pin", u)
+	if u := h.until(t, "registering the newest site", func(update) bool { return true }); u.lease == 0 || !slices.Contains(u.records, link("QmThree")) || !slices.Equal(u.deleted.records, []string{link("QmOne")}) {
+		t.Fatalf("registration %+v, want QmThree, which replaced QmTwo's pin, and the first site deleted", u)
 	}
 	waitKubo(t, k, "QmOne unpinned, QmThree pinned, QmTwo never", func(k *fakeKubo) bool {
 		return slices.Equal(k.unpinned, []string{"QmOne"}) && len(k.pins) == 1 && k.pins["QmThree"] == pinName

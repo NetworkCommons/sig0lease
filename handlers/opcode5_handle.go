@@ -4,7 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"time"
+	"slices"
 
 	"codeberg.org/miekg/dns"
 	"github.com/NetworkCommons/sig0lease/pkg/dnsmsg"
@@ -60,19 +60,29 @@ func (h *UpdateHandler) Handle(ctx context.Context, w dns.ResponseWriter, r *dns
 		return NewErrorResult(msg, fmt.Sprintf("lease parsing failed: %v", err), err)
 	}
 
-	updateKeyRRs, updateOtherRRs, err := extractUpdateRecords(r, h.blacklistedTypes)
+	recs, err := extractUpdateRecords(r, h.blacklistedTypes)
 	if err != nil {
 		h.logger.Debugf("Invalid update records: %v", err)
 		var blacklisted *blacklistedTypeError
-		if errors.As(err, &blacklisted) {
+		var rrsetDelete *rrsetDeleteError
+		switch {
+		case errors.As(err, &blacklisted):
 			msg := makeErrorResponse(r, dns.RcodeRefused, dns.ExtendedErrorProhibited, err.Error())
+			return NewErrorResult(msg, err.Error(), err)
+		case errors.As(err, &rrsetDelete):
+			msg := makeErrorResponse(r, dns.RcodeRefused, dns.ExtendedErrorNotSupported, err.Error())
 			return NewErrorResult(msg, err.Error(), err)
 		}
 		msg := makeErrorResponse(r, dns.RcodeFormatError, dns.ExtendedErrorOther, err.Error())
 		return NewErrorResult(msg, err.Error(), err)
 	}
 
-	leaseDuration, keyLeaseDuration := requestedLeases(requestedLease, len(updateKeyRRs) > 0, len(updateOtherRRs) > 0)
+	leaseDuration, keyLeaseDuration := requestedLeases(requestedLease, len(recs.keyAdds) > 0, len(recs.otherAdds) > 0)
+	if err := checkUpdateRecords(recs, leaseDuration, keyLeaseDuration); err != nil {
+		h.logger.Debugf("Invalid update records: %v", err)
+		msg := makeErrorResponse(r, dns.RcodeFormatError, dns.ExtendedErrorOther, err.Error())
+		return NewErrorResult(msg, err.Error(), err)
+	}
 
 	// A duration outside lease_policy is raised to its minimum or cut to its maximum, as the
 	// SRP handler does; the reply's Update Lease option tells the requester what it got.
@@ -93,8 +103,9 @@ func (h *UpdateHandler) Handle(ctx context.Context, w dns.ResponseWriter, r *dns
 
 	h.logger.Debugf("Parsed lease duration: %d seconds key-lease=%d", leaseDuration, keyLeaseDuration)
 
-	h.logger.Infof("UPDATE request for zone %s: LEASE=%d KEY-LEASE=%d RRs=%s",
-		h.upstreamZone, leaseDuration, keyLeaseDuration, summarizeRRTypes(updateKeyRRs, updateOtherRRs))
+	h.logger.Infof("UPDATE request for zone %s: LEASE=%d KEY-LEASE=%d RRs=%s deletes=%s",
+		h.upstreamZone, leaseDuration, keyLeaseDuration,
+		summarizeRRTypes(recs.keyAdds, recs.otherAdds), summarizeRRTypes(recs.keyDeletes, recs.otherDeletes))
 
 	additionalSigningKeys, err := extractAdditionalSigningKeys(r)
 	if err != nil {
@@ -103,7 +114,8 @@ func (h *UpdateHandler) Handle(ctx context.Context, w dns.ResponseWriter, r *dns
 		return NewErrorResult(msg, err.Error(), err)
 	}
 
-	sigRR, signerKey, signerSource, err := h.extractAndValidateSig0(ctx, r, additionalSigningKeys, updateKeyRRs)
+	// A KEY the request deletes names the signer as well as one it adds does (item 1.3).
+	sigRR, signerKey, signerSource, err := h.extractAndValidateSig0(ctx, r, additionalSigningKeys, slices.Concat(recs.keyAdds, recs.keyDeletes))
 	if err != nil {
 		h.logger.Debugf("SIG(0) validation failed: %v", err)
 		return refusalResult(r, "SIG(0) validation failed", fmt.Errorf("SIG(0) validation failed: %w", err))
@@ -113,27 +125,36 @@ func (h *UpdateHandler) Handle(ctx context.Context, w dns.ResponseWriter, r *dns
 	// granted KEY-LEASE on KEYs and to the granted LEASE on everything else -- one TTL per
 	// RRset, so RFC 2181 S5.2 holds whatever the requester sent. Done in place, after the
 	// signature over the original TTLs is checked, so the lease store keeps what the zone
-	// gets. Records under a lease of 0 (Cases C and D) are deletes, which go upstream with
-	// TTL 0 anyway.
-	for _, keyRR := range updateKeyRRs {
+	// gets. Deletes go upstream with TTL 0.
+	for _, keyRR := range recs.keyAdds {
 		keyRR.Hdr.TTL = min(h.recordTTL, keyLeaseDuration)
 	}
-	for _, rr := range updateOtherRRs {
+	for _, rr := range recs.otherAdds {
 		rr.Header().TTL = min(h.recordTTL, leaseDuration)
 	}
 
-	if err := h.validateSignerHierarchyForUpdateRecords(sigRR.SignerName, updateKeyRRs, updateOtherRRs); err != nil {
+	if err := h.validateSignerHierarchyForUpdateRecords(sigRR.SignerName,
+		slices.Concat(recs.keyAdds, recs.keyDeletes), slices.Concat(recs.otherAdds, recs.otherDeletes)); err != nil {
 		h.logger.Debugf("Update hierarchy validation failed: %v", err)
 		msg := makeErrorResponse(r, dns.RcodeRefused, dns.ExtendedErrorProhibited, fmt.Sprintf("hierarchy validation failed: %v", err))
 		return NewErrorResult(msg, fmt.Sprintf("hierarchy validation failed: %v", err), err)
 	}
 
 	signerID := keyIDFromSIG(sigRR)
+	signerNodeKey := leasepkg.NodeKeyFromSIG(sigRR.SignerName, sigRR.Algorithm, sigRR.KeyTag)
+	// Deleting the signer's KEY takes everything it registered (item 5.3.2), the records and
+	// KEYs this request would add or refresh with it included.
+	if recs.adds() && slices.ContainsFunc(recs.keyDeletes, func(k *dns.KEY) bool { return keyIDFromKEY(k) == signerID }) {
+		err := fmt.Errorf("the request deletes its signer's KEY %s, which takes everything that KEY registered, and adds or refreshes records with it", sigRR.SignerName)
+		msg := makeErrorResponse(r, dns.RcodeFormatError, dns.ExtendedErrorOther, err.Error())
+		return NewErrorResult(msg, "invalid update", err)
+	}
+
 	// useHierarchy is hardcoded false: non-KEY RRs always belong to the
-	// signer (docs/siglease_rfc9664.md 5.1.4). See groupOtherRecordsByTargetKey's doc
+	// signer (docs/siglease_rfc9664.md 5.2.3). See groupOtherRecordsByTargetKey's doc
 	// comment -- the useHierarchy=true path is reserved for a possible
 	// future config option and is not reachable from here today.
-	updateOtherRRsByKeyOwner, err := groupOtherRecordsByTargetKey(signerID, updateKeyRRs, updateOtherRRs, false)
+	updateOtherRRsByKeyOwner, err := groupOtherRecordsByTargetKey(signerID, recs.keyAdds, recs.otherAdds, false)
 	if err != nil {
 		h.logger.Debugf("Failed to map non-KEY records to KEY owners: %v", err)
 		msg := makeErrorResponse(r, dns.RcodeRefused, dns.ExtendedErrorProhibited, fmt.Sprintf("invalid mixed-owner update: %v", err))
@@ -147,16 +168,11 @@ func (h *UpdateHandler) Handle(ctx context.Context, w dns.ResponseWriter, r *dns
 	}
 	h.logger.Debugf("Resolved signer KEY: %s", signerKey.Hdr.Name)
 
-	// Log all extracted request KEY RRs.
-	for i, keyRR := range updateKeyRRs {
-		h.logger.Debugf("Extracted request KEY RR[%d]: %s", i, keyRR.String())
-	}
-
 	// From here to the local apply, this request reads lease-store nodes, writes upstream, and
 	// then changes those nodes: hold their locks throughout, waiting while another request or
 	// a lease expiry holds any of them (docs/siglease_rfc9664.md, "Node Locks"). Taken only
 	// now, after SIG(0) verification, so an unverified request can never hold a lock.
-	locks, err := h.nodeLocks.Acquire(ctx, h.requestLockSet(leaseDuration, keyLeaseDuration, signerID, updateKeyRRs, updateOtherRRs))
+	locks, err := h.nodeLocks.Acquire(ctx, h.requestLockSet(signerID, recs))
 	if err != nil {
 		h.logger.Warnf("UPDATE for zone %s: %v", h.upstreamZone, err)
 		msg := makeErrorResponse(r, dns.RcodeServerFailure, dns.ExtendedErrorOther, "lease store busy, try again")
@@ -164,15 +180,12 @@ func (h *UpdateHandler) Handle(ctx context.Context, w dns.ResponseWriter, r *dns
 	}
 	defer locks.Release()
 
-	// KEY-LEASE!=0, LEASE!=0 requires at least one KEY RR and a Non-KEY RRs.
-
 	var allNotes []string
 	upstreamKeys := make([]*dns.KEY, 0)
 	var acceptedRecordsForUpstream []dns.RR
-	// recordsToDeleteForUpstream accumulates Case D's accompanying non-KEY
-	// deletes (see the case-D loop below), forwarded in the same shared
-	// upstream call as the KEY add/refresh at the end of Handle().
-	var recordsToDeleteForUpstream []dns.RR
+	// deletesForUpstream are the RFC 2136 deletes of what this request deletes: its records,
+	// and each of its KEYs with everything at and below it.
+	var deletesForUpstream []dns.RR
 	// fcfsPrereqs are the prerequisites fcfs_naming attaches to the upstream UPDATE for the
 	// KEYs registered anew (refuseNewKey).
 	var fcfsPrereqs []dns.RR
@@ -182,39 +195,90 @@ func (h *UpdateHandler) Handle(ctx context.Context, w dns.ResponseWriter, r *dns
 	}
 	pendingMutations := make([]pendingLeaseMutation, 0)
 
-	// Case dispatch is defined by the LEASE / KEY-LEASE matrix at top level.
-	if keyLeaseDuration != 0 && leaseDuration != 0 {
-		// Case A: full registration/refresh, requires at least one KEY and one non-KEY RR.
-		if len(updateKeyRRs) == 0 || len(updateOtherRRs) == 0 {
-			msg := makeErrorResponse(r, dns.RcodeFormatError, dns.ExtendedErrorOther,
-				"KEY-LEASE!=0 and LEASE!=0 requires at least one KEY RR and one non-KEY RR")
-			return NewErrorResult(msg, "invalid update for register/refresh", fmt.Errorf("missing required KEY and/or non-KEY record"))
+	// Deletes. Only what this proxy manages is deleted, upstream and in the store; anything
+	// else named is reported in a note, not refused (item 7). Authorization is ownership, not
+	// just DNS-name hierarchy (item 5.3.1): a record may only be deleted by the KEY that
+	// registered it, which for a non-KEY record is always the signer (5.2.3), and a KEY by
+	// itself or by the KEY that registered it. A signer merely "at or above" a record it did
+	// not register cannot delete it directly, only by deleting the record's actual parent, as
+	// a KEY's delete takes everything at and below it, exactly as its expiry does
+	// (subtreeLeases, leaseExpirer). Absent and not the signer's look the same, so a delete
+	// cannot probe for records outside the signer's own subtree.
+	keysToDelete := make([]*dns.KEY, 0, len(recs.keyDeletes))
+	for _, keyRR := range recs.keyDeletes {
+		existing := h.leaseManager.LookupByKEY(keyRR)
+		isSelf := keyIDFromKEY(keyRR) == signerID
+		if existing == nil || (!isSelf && existing.ParentKeyName != signerNodeKey) {
+			allNotes = append(allNotes, fmt.Sprintf("KEY %s not found for delete", keyRR.Hdr.Name))
+			continue
 		}
+		keysToDelete = append(keysToDelete, keyRR)
+	}
+	recordsToDelete := make([]dns.RR, 0, len(recs.otherDeletes))
+	for _, rr := range recs.otherDeletes {
+		existing := h.leaseManager.LookupNonKEYRecord(rr)
+		if existing == nil || existing.ParentKeyName != signerNodeKey {
+			allNotes = append(allNotes, fmt.Sprintf("record not found for delete: %s", rr.String()))
+			continue
+		}
+		recordsToDelete = append(recordsToDelete, rr)
+	}
+	if len(keysToDelete) > 0 || len(recordsToDelete) > 0 {
+		deletesForUpstream = asDeletes(recordsToDelete...)
+		for _, keyRR := range keysToDelete {
+			deletesForUpstream = append(deletesForUpstream, subtreeDeletes(h.leaseManager, leasepkg.NodeKey(keyRR))...)
+		}
+		pendingMutations = append(pendingMutations, pendingLeaseMutation{
+			keyName: signerNodeKey,
+			apply: func() error {
+				// Only the records named here: RemoveNonKEYRecords would forget every record of
+				// the signer's, and leave those this request did not delete published with no
+				// lease to end them.
+				for _, rr := range recordsToDelete {
+					if err := h.leaseManager.RemoveSingleNonKEYRecord(signerNodeKey, leasepkg.RecordKey(rr)); err != nil {
+						return err
+					}
+				}
+				if len(recordsToDelete) > 0 {
+					h.scheduleLeaseExpiry(signerNodeKey)
+				}
+				for _, keyRR := range keysToDelete {
+					forgetSubtree(h.leaseManager, h.timers, leasepkg.NodeKey(keyRR), "delete")
+					h.logger.Debugf("Deleted key for %s", keyRR.Hdr.Name)
+				}
+				return nil
+			},
+		})
+	}
 
-		// A signer may only author new registrations in this request — the new
-		// KEY RR(s) below, and ownership of the non-KEY RRs that always
-		// accompany them in Case A — if it is already lease-managed, is
-		// itself one of the KEY RRs in this Update section, or (if
-		// configured) is an authorized online-only signer. This is one
-		// policy regardless of record type; otherwise there is no valid
-		// owner for the new state, and it must not be silently dropped or
-		// partially applied, it must fail the request.
+	// Adds: registrations and refreshes, on the granted LEASE and KEY-LEASE.
+	if recs.adds() {
+		// A signer may only author new lease-store state in this request -- a new KEY RR, or
+		// non-KEY RRs, which always belong to it (5.2.3) -- if it is already lease-managed, is
+		// itself one of the KEY RRs this request adds, or (if configured) is an authorized
+		// online-only signer. This is one policy regardless of record type; otherwise there is
+		// no valid owner for the new state, and it must not be silently dropped or partially
+		// applied, it must fail the request. A refresh of a KEY is its owner's
+		// (authorizeKeyRefresh).
 		signerManaged := h.leaseManager.LookupBySIG(sigRR.SignerName, sigRR.Algorithm, sigRR.KeyTag) != nil
 		signerInUpdate := false
-		for _, kr := range updateKeyRRs {
+		newKey := false
+		for _, kr := range recs.keyAdds {
 			if keyIDFromKEY(kr) == signerID {
 				signerInUpdate = true
-				break
+			}
+			if h.leaseManager.LookupByKEY(kr) == nil {
+				newKey = true
 			}
 		}
-		if !h.signerAuthorizedForNewRegistration(signerManaged, signerInUpdate, signerSource) {
+		if (newKey || len(recs.otherAdds) > 0) && !h.signerAuthorizedForNewRegistration(signerManaged, signerInUpdate, signerSource) {
 			msg := makeErrorResponse(r, dns.RcodeRefused, dns.ExtendedErrorProhibited,
 				"signing key must be managed, present in the Update section, or (if allow_online_key_registration is enabled) an authorized online signer, to register new records")
 			return NewErrorResult(msg, "signer not authorized for new registration",
 				fmt.Errorf("signer %q is neither lease-managed, present in the Update section, nor an authorized online signer", sigRR.SignerName))
 		}
 
-		for _, keyRR := range updateKeyRRs {
+		for _, keyRR := range recs.keyAdds {
 			keyName := keyRR.Hdr.Name
 			existingKey := h.leaseManager.LookupByKEY(keyRR)
 			keyIsRefresh := existingKey != nil
@@ -230,9 +294,6 @@ func (h *UpdateHandler) Handle(ctx context.Context, w dns.ResponseWriter, r *dns
 					return res
 				}
 				fcfsPrereqs = append(fcfsPrereqs, prereqs...)
-				// Signer authorization for new registrations was already
-				// checked once for the whole request above; Case A always
-				// requires non-KEY RRs, so that check already covers this path.
 			}
 
 			// Every path below stores this key's records once the upstream server has
@@ -255,35 +316,15 @@ func (h *UpdateHandler) Handle(ctx context.Context, w dns.ResponseWriter, r *dns
 					msg := makeErrorResponse(r, dns.RcodeServerFailure, dns.ExtendedErrorNoReachableAuthority, fmt.Sprintf("authoritative key lookup failed: %v", err))
 					return NewErrorResult(msg, "authoritative key lookup failed", err)
 				}
-				if !keyAtFQDN {
-					// Key is managed locally but missing at the DNS server: re-register
-					// it with the lease time that is still left in the lease store.
-					pendingKeyLease := effectiveKeyLease
-					pendingMutations = append(pendingMutations, pendingLeaseMutation{
-						keyName: pendingKeyName,
-						apply: func() error {
-							if err := h.leaseManager.RenewLease(pendingKeyRR, pendingKeyLease, pendingKeyLease); err != nil {
-								return err
-							}
-							if err := h.leaseManager.UpsertNonKEYRecords(leasepkg.NodeKey(pendingKeyRR), pendingRecords, leaseDuration, h.upstreamZone); err != nil {
-								return err
-							}
-							h.scheduleLeaseExpiry(leasepkg.NodeKey(pendingKeyRR))
-							h.logger.Debugf("Lease renewed for %s (KEY-LEASE != 0, key missing at FQDN, remaining key lease=%d)", pendingKeyName, pendingKeyLease)
-							return nil
-						},
-					})
-					upstreamKeys = append(upstreamKeys, keyRR)
-					continue
-				}
-
-				// Normal refresh: ownership already validated above. Defer the
-				// actual write until upstream confirms success, same as every
-				// other lease-store mutation.
+				// Managed locally but missing at the DNS server, the KEY is registered
+				// again with the lease time still left in the lease store (item 4.2), not
+				// the full requested one; otherwise this is a refresh, and the KEY,
+				// already published, is not sent again.
+				pendingKeyLease := effectiveKeyLease
 				pendingMutations = append(pendingMutations, pendingLeaseMutation{
 					keyName: pendingKeyName,
 					apply: func() error {
-						if err := h.leaseManager.RenewLease(pendingKeyRR, keyLeaseDuration, keyLeaseDuration); err != nil {
+						if err := h.leaseManager.RenewLease(pendingKeyRR, pendingKeyLease, pendingKeyLease); err != nil {
 							return err
 						}
 						if len(pendingRecords) > 0 {
@@ -295,18 +336,20 @@ func (h *UpdateHandler) Handle(ctx context.Context, w dns.ResponseWriter, r *dns
 							}
 						}
 						h.scheduleLeaseExpiry(leasepkg.NodeKey(pendingKeyRR))
-						h.logger.Debugf("Lease refreshed for %s (non-KEY lease=%d seconds)", pendingKeyName, leaseDuration)
+						h.logger.Debugf("Lease refreshed for %s (key lease=%d, non-KEY lease=%d seconds)", pendingKeyName, pendingKeyLease, leaseDuration)
 						return nil
 					},
 				})
+				if !keyAtFQDN {
+					upstreamKeys = append(upstreamKeys, keyRR)
+				}
 				continue
 			}
 
-			// Normal path (not refresh): KEY-LEASE != 0 and LEASE != 0.
 			pendingMutations = append(pendingMutations, pendingLeaseMutation{
 				keyName: pendingKeyName,
 				apply: func() error {
-					if err := h.registerKeyLease(keyIDFromSIG(sigRR), pendingKeyRR, keyLeaseDuration, keyLeaseDuration); err != nil {
+					if err := h.registerKeyLease(signerID, pendingKeyRR, keyLeaseDuration, keyLeaseDuration); err != nil {
 						return err
 					}
 					if len(pendingRecords) > 0 {
@@ -324,18 +367,41 @@ func (h *UpdateHandler) Handle(ctx context.Context, w dns.ResponseWriter, r *dns
 			upstreamKeys = append(upstreamKeys, keyRR)
 		}
 
-		// Non-KEY RRs always belong to the signer (docs/siglease_rfc9664.md 5.1.4), grouped
-		// above under signerID regardless of which KEY RR(s) are in this
-		// request. The loop above only reaches that data when the signer
-		// itself is one of the iterated KEY RRs (signerInUpdate). When the
-		// signer is instead delegating a *different* KEY's registration --
-		// an already-managed parent minting a new child, or an authorized
-		// online-only signer doing the same -- that data must still be
-		// attached to the signer's own node here, or it is silently dropped.
+		// Non-KEY RRs always belong to the signer (docs/siglease_rfc9664.md 5.2.3), grouped
+		// above under signerID regardless of which KEY RR(s) are in this request. The loop
+		// above only reaches that data when the signer itself is one of the KEY RRs it adds
+		// (signerInUpdate). When it is not -- the signer adds records alone, or registers a
+		// *different* KEY, an already-managed parent minting a new child or an authorized
+		// online-only signer doing the same -- that data must still be attached to the
+		// signer's own node here, or it is silently dropped.
 		if !signerInUpdate {
-			dataForSigner := updateOtherRRsByKeyOwner[signerID]
-			if len(dataForSigner) > 0 {
-				signerNodeKey := leasepkg.NodeKeyFromSIG(sigRR.SignerName, sigRR.Algorithm, sigRR.KeyTag)
+			if dataForSigner := updateOtherRRsByKeyOwner[signerID]; len(dataForSigner) > 0 {
+				// A signer this proxy leases whose KEY the authoritative DNS no longer has is
+				// registered again with the lease time it has left (item 4.2), as a KEY in the
+				// request is above.
+				if signerLease := h.leaseManager.LookupBySIG(sigRR.SignerName, sigRR.Algorithm, sigRR.KeyTag); signerLease != nil {
+					remainingLease, keyAtFQDN, err := h.effectiveRefreshKeyLease(ctx, signerLease.KeyRR, signerLease, keyLeaseDuration)
+					if err != nil {
+						msg := makeErrorResponse(r, dns.RcodeServerFailure, dns.ExtendedErrorNoReachableAuthority, fmt.Sprintf("authoritative key lookup failed: %v", err))
+						return NewErrorResult(msg, "authoritative key lookup failed", err)
+					}
+					if !keyAtFQDN {
+						pendingKeyRR := signerLease.KeyRR
+						pendingMutations = append(pendingMutations, pendingLeaseMutation{
+							keyName: pendingKeyRR.Hdr.Name,
+							apply: func() error {
+								return h.leaseManager.RenewLease(pendingKeyRR, remainingLease, remainingLease)
+							},
+						})
+						// The stored KEY, not one from this request, so it has not had its
+						// TTL set above: set it on a copy, leaving the store's record alone.
+						upstreamKeyRR := copyRR(pendingKeyRR).(*dns.KEY)
+						upstreamKeyRR.Hdr.TTL = min(h.recordTTL, remainingLease)
+						upstreamKeys = append(upstreamKeys, upstreamKeyRR)
+						allNotes = append(allNotes, fmt.Sprintf("KEY %s was missing at the authoritative DNS and has been re-registered with remaining lease", pendingKeyRR.Hdr.Name))
+					}
+				}
+
 				acceptedRecords, notes, err := h.filterDuplicateRegistrations(ctx, signerNodeKey, dataForSigner)
 				if err != nil {
 					return refusalResult(r, "duplicate registration rejected", err)
@@ -354,272 +420,15 @@ func (h *UpdateHandler) Handle(ctx context.Context, w dns.ResponseWriter, r *dns
 				allNotes = append(allNotes, notes...)
 			}
 		}
-	} else if keyLeaseDuration == 0 && leaseDuration != 0 {
-		// Case B: non-KEY-only registration/refresh.
-		if len(updateOtherRRs) == 0 {
-			msg := makeErrorResponse(r, dns.RcodeFormatError, dns.ExtendedErrorOther,
-				"KEY-LEASE=0 and LEASE!=0 requires at least one non-KEY RR")
-			return NewErrorResult(msg, "invalid non-KEY-only lease request", fmt.Errorf("no non-KEY RR present"))
-		}
-		if len(updateKeyRRs) > 0 {
-			msg := makeErrorResponse(r, dns.RcodeFormatError, dns.ExtendedErrorOther,
-				"KEY-LEASE=0 and LEASE!=0 does not allow KEY RRs in Update section")
-			return NewErrorResult(msg, "invalid non-KEY-only lease request", fmt.Errorf("unexpected KEY RR in non-KEY-only lease request"))
-		}
-
-		signerLease := h.leaseManager.LookupBySIG(sigRR.SignerName, sigRR.Algorithm, sigRR.KeyTag)
-		if signerLease == nil {
-			msg := makeErrorResponse(r, dns.RcodeRefused, dns.ExtendedErrorProhibited,
-				"KEY-LEASE=0 and LEASE!=0 requires signing KEY to already be managed")
-			return NewErrorResult(msg, "signing key not managed for non-KEY-only lease", fmt.Errorf("signing key not found in lease store"))
-		}
-
-		signerOwnerKey := leasepkg.NodeKey(signerKey)
-		keyExists, err := h.authoritativeHasKeyAtName(ctx, signerKey.Hdr.Name)
-		if err != nil {
-			msg := makeErrorResponse(r, dns.RcodeServerFailure, dns.ExtendedErrorNoReachableAuthority, fmt.Sprintf("authoritative key lookup failed: %v", err))
-			return NewErrorResult(msg, "authoritative key lookup failed", err)
-		}
-		if !keyExists {
-			// Key is managed locally but missing at the DNS server: put it back
-			// with the lease time still remaining in the lease store, mirroring
-			// Case A's re-registration behavior, instead of failing the request.
-			remainingLease := uint32(signerLease.TimeRemaining() / time.Second)
-			if remainingLease == 0 {
-				remainingLease = 1
-			}
-			pendingKeyRR := signerLease.KeyRR
-			pendingKeyLease := remainingLease
-			pendingMutations = append(pendingMutations, pendingLeaseMutation{
-				keyName: pendingKeyRR.Hdr.Name,
-				apply: func() error {
-					return h.leaseManager.RenewLease(pendingKeyRR, pendingKeyLease, pendingKeyLease)
-				},
-			})
-			// The stored KEY, not one from this request (KEY-LEASE is 0 here), so it has
-			// not had its TTL set above: set it on a copy, leaving the store's record alone.
-			upstreamKeyRR := copyRR(pendingKeyRR).(*dns.KEY)
-			upstreamKeyRR.Hdr.TTL = min(h.recordTTL, pendingKeyLease)
-			upstreamKeys = append(upstreamKeys, upstreamKeyRR)
-			allNotes = append(allNotes, fmt.Sprintf("KEY %s was missing at the authoritative DNS and has been re-registered with remaining lease", pendingKeyRR.Hdr.Name))
-		}
-
-		acceptedRecords, notes, err := h.filterDuplicateRegistrations(ctx, signerOwnerKey, updateOtherRRs)
-		if err != nil {
-			return refusalResult(r, "duplicate registration rejected", err)
-		}
-		if len(acceptedRecords) > 0 {
-			pendingMutations = append(pendingMutations, pendingLeaseMutation{
-				keyName: signerOwnerKey,
-				apply: func() error {
-					if err := h.leaseManager.UpsertNonKEYRecords(signerOwnerKey, acceptedRecords, leaseDuration, h.upstreamZone); err != nil {
-						return err
-					}
-					h.scheduleLeaseExpiry(signerOwnerKey)
-					return nil
-				},
-			})
-		}
-
-		acceptedRecordsForUpstream = append(acceptedRecordsForUpstream, acceptedRecords...)
-		allNotes = append(allNotes, notes...)
-	} else if keyLeaseDuration == 0 && leaseDuration == 0 {
-		// Case C: delete matrix. Only forward upstream, and only touch the
-		// local lease store, for records we actually manage; records that
-		// aren't found locally are reported via a note but otherwise ignored
-		// (docs/siglease_rfc9664.md item 7).
-		//
-		// Authorization is ownership-based, not just DNS-name hierarchy: a
-		// record (KEY or non-KEY) may only be deleted by its immediate
-		// parent -- the KEY that registered it -- or, for a KEY, by itself,
-		// whoever registered it.
-		// A signer merely hierarchically "at or above" a record it did not
-		// itself register cannot delete it directly; it can only reach that
-		// data by deleting the record's actual parent, which cascades.
-		if len(updateKeyRRs) == 0 && len(updateOtherRRs) == 0 {
-			msg := makeErrorResponse(r, dns.RcodeFormatError, dns.ExtendedErrorOther,
-				"KEY-LEASE=0 and LEASE=0 requires at least one KEY RR or one non-KEY RR")
-			return NewErrorResult(msg, "invalid delete request", fmt.Errorf("no records present for delete"))
-		}
-
-		signerOwnerKey := leasepkg.NodeKey(signerKey)
-
-		keysToDelete := make([]*dns.KEY, 0, len(updateKeyRRs))
-		for _, keyRR := range updateKeyRRs {
-			existing := h.leaseManager.LookupByKEY(keyRR)
-			isSelf := keyIDFromKEY(keyRR) == signerID
-			if existing == nil || (!isSelf && existing.ParentKeyName != signerOwnerKey) {
-				allNotes = append(allNotes, fmt.Sprintf("KEY %s not found for delete", keyRR.Hdr.Name))
-				continue
-			}
-			keysToDelete = append(keysToDelete, keyRR)
-		}
-
-		recordsToDelete := make([]dns.RR, 0, len(updateOtherRRs))
-		for _, rr := range updateOtherRRs {
-			existing := h.leaseManager.LookupNonKEYRecord(rr)
-			if existing == nil || existing.ParentKeyName != signerOwnerKey {
-				allNotes = append(allNotes, fmt.Sprintf("record not found for delete: %s", rr.String()))
-				continue
-			}
-			recordsToDelete = append(recordsToDelete, rr)
-		}
-
-		if len(keysToDelete) == 0 && len(recordsToDelete) == 0 {
-			// Nothing locally managed to delete, so there is nothing to
-			// confirm upstream either: just report the notes.
-			return NewProcessedResult(h.buildSuccessResponse(r, allNotes, grantedLease))
-		}
-
-		// One UPDATE deletes the records named here and, for each named KEY, everything at and
-		// below it -- a KEY's delete takes its subtree along, exactly as its expiry does
-		// (subtreeLeases, leaseExpirer). Nothing is forgotten locally before that UPDATE is
-		// confirmed; if it is not, the request fails and nothing has changed.
-		deletes := asDeletes(recordsToDelete...)
-		for _, keyRR := range keysToDelete {
-			deletes = append(deletes, subtreeDeletes(h.leaseManager, leasepkg.NodeKey(keyRR))...)
-		}
-		if _, err := h.upstream().send(ctx, nil, deletes); err != nil {
-			msg := makeErrorResponse(r, dns.RcodeServerFailure, dns.ExtendedErrorNoReachableAuthority, err.Error())
-			return NewErrorResult(msg, err.Error(), err)
-		}
-
-		// Upstream confirmed. Remove only the records named here --
-		// h.leaseManager.RemoveNonKEYRecords(signerOwnerKey) would wipe the owner's *entire*
-		// non-KEY record set locally, silently forgetting (and thus orphaning upstream forever)
-		// any other records under the same owner that this request never asked to delete --
-		// and each named KEY's subtree.
-		for _, rr := range recordsToDelete {
-			if err := h.leaseManager.RemoveSingleNonKEYRecord(signerOwnerKey, leasepkg.RecordKey(rr)); err != nil {
-				panic(fmt.Sprintf("Case C delete of %s: %v", rr.String(), err))
-			}
-		}
-		for _, keyRR := range keysToDelete {
-			forgetSubtree(h.leaseManager, h.timers, leasepkg.NodeKey(keyRR), "Case C delete")
-			h.logger.Debugf("Deleted key for %s (KEY-LEASE=0, LEASE=0)", keyRR.Hdr.Name)
-		}
-
-		return NewProcessedResult(h.buildSuccessResponse(r, allNotes, grantedLease))
-	} else if keyLeaseDuration != 0 && leaseDuration == 0 {
-		// Case D: KEY-only registration/refresh with optional non-KEY deletes.
-		if len(updateKeyRRs) == 0 {
-			msg := makeErrorResponse(r, dns.RcodeFormatError, dns.ExtendedErrorOther,
-				"KEY-LEASE!=0 and LEASE=0 requires at least one KEY RR")
-			return NewErrorResult(msg, "invalid key-only lease request", fmt.Errorf("missing required KEY record"))
-		}
-
-		signerManaged := h.leaseManager.LookupBySIG(sigRR.SignerName, sigRR.Algorithm, sigRR.KeyTag) != nil
-		signerInUpdate := false
-		for _, kr := range updateKeyRRs {
-			if keyIDFromKEY(kr) == signerID {
-				signerInUpdate = true
-				break
-			}
-		}
-
-		for _, keyRR := range updateKeyRRs {
-			keyName := keyRR.Hdr.Name
-			scopedOtherRecords := updateOtherRRsByKeyOwner[keyIDFromKEY(keyRR)]
-			notes := make([]string, 0)
-			// Only records actually present locally are real deletions: a
-			// record named here that isn't found gets a note (docs/siglease_rfc9664.md
-			// item 7) but must not be sent upstream as a delete or removed
-			// from local state that never had it.
-			recordsToDelete := make([]dns.RR, 0, len(scopedOtherRecords))
-			for _, rr := range scopedOtherRecords {
-				existing := h.leaseManager.LookupNonKEYRecord(rr)
-				if existing == nil || existing.ParentKeyName != leasepkg.NodeKey(keyRR) {
-					notes = append(notes, fmt.Sprintf("record not found for delete: %s", rr.String()))
-					continue
-				}
-				recordsToDelete = append(recordsToDelete, rr)
-			}
-
-			effectiveKeyLease := keyLeaseDuration
-			existingKey := h.leaseManager.LookupByKEY(keyRR)
-			keyIsRefresh := existingKey != nil
-			if !keyIsRefresh {
-				// New KEY registration: the same checks as Case A's
-				// (docs/siglease_rfc9664.md item 6 applies to every case, not just Case A).
-				prereqs, res := h.refuseNewKey(ctx, r, keyRR, signerID, sigRR.SignerName)
-				if res != nil {
-					return res
-				}
-				fcfsPrereqs = append(fcfsPrereqs, prereqs...)
-				if !h.signerAuthorizedForNewRegistration(signerManaged, signerInUpdate, signerSource) {
-					msg := makeErrorResponse(r, dns.RcodeRefused, dns.ExtendedErrorProhibited,
-						"signing key must be managed, present in the Update section, or (if allow_online_key_registration is enabled) an authorized online signer, to register a new KEY RR")
-					return NewErrorResult(msg, "signer not authorized for new registration",
-						fmt.Errorf("signer %q is neither lease-managed, present in the Update section, nor an authorized online signer", sigRR.SignerName))
-				}
-			} else {
-				if err := h.authorizeKeyRefresh(keyRR, signerID); err != nil {
-					msg := makeErrorResponse(r, dns.RcodeRefused, dns.ExtendedErrorProhibited, err.Error())
-					return NewErrorResult(msg, err.Error(), err)
-				}
-				// Key is managed locally but missing at the DNS server: put it
-				// back with the lease time still remaining, rather than granting
-				// the full newly-requested duration.
-				lease, _, err := h.effectiveRefreshKeyLease(ctx, keyRR, existingKey, keyLeaseDuration)
-				if err != nil {
-					msg := makeErrorResponse(r, dns.RcodeServerFailure, dns.ExtendedErrorNoReachableAuthority, fmt.Sprintf("authoritative key lookup failed: %v", err))
-					return NewErrorResult(msg, "authoritative key lookup failed", err)
-				}
-				effectiveKeyLease = lease
-			}
-
-			pendingKeyRR := keyRR
-			pendingKeyName := keyName
-			pendingRecordsToRemove := recordsToDelete
-			pendingKeyLease := effectiveKeyLease
-			pendingIsRefresh := keyIsRefresh
-			pendingMutations = append(pendingMutations, pendingLeaseMutation{
-				keyName: pendingKeyName,
-				apply: func() error {
-					var err error
-					if pendingIsRefresh {
-						err = h.leaseManager.RenewLease(pendingKeyRR, pendingKeyLease, pendingKeyLease)
-					} else {
-						err = h.registerKeyLease(keyIDFromSIG(sigRR), pendingKeyRR, pendingKeyLease, pendingKeyLease)
-					}
-					if err != nil {
-						return err
-					}
-					// Remove only the specific records confirmed deleted
-					// upstream (see recordsToDeleteForUpstream below) --
-					// h.leaseManager.RemoveNonKEYRecords(nodeKey) would wipe
-					// every non-KEY record this key owns, including ones this
-					// request never named, silently orphaning them upstream
-					// forever. The upstream delete for these records was
-					// already confirmed successful before apply() ever runs
-					// (see the shared upstream-forwarding block below), and
-					// this request holds their node locks, so a failure here
-					// (the record owned by another node) is impossible: it
-					// fails hard, as in Case C and lease expiry.
-					for _, rr := range pendingRecordsToRemove {
-						if err := h.leaseManager.RemoveSingleNonKEYRecord(leasepkg.NodeKey(pendingKeyRR), leasepkg.RecordKey(rr)); err != nil {
-							panic(fmt.Sprintf("Case D delete of %s for %s: %v", rr.String(), pendingKeyName, err))
-						}
-					}
-					h.scheduleLeaseExpiry(leasepkg.NodeKey(pendingKeyRR))
-					return nil
-				},
-			})
-
-			upstreamKeys = append(upstreamKeys, keyRR)
-			recordsToDeleteForUpstream = append(recordsToDeleteForUpstream, recordsToDelete...)
-			allNotes = append(allNotes, notes...)
-		}
 	}
 
-	// Upstream forwarding: forward KEY RRs that need to be registered
-	// upstream, non-KEY RRs that need to be added, and (Case D) non-KEY
-	// records that need to be deleted -- all in one combined UPDATE, so
-	// the add and delete halves of a single request are confirmed or
-	// rejected together rather than racing across two separate round trips.
-	if len(upstreamKeys) > 0 || len(acceptedRecordsForUpstream) > 0 || len(recordsToDeleteForUpstream) > 0 {
+	// Upstream forwarding: the deletes, the KEY RRs to register, and the non-KEY RRs to add,
+	// all in one UPDATE, which the authoritative server applies as a whole (RFC 2136 S3.7):
+	// a resolver sees a record replaced by another, never neither nor both, and the halves
+	// of a request are confirmed or rejected together.
+	if len(upstreamKeys) > 0 || len(acceptedRecordsForUpstream) > 0 || len(deletesForUpstream) > 0 {
 		h.logger.Debugf("Sending UPDATE to upstream (configured zone=%s), keys=%d", h.upstreamZone, len(upstreamKeys))
-		upstreamResp, err := h.upstream().send(ctx, fcfsPrereqs, upstreamUpdateRecords(upstreamKeys, acceptedRecordsForUpstream, recordsToDeleteForUpstream))
+		upstreamResp, err := h.upstream().send(ctx, fcfsPrereqs, upstreamUpdateRecords(deletesForUpstream, upstreamKeys, acceptedRecordsForUpstream))
 		if err != nil {
 			h.logger.Debugf("UPDATE for zone=%s keys=%d: %v", h.upstreamZone, len(upstreamKeys), err)
 			if upstreamResp != nil && prerequisiteFailed(upstreamResp.Rcode, fcfsPrereqs) {
@@ -651,28 +460,27 @@ func (h *UpdateHandler) Handle(ctx context.Context, w dns.ResponseWriter, r *dns
 }
 
 // requestLockSet returns the lease-store nodes Handle locks for one request
-// (docs/siglease_rfc9664.md, "Node Locks"). A delete (Case C: LEASE=0, KEY-LEASE=0) locks each
-// KEY it names together with that KEY's whole current subtree, which the delete cascades
-// into, and each non-KEY record it names. Every other case may register what it names, so it
-// locks each named KEY and non-KEY record together with the signer's node, their only
-// possible parent: a new KEY is registered under its signer, and non-KEY records always
-// belong to the signer. A refresh would not need the parent, but whether an RR is a refresh
-// is only known from the checks this lock protects.
-func (h *UpdateHandler) requestLockSet(leaseDuration, keyLeaseDuration uint32, signerID keyID, keyRRs []*dns.KEY, otherRRs []dns.RR) func() []string {
-	deleting := leaseDuration == 0 && keyLeaseDuration == 0
+// (docs/siglease_rfc9664.md, "Node Locks"). Each KEY it deletes is locked together with that
+// KEY's whole current subtree, which the delete cascades into, and each record it deletes.
+// Each KEY and record it adds may be a registration, so it is locked together with the
+// signer's node, their only possible parent: a new KEY is registered under its signer, and
+// non-KEY records always belong to the signer. A refresh would not need the parent, but
+// whether an RR is a refresh is only known from the checks this lock protects.
+func (h *UpdateHandler) requestLockSet(signerID keyID, recs updateRecords) func() []string {
 	return func() []string {
-		ids := make([]string, 0, 1+len(keyRRs)+len(otherRRs))
-		if !deleting {
+		ids := make([]string, 0, 1+len(recs.keyAdds)+len(recs.otherAdds)+len(recs.keyDeletes)+len(recs.otherDeletes))
+		if recs.adds() {
 			ids = append(ids, leasepkg.NodeKeyFromSIG(signerID.Name, signerID.Algorithm, signerID.KeyTag))
 		}
-		for _, keyRR := range keyRRs {
+		for _, keyRR := range recs.keyAdds {
+			ids = append(ids, leasepkg.NodeKey(keyRR))
+		}
+		for _, keyRR := range recs.keyDeletes {
 			nodeKey := leasepkg.NodeKey(keyRR)
 			ids = append(ids, nodeKey)
-			if deleting {
-				ids = append(ids, h.leaseManager.ListSubtreeKeys(nodeKey)...)
-			}
+			ids = append(ids, h.leaseManager.ListSubtreeKeys(nodeKey)...)
 		}
-		for _, rr := range otherRRs {
+		for _, rr := range slices.Concat(recs.otherAdds, recs.otherDeletes) {
 			ids = append(ids, leasepkg.RecordKey(rr))
 		}
 		return ids

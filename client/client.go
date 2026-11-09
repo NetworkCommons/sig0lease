@@ -133,7 +133,7 @@ func (c *Client) queryUDP(msg *dns.Msg) (*dns.Msg, error) {
 	// payload size of dns.DefaultMsgSize via its OPT record (see
 	// dnsmsg.NewLeaseUpdate), so a reply within that negotiated size must be
 	// read whole; sizing this buffer at the historic pre-EDNS 512-byte limit
-	// silently truncated any larger response (e.g. a Case C delete with
+	// silently truncated any larger response (e.g. a KEY delete with
 	// several status-note TXT records, or a large RSA KEY answer), corrupting
 	// or failing to unpack it. dns.MaxMsgSize covers any negotiated size.
 	buf := make([]byte, dns.MaxMsgSize)

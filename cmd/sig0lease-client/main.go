@@ -398,7 +398,7 @@ func cmdName(args []string) {
 	req.Define(fs, proxyUsage)
 	modes.Define(fs, "the name: its records go, and its KEY too unless -keep-names")
 	fullName := fs.String("name", "", "the name, fully qualified, e.g. mysite.dev.zenr.io. (required)")
-	withdraw := fs.Bool("withdraw", false, "send one withdrawal of the -addr and -record records and exit, keeping the name and anything else it has")
+	withdraw := fs.Bool("withdraw", false, "send one update deleting the -addr and -record records and exit, keeping the name and anything else it has")
 	var addrs, records cli.Repeatable
 	fs.Var(&addrs, "addr", "an address of the name: an A or AAAA record at it (repeatable)")
 	fs.Var(&records, "record", `a record "<owner> <type> <data>", the owner @ for the name itself or relative to it (repeatable)`)
@@ -644,10 +644,11 @@ Commands:
                           relative to it: '_dnslink TXT "dnslink=/ipfs/bafy..."',
                           "www CNAME site.dev.zenr.io." (repeatable)
       -once               send one registration and exit
-      -withdraw           send one withdrawal of the -addr and -record records and exit, keeping
-                          the name and anything else it has (Case D)
-      -deregister         send one deregistration and exit: the records and the KEY go, so the
-                          name is free (Case C), unless -keep-names keeps the KEY (Case D)
+      -withdraw           send one update deleting the -addr and -record records and exit,
+                          keeping the name and anything else it has
+      -deregister         send one deregistration and exit: the KEY is deleted, and with it what
+                          it registered, so the name is free; with -keep-names, the records are
+                          deleted and the KEY refreshed
       -keep-names         with -deregister: keep the name for the key, asking for -key-lease
 
       Plus the request flags below; the key is the name's own, in the keystore.
@@ -680,11 +681,11 @@ Commands:
       Plus the request flags below; -ttl is the TTL of the KEYs the command builds from the
       signing key (-same-key, -signer additional), rr-specs carry their own.
 
-      The proxy dispatches on the two leases and requires records to match:
-        KEY-LEASE != 0, LEASE != 0   at least one KEY and one other record
-        KEY-LEASE = 0,  LEASE != 0   other records only, the signer already leased
-        KEY-LEASE != 0, LEASE = 0    at least one KEY
-        both 0                        KEYs only: delete them and what they registered
+      Each rr-spec adds its record (class IN) or deletes it (class NONE, TTL 0, RFC 2136
+      S2.5.4). LEASE and KEY-LEASE are the leases of the other records and of the KEYs the
+      update adds: not 0 when it adds one of that kind, 0 when it adds none. A KEY's delete
+      also deletes what the KEY registered. The update still carries the lease option when it
+      only deletes: without it, the proxy does not take the update as a lease request.
 
       // Lease the signing key itself (-lease 0): -same-key adds its KEY
       sig0lease-client register -server 127.0.0.1:8053 -lease 0 -key-lease 3600 -same-key \
@@ -701,6 +702,13 @@ Commands:
       // -k 13: an owner name, its ECDSAP256SHA256 key generated on first use
       sig0lease-client register -server 127.0.0.1:8053 -lease 0 -key-lease 3600 -same-key -k 13 \
         test.dev.zenr.io.
+      // Replace a record in one update: the new one added, the old one deleted
+      sig0lease-client register -server 127.0.0.1:8053 -lease 300 -key-lease 0 \
+        Ktest.dev.zenr.io.+015+05044 'client.test.dev.zenr.io. 300 IN TXT "new"' \
+        'client.test.dev.zenr.io. 0 NONE TXT "hello"'
+      // Delete the signing key's KEY, and with it what it registered
+      sig0lease-client register -server 127.0.0.1:8053 -lease 0 -key-lease 0 \
+        Ktest.dev.zenr.io.+015+05044 "test.dev.zenr.io. 0 NONE KEY 512 3 15 c2yG..."
 
   verify [-server host:port] [-transport tcp|udp|tls|doh] <name>
       Ask the proxy for the KEY at name.

@@ -50,11 +50,21 @@ func (r *nameRegistrar) none(t *testing.T, d time.Duration) {
 	}
 }
 
-// expect fails unless got registers records on lease and keyLease.
-func expect(t *testing.T, what string, got sent, records []string, lease, keyLease uint32) {
+// expect fails unless got adds the name's KEY and adds, and deletes deletes, on lease and
+// keyLease.
+func expect(t *testing.T, what string, got sent, adds, deletes []string, lease, keyLease uint32) {
 	t.Helper()
-	if !slices.Equal(got.records, records) || got.lease != lease || got.keyLease != keyLease {
-		t.Fatalf("%s: sent %+v, want records %q, lease %d, key lease %d", what, got, records, lease, keyLease)
+	want := sent{zone: "example.", keys: []string{"site.example."}, records: adds, deleted: deletes, lease: lease, keyLease: keyLease}
+	if !got.equal(want) {
+		t.Fatalf("%s: sent %+v, want %+v", what, got, want)
+	}
+}
+
+// expectFreed fails unless got deletes the name's KEY alone, which frees the name.
+func expectFreed(t *testing.T, what string, got sent) {
+	t.Helper()
+	if want := (sent{zone: "example.", keysDeleted: []string{"site.example."}}); !got.equal(want) {
+		t.Fatalf("%s: sent %+v, want %+v", what, got, want)
 	}
 }
 
@@ -135,47 +145,50 @@ func TestName_RegistersWithdrawsAndDeregisters(t *testing.T) {
 	n := startTestName(t, reg, nil, false)
 
 	n.Set(records(t, siteA, wwwA))
-	expect(t, "first update", reg.next(t), []string{siteA, wwwA}, 30, 600)
+	expect(t, "first update", reg.next(t), []string{siteA, wwwA}, nil, 30, 600)
 
 	n.Set(records(t, siteA))
-	expect(t, "withdrawal", reg.next(t), []string{wwwA}, 0, 600)
-	expect(t, "registration after it", reg.next(t), []string{siteA}, 30, 600)
+	expect(t, "registration deleting what is gone", reg.next(t), []string{siteA}, []string{wwwA}, 30, 600)
 
 	n.Set(nil)
-	expect(t, "update after no records, keeping the name", reg.next(t), []string{siteA}, 0, 600)
+	expect(t, "update after no records, keeping the name", reg.next(t), nil, []string{siteA}, 0, 600)
 	n.Stop()
 	n.Wait()
-	expect(t, "update on Stop, freeing the name", reg.next(t), nil, 0, 0)
+	expectFreed(t, "update on Stop, freeing the name", reg.next(t))
 	reg.none(t, 50*time.Millisecond)
 }
 
-// With KeepNames, Stop deletes the records and keeps the KEY (Case D); without it, it frees
-// the name (Case C). While the Name runs it keeps the name whatever KeepNames says: a Set with
-// no records deletes them keeping the KEY, as StopKeepingNames does; a Stop after such a Set
-// frees the name, unless KeepNames. The store records the name as held until it is freed.
+// With KeepNames, Stop deletes the records and refreshes the KEY; without it, it deletes the
+// KEY, which frees the name. While the Name runs it keeps the name whatever KeepNames says: a
+// Set with no records deletes them keeping the KEY, as StopKeepingNames does; a Stop after
+// such a Set frees the name, unless KeepNames. The store records the name as held until it is
+// freed.
 func TestName_KeepNames(t *testing.T) {
 	for _, tt := range []struct {
-		name     string
-		keep     bool
-		stop     func(*Name)
-		records  []string // the update on stopping: Case D lists the records it deletes
-		keyLease uint32
+		name string
+		keep bool
+		stop func(*Name)
+		kept bool // the update on stopping keeps the name, deleting the records, or frees it
 	}{
-		{"Stop keeping the name", true, (*Name).Stop, []string{siteA}, 600},
-		{"Stop freeing the name", false, (*Name).Stop, nil, 0},
-		{"StopKeepingNames without KeepNames", false, (*Name).StopKeepingNames, []string{siteA}, 600},
+		{"Stop keeping the name", true, (*Name).Stop, true},
+		{"Stop freeing the name", false, (*Name).Stop, false},
+		{"StopKeepingNames without KeepNames", false, (*Name).StopKeepingNames, true},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			reg := newNameRegistrar()
 			store := newMemNames()
 			n := startTestName(t, reg, store, tt.keep)
 			n.Set(records(t, siteA))
-			expect(t, "registration", reg.next(t), []string{siteA}, 30, 600)
+			expect(t, "registration", reg.next(t), []string{siteA}, nil, 30, 600)
 			tt.stop(n)
 			n.Wait()
-			expect(t, "update on stopping", reg.next(t), tt.records, 0, tt.keyLease)
-			if held, _ := store.state("site.example."); held != (tt.keyLease != 0) {
-				t.Fatalf("name recorded as held after stopping: %v, want %v", held, tt.keyLease != 0)
+			if tt.kept {
+				expect(t, "update on stopping", reg.next(t), nil, []string{siteA}, 0, 600)
+			} else {
+				expectFreed(t, "update on stopping", reg.next(t))
+			}
+			if held, _ := store.state("site.example."); held != tt.kept {
+				t.Fatalf("name recorded as held after stopping: %v, want %v", held, tt.kept)
 			}
 		})
 	}
@@ -186,15 +199,15 @@ func TestName_KeepNames(t *testing.T) {
 			store := newMemNames()
 			n := startTestName(t, reg, store, keep)
 			n.Set(records(t, siteA))
-			expect(t, "registration", reg.next(t), []string{siteA}, 30, 600)
+			expect(t, "registration", reg.next(t), []string{siteA}, nil, 30, 600)
 			n.Set(nil)
-			expect(t, "update after no records", reg.next(t), []string{siteA}, 0, 600)
+			expect(t, "update after no records", reg.next(t), nil, []string{siteA}, 0, 600)
 			n.Stop()
 			n.Wait()
 			if keep {
 				reg.none(t, 50*time.Millisecond)
 			} else {
-				expect(t, "update on Stop", reg.next(t), nil, 0, 0)
+				expectFreed(t, "update on Stop", reg.next(t))
 			}
 			if held, _ := store.state("site.example."); held != keep {
 				t.Fatalf("name recorded as held after stopping: %v, want %v", held, keep)
@@ -204,7 +217,7 @@ func TestName_KeepNames(t *testing.T) {
 }
 
 // While the registrar answers that another key holds the name, nothing at it is the Name's:
-// a change of records withdraws nothing, and Stop deregisters nothing and records the name as
+// a change of records deletes nothing, and Stop deregisters nothing and records the name as
 // not held. Any other refusal leaves it unknown, so Stop deregisters.
 func TestName_HeldByAnotherKey(t *testing.T) {
 	for _, tc := range []struct {
@@ -222,18 +235,17 @@ func TestName_HeldByAnotherKey(t *testing.T) {
 			n := startTestName(t, reg, store, false)
 
 			n.Set(records(t, siteA, wwwA))
-			expect(t, "registration", reg.next(t), []string{siteA, wwwA}, 30, 600)
+			expect(t, "registration", reg.next(t), []string{siteA, wwwA}, nil, 30, 600)
 			n.Set(records(t, siteA))
 			if !tc.deregister {
-				expect(t, "registration after the change", reg.next(t), []string{siteA}, 30, 600)
+				expect(t, "registration after the change", reg.next(t), []string{siteA}, nil, 30, 600)
 			} else {
-				expect(t, "withdrawal", reg.next(t), []string{wwwA}, 0, 600)
-				expect(t, "registration after it", reg.next(t), []string{siteA}, 30, 600)
+				expect(t, "registration after the change", reg.next(t), []string{siteA}, []string{wwwA}, 30, 600)
 			}
 			n.Stop()
 			n.Wait()
 			if tc.deregister {
-				expect(t, "update on Stop", reg.next(t), nil, 0, 0)
+				expectFreed(t, "update on Stop", reg.next(t))
 			}
 			reg.none(t, 50*time.Millisecond)
 			if held, recs := store.state("site.example."); held || recs != nil {
@@ -243,8 +255,8 @@ func TestName_HeldByAnotherKey(t *testing.T) {
 	}
 }
 
-// The records an earlier run registered, which Store kept, are withdrawn when the first Set
-// lacks them; the store follows what is registered and held.
+// The records an earlier run registered, which Store kept, are deleted by the first
+// registration when the first Set lacks them; the store follows what is registered and held.
 func TestName_WithdrawsWhatTheStoreKept(t *testing.T) {
 	store := newMemNames()
 	store.Save("site.example.", true, records(t, siteA, wwwA))
@@ -252,8 +264,7 @@ func TestName_WithdrawsWhatTheStoreKept(t *testing.T) {
 	n := startTestName(t, reg, store, false)
 
 	n.Set(records(t, siteA))
-	expect(t, "withdrawal", reg.next(t), []string{wwwA}, 0, 600)
-	expect(t, "registration", reg.next(t), []string{siteA}, 30, 600)
+	expect(t, "registration", reg.next(t), []string{siteA}, []string{wwwA}, 30, 600)
 	deadline := time.Now().Add(5 * time.Second)
 	for {
 		if held, recs := store.state("site.example."); held && slices.Equal(recs, []string{siteA}) {
@@ -268,7 +279,7 @@ func TestName_WithdrawsWhatTheStoreKept(t *testing.T) {
 
 	n.Stop()
 	n.Wait()
-	expect(t, "update on Stop", reg.next(t), nil, 0, 0)
+	expectFreed(t, "update on Stop", reg.next(t))
 	if held, recs := store.state("site.example."); held || len(recs) != 0 {
 		t.Fatalf("store after the name was freed: held %v, records %q; want neither", held, recs)
 	}
@@ -282,7 +293,7 @@ func TestStartName_RefusesABadClient(t *testing.T) {
 	}
 }
 
-// Release frees the name with its KEY alone (Case C), and records it as freed only once the
+// Release frees the name by deleting its KEY alone, and records it as freed only once the
 // proxy confirms it, or answers that another key holds the name.
 func TestRelease(t *testing.T) {
 	for _, tt := range []struct {
@@ -316,7 +327,7 @@ func TestRelease(t *testing.T) {
 			if len(got) != 1 {
 				t.Fatalf("%d updates sent, want 1", len(got))
 			}
-			expect(t, "release", got[0], nil, 0, 0)
+			expectFreed(t, "release", got[0])
 			if held, _ := store.state("site.example."); held != tt.wantHeld {
 				t.Errorf("name recorded as held: %v, want %v; logged %q", held, tt.wantHeld, logged)
 			}

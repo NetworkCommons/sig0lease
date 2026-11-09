@@ -418,7 +418,7 @@ did not catch it: OpenThread is not in it, and mDNSResponder's `srp-client` neve
 (§12).
 
 A removal with a `KEY-LEASE` of 0 frees the names, and is done before it is answered, as an
-RFC 9664 Case C delete is: the handler drops the KEY adds too, and the same UPDATE deletes,
+RFC 9664 KEY delete is: the handler drops the KEY adds too, and the same UPDATE deletes,
 record by record, every KEY and record the lease store holds at and below the host
 (`subtreeDeletes`), also an instance no longer advertised that still holds its name, which no
 Delete All RRsets reaches. Once the authoritative server confirms it, the store forgets the

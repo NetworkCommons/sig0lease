@@ -77,7 +77,7 @@ func fcfsTestTXT(name string) *dns.TXT {
 	return txt
 }
 
-// selfRegistration is a key registering itself, with a TXT at its own name: Case A.
+// selfRegistration is a key registering itself, with a TXT at its own name.
 func selfRegistration(t *testing.T, k *keyrec.LoadedKey) *dns.Msg {
 	return buildFCFSUpdate(t, k, []*dns.KEY{k.PublicKey}, []dns.RR{fcfsTestTXT(k.PublicKey.Hdr.Name)}, 120, 120)
 }
@@ -200,7 +200,7 @@ func TestFCFSNaming_RegistersBelowAnotherKey_YXDOMAIN(t *testing.T) {
 	}
 }
 
-// The key holding a name registers another KEY below it (Case D): only the names below the
+// The key holding a name registers another KEY below it: only the names below the
 // holder's own are checked.
 func TestFCFSNaming_HolderRegistersBelowItself(t *testing.T) {
 	alice := fcfsTestKey(t, "alice.dev.zenr.io.")

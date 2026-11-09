@@ -69,24 +69,24 @@ func TestDecodeLease_RcodeFitsTheHeader(t *testing.T) {
 
 // TestRequestedLeases_FourByteFollowsRecordKinds: the 8-byte variant's two values pass through;
 // the 4-byte variant's one value goes to the KEYs and to the other records the Update section
-// has (RFC 9664 S4), which selects Case A, B or D as the 8-byte variant would.
+// adds (RFC 9664 S4), 0 to a kind it adds none of, as the 8-byte variant would have it.
 func TestRequestedLeases_FourByteFollowsRecordKinds(t *testing.T) {
 	tests := []struct {
 		name                 string
 		lo                   *leasepkg.LeaseOption
-		hasKeys, hasOthers   bool
+		addsKeys, addsOthers bool
 		wantLease, wantKeyLe uint32
 	}{
 		{"8-byte", leasepkg.Encode8Byte(120, 600), true, true, 120, 600},
-		{"4-byte, KEYs and other records: Case A", leasepkg.Encode4Byte(600), true, true, 600, 600},
-		{"4-byte, other records only: Case B", leasepkg.Encode4Byte(600), false, true, 600, 0},
-		{"4-byte, KEYs only: Case D", leasepkg.Encode4Byte(600), true, false, 0, 600},
-		{"4-byte, no records: Case B, refused there", leasepkg.Encode4Byte(600), false, false, 600, 0},
-		{"4-byte 0: Case C", leasepkg.Encode4Byte(0), true, true, 0, 0},
+		{"4-byte, KEYs and other records added", leasepkg.Encode4Byte(600), true, true, 600, 600},
+		{"4-byte, other records only added", leasepkg.Encode4Byte(600), false, true, 600, 0},
+		{"4-byte, KEYs only added", leasepkg.Encode4Byte(600), true, false, 0, 600},
+		{"4-byte, nothing added: deletes only", leasepkg.Encode4Byte(600), false, false, 0, 0},
+		{"4-byte 0, records added: refused by checkUpdateRecords", leasepkg.Encode4Byte(0), true, true, 0, 0},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			lease, keyLease := requestedLeases(tt.lo, tt.hasKeys, tt.hasOthers)
+			lease, keyLease := requestedLeases(tt.lo, tt.addsKeys, tt.addsOthers)
 			if lease != tt.wantLease || keyLease != tt.wantKeyLe {
 				t.Fatalf("LEASE/KEY-LEASE = %d/%d, want %d/%d", lease, keyLease, tt.wantLease, tt.wantKeyLe)
 			}
@@ -162,7 +162,7 @@ func wireRcode(t *testing.T, resp *dns.Msg) uint16 {
 }
 
 // TestHandle_FourByteVariant_KeysAndRecordsShareOneLease: with prefer_4byte_variant, a 4-byte
-// request carrying a KEY and a TXT is Case A with one lease for both. The policy grants the TXT
+// request adding a KEY and a TXT has one lease for both. The policy grants the TXT
 // at most 900 s and would grant the KEY 1800 s, but RFC 9664 S4 has them expire together, so
 // both get 900 s, and the reply says so in the 4-byte variant.
 func TestHandle_FourByteVariant_KeysAndRecordsShareOneLease(t *testing.T) {
@@ -190,7 +190,7 @@ func TestHandle_FourByteVariant_KeysAndRecordsShareOneLease(t *testing.T) {
 }
 
 // TestHandle_FourByteVariant_RecordsOnly: a 4-byte request with only non-KEY records, as
-// mDNSResponder sends, is Case B under the signer's managed KEY, answered in the 4-byte variant.
+// mDNSResponder sends, adds them under the signer's managed KEY, answered in the 4-byte variant.
 func TestHandle_FourByteVariant_RecordsOnly(t *testing.T) {
 	h, signer := setupFourByteHandler(t, true, true)
 	if err := h.leaseManager.Register(signer.PublicKey.Clone().(*dns.KEY), 1800, 1800, "dev.zenr.io."); err != nil {

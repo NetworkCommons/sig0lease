@@ -178,11 +178,11 @@ type updateSender interface {
 }
 
 // asDeletes returns rrs as RFC 2136 "Delete An RR From An RRset" instructions
-// (updatecore.AsDelete), for updatecore.BuildAndSign.
+// (dnsmsg.AsDelete), for updatecore.BuildAndSign.
 func asDeletes[RR dns.RR](rrs ...RR) []dns.RR {
 	deletes := make([]dns.RR, 0, len(rrs))
 	for _, rr := range rrs {
-		deletes = append(deletes, updatecore.AsDelete(rr))
+		deletes = append(deletes, dnsmsg.AsDelete(rr))
 	}
 	return deletes
 }

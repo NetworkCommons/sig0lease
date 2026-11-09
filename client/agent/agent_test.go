@@ -83,15 +83,39 @@ func (r *registrar) Send(ctx context.Context, addr string, network baseclient.Ne
 	return &dns.Msg{MsgHeader: dns.MsgHeader{Rcode: rcode}}, nil
 }
 
-// update is what an update registers: its host name (or RFC 9664 name) and addresses, its
-// live instances, the instances it withdraws, an RFC 9664 name's other records, and the
-// leases it asks for.
+// rrs is what an update adds, or deletes: addresses, SRV instances, and an RFC 9664 name's
+// other records.
+type rrs struct {
+	addrs     []string
+	instances []string
+	records   []string
+}
+
+func (s *rrs) add(rr dns.RR) {
+	switch r := rr.(type) {
+	case *dns.A:
+		s.addrs = append(s.addrs, r.A.Addr.String())
+	case *dns.AAAA:
+		s.addrs = append(s.addrs, r.AAAA.Addr.String())
+	case *dns.SRV:
+		s.instances = append(s.instances, r.Hdr.Name)
+	case *dns.TXT:
+		if !strings.Contains(r.Hdr.Name, "._") {
+			s.records = append(s.records, rfc9664.Describe(r))
+		}
+	case *dns.TLSA:
+		s.records = append(s.records, rfc9664.Describe(r))
+	}
+}
+
+// update is what an update registers: its host name (or RFC 9664 name), the records it adds,
+// those it deletes (class NONE, RFC 2136 S2.5.4), the instances it withdraws, and the leases it
+// asks for.
 type update struct {
-	host            string
-	addrs           []string
-	instances       []string
+	host string
+	rrs
+	deleted         rrs
 	withdrawn       []string
-	records         []string
 	lease, keyLease uint32
 }
 
@@ -101,23 +125,14 @@ func summarize(m *dns.Msg) update {
 		u.lease, u.keyLease = lo.Lease, *lo.KeyLease
 	}
 	for _, rr := range m.Ns {
-		switch r := rr.(type) {
-		case *dns.KEY:
-			if !strings.Contains(r.Hdr.Name, "._") {
-				u.host = r.Hdr.Name
-			}
-		case *dns.A:
-			u.addrs = append(u.addrs, r.A.Addr.String())
-		case *dns.AAAA:
-			u.addrs = append(u.addrs, r.AAAA.Addr.String())
-		case *dns.SRV:
-			u.instances = append(u.instances, r.Hdr.Name)
-		case *dns.TXT:
-			if !strings.Contains(r.Hdr.Name, "._") {
-				u.records = append(u.records, rfc9664.Describe(r))
-			}
-		case *dns.TLSA:
-			u.records = append(u.records, rfc9664.Describe(r))
+		switch {
+		case rr.Header().Class == dns.ClassNONE:
+			u.deleted.add(rr)
+		case rr.Header().Class == dns.ClassINET:
+			u.add(rr)
+		}
+		if k, ok := rr.(*dns.KEY); ok && !strings.Contains(k.Hdr.Name, "._") {
+			u.host = k.Hdr.Name
 		}
 	}
 	for _, rr := range m.Ns {
@@ -126,6 +141,7 @@ func summarize(m *dns.Msg) update {
 		}
 	}
 	slices.Sort(u.instances)
+	slices.Sort(u.deleted.instances)
 	slices.Sort(u.withdrawn)
 	return u
 }
@@ -731,8 +747,9 @@ func TestRun_RegistrarChangeRestartsItsOwn(t *testing.T) {
 	h.logs.waitFor(t, "template: the srp registrar for other.test. changed")
 }
 
-// A name is registered with its addresses and records, its records withdrawn as the template
-// and the machine change, and deregistered on stop as its on_stop says.
+// A name is registered with its addresses and records, registered again as the template and the
+// machine change, deleting in the same update what they no longer give, and deregistered on
+// stop as its on_stop says.
 func TestRun_Names(t *testing.T) {
 	h := newHarness(t, nameTemplate(`
 names:
@@ -753,22 +770,20 @@ names:
     addresses: [auto]
     records: ['@ TXT "hello"']
 `))
-	u = h.until(t, "withdrawing _dnslink", func(update) bool { return true })
-	if !slices.Equal(u.records, []string{`_dnslink.site.dev.test. TXT "dnslink=/ipfs/x"`}) || u.lease != 0 || u.keyLease != 1209600 {
-		t.Fatalf("update after the template change %+v, want _dnslink withdrawn (LEASE 0, the KEY kept)", u)
+	u = h.until(t, "registering site again", func(update) bool { return true })
+	if !slices.Equal(u.records, []string{`site.dev.test. TXT "hello"`}) || !slices.Equal(u.deleted.records, []string{`_dnslink.site.dev.test. TXT "dnslink=/ipfs/x"`}) || u.lease != 3600 || u.keyLease != 1209600 {
+		t.Fatalf("update after the template change %+v, want the TXT record left and _dnslink deleted", u)
 	}
-	h.until(t, "registering site again", func(u update) bool { return u.lease != 0 && len(u.records) == 1 })
 
 	h.setMachine("192.0.2.11")
-	u = h.until(t, "withdrawing the old address", func(update) bool { return true })
-	if !slices.Equal(u.addrs, []string{"192.0.2.10"}) || u.lease != 0 {
-		t.Fatalf("update after the machine's address changed %+v, want 192.0.2.10 withdrawn", u)
+	u = h.until(t, "registering the new address", func(update) bool { return true })
+	if !slices.Equal(u.addrs, []string{"192.0.2.11"}) || !slices.Equal(u.deleted.addrs, []string{"192.0.2.10"}) || u.lease != 3600 {
+		t.Fatalf("update after the machine's address changed %+v, want 192.0.2.11 added and 192.0.2.10 deleted", u)
 	}
-	h.until(t, "registering the new address", func(u update) bool { return slices.Equal(u.addrs, []string{"192.0.2.11"}) && u.lease != 0 })
 
 	h.stop(t)
 	u = h.until(t, "deregistering site", func(update) bool { return true })
-	if !slices.Equal(u.addrs, []string{"192.0.2.11"}) || len(u.records) != 1 || u.lease != 0 || u.keyLease != 1209600 {
+	if len(u.addrs) != 0 || len(u.records) != 0 || !slices.Equal(u.deleted.addrs, []string{"192.0.2.11"}) || len(u.deleted.records) != 1 || u.lease != 0 || u.keyLease != 1209600 {
 		t.Fatalf("update on stop %+v, want the records deleted and the name kept (on_stop: keep)", u)
 	}
 }
@@ -788,8 +803,9 @@ func TestRun_LogsWarnings(t *testing.T) {
 }
 
 // A name's service is registered as its SRV records, with the TLSA record its certificate
-// gives, once its probe passes, and withdrawn while its certificate cannot be read or after
-// ProbeFailures failed probes in a row. A new key in the certificate replaces the TLSA record.
+// gives, once its probe passes, and deleted while its certificate cannot be read or after
+// ProbeFailures failed probes in a row. A new key in the certificate replaces the TLSA record:
+// each change is one update.
 func TestRun_NameServices(t *testing.T) {
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -826,19 +842,18 @@ names:
 	h.logs.waitFor(t, "a.dev.test.: _xmpp-client._tcp: not registered until its probe passes")
 
 	newSPKI := writeCert(t, cert)
-	if u = h.until(t, "withdrawing the old TLSA record", func(u update) bool { return u.lease == 0 }); !slices.Equal(u.records, tlsa(spki)) || len(u.instances) != 0 {
-		t.Fatalf("withdrawal after the new key %+v, want the old TLSA record alone", u)
-	}
-	if u = h.until(t, "registering the new TLSA record", func(u update) bool { return u.lease != 0 }); !slices.Equal(u.records, tlsa(newSPKI)) || !slices.Equal(u.instances, srvs) {
-		t.Fatalf("registration after the new key %+v, want the SRV records and the new TLSA record", u)
+	if u = h.until(t, "replacing the TLSA record", func(update) bool { return true }); !slices.Equal(u.records, tlsa(newSPKI)) || !slices.Equal(u.instances, srvs) ||
+		!slices.Equal(u.deleted.records, tlsa(spki)) || len(u.deleted.instances) != 0 || u.lease == 0 {
+		t.Fatalf("registration after the new key %+v, want the SRV records and the new TLSA record, the old one deleted", u)
 	}
 	h.logs.waitFor(t, "a.dev.test.: _xmpp-server._tcp: certificate "+cert+" has a new key; its TLSA record follows")
 
 	if err := os.Remove(cert); err != nil {
 		t.Fatal(err)
 	}
-	if u = h.until(t, "withdrawing xmpp-server", func(u update) bool { return u.lease == 0 }); !slices.Equal(u.records, tlsa(newSPKI)) || !slices.Equal(u.instances, srvs) {
-		t.Fatalf("withdrawal without the certificate %+v, want the SRV and TLSA records", u)
+	if u = h.until(t, "deleting xmpp-server", func(update) bool { return true }); !slices.Equal(u.deleted.records, tlsa(newSPKI)) || !slices.Equal(u.deleted.instances, srvs) ||
+		len(u.instances) != 0 || !slices.Equal(u.addrs, []string{"127.0.0.1"}) || u.lease == 0 {
+		t.Fatalf("registration without the certificate %+v, want a's address, the SRV and TLSA records deleted", u)
 	}
 	h.logs.waitFor(t, "a.dev.test.: _xmpp-server._tcp: certificate: open "+cert+": no such file or directory; not registered until it can be read")
 	spki = writeCert(t, cert)
@@ -848,8 +863,9 @@ names:
 	h.logs.waitFor(t, "a.dev.test.: _xmpp-server._tcp: certificate "+cert+" read")
 
 	ln.Close()
-	if u = h.until(t, "withdrawing xmpp-server after its probes", func(u update) bool { return u.lease == 0 }); !slices.Equal(u.instances, srvs) || !slices.Equal(u.records, tlsa(spki)) {
-		t.Fatalf("withdrawal after failed probes %+v, want the SRV and TLSA records", u)
+	if u = h.until(t, "deleting xmpp-server after its probes", func(update) bool { return true }); !slices.Equal(u.deleted.instances, srvs) || !slices.Equal(u.deleted.records, tlsa(spki)) ||
+		len(u.instances) != 0 || !slices.Equal(u.addrs, []string{"127.0.0.1"}) || u.lease == 0 {
+		t.Fatalf("registration after failed probes %+v, want a's address, the SRV and TLSA records deleted", u)
 	}
 	h.logs.waitFor(t, "a.dev.test.: _xmpp-server._tcp: probe failed 3 times in a row, withdrawing it")
 }
@@ -866,11 +882,9 @@ func TestRun_NameServiceChanges(t *testing.T) {
 	}
 
 	h.write(t, nameTemplate("names: [{name: a.dev.test., addresses: [127.0.0.1], services: [{type: xmpp-server, probe: none, subdomains: [rooms]}]}]\n"))
-	if u := h.until(t, "withdrawing the TLSA record", func(u update) bool { return u.lease == 0 }); !slices.Equal(u.records, tlsa) || len(u.instances) != 0 {
-		t.Fatalf("withdrawal %+v, want the TLSA record alone", u)
-	}
-	if u := h.until(t, "registering a again", func(u update) bool { return u.lease != 0 }); !slices.Equal(u.instances, []string{"_xmpp-server._tcp.a.dev.test.", "_xmpp-server._tcp.rooms.a.dev.test."}) || len(u.records) != 0 {
-		t.Fatalf("registration after the change %+v, want the SRV records for a and rooms.a, no TLSA record", u)
+	if u := h.until(t, "registering a again", func(update) bool { return true }); !slices.Equal(u.instances, []string{"_xmpp-server._tcp.a.dev.test.", "_xmpp-server._tcp.rooms.a.dev.test."}) || len(u.records) != 0 ||
+		!slices.Equal(u.deleted.records, tlsa) || len(u.deleted.instances) != 0 || u.lease == 0 {
+		t.Fatalf("registration after the change %+v, want the SRV records for a and rooms.a, the TLSA record deleted", u)
 	}
 }
 
@@ -897,10 +911,10 @@ func TestRun_NameRemoved(t *testing.T) {
 	h.logs.waitFor(t, "gone.dev.test.: registered")
 
 	h.write(t, nameTemplate("names:\n  - {name: site.dev.test., records: ['@ TXT x']}\n"))
-	if u := h.until(t, "deregistering gone", func(u update) bool { return u.host == "gone.dev.test." && u.lease == 0 }); u.keyLease != 1209600 || len(u.addrs) != 1 {
+	if u := h.until(t, "deregistering gone", func(u update) bool { return u.host == "gone.dev.test." && u.lease == 0 }); u.keyLease != 1209600 || len(u.deleted.addrs) != 1 || len(u.addrs) != 0 {
 		t.Errorf("gone's first update after its removal %+v, want its address deleted, the name kept as on_stop says", u)
 	}
-	if u := h.until(t, "freeing gone", func(u update) bool { return u.host == "gone.dev.test." }); u.lease != 0 || u.keyLease != 0 || len(u.addrs) != 0 {
+	if u := h.until(t, "freeing gone", func(u update) bool { return u.host == "gone.dev.test." }); u.lease != 0 || u.keyLease != 0 || len(u.addrs) != 0 || len(u.deleted.addrs) != 0 {
 		t.Errorf("gone's next update %+v, want its KEY alone, both leases 0", u)
 	}
 	h.logs.waitFor(t, "template: gone.dev.test. removed; freeing it")
@@ -932,7 +946,7 @@ func TestRun_KeepsNamesWhileRunning(t *testing.T) {
 	if u := got["box.srp.test."]; len(u.addrs) != 0 || u.keyLease != 1209600 {
 		t.Errorf("box's update with no address %+v, want it deregistered keeping its names", u)
 	}
-	if u := got["site.dev.test."]; !slices.Equal(u.addrs, []string{"192.0.2.10"}) || u.lease != 0 || u.keyLease != 1209600 {
+	if u := got["site.dev.test."]; len(u.addrs) != 0 || !slices.Equal(u.deleted.addrs, []string{"192.0.2.10"}) || u.lease != 0 || u.keyLease != 1209600 {
 		t.Errorf("site's update with no address %+v, want its address deleted and the name kept", u)
 	}
 
@@ -941,7 +955,7 @@ func TestRun_KeepsNamesWhileRunning(t *testing.T) {
 	if u := got["box.srp.test."]; len(u.addrs) != 0 || len(u.withdrawn) != 0 || u.keyLease != 0 {
 		t.Errorf("box's update on stopping %+v, want the host alone freed", u)
 	}
-	if u := got["site.dev.test."]; len(u.addrs) != 0 || u.lease != 0 || u.keyLease != 0 {
+	if u := got["site.dev.test."]; len(u.addrs) != 0 || len(u.deleted.addrs) != 0 || u.lease != 0 || u.keyLease != 0 {
 		t.Errorf("site's update on stopping %+v, want its KEY alone, both leases 0", u)
 	}
 	h.none(t, 100*time.Millisecond)

@@ -10,12 +10,12 @@ import (
 	"time"
 
 	"codeberg.org/miekg/dns"
+	"github.com/NetworkCommons/sig0lease/pkg/dnsmsg"
 	"github.com/NetworkCommons/sig0lease/pkg/dnsname"
 	"github.com/NetworkCommons/sig0lease/pkg/dnssd"
 	leasepkg "github.com/NetworkCommons/sig0lease/pkg/lease"
 	"github.com/NetworkCommons/sig0lease/pkg/sig0"
 	"github.com/NetworkCommons/sig0lease/pkg/srp"
-	"github.com/NetworkCommons/sig0lease/pkg/updatecore"
 )
 
 // SRPHandler implements handlers.Handler for opcode 5 (UPDATE), the RFC 9665 SRP path --
@@ -380,7 +380,7 @@ func (h *SRPHandler) Handle(ctx context.Context, w dns.ResponseWriter, r *dns.Ms
 	forwardRecords = append(forwardRecords, h.ptrDeleteDiff(cu)...)
 	forwardRecords = append(forwardRecords, synthesizeOmittedInstanceKeys(cu, keyLease)...)
 	// Freeing the names, the same UPDATE also deletes, record by record, every KEY and record
-	// the store holds at and below the host, as an RFC 9664 Case C delete does: the
+	// the store holds at and below the host, as an RFC 9664 KEY delete does: the
 	// requester's Delete All RRsets miss an instance that is no longer advertised but still
 	// holds its name (removeHost adds only live ones). The answer then means the names are
 	// free, with nothing left for a timer to delete after it.
@@ -762,7 +762,7 @@ func (h *SRPHandler) ptrDeleteDiff(cu *srp.ClassifiedUpdate) []dns.RR {
 				continue
 			}
 			if !named[rrKey] {
-				diff = append(diff, updatecore.AsDelete(rec.RR))
+				diff = append(diff, dnsmsg.AsDelete(rec.RR))
 			}
 		}
 	}

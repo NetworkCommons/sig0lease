@@ -80,9 +80,9 @@ func TestHandle_AuthoritativeLookupFailureIsServfail(t *testing.T) {
 	}{
 		// No KEY in the request and none in the lease store: the signer's KEY is looked up.
 		{"signer KEY", dns.TypeKEY, false, leasepkg.Encode8Byte(120, 0), "failed to resolve signer KEY"},
-		// Case A: the new KEY's own duplicate check.
+		// A KEY added anew: its own duplicate check.
 		{"KEY duplicate check", dns.TypeKEY, true, leasepkg.Encode8Byte(120, 120), "authoritative duplicate check failed"},
-		// Case A: the records' duplicate check (filterDuplicateRegistrations).
+		// Records added with it: their duplicate check (filterDuplicateRegistrations).
 		{"record duplicate check", dns.TypeTXT, true, leasepkg.Encode8Byte(120, 120), "authoritative duplicate check failed"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
