@@ -49,7 +49,12 @@ start_bind9() {
     require_command named-checkconf
 
     BIND9_RUNDIR="$(mktemp -d /tmp/sig0lease-bind9.XXXXXX)"
-    sed "s#@RUNDIR@#${BIND9_RUNDIR}#g; s#@SIG0_QUOTA@#${BIND9_SIG0_QUOTA}#g" "${BIND9_TEMPLATE_DIR}/named.conf.in" > "${BIND9_RUNDIR}/named.conf"
+    sed "s#@RUNDIR@#${BIND9_RUNDIR}#g; s#@ADDR@#${BIND9_ADDR}#g; s#@PORT@#${BIND9_PORT}#g; s#@SIG0_QUOTA@#${BIND9_SIG0_QUOTA}#g" \
+        "${BIND9_TEMPLATE_DIR}/named.conf.in" > "${BIND9_RUNDIR}/named.conf"
+    if grep -q '@[A-Z0-9_]*@' "${BIND9_RUNDIR}/named.conf"; then
+        log_error "named.conf.in has a placeholder start_bind9 does not fill in: $(grep -o '@[A-Z0-9_]*@' "${BIND9_RUNDIR}/named.conf" | sort -u | tr '\n' ' ')"
+        return 1
+    fi
     sed "s#@SRP_REGISTRAR_PORT@#${BIND9_SRP_REGISTRAR_PORT}#g; s#@SRP_REGISTRAR_TLS_PORT@#${BIND9_SRP_REGISTRAR_TLS_PORT}#g" "${BIND9_TEMPLATE_DIR}/srp.test.zone.in" > "${BIND9_RUNDIR}/srp.test.zone"
     cp "${BIND9_TEMPLATE_DIR}/update.test.zone.in" "${BIND9_RUNDIR}/update.test.zone"
     cp "${BIND9_TEMPLATE_DIR}/default.service.arpa.zone.in" "${BIND9_RUNDIR}/default.service.arpa.zone"
