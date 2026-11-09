@@ -1,6 +1,8 @@
-# The release, built on this machine from the checkout: the proxy for the registrar's Linux, the
-# page (make web), and config.base.yaml, the checkout's config.yaml, which each instance's config
-# is made from (config.yml), before anything is built.
+# The release, built on this machine from the checkout into sig0lease_build_dir: the proxy for the
+# registrar's Linux, the page (make web) in web/, and config.base.yaml, the checkout's config.yaml,
+# which each instance's config is made from (config.yml), before anything is built. The same code
+# and Go build the same proxy, byte for byte: it records neither the commit, which the release's
+# name gives, nor where it was built.
 
 - name: Build the release
   delegate_to: localhost
@@ -52,7 +54,7 @@
 
     - name: Build the proxy for linux/{{ sig0lease_goarch }}
       ansible.builtin.command:
-        cmd: go build -trimpath -o {{ sig0lease_build_dir }}/sig0lease ./cmd/sig0lease
+        cmd: go build -trimpath -buildvcs=false -o {{ sig0lease_build_dir }}/sig0lease ./cmd/sig0lease
         chdir: "{{ sig0lease_repo }}"
       environment:
         GOOS: linux
@@ -65,6 +67,13 @@
         cmd: make -s web
         chdir: "{{ sig0lease_repo }}"
       changed_when: true
+
+    - name: Copy the page into the release
+      ansible.builtin.copy:
+        src: "{{ sig0lease_repo }}/bin/web/"
+        dest: "{{ sig0lease_build_dir }}/web/"
+        mode: "0644"
+        directory_mode: "0755"
 
     - name: Copy config.yaml, which each instance's config is made from
       ansible.builtin.copy:

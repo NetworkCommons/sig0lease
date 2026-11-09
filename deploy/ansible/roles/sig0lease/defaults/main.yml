@@ -19,6 +19,9 @@ sig0lease_keystore: "{{ sig0lease_etc }}/{{ registrar_instance }}/keystore"  # i
 sig0lease_etc: /etc/sig0lease
 sig0lease_state_root: /var/lib/sig0lease
 
+# The service unit, one for every instance.
+sig0lease_unit: /etc/systemd/system/sig0lease@.service
+
 # Where this machine builds a release: under bin/, which git ignores.
 sig0lease_build_dir: "{{ sig0lease_repo }}/bin/deploy/{{ sig0lease_release }}"
 

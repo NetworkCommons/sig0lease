@@ -61,5 +61,5 @@
 - name: Install the service, one per instance
   ansible.builtin.template:
     src: sig0lease@.service.j2
-    dest: /etc/systemd/system/sig0lease@.service
+    dest: "{{ sig0lease_unit }}"
     mode: "0644"

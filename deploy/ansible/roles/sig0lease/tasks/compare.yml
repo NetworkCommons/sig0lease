@@ -1,0 +1,82 @@
+# Whether the instance already runs the release sig0lease_release, about to be installed in it
+# (deploy: the build in sig0lease_source_dir on sig0lease_source_host, this machine; promote:
+# staging's release, on the registrar), as sig0lease_unchanged, and if not, why, as
+# sig0lease_differences. It does when the release current points at holds the same files, byte
+# for byte, with the instance's config (sig0lease_config_text) as its config.yaml, and its proxy
+# runs, started after current, the program and config.yaml current points at, the instance's key
+# and the service unit last changed. Changes nothing.
+
+- name: Find the release running in {{ registrar_instance }}
+  ansible.builtin.stat:
+    path: "{{ sig0lease_root }}/current"
+  register: sig0lease_running
+
+- name: Find what changed since the proxy started, of what it starts with, in {{ registrar_instance }}
+  ansible.builtin.shell: |
+    set -euo pipefail
+    if ! systemctl is-active --quiet {{ sig0lease_service }}; then
+        echo "{{ sig0lease_service }} is not running"
+        exit 0
+    fi
+    find {{ sig0lease_root }}/current {{ sig0lease_root }}/current/sig0lease \
+        {{ sig0lease_root }}/current/config.yaml {{ sig0lease_keystore }} {{ sig0lease_unit }} \
+        -newermt "$(systemctl show --timestamp=us+utc -p ExecMainStartTimestamp --value {{ sig0lease_service }})" \
+        -printf '%p changed since the proxy started\n'
+  args:
+    executable: /bin/bash
+  register: sig0lease_since_start
+  changed_when: false
+  when: sig0lease_running.stat.islnk | default(false)
+
+- name: List the files of {{ sig0lease_release }}
+  ansible.builtin.find:
+    paths: "{{ sig0lease_source_dir }}"
+    recurse: true
+    file_type: file
+    hidden: true
+    get_checksum: true
+  delegate_to: "{{ sig0lease_source_host }}"
+  register: sig0lease_source_files
+
+- name: List the files of the release running in {{ registrar_instance }}
+  ansible.builtin.find:
+    paths: "{{ sig0lease_running.stat.lnk_source }}"
+    recurse: true
+    file_type: file
+    hidden: true
+    get_checksum: true
+  register: sig0lease_running_files
+  when: sig0lease_running.stat.islnk | default(false)
+
+- name: Compare the two
+  ansible.builtin.set_fact:
+    sig0lease_differences: "{{ sig0lease_found }}"
+    sig0lease_unchanged: "{{ sig0lease_found | length == 0 }}"
+  vars:
+    # Each file's checksum by its path in the release; the release's config.yaml is the instance's.
+    sig0lease_new: >-
+      {{ dict(sig0lease_source_files.files | map(attribute='path') | map('relpath', sig0lease_source_dir)
+              | zip(sig0lease_source_files.files | map(attribute='checksum')))
+         | dict2items | rejectattr('key', 'equalto', 'config.yaml') | items2dict
+         | combine({'config.yaml': sig0lease_config_text | hash('sha1')}) }}
+    sig0lease_old: >-
+      {{ dict(sig0lease_running_files.files | default([]) | map(attribute='path')
+              | map('relpath', sig0lease_running.stat.lnk_source | default('/'))
+              | zip(sig0lease_running_files.files | default([]) | map(attribute='checksum'))) }}
+    sig0lease_files_differing: >-
+      {{ (sig0lease_new | dict2items | difference(sig0lease_old | dict2items)
+          + sig0lease_old | dict2items | difference(sig0lease_new | dict2items))
+         | map(attribute='key') | unique | sort }}
+    sig0lease_found: >-
+      {{ [registrar_instance ~ ' has no release yet'] if not sig0lease_running.stat.islnk | default(false) else
+         sig0lease_since_start.stdout_lines
+         + ([(sig0lease_running.stat.lnk_source | basename) ~ ' differs in ' ~ sig0lease_files_differing | join(', ')]
+            if sig0lease_files_differing else []) }}
+
+- name: Say whether there is anything to install
+  ansible.builtin.debug:
+    msg: >-
+      {{ (registrar_instance ~ ' already runs ' ~ (sig0lease_running.stat.lnk_source | basename) ~ ', the same files as '
+          ~ sig0lease_release ~ ', and nothing it starts with changed since its proxy started: nothing to install.')
+         if sig0lease_unchanged | bool else
+         (sig0lease_release ~ ' goes to ' ~ registrar_instance ~ ': ' ~ sig0lease_differences | join('; ') ~ '.') }}

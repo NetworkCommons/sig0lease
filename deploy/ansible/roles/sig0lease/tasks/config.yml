@@ -1,7 +1,8 @@
 # The instance's config, as sig0lease_config: sig0lease_base_config, the repository's config.yaml
-# at the release's commit, with sig0lease_config_overrides merged in; and its key, as
-# sig0lease_key_files, the .key and .private files in keystore/server on this machine, which
-# prepare.yml copies. Changes nothing anywhere.
+# at the release's commit, with sig0lease_config_overrides merged in, and as sig0lease_config_text,
+# the release's config.yaml that activate.yml writes; and its key, as sig0lease_key_files, the .key
+# and .private files in keystore/server on this machine, which prepare.yml copies. Changes nothing
+# anywhere.
 
 - name: The instances serve zones apart, and each a zone for every handler config.yaml has
   ansible.builtin.assert:
@@ -68,3 +69,12 @@
   loop: "{{ sig0lease_config.handlers | dict2items }}"
   loop_control:
     label: "{{ item.key }}"
+
+- name: Write out the instance's config.yaml
+  ansible.builtin.set_fact:
+    sig0lease_config_text: |
+      # The config of the registrar's {{ registrar_instance }} instance: config.base.yaml, the
+      # repository's config.yaml at the release's commit, with sig0lease_config_overrides and
+      # registrar_instances.{{ registrar_instance }} (deploy/ansible). Made by every deploy and
+      # promote: change those instead.
+      {{ sig0lease_config | to_nice_yaml(indent=2, sort_keys=false) }}

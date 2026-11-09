@@ -1,7 +1,8 @@
 # The community registrar (deploy/README.md), make deploy: nginx in front, with the registrar's
 # Let's Encrypt certificate, then the proxy, built from this checkout, installed on staging as a
-# release and checked; a release that fails its checks is replaced by the one before it. It
-# reaches stable only through make promote (promote.yml).
+# release and checked, unless staging runs the same release already; a release that fails its
+# checks is replaced by the one before it. It reaches stable only through make promote
+# (promote.yml).
 - name: Community registrar, staging
   hosts: registrar
   pre_tasks:
