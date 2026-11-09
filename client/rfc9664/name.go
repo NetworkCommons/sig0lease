@@ -47,6 +47,10 @@ type Name struct {
 	*baseclient.Keeper[[]dns.RR]
 	cfg     NameConfig
 	applied []dns.RR // what was last sent to be registered; nil: nothing
+	// gone is what the registration of applied deletes (Config.Gone) until one succeeds:
+	// records registered before that applied lacks. The running client's callbacks clear it;
+	// to and leave read it once the Keeper has stopped that client, as heldByOther.
+	gone []dns.RR
 	// heldByOther is whether the registrar's last answer to registering applied was that
 	// another key holds the name: then nothing at the name is this key's, to withdraw or
 	// deregister. The running client's callbacks write it; to and leave read it once the
@@ -120,7 +124,7 @@ func (n *Name) client(records, gone []dns.RR) (*Client, error) {
 		n.cfg.logf("registered %s, lease %ds, key lease %ds", describe(records), lease, keyLease)
 		if len(gone) > 0 {
 			n.cfg.logf("withdrew %s", describe(gone))
-			gone = nil
+			gone, n.gone = nil, nil
 		}
 	}
 	c.OnError = func(err error) {
@@ -132,7 +136,8 @@ func (n *Name) client(records, gone []dns.RR) (*Client, error) {
 
 // to moves the name to next (Moves.To): it deregisters the name, keeping it, if next has no
 // records, and otherwise keeps next registered, the first registration deleting the records
-// next lacks, unless another key holds the name.
+// next lacks, unless another key holds the name: those last applied, and those an earlier
+// registration was to delete if none has succeeded since.
 func (n *Name) to(next []dns.RR) (func(context.Context), error) {
 	if len(next) == 0 {
 		registered := len(n.applied) > 0 && !n.heldByOther
@@ -143,7 +148,7 @@ func (n *Name) to(next []dns.RR) (func(context.Context), error) {
 	}
 	var gone []dns.RR
 	if !n.heldByOther {
-		gone = Diff(n.applied, next)
+		gone = Diff(slices.Concat(n.applied, n.gone), next)
 	}
 	c, err := n.client(next, gone)
 	if err != nil {
@@ -154,15 +159,16 @@ func (n *Name) to(next []dns.RR) (func(context.Context), error) {
 	} else {
 		n.cfg.logf("registering %s", describe(next))
 	}
-	n.applied, n.holding = next, false
+	n.applied, n.gone, n.holding = next, gone, false
 	return func(ctx context.Context) {
 		_ = c.Run(ctx) // returns only once ctx ends; OnRegistered/OnError report each cycle
 	}, nil
 }
 
-// leave deregisters what was last registered, keeping the name if keepName (Moves.Leave):
-// nothing when another key holds the name. With nothing registered, it frees the name a Set
-// with no records kept, unless keepName.
+// leave deregisters what was last registered, keeping the name if keepName (Moves.Leave),
+// with the records a registration was to delete if none has succeeded since: nothing when
+// another key holds the name. With nothing registered, it frees the name a Set with no
+// records kept, unless keepName.
 func (n *Name) leave(keepName bool) error {
 	if len(n.applied) == 0 {
 		if n.holding && !keepName {
@@ -176,10 +182,11 @@ func (n *Name) leave(keepName bool) error {
 		save(n.cfg, false, nil)
 		return nil
 	}
-	c, err := n.client(n.applied, nil)
+	c, err := n.client(slices.Concat(n.applied, n.gone), nil)
 	if err != nil {
 		return err
 	}
+	n.gone = nil
 	deregister(n.cfg, c, keepName)
 	return nil
 }

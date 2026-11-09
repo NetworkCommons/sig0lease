@@ -18,7 +18,15 @@ import (
 // answer.
 type nameRegistrar struct {
 	sent   chan *dns.Msg
+	mu     sync.Mutex
 	answer *dns.Msg
+}
+
+// setAnswer makes the registrar answer the next updates with answer.
+func (r *nameRegistrar) setAnswer(answer *dns.Msg) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.answer = answer
 }
 
 func newNameRegistrar() *nameRegistrar {
@@ -27,6 +35,8 @@ func newNameRegistrar() *nameRegistrar {
 
 func (r *nameRegistrar) Send(ctx context.Context, addr string, network baseclient.Network, msg *dns.Msg) (*dns.Msg, error) {
 	r.sent <- msg
+	r.mu.Lock()
+	defer r.mu.Unlock()
 	return r.answer, nil
 }
 
@@ -155,6 +165,29 @@ func TestName_RegistersWithdrawsAndDeregisters(t *testing.T) {
 	n.Stop()
 	n.Wait()
 	expectFreed(t, "update on Stop, freeing the name", reg.next(t))
+	reg.none(t, 50*time.Millisecond)
+}
+
+// The records a registration was to delete stay to delete until one succeeds: the next
+// change's registration deletes them with what it no longer has, and so does the
+// deregistration on Stop.
+func TestName_DeletesUntilARegistrationSucceeds(t *testing.T) {
+	const siteA2 = "site.example. A 192.0.2.2"
+	reg := newNameRegistrar()
+	n := startTestName(t, reg, nil, true)
+
+	n.Set(records(t, siteA, wwwA))
+	expect(t, "first update", reg.next(t), []string{siteA, wwwA}, nil, 30, 600)
+
+	reg.setAnswer(clienttest.Answer(dns.RcodeServerFailure))
+	n.Set(records(t, siteA))
+	expect(t, "registration deleting www, failing", reg.next(t), []string{siteA}, []string{wwwA}, 30, 600)
+	n.Set(records(t, siteA2))
+	expect(t, "next registration, deleting www still", reg.next(t), []string{siteA2}, []string{siteA, wwwA}, 30, 600)
+
+	n.Stop()
+	n.Wait()
+	expect(t, "update on Stop, keeping the name", reg.next(t), nil, []string{siteA2, siteA, wwwA}, 0, 600)
 	reg.none(t, 50*time.Millisecond)
 }
 
