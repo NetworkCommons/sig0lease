@@ -387,16 +387,17 @@ func cmdUpdate(command string, args []string) {
 }
 
 // cmdName keeps one name registered through client/rfc9664, as sig0lease-srp-client keeps
-// a host through client/srp: the name, one label below the zone, with its own key, its
-// addresses and records; or it registers, withdraws or deregisters them once.
+// a host through client/srp: the name, with its own key, its addresses and records; or it
+// registers, withdraws or deregisters them once. The name is given in full: which names a key
+// may register for itself is the proxy's to say (its fcfs_naming allows one label below its
+// zone), and the client cannot look up that zone.
 func cmdName(args []string) {
 	fs := newFlagSet("name")
 	var req cli.Request
 	var modes cli.Modes
 	req.Define(fs, proxyUsage)
 	modes.Define(fs, "the name: its records go, and its KEY too unless -keep-names")
-	zone := fs.String("zone", "", "the proxy's zone, its update_handler's upstream_zone (required)")
-	label := fs.String("name", "", "the name's label, one below the zone (required)")
+	fullName := fs.String("name", "", "the name, fully qualified, e.g. mysite.dev.zenr.io. (required)")
 	withdraw := fs.Bool("withdraw", false, "send one withdrawal of the -addr and -record records and exit, keeping the name and anything else it has")
 	var addrs, records cli.Repeatable
 	fs.Var(&addrs, "addr", "an address of the name: an A or AAAA record at it (repeatable)")
@@ -405,8 +406,8 @@ func cmdName(args []string) {
 		os.Exit(2)
 	}
 	switch {
-	case *zone == "" || *label == "":
-		cli.Fail(fmt.Errorf("-zone and -name are required"))
+	case *fullName == "":
+		cli.Fail(fmt.Errorf("-name is required"))
 	case fs.NArg() != 0:
 		cli.Fail(fmt.Errorf("unexpected arguments %q: everything is a flag", fs.Args()))
 	case *withdraw && (modes.Once || modes.Deregister):
@@ -418,7 +419,10 @@ func cmdName(args []string) {
 		}
 	}
 
-	name := *label + "." + dnsutil.Fqdn(*zone)
+	if err := rfc9664.CheckName(*fullName); err != nil {
+		cli.Fail(fmt.Errorf("-name: %w", err))
+	}
+	name := dnsutil.Fqdn(*fullName)
 	var problems []string
 	var parsed []netip.Addr
 	for _, a := range addrs {
@@ -442,8 +446,7 @@ func cmdName(args []string) {
 		cli.Fail(err)
 	}
 	c, err := rfc9664.NewClient(rfc9664.Config{
-		Zone:              *zone,
-		Label:             *label,
+		Name:              name,
 		Key:               key,
 		Records:           all,
 		RequestedLease:    uint32(req.Lease),
@@ -631,12 +634,11 @@ Flags come before the arguments. They are spelled as sig0lease-srp-client's.
 Commands:
   name [flags]
       Keep one name registered through client/rfc9664, as sig0lease-srp-client keeps a host:
-      the name, one label below the proxy's zone, with its own key, its addresses and records,
-      refreshed on the lease clock until Ctrl-C. A name another key holds is tried again
-      with a backoff, never renamed.
+      the name, with its own key, its addresses and records, refreshed on the lease clock
+      until Ctrl-C. A name another key holds is tried again with a backoff, never renamed.
+      With fcfs_naming, the proxy lets a key register itself only one label below its zone.
 
-      -zone string        the proxy's zone, its update_handler's upstream_zone (required)
-      -name string        the name's label (required)
+      -name string        the name, fully qualified (required)
       -addr value         an address of the name, as an A or AAAA record at it (repeatable)
       -record value       a record "<owner> <type> <data>", the owner @ for the name itself or
                           relative to it: '_dnslink TXT "dnslink=/ipfs/bafy..."',
@@ -650,7 +652,7 @@ Commands:
 
       Plus the request flags below; the key is the name's own, in the keystore.
 
-      sig0lease-client name -server 127.0.0.1:8053 -zone dev.zenr.io. -name mysite -k 13 \
+      sig0lease-client name -server 127.0.0.1:8053 -name mysite.dev.zenr.io. -k 13 \
         -addr 192.0.2.10 -record '_dnslink TXT "dnslink=/ipfs/bafy..."'
 
   register [flags] <keyname> [rr-spec...]

@@ -56,10 +56,10 @@ registrars:
         hosts: [mymac.local.]           # or all_hosts: true
         services: [_ssh._tcp, _rfb._tcp] # default: every type the daemon sees
 
-  # An rfc9664 registrar registers names, typed or linked rather than browsed: each one label
-  # right below the zone, held by its own key, with its addresses and records.
+  # An rfc9664 registrar registers names, typed or linked rather than browsed: each given in
+  # full, held by its own key, with its addresses and records. The proxy decides which names it
+  # takes: the demo's, one label right below its zone (docs/siglease_rfc9664.md).
   - protocol: rfc9664
-    zone: dev.zenr.io.
     server: 127.0.0.1:8053              # the proxy, run here (docs/srp-live-demo.md); required:
                                         # RFC 9664 has no registrar discovery
     transport: tcp
@@ -67,12 +67,12 @@ registrars:
     key_lease: 336h
     on_stop: keep
     names:
-      - name: mysite                    # mysite.dev.zenr.io.; held by another key, it is tried again
+      - name: mysite.dev.zenr.io.       # held by another key, it is tried again
         addresses: [auto]               # A/AAAA at the name, as for a host
         records:                        # "<owner> <type> <data>", the owner @ or relative to the name
           - '_dnslink TXT "dnslink=/ipns/k51qzi5uqu5dlvj2baxnqndepeb86cbk3ng7n3i46uzyxzyqj2xjonzllnv0v8"'
           - "www CNAME mysite.dev.zenr.io."
-      - name: chat                      # an XMPP server's domain, chat.dev.zenr.io.
+      - name: chat.dev.zenr.io.         # an XMPP server's domain
         addresses: [auto]
         services:                       # found by SRV records at the name, pointing at it
           - type: xmpp-client           # _xmpp-client._tcp.chat, port 5222, probed over TCP
@@ -80,7 +80,7 @@ registrars:
             subdomains: [rooms]         # and _xmpp-server._tcp.rooms.chat: its group chat service
             tlsa: certs/chat.crt        # a TLSA record for this certificate's key (DANE); relative
                                         # to this file, read at every poll
-      - name: files                     # an IPFS node's folder, files.dev.zenr.io. (docs/demo.md, D3)
+      - name: files.dev.zenr.io.        # an IPFS node's folder (docs/demo.md, D3)
         ipfs:
           api: http://127.0.0.1:5001    # the node's RPC API: the default, IPFS Desktop's too
           publish: {mfs: /community}    # _dnslink.files: the folder's CID as it changes; and

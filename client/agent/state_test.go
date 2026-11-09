@@ -112,8 +112,8 @@ func TestHostStore_Names(t *testing.T) {
 	}
 }
 
-// A host or name is wanted where it was registered: from the template's keystore, in its
-// domain or zone, through its registrar, as one of its hosts or names or, if a mirror
+// A host or name is wanted where it was registered: from the template's keystore, a host in
+// its domain, through its registrar, as one of its hosts or names or, if a mirror
 // registered it, as one a mirror of that type selects.
 func TestWanted(t *testing.T) {
 	t.Setenv("CLIENT_KEYSTORE_DIR", "")
@@ -128,9 +128,8 @@ registrars:
     hosts: [{name: box, addresses: [192.0.2.1]}]
     mirrors: [{type: mdns, hosts: [MyMac.local.]}]
   - protocol: rfc9664
-    zone: dev.test.
     server: 127.0.0.1:8159
-    names: [{name: site, addresses: [192.0.2.1]}]
+    names: [{name: site.dev.test., addresses: [192.0.2.1]}]
 `), path)
 	if err != nil {
 		t.Fatal(err)
@@ -139,7 +138,7 @@ registrars:
 	here := savedRegistrarOf(plan.Registrars[0])
 	other := here
 	other.Server = "127.0.0.1:9999"
-	zone := savedRegistrarOf(plan.Registrars[1])
+	proxy := savedRegistrarOf(plan.Registrars[1])
 	for _, tt := range []struct {
 		host     string
 		e        savedHost
@@ -154,9 +153,11 @@ registrars:
 		{"other.srp.test.", savedHost{Source: "mdns", Registrar: here}, keystore, false},
 		{"box.srp.test.", savedHost{Source: sourceHosts, Registrar: other}, keystore, false},
 		{"box.srp.test.", savedHost{Source: sourceHosts, Registrar: here}, filepath.Join(dir, "old"), false},
-		{"site.dev.test.", savedHost{Source: sourceNames, Registrar: zone}, keystore, true},
-		{"gone.dev.test.", savedHost{Source: sourceNames, Registrar: zone}, keystore, false},
-		{"site.dev.test.", savedHost{Source: sourceHosts, Registrar: zone}, keystore, false},
+		{"site.dev.test.", savedHost{Source: sourceNames, Registrar: proxy}, keystore, true},
+		{"gone.dev.test.", savedHost{Source: sourceNames, Registrar: proxy}, keystore, false},
+		{"site.dev.test.", savedHost{Source: sourceHosts, Registrar: proxy}, keystore, false},
+		// Registered when a registrar named its zone: freed and registered again.
+		{"site.dev.test.", savedHost{Source: sourceNames, Registrar: savedRegistrar{Domain: "dev.test.", Server: proxy.Server, Transport: proxy.Transport}}, keystore, false},
 		{"box.srp.test.", savedHost{Source: sourceNames, Registrar: here}, keystore, false},
 	} {
 		if _, got := wanted(plan, tt.keystore, tt.host, tt.e); got != tt.want {

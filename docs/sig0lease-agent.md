@@ -55,10 +55,9 @@ registrars:
             probe: {http: /health}
 
   - protocol: rfc9664
-    zone: dev.zenr.io.
     server: 127.0.0.1:8053
     names:
-      - name: mysite                # mysite.dev.zenr.io.
+      - name: mysite.dev.zenr.io.
         addresses: [auto]
         records: ['_dnslink TXT "dnslink=/ipns/k51..."']
 ```
@@ -97,12 +96,11 @@ An `rfc9664` registrar also takes:
 
 | Field | Default | Meaning |
 |---|---|---|
-| `zone` | required | The proxy's zone (`update_handler`'s `upstream_zone`). Names become `<name>.<zone>`. |
 | `resolvers` | `8.8.8.8:53`, `8.8.4.4:53` | As for `srp`, asked for a site one of its names follows (`ipfs: {follow:}`) when the proxy refuses it as a name it does not serve. Unused without such a name, which `validate` warns of. |
 | `names` | none | What it registers (below). |
 
-A domain or zone may have one registrar of each protocol, and an rfc9664 name may not be in an
-srp domain, or above one: the proxy serves a name through one handler. A registrar may grant
+A domain has one srp registrar, and a proxy (`server`) one rfc9664 registrar. A name is given
+once, and may not be in an srp domain, or above one: the proxy serves a name through one handler. A registrar may grant
 other leases than asked: this project's proxy raises one below its `lease_policy` minimum and
 cuts one above its maximum. The agent refreshes on what it grants.
 
@@ -208,13 +206,13 @@ every poll; the failure is logged once.
 
 ### names
 
-Under an `rfc9664` registrar. A name is one label right below the zone, held by its own key,
-with its addresses and records, registered in one RFC 9664 update signed with that key: the
+Under an `rfc9664` registrar. A name is given in full, held by its own key, with its addresses
+and records, registered in one RFC 9664 update signed with that key: the
 KEY and the records, on the registrar's leases (the handler's Case A).
 
 | Field | Meaning |
 |---|---|
-| `name` | The label: letters, digits and hyphens, as a host's. The proxy's `fcfs_naming` lets a key register itself only one label below the zone. Unique in its registrar, ignoring case. |
+| `name` | The name, fully qualified (the trailing dot optional), of two labels at least, each of letters, digits and hyphens, as a host's. Which names a key may register is the proxy's to say: with `fcfs_naming`, one label below its zone, which a requester cannot look up (`docs/siglease_rfc9664.md`, "Client Use Cases"); the request's Zone Section is the name's parent. Unique in the template, ignoring case. |
 | `addresses` | `auto`, IP addresses, or both, as a host's: registered as A and AAAA records at the name. Optional. |
 | `records` | `"<owner> <type> <data>"`, the owner `@` for the name itself or relative to it (`_dnslink`, `www`), the data in zone-file format. At or below the name, class IN, no KEY or SIG, no A or AAAA at the name (`addresses:` has those). Each once. |
 | `services` | Services found at the name by SRV records (below). They need `addresses:`, which the SRV records point at. |
@@ -232,7 +230,7 @@ domain is found:
 
 ```yaml
     names:
-      - name: chat                    # chat.dev.zenr.io., the XMPP server's domain
+      - name: chat.dev.zenr.io.       # the XMPP server's domain
         addresses: [auto]
         services:
           - type: xmpp-client         # _xmpp-client._tcp.chat SRV 0 0 5222 chat.dev.zenr.io.
@@ -274,11 +272,11 @@ old one leaked, changes it.
 
 ```yaml
     names:
-      - name: a                       # a member: its folder, as the site of a.dev.zenr.io
+      - name: a.dev.zenr.io.          # a member: its folder, as the site of a.dev.zenr.io
         ipfs:
           api: http://127.0.0.1:5001  # the node's RPC API: the default, IPFS Desktop's too
           publish: {mfs: /community}  # _dnslink.a TXT "dnslink=/ipfs/<the folder's CID>"
-      - name: site                    # a community node: a's site, once its node holds it all
+      - name: site.dev.zenr.io.       # a community node: a's site, once its node holds it all
         ipfs: {follow: a.dev.zenr.io}
 ```
 
@@ -347,8 +345,9 @@ answer on.
 - a registrar whose `server`, `transport`, `resolvers`, `lease`, `key_lease` or `on_stop`
   changed deregisters what it registers, keeping the names, then registers it again; a new
   `server` or `transport` also frees the names held through the old one. Another registrar's
-  hosts and names are not touched. A registrar with a new `domain` or `zone` is a new
-  registrar: the old one's hosts and names are removed, as above;
+  hosts and names are not touched. An srp registrar with a new `domain` is a new registrar: the
+  old one's hosts are removed, as above. A name moved to another rfc9664 registrar is freed
+  through the old one, then registered through the new one;
 - a changed `keystore` deregisters everything, frees the names held with the old keys, then
   registers everything again with the new ones;
 - a changed mirror is restarted, its hosts keeping their names; the hosts it no longer
@@ -410,7 +409,7 @@ from it, and stopping deregisters nothing (the agent logs `another key holds the
 
 `sig0lease-agent-state.json`, in the keystore, records each host the agent registered, the
 mirror's included, while its names may be held for its key, and each name while it may be held
-or has records registered: where it was registered (domain or zone, registrar, transport,
+or has records registered: where it was registered (a host's domain, the registrar, transport,
 resolvers), what registers it (`hosts:`, a mirror, or `names:`), whether its names are held and,
 if a rename changed them, which ones, and a name's records. It is written
 atomically and checksummed, with the same code as the proxy's lease snapshots
@@ -423,8 +422,8 @@ name is registered again.
 At every start, and after every template change, the agent frees the names of the hosts and
 names the file records that the template no longer registers, then forgets them: hosts and
 names removed while it was stopped as well as while it ran, hosts a mirror no longer selects,
-and hosts and names registered in another domain or zone, through another registrar or from
-another keystore. A host gets one deregistration of the host alone with a KEY lease of 0; the
+hosts registered in another domain, and hosts and names registered through another registrar
+or from another keystore. A host gets one deregistration of the host alone with a KEY lease of 0; the
 registrar removes the host's service instances with it (RFC 9665 §3.2.5.5.1, "even if the SRP
 requester doesn't list them"). A name gets its KEY alone with both leases 0 (Case C), which
 deletes every record the key registered. `plan` lists them. A release that fails is logged and

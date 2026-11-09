@@ -95,8 +95,9 @@ start_proxy() {
 
 # template <file> <copy> -- copies an agent template for this run (the copy may be the file): a
 # relative keystore made absolute, as the agent takes it relative to the template's directory;
-# each registrar's zone and domain the demo's (ZONE, DOMAIN); and with REGISTRAR each registrar's
-# server, this machine's proxy (127.0.0.1:8053), replaced by REGISTRAR, with TRANSPORT.
+# each srp registrar's domain the demo's (DOMAIN), and each rfc9664 name, given in full on one
+# "- name:" line, its first label in the demo's ZONE; and with REGISTRAR each registrar's server,
+# this machine's proxy (127.0.0.1:8053), replaced by REGISTRAR, with TRANSPORT.
 template() {
     local dir
     dir="$(cd "$(dirname "$1")" && pwd)" || exit 1
@@ -104,7 +105,15 @@ template() {
         -v zone="${zone:-}" -v domain="${domain:-}" '
         BEGIN { sub(/[.]$/, "", zone); sub(/[.]$/, "", domain) }
         /^keystore: [^\/ #]/ { sub(/^keystore: /, "keystore: " dir "/") }
-        zone != "" && /^ *zone: / { sub(/zone: [^ #]*/, "zone: " zone ".") }
+        /^ *- protocol: / { names = /protocol: rfc9664/ }
+        zone != "" && names && match($0, /^ *- name: [^ .#]+[.][^ #]*/) {
+            head = substr($0, 1, RSTART + RLENGTH - 1)
+            label = head
+            sub(/^ *- name: /, "", label)
+            sub(/[.].*/, "", label)
+            sub(/name: .*/, "name: " label "." zone ".", head)
+            $0 = head substr($0, RSTART + RLENGTH)
+        }
         domain != "" && /^ *domain: / { sub(/domain: [^ #]*/, "domain: " domain ".") }
         server != "" && /^ *server: 127\.0\.0\.1:8053/ {
             indent = $0

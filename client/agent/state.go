@@ -90,7 +90,8 @@ func savedRegistrarOf(r Registrar) savedRegistrar {
 }
 
 // sameRegistration reports whether names registered through r are held where names
-// registered through o are: the same domain, through the same registrar.
+// registered through o are: the same domain (an SRP registrar's; none for RFC 9664), through
+// the same registrar.
 func (r savedRegistrar) sameRegistration(o savedRegistrar) bool {
 	return dnsname.EqualFold(r.Domain, o.Domain) && r.Server == o.Server && r.Transport == o.Transport
 }
@@ -263,7 +264,7 @@ func wanted(plan *Plan, keystore, owner string, e savedHost) (Lifetime, bool) {
 			if r.Protocol != RFC9664 {
 				continue
 			}
-			if i := slices.IndexFunc(r.Names, func(n Name) bool { return dnsname.EqualFold(n.Name, label) }); i >= 0 {
+			if i := slices.IndexFunc(r.Names, func(n Name) bool { return dnsname.EqualFold(n.Name, owner) }); i >= 0 {
 				return r.Names[i].Lifetime, true
 			}
 		case r.Protocol != SRP:

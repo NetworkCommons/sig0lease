@@ -84,10 +84,12 @@ finish() {
 trap finish EXIT
 trap 'exit 130' INT TERM
 
+# registrar <protocol> [<line>] -- a registrar through this machine's proxy, with <line> (an srp
+# registrar's domain) if given.
 registrar() {
+    echo "  - protocol: $1"
+    [ -z "${2:-}" ] || echo "    $2"
     cat << EOF
-  - protocol: $1
-    $2
     server: 127.0.0.1:8053
     lease: 10m
     on_stop: release
@@ -100,10 +102,10 @@ keystore: $PWD/demo/keys-ipfs-$role
 registrars:
 EOF
     if [ "$role" = member ]; then
-        registrar rfc9664 "zone: $zone."
+        registrar rfc9664
         cat << EOF
     names:
-      - name: $member
+      - name: $member.$zone.
         ipfs: {api: "$api", publish: {mfs: "$folder"}}
 EOF
     else
@@ -115,10 +117,10 @@ EOF
         services:
           - {type: ipfs-gateway, port: $gateway}
 EOF
-        registrar rfc9664 "zone: $zone."
+        registrar rfc9664
         cat << EOF
     names:
-      - name: $site
+      - name: $site.$zone.
         ipfs: {api: "$api", follow: $member.$zone}
 EOF
     fi

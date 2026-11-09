@@ -129,7 +129,6 @@ server() {
 keystore: $PWD/demo/keys-chat
 registrars:
   - protocol: rfc9664
-    zone: $zone.
     server: 127.0.0.1:8053
     lease: 10m
     on_stop: release
@@ -137,7 +136,7 @@ registrars:
 EOF
     for i in "${!labels[@]}"; do
         cat << EOF
-      - name: ${labels[$i]}
+      - name: ${labels[$i]}.$zone.
         addresses: [${ADDRESS:-auto}]
         services:
           - {type: xmpp-client, port: $(c2s_port "$i")}

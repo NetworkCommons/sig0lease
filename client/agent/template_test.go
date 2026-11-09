@@ -65,7 +65,7 @@ func TestLoad_ExampleTemplate(t *testing.T) {
 }
 
 // The demo's templates (docs/demo.md) stay valid: each an srp registrar with host demo and an
-// rfc9664 one with name demo, both through the proxy on the same machine.
+// rfc9664 one with name demo.dev.zenr.io., both through the proxy on the same machine.
 func TestLoad_DemoTemplates(t *testing.T) {
 	for _, file := range []string{"demo.yaml", "conflict.yaml"} {
 		p, err := Load(filepath.Join("..", "..", "demo", file))
@@ -73,9 +73,9 @@ func TestLoad_DemoTemplates(t *testing.T) {
 			t.Fatalf("%s: %v", file, err)
 		}
 		if len(p.Registrars) != 2 || len(p.Registrars[0].Hosts) != 1 || p.Registrars[0].Hosts[0].Name != "demo" ||
-			len(p.Registrars[1].Names) != 1 || p.Registrars[1].Names[0].Name != "demo" ||
+			len(p.Registrars[1].Names) != 1 || p.Registrars[1].Names[0].Name != "demo.dev.zenr.io." ||
 			p.Registrars[0].Server != "127.0.0.1:8053" || p.Registrars[1].Server != "127.0.0.1:8053" {
-			t.Fatalf("%s: %+v, want host demo and name demo, through 127.0.0.1:8053", file, p.Registrars)
+			t.Fatalf("%s: %+v, want host demo and name demo.dev.zenr.io., through 127.0.0.1:8053", file, p.Registrars)
 		}
 	}
 }
@@ -89,8 +89,8 @@ func TestParse_RegistrarDefaults(t *testing.T) {
 	if r.Lifetime != (Lifetime{Lease: 5400, KeyLease: 7200}) || r.Transport != baseclient.NetworkTLS || r.Server != "192.0.2.1:853" {
 		t.Fatalf("registrar = %+v", r)
 	}
-	r = mustParse(t, "registrars: [{protocol: rfc9664, zone: dev.test, server: 192.0.2.1:53}]\n").Registrars[0]
-	if r.Protocol != RFC9664 || r.Domain != "dev.test." || r.Transport != baseclient.NetworkTCP || r.Lifetime != (Lifetime{Lease: 3600, KeyLease: 1209600, KeepNames: true}) {
+	r = mustParse(t, "registrars: [{protocol: rfc9664, server: 192.0.2.1:53}]\n").Registrars[0]
+	if r.Protocol != RFC9664 || r.Domain != "" || r.Transport != baseclient.NetworkTCP || r.Lifetime != (Lifetime{Lease: 3600, KeyLease: 1209600, KeepNames: true}) {
 		t.Fatalf("rfc9664 registrar = %+v", r)
 	}
 }
@@ -102,12 +102,11 @@ func TestParse_HostOverridesTheLifetime(t *testing.T) {
       - {name: b, addresses: [192.0.2.2], lease: 2m, key_lease: 10m, on_stop: release}
       - {name: c, addresses: [192.0.2.3], on_stop: release}
   - protocol: rfc9664
-    zone: dev.test.
     server: 192.0.2.1:53
     lease: 2h
     names:
-      - {name: d, addresses: [192.0.2.4]}
-      - {name: e, addresses: [192.0.2.5], on_stop: release}
+      - {name: d.dev.test, addresses: [192.0.2.4]}
+      - {name: e.dev.test, addresses: [192.0.2.5], on_stop: release}
 `))
 	hosts, names := p.Registrars[0].Hosts, p.Registrars[1].Names
 	for i, want := range []Lifetime{
@@ -226,16 +225,15 @@ func TestParse_Names(t *testing.T) {
 	p := mustParse(t, `
 registrars:
   - protocol: rfc9664
-    zone: dev.test.
     server: 192.0.2.1:53
     names:
-      - name: mysite
+      - name: mysite.dev.test.
         addresses: [auto, 2001:db8::1]
         records:
           - '_dnslink TXT "dnslink=/ipfs/bafy"'
           - "@ MX 10 mail.example."
           - "www CNAME mysite.dev.test."
-      - name: other
+      - name: other.dev.test.
         records: ["@ TXT hello"]
 `)
 	n := p.Registrars[0].Names
@@ -261,13 +259,12 @@ func TestParse_UnusedResolvers(t *testing.T) {
 	p := mustParse(t, `
 registrars:
   - protocol: rfc9664
-    zone: dev.test.
     server: 192.0.2.1:53
     resolvers: [192.0.2.53:53]
     names:
-      - {name: a, ipfs: {publish: {mfs: /community}}}
+      - {name: a.dev.test., ipfs: {publish: {mfs: /community}}}
 `)
-	want := []string{"registrars[0] (rfc9664 dev.test.): resolvers: unused: none of its names follows a site (ipfs: {follow:})"}
+	want := []string{"registrars[0] (rfc9664 192.0.2.1:53): resolvers: unused: none of its names follows a site (ipfs: {follow:})"}
 	if !slices.Equal(p.Warnings, want) {
 		t.Errorf("warnings = %q, want %q", p.Warnings, want)
 	}
@@ -280,13 +277,12 @@ func TestParse_NameIPFS(t *testing.T) {
 	p := mustParse(t, `
 registrars:
   - protocol: rfc9664
-    zone: dev.test.
     server: 192.0.2.1:53
     resolvers: [192.0.2.53:53]
     names:
-      - {name: a, ipfs: {publish: {mfs: /community}}}
-      - {name: site, ipfs: {api: "http://127.0.0.1:5002", follow: a.dev.test}}
-      - {name: b, ipfs: {}}
+      - {name: a.dev.test., ipfs: {publish: {mfs: /community}}}
+      - {name: site.dev.test., ipfs: {api: "http://127.0.0.1:5002", follow: a.dev.test}}
+      - {name: b.dev.test., ipfs: {}}
 `)
 	r := p.Registrars[0]
 	if !slices.Equal(r.Resolvers, []string{"192.0.2.53:53"}) {
@@ -310,25 +306,24 @@ registrars:
 keystore: keys
 registrars:
   - protocol: rfc9664
-    zone: dev.test.
     server: 192.0.2.1:53
     names:
-      - {name: both, ipfs: {publish: {mfs: /x}, follow: a.dev.test}}
-      - {name: badapi, ipfs: {api: "https://127.0.0.1:5001/api"}}
-      - {name: badmfs, ipfs: {publish: {mfs: community}}}
-      - {name: self, ipfs: {follow: self.dev.test.}}
-      - {name: badfollow, ipfs: {follow: a}}
-      - {name: twice, records: ['_dnslink TXT "dnslink=/ipfs/x"'], ipfs: {publish: {mfs: /x}}}
-      - {name: addrs, records: ['_dnsaddr TXT "dnsaddr=/ip4/192.0.2.1/tcp/4001/p2p/x"'], ipfs: {}}
+      - {name: both.dev.test., ipfs: {publish: {mfs: /x}, follow: a.dev.test}}
+      - {name: badapi.dev.test., ipfs: {api: "https://127.0.0.1:5001/api"}}
+      - {name: badmfs.dev.test., ipfs: {publish: {mfs: community}}}
+      - {name: self.dev.test., ipfs: {follow: self.dev.test.}}
+      - {name: badfollow.dev.test., ipfs: {follow: a}}
+      - {name: twice.dev.test., records: ['_dnslink TXT "dnslink=/ipfs/x"'], ipfs: {publish: {mfs: /x}}}
+      - {name: addrs.dev.test., records: ['_dnsaddr TXT "dnsaddr=/ip4/192.0.2.1/tcp/4001/p2p/x"'], ipfs: {}}
 `)
 	for _, want := range []string{
-		"names[0] (both): ipfs: publish: and follow: are two sites for one name; give one",
-		`names[1] (badapi): ipfs: api: "https://127.0.0.1:5001/api": want http://host:port`,
-		`names[2] (badmfs): ipfs: publish: mfs: "community": want a path in the node's files`,
-		"names[3] (self): ipfs: follow: self.dev.test. is this name",
-		`names[4] (badfollow): ipfs: follow: "a": want the name of another site`,
-		"names[5] (twice): ipfs: registers the TXT records at _dnslink.twice.dev.test., which records[0] registers too",
-		"names[6] (addrs): ipfs: registers the TXT records at _dnsaddr.addrs.dev.test., which records[0] registers too",
+		"names[0] (both.dev.test.): ipfs: publish: and follow: are two sites for one name; give one",
+		`names[1] (badapi.dev.test.): ipfs: api: "https://127.0.0.1:5001/api": want http://host:port`,
+		`names[2] (badmfs.dev.test.): ipfs: publish: mfs: "community": want a path in the node's files`,
+		"names[3] (self.dev.test.): ipfs: follow: self.dev.test. is this name",
+		`names[4] (badfollow.dev.test.): ipfs: follow: "a": want the name of another site`,
+		"names[5] (twice.dev.test.): ipfs: registers the TXT records at _dnslink.twice.dev.test., which records[0] registers too",
+		"names[6] (addrs.dev.test.): ipfs: registers the TXT records at _dnsaddr.addrs.dev.test., which records[0] registers too",
 	} {
 		wantProblem(t, got, want)
 	}
@@ -346,10 +341,9 @@ func TestParse_NameServices(t *testing.T) {
 	n := mustParse(t, `
 registrars:
   - protocol: rfc9664
-    zone: dev.test.
     server: 192.0.2.1:53
     names:
-      - name: a
+      - name: a.dev.test.
         addresses: [auto]
         services:
           - type: xmpp-client
@@ -391,19 +385,18 @@ registrars:
         addresses: [auto]
         services: [{type: ssh, subdomains: [x], tlsa: c.pem}]
   - protocol: rfc9664
-    zone: dev.test.
     server: 192.0.2.1:53
     names:
-      - name: bare
+      - name: bare.dev.test.
         records: ['@ TXT x']
         services: [{type: xmpp-client}]
-      - name: hostish
+      - name: hostish.dev.test.
         addresses: [auto]
         services:
           - {type: xmpp-client, instance: Chat, txt: {a: b}, subtypes: [_x]}
           - {type: ipp}
           - {type: xmpp-server, subdomains: [rooms, Rooms, -bad]}
-      - name: twice
+      - name: twice.dev.test.
         addresses: [auto]
         records: ['_xmpp-client._tcp SRV 0 0 5222 twice.dev.test.']
         services:
@@ -415,16 +408,16 @@ registrars:
 	for _, want := range []string{
 		"hosts[0] (box): services[0]: subdomains: a name's service has it, not a host's",
 		"hosts[0] (box): services[0]: tlsa: a name's service has it, not a host's",
-		"names[0] (bare): services: their SRV records point at the name, which needs addresses:",
-		"names[1] (hostish): services[0]: instance: a host's service has it, not a name's",
-		"names[1] (hostish): services[0]: txt: a host's service has it",
-		"names[1] (hostish): services[0]: subtypes: a host's service has it",
-		"names[1] (hostish): services[1]: type ipp has TXT keys or subtypes, which a name's service cannot carry",
-		"names[1] (hostish): services[2]: subdomains: Rooms twice",
-		`names[1] (hostish): services[2]: subdomains: "-bad": want a name relative to the name`,
-		"names[2] (twice): services[0]: registers the SRV records at _xmpp-client._tcp.twice.dev.test., which records[0] registers too",
-		"names[2] (twice): services[2]: registers the SRV records at _xmpp-server._tcp.twice.dev.test., which services[1] registers too",
-		"names[2] (twice): services[3]: registers the TLSA records at _5269._tcp.twice.dev.test., which services[1] registers too",
+		"names[0] (bare.dev.test.): services: their SRV records point at the name, which needs addresses:",
+		"names[1] (hostish.dev.test.): services[0]: instance: a host's service has it, not a name's",
+		"names[1] (hostish.dev.test.): services[0]: txt: a host's service has it",
+		"names[1] (hostish.dev.test.): services[0]: subtypes: a host's service has it",
+		"names[1] (hostish.dev.test.): services[1]: type ipp has TXT keys or subtypes, which a name's service cannot carry",
+		"names[1] (hostish.dev.test.): services[2]: subdomains: Rooms twice",
+		`names[1] (hostish.dev.test.): services[2]: subdomains: "-bad": want a name relative to the name`,
+		"names[2] (twice.dev.test.): services[0]: registers the SRV records at _xmpp-client._tcp.twice.dev.test., which records[0] registers too",
+		"names[2] (twice.dev.test.): services[2]: registers the SRV records at _xmpp-server._tcp.twice.dev.test., which services[1] registers too",
+		"names[2] (twice.dev.test.): services[3]: registers the TLSA records at _5269._tcp.twice.dev.test., which services[1] registers too",
 	} {
 		wantProblem(t, got, want)
 	}
@@ -440,13 +433,13 @@ func TestParse_DoHServer(t *testing.T) {
 registrars:
   - {protocol: srp, domain: a.test., transport: doh}
   - {protocol: srp, domain: b.test., transport: doh, server: "192.0.2.1:8080"}
-  - {protocol: rfc9664, zone: c.test., transport: doh, server: "https://proxy.example/dns-query", names: [{name: x, addresses: [192.0.2.1]}]}
+  - {protocol: rfc9664, transport: doh, server: "https://proxy.example/dns-query", names: [{name: x.c.test., addresses: [192.0.2.1]}]}
   - {protocol: srp, domain: d.test., server: "https://proxy.example"}
 `)
 	for _, want := range []string{
 		"registrars[0] (srp a.test.): server is required with transport doh",
 		`registrars[1] (srp b.test.): server: "192.0.2.1:8080": want an http or https URL`,
-		`registrars[2] (rfc9664 c.test.): server: "https://proxy.example/dns-query": want an http or https URL`,
+		`registrars[2] (rfc9664 https://proxy.example/dns-query): server: "https://proxy.example/dns-query": want an http or https URL`,
 		`registrars[3] (srp d.test.): server: "https://proxy.example": want host:port`,
 	} {
 		wantProblem(t, got, want)
@@ -467,7 +460,6 @@ registrars:
     server: nope
     lease: 30h
     key_lease: 2h
-    zone: x.test.
     hosts:
       - name: Box
         addresses: []
@@ -490,14 +482,13 @@ registrars:
       - {type: mdns, hosts: [box.local.], all_hosts: true}
       - {type: ssh}
   - protocol: rfc9664
-    zone: dev.test.
     resolvers: [nope]
     hosts: []
     names:
-      - name: a.b
+      - name: a
         addresses: [auto]
-      - name: empty
-      - name: bad
+      - name: empty.dev.test.
+      - name: bad.dev.test.
         records:
           - "x.dev.test. TXT abs"
           - "@ A 192.0.2.1"
@@ -506,13 +497,12 @@ registrars:
           - "@ NOPE x"
           - "x TXT twice"
           - "x TXT twice"
-      - name: bad
+      - name: Bad.dev.test.
         addresses: [192.0.2.1]
   - protocol: dhcp
 `)
 	for _, want := range []string{
 		"srp registrar's, not an rfc9664 one's",
-		"zone: is an rfc9664 registrar's, not an srp one's",
 		"registrars[0]: domain is required",
 		"keystore directory is required",
 		`transport "quic"`,
@@ -539,26 +529,26 @@ registrars:
 		"give hosts: or all_hosts: true, not both or neither",
 		"box.local. would be registered as box",
 		`"ssh" is not a complex type`,
-		"registrars[1] (rfc9664 dev.test.): server is required",
-		`registrars[1] (rfc9664 dev.test.): resolvers: "nope": want host:port`,
+		"registrars[1]: server is required",
+		`registrars[1]: resolvers: "nope": want host:port`,
 		"hosts: is an srp registrar's",
-		`names[0] (a.b): name "a.b": one label`,
-		"names[1] (empty): nothing to register",
+		`names[0] (a): name "a" has one label: give the name in full`,
+		"names[1] (empty.dev.test.): nothing to register",
 		"records[0]: \"x.dev.test. TXT abs\": owner x.dev.test.: relative to the name",
 		"records[1]: \"@ A 192.0.2.1\": an address of the name itself: give it with the name's addresses",
 		"records[2]: \"@ KEY",
 		"records[3]: \"@ MX ten mail.example.\"",
 		"records[4]: \"@ NOPE x\"",
 		`records[6]: "x TXT twice" twice`,
-		"a second name bad",
+		"a second name Bad.dev.test.",
 		`registrars[2]: protocol "dhcp": want srp or rfc9664`,
 	} {
 		wantProblem(t, got, want)
 	}
 }
 
-// Registrars are one per domain or zone, an rfc9664 name stays out of the srp domains, and a
-// mirror type is mirrored once.
+// Registrars are one per srp domain or rfc9664 proxy, a name is given once, an rfc9664 name
+// stays out of the srp domains, and a mirror type is mirrored once.
 func TestParse_RegistrarsTogether(t *testing.T) {
 	got := problems(t, `
 registrars:
@@ -569,22 +559,26 @@ registrars:
     domain: SRP.dev.test
     mirrors: [{type: mdns, all_hosts: true}]
   - protocol: rfc9664
-    zone: dev.test.
     server: 192.0.2.1:53
     names:
-      - {name: srp, records: ["@ TXT covers"]}
-      - {name: fine, records: ["@ TXT fine"]}
+      - {name: srp.dev.test., records: ["@ TXT covers"]}
+      - {name: fine.dev.test., records: ["@ TXT fine"]}
+      - {name: inside.srp.dev.test., records: ["@ TXT inside"]}
+      - {name: twice.dev.test., records: ["@ TXT one"]}
   - protocol: rfc9664
-    zone: srp.dev.test.
     server: 192.0.2.1:53
+  - protocol: rfc9664
+    server: 192.0.2.2:53
     names:
-      - {name: inside, records: ["@ TXT inside"]}
+      - {name: Twice.dev.test., records: ["@ TXT two"]}
 `)
 	for _, want := range []string{
 		"registrars[1] (srp SRP.dev.test.): a second srp registrar for SRP.dev.test.",
 		"registrars[1] (srp SRP.dev.test.): a second mdns mirror",
-		"registrars[2] (rfc9664 dev.test.): name srp.dev.test.: in the srp domain srp.dev.test., or above it",
-		"registrars[3] (rfc9664 srp.dev.test.): name inside.srp.dev.test.: in the srp domain srp.dev.test.",
+		"registrars[2] (rfc9664 192.0.2.1:53): name srp.dev.test.: in the srp domain srp.dev.test., or above it",
+		"registrars[2] (rfc9664 192.0.2.1:53): name inside.srp.dev.test.: in the srp domain srp.dev.test.",
+		"registrars[3] (rfc9664 192.0.2.1:53): a second rfc9664 registrar at 192.0.2.1:53",
+		"registrars[4] (rfc9664 192.0.2.2:53): a second name Twice.dev.test.",
 	} {
 		wantProblem(t, got, want)
 	}
@@ -597,9 +591,26 @@ registrars:
 func TestParse_DomainLabels(t *testing.T) {
 	for _, d := range []string{".", "a..b.", "_srp.example.", "-a.example."} {
 		wantProblem(t, problems(t, "registrars: [{protocol: srp, domain: \""+d+"\"}]\n"), "registrars[0]: domain")
-		wantProblem(t, problems(t, "registrars: [{protocol: rfc9664, server: 192.0.2.1:53, zone: \""+d+"\"}]\n"), "registrars[0]: zone")
 	}
 	mustParse(t, "registrars: [{protocol: srp, domain: default.service.arpa}]\n")
+}
+
+// An rfc9664 name is given in full, of host name labels: the Zone Section is its parent.
+func TestParse_NameLabels(t *testing.T) {
+	for d, want := range map[string]string{
+		".":             "has one label",
+		"mysite":        "has one label",
+		"a..b.":         "label is empty",
+		"_srp.example.": "want labels of letters, digits and hyphens",
+		"-a.example.":   "want labels of letters, digits and hyphens",
+	} {
+		got := problems(t, "registrars: [{protocol: rfc9664, server: 192.0.2.1:53, names: [{name: \""+d+"\", addresses: [auto]}]}]\n")
+		wantProblem(t, got, "registrars[0] (rfc9664 192.0.2.1:53): names[0] ("+d+"): name \""+d+"\"")
+		wantProblem(t, got, want)
+	}
+	if n := mustParse(t, "registrars: [{protocol: rfc9664, server: 192.0.2.1:53, names: [{name: mysite.dev.test, addresses: [auto]}]}]\n").Registrars[0].Names[0]; n.Name != "mysite.dev.test." {
+		t.Errorf("name = %q, want mysite.dev.test.", n.Name)
+	}
 }
 
 func TestParse_ProbeSyntax(t *testing.T) {

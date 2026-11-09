@@ -1,8 +1,10 @@
 // Package rfc9664 implements a requester for this proxy's RFC 9664 handler (update_handler):
 // one name, held by its own key, with records at and below it, registered as a DNS UPDATE
-// signed with SIG(0) and kept on an Update Lease (RFC 9664). The name is one label below the
-// zone, the only name a key registers for itself under the handler's fcfs_naming
-// (docs/siglease_rfc9664.md, "First-Come First-Served Naming"). Every request carries the
+// signed with SIG(0) and kept on an Update Lease (RFC 9664). The name is given in full: which
+// names a key may register for itself is the proxy's to say -- one label below its zone, under
+// the handler's fcfs_naming (docs/siglease_rfc9664.md, "First-Come First-Served Naming") -- and a
+// requester cannot look that zone up. The Zone Section names the name's parent, which encloses
+// every name a request writes (docs/siglease_rfc9664.md, "The Zone Section"). Every request carries the
 // name's KEY in its Update section, so the proxy verifies it with the key it registers, and
 // is one of the handler's lease cases (Behavior Specification item 5):
 //
@@ -42,8 +44,8 @@ import (
 
 // Config configures a Client. See NewClient for the defaults.
 type Config struct {
-	Zone  string // the zone the name is in, sent as the Zone Section; trailing dot optional
-	Label string // the name's single label: the name is Label.Zone
+	// Name is the name, fully qualified (trailing dot optional), at least two labels: CheckName.
+	Name string
 	// Key is the name's SIG(0) key: required, as the key is what holds the name.
 	Key *keyrec.LoadedKey
 	// Records are what Register registers: records at the name or below it, fully
@@ -74,18 +76,17 @@ type Config struct {
 // Client is one name's registration: build, sign, send, and (Run) keep it on the refresh clock.
 type Client struct {
 	cfg  Config
-	name string
+	name string // fully qualified
+	zone string // the Zone Section: the name's parent
 }
 
 // NewClient validates cfg and applies its defaults.
 func NewClient(cfg Config) (*Client, error) {
-	if cfg.Zone == "" {
-		return nil, fmt.Errorf("rfc9664/client: Zone is required")
+	if err := CheckName(cfg.Name); err != nil {
+		return nil, fmt.Errorf("rfc9664/client: %w", err)
 	}
-	cfg.Zone = dnsutil.Fqdn(cfg.Zone)
-	if err := dnsname.CheckLabel(cfg.Label); err != nil {
-		return nil, fmt.Errorf("rfc9664/client: Label: %w", err)
-	}
+	name := cfg.name()
+	_, zone, _ := dnsname.CutFirstLabel(name)
 	if cfg.Key == nil {
 		return nil, fmt.Errorf("rfc9664/client: Key is required")
 	}
@@ -95,7 +96,6 @@ func NewClient(cfg Config) (*Client, error) {
 	if err := cfg.Network.Validate(); err != nil {
 		return nil, fmt.Errorf("rfc9664/client: Network: %w", err)
 	}
-	name := cfg.name()
 	if err := CheckRecords(name, cfg.Records); err != nil {
 		return nil, fmt.Errorf("rfc9664/client: %w", err)
 	}
@@ -123,11 +123,28 @@ func NewClient(cfg Config) (*Client, error) {
 	if cfg.Sleep == nil {
 		cfg.Sleep = baseclient.SleepContext
 	}
-	return &Client{cfg: cfg, name: name}, nil
+	return &Client{cfg: cfg, name: name, zone: zone}, nil
 }
 
 // name is the name cfg registers, fully qualified.
-func (cfg Config) name() string { return cfg.Label + "." + dnsutil.Fqdn(cfg.Zone) }
+func (cfg Config) name() string { return dnsutil.Fqdn(cfg.Name) }
+
+// CheckName returns an error unless name can be a Config's Name: a name below another, each
+// label one the library sends as one (dnsname.CheckLabel). A name of one label is below no zone
+// a proxy serves. Whether its key may register it is the proxy's to say.
+func CheckName(name string) error {
+	labels := dnsname.Labels(dnsutil.Fqdn(name))
+	labels = labels[:len(labels)-1] // the root's
+	if len(labels) < 2 {
+		return fmt.Errorf("name %q has one label: give the name in full, e.g. mysite.dev.zenr.io.", name)
+	}
+	for _, l := range labels {
+		if err := dnsname.CheckLabel(l); err != nil {
+			return fmt.Errorf("name %q: %w", name, err)
+		}
+	}
+	return nil
+}
 
 // CheckRecords reports whether records can be registered for name: each at name or below it,
 // of class IN, and neither a KEY (name's own is its key's) nor a SIG.
@@ -220,7 +237,7 @@ func (c *Client) send(ctx context.Context, records []dns.RR, lease, keyLease uin
 		update[i] = rr.Clone()
 		update[i].Header().TTL = c.cfg.TTL
 	}
-	msg, err := dnsmsg.NewLeaseUpdate(c.cfg.Zone, []*dns.KEY{key}, update, lease, keyLease)
+	msg, err := dnsmsg.NewLeaseUpdate(c.zone, []*dns.KEY{key}, update, lease, keyLease)
 	if err != nil {
 		return nil, 0, fmt.Errorf("rfc9664/client: %w", err)
 	}

@@ -350,7 +350,7 @@ func (a *agent) startRegistrar(r Registrar) error {
 		}
 		a.logf("registering in %s through %s over %s", r.Domain, registrar, r.Transport)
 	case RFC9664:
-		a.logf("registering names in %s through %s over %s", r.Domain, r.Server, r.Transport)
+		a.logf("registering names through %s over %s", r.Server, r.Transport)
 	}
 	for _, h := range r.Hosts {
 		if err := a.startHost(r, h); err != nil {
@@ -394,10 +394,9 @@ func (a *agent) resolverQuery(resolvers []string) clientsrp.DNSQuery {
 }
 
 // nameConfig is every RFC 9664 client's configuration for registering through r, before a
-// name's label, key and leases.
+// name's name, key and leases.
 func (a *agent) nameConfig(r savedRegistrar) rfc9664.Config {
 	return rfc9664.Config{
-		Zone:    r.Domain,
 		Server:  r.Server,
 		Network: r.Transport,
 		Send:    a.opts.Send,
@@ -424,8 +423,8 @@ func (a *agent) keeperConfig(keepNames bool) baseclient.KeeperConfig {
 
 // release frees the names the state file records as held for hosts and names plan does not
 // register (wanted), and forgets them: hosts and names removed from the template, while the
-// agent ran or not, hosts a mirror no longer selects, and hosts and names registered in
-// another domain or zone, through another registrar or from another keystore. Any of them
+// agent ran or not, hosts a mirror no longer selects, hosts registered in another domain, and
+// hosts and names registered through another registrar or from another keystore. Any of them
 // still running has been stopped first. A release that fails is logged, and tried again at
 // the next start or template change; until then, the names stay held until their key lease
 // ends.
@@ -464,13 +463,13 @@ func (a *agent) heldKey(owner string) *keyrec.LoadedKey {
 // releaseHeld frees the names of owner, whose entry e is, with its key: an SRP host's
 // (clientsrp.Release) or an RFC 9664 name's (rfc9664.Release).
 func (a *agent) releaseHeld(owner string, e savedHost, key *keyrec.LoadedKey) error {
-	label, _, _ := dnsname.CutFirstLabel(owner)
 	kc := baseclient.KeeperConfig{StopTimeout: a.opts.StopTimeout, Logf: a.opts.Logf}
 	if e.Source == sourceNames {
 		c := a.nameConfig(e.Registrar)
-		c.Label, c.Key = label, key
+		c.Name, c.Key = owner, key
 		return rfc9664.Release(rfc9664.NameConfig{Client: c, Store: a.store.names(e.Registrar), KeeperConfig: kc})
 	}
+	label, _, _ := dnsname.CutFirstLabel(owner)
 	c := a.srpConfig(e.Registrar)
 	c.HostLabel, c.Key = label, key
 	return clientsrp.Release(clientsrp.HostConfig{Client: c, Store: a.store.view(e.Source, e.Registrar), KeeperConfig: kc})
@@ -520,13 +519,13 @@ func (a *agent) startHost(r Registrar, h Host) error {
 }
 
 func (a *agent) startName(r Registrar, n Name) error {
-	owner := r.Owner(n.Name)
+	owner := n.Name
 	key, err := a.key(a.plan.Keystore, owner)
 	if err != nil {
 		return fmt.Errorf("signing key for %s: %w", owner, err)
 	}
 	c := a.nameConfig(savedRegistrarOf(r))
-	c.Label, c.Key = n.Name, key
+	c.Name, c.Key = owner, key
 	c.RequestedLease, c.RequestedKeyLease = n.Lease, n.KeyLease
 	w, err := rfc9664.StartName(rfc9664.NameConfig{
 		Client:       c,
@@ -595,7 +594,7 @@ func (hr *hostRun) publish(a *agent) {
 	hr.worker.Set(addrs, insts)
 }
 
-func (nr *nameRun) label() string { return nr.registrar.Owner(nr.name.Name) }
+func (nr *nameRun) label() string { return nr.name.Name }
 
 func (nr *nameRun) addresses(a *agent) []netip.Addr {
 	return a.addresses(nr.name.Auto, nr.name.Addresses)
@@ -851,7 +850,7 @@ func (a *agent) updateRegistrar(r Registrar) error {
 		}
 	}
 	for _, n := range r.Names {
-		owner := r.Owner(n.Name)
+		owner := n.Name
 		switch nr := a.names[owner]; {
 		case nr == nil:
 			a.logf("template: %s added", owner)
@@ -874,12 +873,13 @@ func (a *agent) updateRegistrar(r Registrar) error {
 // applied; release then frees their names, whatever their on_stop says.
 func (a *agent) stopRemoved(plan *Plan) {
 	owners := map[string]bool{}
+	nameRegistrars := map[string]Registrar{} // an RFC 9664 name's, which can move between proxies
 	for _, r := range plan.Registrars {
 		for _, h := range r.Hosts {
 			owners[r.Owner(h.Name)] = true
 		}
 		for _, n := range r.Names {
-			owners[r.Owner(n.Name)] = true
+			nameRegistrars[n.Name] = r
 		}
 	}
 	var hosts []*hostRun
@@ -892,11 +892,16 @@ func (a *agent) stopRemoved(plan *Plan) {
 	}
 	var names []*nameRun
 	for owner, nr := range a.names {
-		if !owners[owner] {
+		switch r, ok := nameRegistrars[owner]; {
+		case !ok:
 			a.logf("template: %s removed; freeing it", owner)
-			names = append(names, nr)
-			delete(a.names, owner)
+		case !r.same(nr.registrar):
+			a.logf("template: %s moved to the %s; freeing it at the %s", owner, r, nr.registrar)
+		default:
+			continue
 		}
+		names = append(names, nr)
+		delete(a.names, owner)
 	}
 	stop(hosts, names, false)
 }

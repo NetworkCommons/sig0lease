@@ -62,8 +62,9 @@ creating its directory, so it is safe beside a running proxy. It still runs each
 `Setup`, so it needs the same keystore as the proxy itself.
 
 Run the client against a proxy. Its commands take `<command> [flags] [args]`, the flags first,
-spelled as `sig0lease-srp-client`'s (`cmd/internal/cli`): `-server`, `-transport tcp|udp|tls`
-(default `tcp`), `-keystore`, `-k`, `-lease`, `-key-lease`, `-ttl`. `sig0lease-client help`
+spelled as `sig0lease-srp-client`'s (`cmd/internal/cli`): `-server`, `-transport tcp|udp|tls|doh`
+(default `tcp`, as for `sig0lease-srp-client` and the agent; with `doh`, `-server` is the proxy's
+URL), `-keystore`, `-k`, `-lease`, `-key-lease`, `-ttl`. `sig0lease-client help`
 lists them all. A keystore is required, given with `-keystore <dir>` or `CLIENT_KEYSTORE_DIR`
 (the flag wins if both are given; `sig0lease-srp-client` and `sig0lease-agent` follow the same
 convention):
@@ -88,8 +89,10 @@ filename, and any existing key for that name is reused regardless of its algorit
 
 The client binary supports these commands:
 
-- `name` - keep one name registered through the `client/rfc9664` library, as `sig0lease-srp-client` keeps a host through `client/srp`: the name, one label below the zone, with its own key, its addresses (`-addr`) and records (`-record`, written as in a `sig0lease-agent` template), refreshed on the lease clock until stopped. `-once`, `-withdraw` and `-deregister [-keep-names]` send one request instead (Cases A, D, and C or D).
-- `register`, `refresh` - send exactly the signed UPDATE-LEASE request described: the KEY and other records given (`rr-spec`), the signer's KEY where `-signer` puts it, the Zone Section `-zone` names (default: the signing key's name). The test suite uses them to send the shapes the proxy must refuse.
+- `name` - keep one name registered through the `client/rfc9664` library, as `sig0lease-srp-client` keeps a host through `client/srp`: the name, with its own key, its addresses (`-addr`) and records (`-record`, written as in a `sig0lease-agent` template), refreshed on the lease clock until stopped. `-once`, `-withdraw` and `-deregister [-keep-names]` send one request instead (Cases A, D, and C or D).
+  - The name is given in full (`-name mysite.dev.zenr.io.`). Which names a key may register for itself is the proxy's to decide: with `fcfs_naming`, one label below its zone (see "First-Come First-Served Naming"). The client cannot look that zone up: a handler's zone need not be a DNS zone of its own, and when it is not, an SOA lookup finds the enclosing zone's apex instead (`dig SOA dev.zenr.io.` shows which). So it neither asks for the zone nor checks the name against it; a single label is refused before anything is sent. The name after its first label goes in the Zone Section (see "The Zone Section").
+  - `name` signs with the name's own key, so a deeper name given to it is that key registering itself, which `fcfs_naming` refuses. A KEY below a name is registered with `register`, signed by the key holding the name; records below it go in the name's own `-record` entries, the owner relative to the name (`-name alice.dev.zenr.io. -record 'bob TXT "hello"'` writes at `bob.alice.dev.zenr.io.`).
+- `register`, `refresh` - send exactly the signed UPDATE-LEASE request described: the KEY and other records given (`rr-spec`), the signer's KEY where `-signer` puts it, the Zone Section `-zone` names (default: the signing key's name). The test suite uses them for shapes `client/rfc9664` never builds, the ones the proxy must refuse included: the signer's KEY in the Additional section or left out, a key signing records it does not hold. The library's requests always carry the name's own KEY in the Update section, with records at or below the name.
 - `register-tamper` - sign the request, then flip one payload bit to confirm the proxy rejects a bad SIG(0).
 - `verify` - query whether a registration is currently active.
 - `list-keys` - list available keystore entries.
@@ -97,7 +100,7 @@ The client binary supports these commands:
 Examples:
 
 ```bash
-sig0lease-client name -server 127.0.0.1:8053 -zone dev.zenr.io. -name mysite -k 13 \
+sig0lease-client name -server 127.0.0.1:8053 -name mysite.dev.zenr.io. -k 13 \
   -addr 192.0.2.10 -record '_dnslink TXT "dnslink=/ipfs/bafy..."'
 sig0lease-client register -server 127.0.0.1:8053 -lease 300 -key-lease 3600 -same-key \
   Ktest.dev.zenr.io.+015+05044 'client.test.dev.zenr.io. 300 IN TXT "hello"'
@@ -265,7 +268,7 @@ The refusal is the client's cue to ask a resolver instead, which needs the EDE: 
 
 Both handlers read the Zone Section the same way (`handlers.refuseOutsideZoneSection`): it must enclose every name in the Update section, as RFC 2136 §3.4.1.3 requires, or the answer is `NOTZONE`; anything but one entry is `FORMERR`. Nothing else reads it. Which handler takes an UPDATE, and what it may change, go by the names: this handler's zone check (above), the signer's name and the SIG(0) checks; SRP takes an update by its host name (`docs/siglease_rfc9665.md` §3). The UPDATE sent upstream names the handler's own zone, and its lookups ask that zone's server.
 
-A requester may therefore send the zone apex, as RFC 2136 asks and as `nsupdate` and other stock clients do, the handler's `upstream_zone` (`client/rfc9664`, `client/srp`), or any name above its records, such as its key's name (`sig0lease-client`'s default). Until 2026-10, this handler required the Zone Section at or below the signer's name, from the first design, in which each client had its own "downstream zone" named like its key; that refused the zone apex, and checked a field the requester chooses freely, so it constrained nothing the per-name checks did not.
+A requester may therefore send the zone apex, as RFC 2136 asks and as `nsupdate` and other stock clients do, the handler's `upstream_zone` (`client/srp`'s registration domain), or any name above its records: its key's name (the default of `sig0lease-client register`), or the name's parent (`client/rfc9664`: `sig0lease-client name`, `sig0lease-agent`'s names, the demo's page). This is more lenient than RFC 2136 §3.1.1, which answers `NOTAUTH` to any Zone Section that is not one of the server's zones: a server whose zone is `zenr.io.` would refuse `dev.zenr.io.`. The proxy reads the Zone Section only for the `NOTZONE` check, so a client needs no lookup to fill it in. Until 2026-10, this handler required the Zone Section at or below the signer's name, from the first design, in which each client had its own "downstream zone" named like its key; that refused the zone apex, and checked a field the requester chooses freely, so it constrained nothing the per-name checks did not.
 
 ### First-Come First-Served Naming (`fcfs_naming`)
 

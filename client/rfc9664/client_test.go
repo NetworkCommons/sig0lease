@@ -66,8 +66,7 @@ func testKey(t *testing.T) *keyrec.LoadedKey {
 func testConfig(t *testing.T, send baseclient.Transport, records ...string) Config {
 	t.Helper()
 	cfg := Config{
-		Zone:              "example",
-		Label:             "site",
+		Name:              "site.example",
 		Key:               testKey(t),
 		RequestedLease:    30,
 		RequestedKeyLease: 600,
@@ -103,8 +102,9 @@ func TestNewClient_Refuses(t *testing.T) {
 		modify func(*Config)
 		want   string
 	}{
-		{"no zone", func(c *Config) { c.Zone = "" }, "Zone is required"},
-		{"two labels", func(c *Config) { c.Label = "www.site" }, "Label"},
+		{"no name", func(c *Config) { c.Name = "" }, "has one label"},
+		{"one label", func(c *Config) { c.Name = "site." }, "has one label"},
+		{"empty label", func(c *Config) { c.Name = "site..example" }, "label is empty"},
 		{"no key", func(c *Config) { c.Key = nil }, "Key is required"},
 		{"no server", func(c *Config) { c.Server = "" }, "Server is required"},
 		{"lease above key lease", func(c *Config) { c.RequestedLease = 700 }, "must not exceed"},

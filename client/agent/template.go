@@ -8,7 +8,7 @@
 // fields. A service whose probe fails is withdrawn and registered again once it passes.
 // Complex types are code, not data: a template uses them but cannot define them; "mdns", under
 // an srp registrar's mirrors:, mirrors what a running mDNSResponder sees (client/mdnsbridge).
-// An rfc9664 one holds names, each with its own key, its addresses, its records and its
+// An rfc9664 one holds names, each given in full, with its own key, its addresses, its records and its
 // services, which SRV records find at the name (RFC 2782), with a TLSA record for a TLS one
 // (DANE) (client/rfc9664); "ipfs", a name's ipfs:, publishes an IPFS node at the name: its
 // addresses, and a folder of its files or the one another name publishes (client/kubo). See
@@ -32,6 +32,7 @@ import (
 	"time"
 
 	"codeberg.org/miekg/dns"
+	"codeberg.org/miekg/dns/dnsutil"
 	"codeberg.org/miekg/dns/rdata"
 	baseclient "github.com/NetworkCommons/sig0lease/client"
 	"github.com/NetworkCommons/sig0lease/client/kubo"
@@ -102,7 +103,7 @@ const (
 // Registrar is where and how its hosts or names register.
 type Registrar struct {
 	Protocol  Protocol
-	Domain    string             // SRP: the domain; RFC 9664: the zone. Fully qualified.
+	Domain    string             // SRP only: the domain, fully qualified
 	Server    string             // "host:port", a URL with NetworkDoH; SRP only: "" to discover the registrar
 	Transport baseclient.Network //
 	// Resolvers are asked, as "host:port" over UDP, by SRP for discovery and KEY lookups, and by
@@ -115,7 +116,8 @@ type Registrar struct {
 	Names     []Name   // RFC 9664
 }
 
-// Owner returns the name a host or name labelled label registers through r, fully qualified.
+// Owner returns the name a host labelled label registers through r, an SRP registrar, fully
+// qualified. An RFC 9664 name is given in full (Name.Name).
 func (r Registrar) Owner(label string) string { return label + "." + r.Domain }
 
 // connection is r without what it registers: what its hosts, names and mirrors register
@@ -125,12 +127,27 @@ func (r Registrar) connection() Registrar {
 	return r
 }
 
-// same reports whether r and o are the template's same registrar: the same protocol and domain.
+// same reports whether r and o are the template's same registrar: the same protocol and, for
+// SRP, the same domain, for RFC 9664 the same proxy. An RFC 9664 registrar names no zone: which
+// names a key may register is the proxy's to say, and a requester cannot look its zone up.
 func (r Registrar) same(o Registrar) bool {
-	return r.Protocol == o.Protocol && dnsname.EqualFold(r.Domain, o.Domain)
+	return r.Protocol == o.Protocol && dnsname.EqualFold(r.Domain, o.Domain) && (r.Protocol == SRP || r.Server == o.Server)
 }
 
-func (r Registrar) String() string { return fmt.Sprintf("%s registrar for %s", r.Protocol, r.Domain) }
+// place is what tells r apart in the template: an SRP registrar's domain, an RFC 9664 one's proxy.
+func (r Registrar) place() string {
+	if r.Protocol == RFC9664 {
+		return r.Server
+	}
+	return r.Domain
+}
+
+func (r Registrar) String() string {
+	if r.Protocol == RFC9664 {
+		return fmt.Sprintf("%s registrar at %s", r.Protocol, r.Server)
+	}
+	return fmt.Sprintf("%s registrar for %s", r.Protocol, r.Domain)
+}
 
 // Lifetime is how long a host's registration lasts: its records, its key, and whether its
 // names outlive the agent stopping.
@@ -230,10 +247,9 @@ func (p Probe) String() string {
 	}
 }
 
-// Name is one RFC 9664 name: a label right below its registrar's zone, held by its own key,
-// with its addresses, records and services.
+// Name is one RFC 9664 name, held by its own key, with its addresses, records and services.
 type Name struct {
-	Name      string       // the label
+	Name      string       // the name, fully qualified
 	Auto      bool         // this machine's addresses too, as they change
 	Addresses []netip.Addr // literal addresses
 	Records   []dns.RR     // at or below the name, fully qualified; no address of the name
@@ -292,12 +308,10 @@ type templateDoc struct {
 	Registrars []registrarDoc     `yaml:"registrars"`
 }
 
-// registrarDoc is either protocol's: domain, hosts and mirrors are srp's, zone and names
-// rfc9664's.
+// registrarDoc is either protocol's: domain, hosts and mirrors are srp's, names rfc9664's.
 type registrarDoc struct {
 	Protocol  string      `yaml:"protocol"`
 	Domain    string      `yaml:"domain"`
-	Zone      string      `yaml:"zone"`
 	Server    string      `yaml:"server"`
 	Transport string      `yaml:"transport"`
 	Resolvers []string    `yaml:"resolvers"`
@@ -572,7 +586,7 @@ func unused(registrars []Registrar) []string {
 	for i, r := range registrars {
 		follows := slices.ContainsFunc(r.Names, func(n Name) bool { return n.IPFS != nil && n.IPFS.Follow != "" })
 		if r.Protocol == RFC9664 && len(r.Resolvers) > 0 && !follows {
-			warnings = append(warnings, fmt.Sprintf("registrars[%d] (%s %s): resolvers: unused: none of its names follows a site (ipfs: {follow:})", i, r.Protocol, r.Domain))
+			warnings = append(warnings, fmt.Sprintf("registrars[%d] (%s %s): resolvers: unused: none of its names follows a site (ipfs: {follow:})", i, r.Protocol, r.place()))
 		}
 	}
 	return warnings
@@ -607,16 +621,14 @@ func parseRegistrar(d registrarDoc, types map[string]typeDef, dir, where string,
 	case SRP:
 		r.Domain = parseDomain(d.Domain, "domain", where, problems)
 	case RFC9664:
-		r.Domain = parseDomain(d.Zone, "zone", where, problems)
 	default:
 		*problems = append(*problems, fmt.Sprintf("%s: protocol %q: want srp or rfc9664", where, d.Protocol))
 		return Registrar{}, false
 	}
-	if r.Domain != "" {
-		where += fmt.Sprintf(" (%s %s)", r.Protocol, r.Domain)
+	if r.place() != "" {
+		where += fmt.Sprintf(" (%s %s)", r.Protocol, r.place())
 	}
 	if r.Protocol == SRP {
-		misplaced("zone", d.Zone != "", RFC9664)
 		misplaced("names", d.Names != nil, RFC9664)
 	} else {
 		misplaced("domain", d.Domain != "", SRP)
@@ -655,36 +667,37 @@ func parseRegistrar(d registrarDoc, types map[string]typeDef, dir, where string,
 			}
 		}
 	} else {
-		labels := map[string]bool{}
 		for i, nd := range d.Names {
 			nwhere := fmt.Sprintf("%s: names[%d]", where, i)
 			if nd.Name != "" {
 				nwhere += " (" + nd.Name + ")"
 			}
-			if labels[dnsname.Fold(nd.Name)] {
-				*problems = append(*problems, fmt.Sprintf("%s: a second name %s", nwhere, nd.Name))
-			}
-			labels[dnsname.Fold(nd.Name)] = true
 			r.Names = append(r.Names, parseName(nd, r, types, dir, nwhere, problems))
 		}
 	}
 	return r, true
 }
 
-// parseDomain reads an srp registrar's domain or an rfc9664 one's zone, field.
+// parseDomain reads an srp registrar's domain, field.
 func parseDomain(given, field, where string, problems *[]string) string {
 	if given == "" {
 		*problems = append(*problems, fmt.Sprintf("%s: %s is required", where, field))
 		return ""
 	}
-	// Every host's and name's name ends in it, so its labels are host name labels too.
+	// Every host's name ends in it, so its labels are host name labels too.
 	domain := strings.TrimSuffix(given, ".") + "."
-	labels := dnsname.Labels(domain)
-	labels = labels[:len(labels)-1] // the root's
-	if len(labels) == 0 || slices.ContainsFunc(labels, func(l string) bool { return !dnsname.IsHostLabel(l) }) {
+	if !hostLabels(domain) {
 		*problems = append(*problems, fmt.Sprintf("%s: %s %q: want labels of letters, digits and hyphens, as in a host name", where, field, given))
 	}
 	return domain
+}
+
+// hostLabels reports whether every label of name, fully qualified, is a host name label
+// (dnsname.IsHostLabel), and it has one at least.
+func hostLabels(name string) bool {
+	labels := dnsname.Labels(name)
+	labels = labels[:len(labels)-1] // the root's
+	return len(labels) > 0 && !slices.ContainsFunc(labels, func(l string) bool { return !dnsname.IsHostLabel(l) })
 }
 
 // parseHosts validates an srp registrar's hosts into r.
@@ -729,10 +742,12 @@ func parseHosts(r *Registrar, docs []hostDoc, types map[string]typeDef, where st
 // parseName validates an rfc9664 registrar's name d, registered through r, in the template in
 // dir.
 func parseName(d nameDoc, r Registrar, types map[string]typeDef, dir, where string, problems *[]string) Name {
-	n := Name{Name: d.Name}
-	owner := r.Owner(d.Name)
-	if !dnsname.IsHostLabel(d.Name) {
-		*problems = append(*problems, fmt.Sprintf("%s: name %q: one label of letters, digits and hyphens, not starting or ending with a hyphen, at most 63, right below the zone", where, d.Name))
+	n := Name{Name: dnsutil.Fqdn(d.Name)}
+	owner := n.Name
+	if err := rfc9664.CheckName(d.Name); err != nil {
+		*problems = append(*problems, fmt.Sprintf("%s: %v", where, err))
+	} else if !hostLabels(owner) {
+		*problems = append(*problems, fmt.Sprintf("%s: name %q: want labels of letters, digits and hyphens, not starting or ending with a hyphen, at most 63 each, as in a host name", where, d.Name))
 	}
 	n.Auto, n.Addresses = parseAddresses(d.Addresses, where, problems)
 	n.Records = rfc9664.ParseRecords(owner, d.Records, func(j int, err error) {
@@ -827,12 +842,13 @@ func parseIPFS(d ipfsDoc, owner, where string, problems *[]string) *IPFS {
 	return ip
 }
 
-// checkRegistrars reports what registrars cannot all have: two for the same domain or zone,
-// an rfc9664 name in an srp domain or above one, and two mirrors of one type.
+// checkRegistrars reports what registrars cannot all have: two for the same domain or proxy,
+// an rfc9664 name given twice, or in an srp domain or above one, and two mirrors of one type.
 func checkRegistrars(registrars []Registrar, problems *[]string) {
 	mirrors := map[string]bool{}
+	names := map[string]bool{}
 	for i, r := range registrars {
-		where := fmt.Sprintf("registrars[%d] (%s %s)", i, r.Protocol, r.Domain)
+		where := fmt.Sprintf("registrars[%d] (%s %s)", i, r.Protocol, r.place())
 		for _, o := range registrars[:i] {
 			if r.same(o) {
 				*problems = append(*problems, fmt.Sprintf("%s: a second %s", where, r))
@@ -845,7 +861,11 @@ func checkRegistrars(registrars []Registrar, problems *[]string) {
 			mirrors[m.Type] = true
 		}
 		for _, n := range r.Names {
-			name := r.Owner(n.Name)
+			name := n.Name
+			if names[dnsname.Fold(name)] {
+				*problems = append(*problems, fmt.Sprintf("%s: a second name %s", where, name))
+			}
+			names[dnsname.Fold(name)] = true
 			for _, o := range registrars {
 				if o.Protocol == SRP && o.Domain != "" && (dnsname.IsAtOrBelow(name, o.Domain) || dnsname.IsAtOrBelow(o.Domain, name)) {
 					*problems = append(*problems, fmt.Sprintf("%s: name %s: in the srp domain %s, or above it; the proxy serves a name through one handler", where, name, o.Domain))

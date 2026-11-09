@@ -80,8 +80,8 @@ REGISTRAR=<registrar>:853 TRANSPORT=tls demo/ipfs.sh member     # over DNS-over-
   `REGISTRAR=<registrar>:<port> ZONE=<zone> DOMAIN=srp.<zone> demo/run.sh`.
 - The scripts copy each template they run (`demo/demo.yaml`, `demo/conflict.yaml`,
   `demo/mac.yaml`, and the ones `ipfs.sh` and `chat.sh` write) into their log directory, with
-  each registrar's `zone:` and `domain:` the demo's, and `server: 127.0.0.1:8053` replaced by
-  `REGISTRAR`; the files in `demo/` stay as they are.
+  each srp registrar's `domain:` the demo's, each rfc9664 name's first label in the demo's
+  zone, and `server: 127.0.0.1:8053` replaced by `REGISTRAR`; the files in `demo/` stay as they are.
 - D6: the page, still served by the laptop, asks the registrar's web server,
   `https://<registrar>/dns-query`, over DNS-over-HTTPS; `DOH=<url>` names another. The phones then
   need the internet, not the laptop's proxy.
@@ -95,8 +95,8 @@ REGISTRAR=<registrar>:853 TRANSPORT=tls demo/ipfs.sh member     # over DNS-over-
 
 **Needs**: the laptop. Check that the names are free, before the rehearsal and on the day:
 `demo/watch.sh once` shows no `demo` instance, and `(no records)` under the name `demo`. If
-another key holds them, change `name: demo` in `demo/demo.yaml` (both registrars) and run
-`watch.sh` with `NAME=<the new label>`.
+another key holds them, change the label `demo` in `demo/demo.yaml` (the host `demo` and the
+name `demo.dev.zenr.io.`) and run `watch.sh` with `NAME=<the new label>`.
 
 **Rehearsal**: `demo/run.sh`, as on the day.
 
@@ -419,7 +419,7 @@ nobody can forge one, but anyone there can read them.
   or the proxy of D1's terminal 1: stop it, then start the script again.
 - The proxy logs errors reaching `ns1.free2air.org`: the network blocks port 53. Use a phone's
   hotspot, or the recording.
-- The agent logs a name held by another key: change `name: demo` (D1, "Needs").
+- The agent logs a name held by another key: change the label `demo` (D1, "Needs").
 - D3: B's script waits for `site`: B's node does not reach A's. `ipfs swarm peers` on B lists
   nobody: both `ipfs daemon` logs show the same swarm key fingerprint? B's resolver may have
   answered "no such name" for `_dnsaddr.a` before A published it, and keeps that answer for up

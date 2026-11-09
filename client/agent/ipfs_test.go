@@ -136,7 +136,7 @@ func TestRun_IPFSPublish(t *testing.T) {
 		"/ip4/192.0.2.5/tcp/4001/p2p/12D3KooOther",
 	)
 	k.mfs["/community"] = "QmOne"
-	h := newHarness(t, nameTemplate(fmt.Sprintf("names: [{name: a, ipfs: {api: %q, publish: {mfs: /community}}}]\n", k.srv.URL)))
+	h := newHarness(t, nameTemplate(fmt.Sprintf("names: [{name: a.dev.test., ipfs: {api: %q, publish: {mfs: /community}}}]\n", k.srv.URL)))
 	h.start(t, nil)
 
 	link := func(cid string) string { return `_dnslink.a.dev.test. TXT "dnslink=/ipfs/` + cid + `"` }
@@ -179,7 +179,7 @@ func TestRun_IPFSPublish(t *testing.T) {
 // Started again while the followed name gives nothing, it gives what its node pinned before.
 func TestRun_IPFSFollow(t *testing.T) {
 	k := newFakeKubo(t, "12D3KooB", "/ip4/192.0.2.6/tcp/4001/p2p/12D3KooB")
-	h := newHarness(t, nameTemplate(fmt.Sprintf("names: [{name: site, ipfs: {api: %q, follow: a.dev.test}}]\n", k.srv.URL)))
+	h := newHarness(t, nameTemplate(fmt.Sprintf("names: [{name: site.dev.test., ipfs: {api: %q, follow: a.dev.test}}]\n", k.srv.URL)))
 	h.reg.setTXT("_dnslink.a.dev.test.", "dnslink=/ipfs/QmOne")
 	gate := make(chan struct{})
 	k.gates["QmTwo"] = gate
@@ -230,7 +230,7 @@ func TestRun_IPFSFollow(t *testing.T) {
 // it, and gives it once pinned.
 func TestRun_IPFSFollowOutsideTheZone(t *testing.T) {
 	k := newFakeKubo(t, "12D3KooB", "/ip4/192.0.2.6/tcp/4001/p2p/12D3KooB")
-	h := newHarness(t, nameTemplate(fmt.Sprintf("names: [{name: site, ipfs: {api: %q, follow: a.example.org}}]\n", k.srv.URL)))
+	h := newHarness(t, nameTemplate(fmt.Sprintf("names: [{name: site.dev.test., ipfs: {api: %q, follow: a.example.org}}]\n", k.srv.URL)))
 	h.reg.zone = "dev.test."
 	var mu sync.Mutex
 	var asked []string

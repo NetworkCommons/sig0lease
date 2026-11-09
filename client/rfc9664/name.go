@@ -25,7 +25,7 @@ type NameStore interface {
 
 // NameConfig configures StartName.
 type NameConfig struct {
-	// Client is the template for every Client the Name makes: Zone, Label, Key, the proxy,
+	// Client is the template for every Client the Name makes: Name, Key, the proxy,
 	// transport and leases. The Name sets Records, OnRegistered and OnError.
 	Client Config
 	// Store, if set, keeps the records registered at the name, loaded at start and saved

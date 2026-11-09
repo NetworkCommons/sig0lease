@@ -98,12 +98,11 @@ EOF
     } > "$AGENT_TEMPLATE.tmp" && mv "$AGENT_TEMPLATE.tmp" "$AGENT_TEMPLATE"
 }
 
-# names_registrar <names: lines> -- the rfc9664 registrar for NAME_ZONE through the proxy,
-# with the names given (written as at the top level), for NAMES_REGISTRAR.
+# names_registrar <names: lines> -- the rfc9664 registrar through the proxy, with the names given
+# (written as at the top level, each in full, in NAME_ZONE), for NAMES_REGISTRAR.
 names_registrar() {
     cat <<EOF
   - protocol: rfc9664
-    zone: ${NAME_ZONE}
     server: ${SRP_PROXY_URL}
     transport: tcp
 EOF
@@ -205,7 +204,7 @@ release_as_holder() {
 # "holder" (sig0lease-client name -once, on client/rfc9664 as the agent's names are), printing
 # the proxy's answer; exits non-zero unless it is NOERROR.
 claim_name_as_holder() {
-    "$CLIENT_BIN" name -server="$SRP_PROXY_URL" -zone="$NAME_ZONE" -name="$1" -keystore="$HOLDER_KEY_DIR" -k=13 -once \
+    "$CLIENT_BIN" name -server="$SRP_PROXY_URL" -name="$1.$NAME_ZONE" -keystore="$HOLDER_KEY_DIR" -k=13 -once \
         -record='@ TXT "holder"'
 }
 
@@ -662,12 +661,12 @@ EOF
 )"
     NAMES_REGISTRAR="$(names_registrar "$(cat <<EOF
 names:
-  - name: site
+  - name: site.${NAME_ZONE}
     addresses: [127.0.0.1]
     records:
       - '_dnslink TXT "dnslink=/ipfs/bafy"'
       - "www CNAME site.${NAME_ZONE}"
-  - name: held
+  - name: held.${NAME_ZONE}
     records: ['@ TXT "agent"']
 EOF
 )")"
@@ -684,7 +683,7 @@ EOF
 
     NAMES_REGISTRAR="$(names_registrar "$(cat <<EOF
 names:
-  - name: site
+  - name: site.${NAME_ZONE}
     addresses: [127.0.0.1]
     records: ["www CNAME site.${NAME_ZONE}"]
 EOF
@@ -732,11 +731,11 @@ HOSTS
 )"
     NAMES_REGISTRAR="$(names_registrar "$(cat <<NAMES
 names:
-  - name: a
+  - name: a.${z}
     addresses: [127.0.0.1]
     services:
       - {type: xmpp-server, port: ${XMPP_A_PORT}, subdomains: [rooms], tlsa: ${XMPP_DIR}/a/cert.pem}
-  - name: b
+  - name: b.${z}
     addresses: [127.0.0.1]
     services:
       - {type: xmpp-server, port: ${XMPP_B_PORT}, tlsa: ${XMPP_DIR}/b/cert.pem}
@@ -806,9 +805,9 @@ HOSTS
 )"
     NAMES_REGISTRAR="$(names_registrar "$(cat <<NAMES
 names:
-  - name: a
+  - name: a.${z}
     ipfs: {api: "http://127.0.0.1:${IPFS_A_API_PORT}", publish: {mfs: /community}}
-  - name: site
+  - name: site.${z}
     ipfs: {api: "http://127.0.0.1:${IPFS_B_API_PORT}", follow: a.${z}}
 NAMES
 )")"

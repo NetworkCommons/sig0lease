@@ -21,11 +21,10 @@ registrars:
             probe: {http: /}
 
   - protocol: rfc9664
-    zone: dev.zenr.io.
     server: 127.0.0.1:8053
     lease: 10m
     on_stop: release
     names:
-      - name: demo
+      - name: demo.dev.zenr.io.
         records:
           - '@ TXT "the other key"'

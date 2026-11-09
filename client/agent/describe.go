@@ -73,8 +73,7 @@ func Describe(w io.Writer, plan *Plan, interfaces func() ([]netip.Addr, error), 
 				p("  registrar: discovered (%s SRV), over %s", clientsrp.DiscoveryService(r.Transport), r.Transport)
 			}
 		case RFC9664:
-			p("rfc9664 zone %s", r.Domain)
-			p("  proxy:     %s over %s", r.Server, r.Transport)
+			p("rfc9664 proxy %s over %s", r.Server, r.Transport)
 		}
 		if len(r.Resolvers) > 0 {
 			p("  resolvers: %s", strings.Join(r.Resolvers, ", "))
@@ -133,7 +132,7 @@ func Describe(w io.Writer, plan *Plan, interfaces func() ([]netip.Addr, error), 
 		}
 
 		for _, n := range r.Names {
-			owner := r.Owner(n.Name)
+			owner := n.Name
 			p("")
 			p("name %s", owner)
 			if err := key(owner); err != nil {

@@ -330,9 +330,9 @@ func srpTemplate(rest string) string {
 	return "keystore: keys\nregistrars:\n  - protocol: srp\n    domain: srp.test.\n    server: 127.0.0.1:8159\n" + indent(rest)
 }
 
-// nameTemplate is srpTemplate's for an rfc9664 registrar for dev.test.
+// nameTemplate is srpTemplate's for an rfc9664 registrar at 127.0.0.1:8159, its names in dev.test.
 func nameTemplate(rest string) string {
-	return "keystore: keys\nregistrars:\n  - protocol: rfc9664\n    zone: dev.test.\n    server: 127.0.0.1:8159\n" + indent(rest)
+	return "keystore: keys\nregistrars:\n  - protocol: rfc9664\n    server: 127.0.0.1:8159\n" + indent(rest)
 }
 
 // indent indents each line of s as a registrar's field.
@@ -736,7 +736,7 @@ func TestRun_RegistrarChangeRestartsItsOwn(t *testing.T) {
 func TestRun_Names(t *testing.T) {
 	h := newHarness(t, nameTemplate(`
 names:
-  - name: site
+  - name: site.dev.test.
     addresses: [auto]
     records: ['@ TXT "hello"', '_dnslink TXT "dnslink=/ipfs/x"']
 `))
@@ -749,7 +749,7 @@ names:
 
 	h.write(t, nameTemplate(`
 names:
-  - name: site
+  - name: site.dev.test.
     addresses: [auto]
     records: ['@ TXT "hello"']
 `))
@@ -775,12 +775,12 @@ names:
 
 // A template's warnings are logged when the agent starts and with each change it applies.
 func TestRun_LogsWarnings(t *testing.T) {
-	const warning = "template: registrars[0] (rfc9664 dev.test.): resolvers: unused"
-	h := newHarness(t, nameTemplate("resolvers: [192.0.2.53:53]\nnames: [{name: site, addresses: [auto]}]\n"))
+	const warning = "template: registrars[0] (rfc9664 127.0.0.1:8159): resolvers: unused"
+	h := newHarness(t, nameTemplate("resolvers: [192.0.2.53:53]\nnames: [{name: site.dev.test., addresses: [auto]}]\n"))
 	h.start(t, nil)
 	h.logs.waitFor(t, warning)
 
-	h.write(t, nameTemplate("resolvers: [192.0.2.53:53]\nnames: [{name: site, addresses: [auto], records: ['@ TXT \"hello\"']}]\n"))
+	h.write(t, nameTemplate("resolvers: [192.0.2.53:53]\nnames: [{name: site.dev.test., addresses: [auto], records: ['@ TXT \"hello\"']}]\n"))
 	h.until(t, "registering the TXT record", func(u update) bool { return len(u.records) == 1 })
 	if n := h.logs.count(warning); n != 2 {
 		t.Errorf("warning logged %d times, want 2: at the start and with the change", n)
@@ -805,7 +805,7 @@ func TestRun_NameServices(t *testing.T) {
 	closed.Close()
 	h := newHarness(t, nameTemplate(fmt.Sprintf(`
 names:
-  - name: a
+  - name: a.dev.test.
     addresses: [127.0.0.1]
     services:
       - {type: xmpp-server, port: %d, subdomains: [rooms], tlsa: a.pem}
@@ -857,7 +857,7 @@ names:
 // A name's service changed in the template is registered as it now is: here offered for a
 // subdomain too, and without its TLSA record.
 func TestRun_NameServiceChanges(t *testing.T) {
-	h := newHarness(t, nameTemplate("names: [{name: a, addresses: [127.0.0.1], services: [{type: xmpp-server, probe: none, tlsa: a.pem}]}]\n"))
+	h := newHarness(t, nameTemplate("names: [{name: a.dev.test., addresses: [127.0.0.1], services: [{type: xmpp-server, probe: none, tlsa: a.pem}]}]\n"))
 	spki := writeCert(t, filepath.Join(h.dir, "a.pem"))
 	h.start(t, nil)
 	tlsa := []string{"_5269._tcp.a.dev.test. TLSA 3 1 1 " + spki}
@@ -865,7 +865,7 @@ func TestRun_NameServiceChanges(t *testing.T) {
 		t.Fatalf("registration %+v, want xmpp-server's SRV and TLSA records", u)
 	}
 
-	h.write(t, nameTemplate("names: [{name: a, addresses: [127.0.0.1], services: [{type: xmpp-server, probe: none, subdomains: [rooms]}]}]\n"))
+	h.write(t, nameTemplate("names: [{name: a.dev.test., addresses: [127.0.0.1], services: [{type: xmpp-server, probe: none, subdomains: [rooms]}]}]\n"))
 	if u := h.until(t, "withdrawing the TLSA record", func(u update) bool { return u.lease == 0 }); !slices.Equal(u.records, tlsa) || len(u.instances) != 0 {
 		t.Fatalf("withdrawal %+v, want the TLSA record alone", u)
 	}
@@ -876,7 +876,7 @@ func TestRun_NameServiceChanges(t *testing.T) {
 
 // A name another key holds is not renamed: the agent says so and tries the same name again.
 func TestRun_NameHeldByAnotherKey(t *testing.T) {
-	h := newHarness(t, nameTemplate("names: [{name: site, records: ['@ TXT x']}]\n"))
+	h := newHarness(t, nameTemplate("names: [{name: site.dev.test., records: ['@ TXT x']}]\n"))
 	h.reg.taken = []string{"site.dev.test."}
 	h.start(t, nil)
 	h.logs.waitFor(t, "site.dev.test. is held by another key (YXDOMAIN)")
@@ -890,13 +890,13 @@ func TestRun_NameHeldByAnotherKey(t *testing.T) {
 // A name removed from the template is deregistered as its on_stop says, then freed with its
 // KEY alone, and forgotten.
 func TestRun_NameRemoved(t *testing.T) {
-	both := "names:\n  - {name: site, records: ['@ TXT x']}\n  - {name: gone, addresses: [192.0.2.1]}\n"
+	both := "names:\n  - {name: site.dev.test., records: ['@ TXT x']}\n  - {name: gone.dev.test., addresses: [192.0.2.1]}\n"
 	h := newHarness(t, nameTemplate(both))
 	h.start(t, nil)
 	h.logs.waitFor(t, "site.dev.test.: registered")
 	h.logs.waitFor(t, "gone.dev.test.: registered")
 
-	h.write(t, nameTemplate("names:\n  - {name: site, records: ['@ TXT x']}\n"))
+	h.write(t, nameTemplate("names:\n  - {name: site.dev.test., records: ['@ TXT x']}\n"))
 	if u := h.until(t, "deregistering gone", func(u update) bool { return u.host == "gone.dev.test." && u.lease == 0 }); u.keyLease != 1209600 || len(u.addrs) != 1 {
 		t.Errorf("gone's first update after its removal %+v, want its address deleted, the name kept as on_stop says", u)
 	}
@@ -915,10 +915,9 @@ func TestRun_NameRemoved(t *testing.T) {
 // Stopping with on_stop: release then frees them.
 func TestRun_KeepsNamesWhileRunning(t *testing.T) {
 	h := newHarness(t, srpTemplate("on_stop: release\nhosts: [{name: box, addresses: [auto]}]\n")+`  - protocol: rfc9664
-    zone: dev.test.
     server: 127.0.0.1:8159
     on_stop: release
-    names: [{name: site, addresses: [auto]}]
+    names: [{name: site.dev.test., addresses: [auto]}]
 `)
 	h.start(t, nil)
 	byHost := func(what string) map[string]update {

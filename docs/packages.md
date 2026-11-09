@@ -255,18 +255,19 @@ what a template (YAML) describes registered: hosts and their services through
 SRP registrars (RFC 9665), and names and their records through this project's
 proxy (RFC 9664).
 
-A template lists its registrars, each with a protocol. An srp one holds hosts --
-each one SRP identity with its own key -- and each host's services. A service
-is an instance of a service type: a built-in preset ("ssh", "http", ...), or a
-type the template defines with the same fields. A service whose probe fails is
-withdrawn and registered again once it passes. Complex types are code, not data:
-a template uses them but cannot define them; "mdns", under an srp registrar's
-mirrors:, mirrors what a running mDNSResponder sees (client/mdnsbridge).
-An rfc9664 one holds names, each with its own key, its addresses, its records
-and its services, which SRV records find at the name (RFC 2782), with a TLSA
-record for a TLS one (DANE) (client/rfc9664); "ipfs", a name's ipfs:, publishes
-an IPFS node at the name: its addresses, and a folder of its files or the one
-another name publishes (client/kubo). See docs/sig0lease-agent.md.
+A template lists its registrars, each with a protocol. An srp one holds
+hosts -- each one SRP identity with its own key -- and each host's services.
+A service is an instance of a service type: a built-in preset ("ssh", "http",
+...), or a type the template defines with the same fields. A service whose
+probe fails is withdrawn and registered again once it passes. Complex types
+are code, not data: a template uses them but cannot define them; "mdns",
+under an srp registrar's mirrors:, mirrors what a running mDNSResponder sees
+(client/mdnsbridge). An rfc9664 one holds names, each given in full, with its
+own key, its addresses, its records and its services, which SRV records find at
+the name (RFC 2782), with a TLSA record for a TLS one (DANE) (client/rfc9664);
+"ipfs", a name's ipfs:, publishes an IPFS node at the name: its addresses,
+and a folder of its files or the one another name publishes (client/kubo).
+See docs/sig0lease-agent.md.
 
 CONSTANTS
 
@@ -360,7 +361,7 @@ type Mirror struct {
     Mirror is a complex type that makes its own hosts.
 
 type Name struct {
-	Name      string       // the label
+	Name      string       // the name, fully qualified
 	Auto      bool         // this machine's addresses too, as they change
 	Addresses []netip.Addr // literal addresses
 	Records   []dns.RR     // at or below the name, fully qualified; no address of the name
@@ -368,8 +369,8 @@ type Name struct {
 	IPFS      *IPFS        // nil: none
 	Lifetime               // the registrar's, with what the name overrides
 }
-    Name is one RFC 9664 name: a label right below its registrar's zone, held by
-    its own key, with its addresses, records and services.
+    Name is one RFC 9664 name, held by its own key, with its addresses, records
+    and services.
 
 type Options struct {
 	// Logf receives the agent's log lines; a host's start with its label, a name's with the
@@ -450,7 +451,7 @@ const (
 )
 type Registrar struct {
 	Protocol  Protocol
-	Domain    string             // SRP: the domain; RFC 9664: the zone. Fully qualified.
+	Domain    string             // SRP only: the domain, fully qualified
 	Server    string             // "host:port", a URL with NetworkDoH; SRP only: "" to discover the registrar
 	Transport baseclient.Network //
 	// Resolvers are asked, as "host:port" over UDP, by SRP for discovery and KEY lookups, and by
@@ -465,8 +466,8 @@ type Registrar struct {
     Registrar is where and how its hosts or names register.
 
 func (r Registrar) Owner(label string) string
-    Owner returns the name a host or name labelled label registers through r,
-    fully qualified.
+    Owner returns the name a host labelled label registers through r, an SRP
+    registrar, fully qualified. An RFC 9664 name is given in full (Name.Name).
 
 func (r Registrar) String() string
 
@@ -850,12 +851,15 @@ package rfc9664 // import "github.com/NetworkCommons/sig0lease/client/rfc9664"
 
 Package rfc9664 implements a requester for this proxy's RFC 9664 handler
 (update_handler): one name, held by its own key, with records at and below it,
-registered as a DNS UPDATE signed with SIG(0) and kept on an Update Lease (RFC
-9664). The name is one label below the zone, the only name a key registers for
-itself under the handler's fcfs_naming (docs/siglease_rfc9664.md, "First-Come
-First-Served Naming"). Every request carries the name's KEY in its Update
-section, so the proxy verifies it with the key it registers, and is one of the
-handler's lease cases (Behavior Specification item 5):
+registered as a DNS UPDATE signed with SIG(0) and kept on an Update Lease
+(RFC 9664). The name is given in full: which names a key may register for
+itself is the proxy's to say -- one label below its zone, under the handler's
+fcfs_naming (docs/siglease_rfc9664.md, "First-Come First-Served Naming") -- and
+a requester cannot look that zone up. The Zone Section names the name's parent,
+which encloses every name a request writes (docs/siglease_rfc9664.md,
+"The Zone Section"). Every request carries the name's KEY in its Update section,
+so the proxy verifies it with the key it registers, and is one of the handler's
+lease cases (Behavior Specification item 5):
 
   - Register: Case A, the KEY and the records, both leases non-zero;
   - Withdraw, and Deregister keeping the name: Case D, the KEY and the records
@@ -874,6 +878,12 @@ Name keeps one name registered as its records change, as client/srp's Host does
 a host.
 
 FUNCTIONS
+
+func CheckName(name string) error
+    CheckName returns an error unless name can be a Config's Name: a name below
+    another, each label one the library sends as one (dnsname.CheckLabel).
+    A name of one label is below no zone a proxy serves. Whether its key may
+    register it is the proxy's to say.
 
 func CheckRecords(name string, records []dns.RR) error
     CheckRecords reports whether records can be registered for name: each at
@@ -950,8 +960,8 @@ func (c *Client) Withdraw(ctx context.Context, records []dns.RR) (*dns.Msg, base
     its KEY (Case D).
 
 type Config struct {
-	Zone  string // the zone the name is in, sent as the Zone Section; trailing dot optional
-	Label string // the name's single label: the name is Label.Zone
+	// Name is the name, fully qualified (trailing dot optional), at least two labels: CheckName.
+	Name string
 	// Key is the name's SIG(0) key: required, as the key is what holds the name.
 	Key *keyrec.LoadedKey
 	// Records are what Register registers: records at the name or below it, fully
@@ -1003,7 +1013,7 @@ func (n *Name) Set(records []dns.RR)
     Set replaces the records the name should have registered (Keeper.Set).
 
 type NameConfig struct {
-	// Client is the template for every Client the Name makes: Zone, Label, Key, the proxy,
+	// Client is the template for every Client the Name makes: Name, Key, the proxy,
 	// transport and leases. The Name sets Records, OnRegistered and OnError.
 	Client Config
 	// Store, if set, keeps the records registered at the name, loaded at start and saved

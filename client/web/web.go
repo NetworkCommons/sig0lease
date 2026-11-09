@@ -241,7 +241,10 @@ func (p *Page) nameOf(label string) (string, error) {
 // nameConfig configures the Name of label's name, with the name's key from the browser's
 // storage, made and kept there the first time.
 func (p *Page) nameConfig(label string) (rfc9664.NameConfig, error) {
-	name := label + "." + p.cfg.Zone
+	name, err := p.nameOf(label)
+	if err != nil {
+		return rfc9664.NameConfig{}, err
+	}
 	key, err := p.key(name)
 	if err != nil {
 		return rfc9664.NameConfig{}, err
@@ -252,7 +255,7 @@ func (p *Page) nameConfig(label string) (rfc9664.NameConfig, error) {
 	}
 	return rfc9664.NameConfig{
 		Client: rfc9664.Config{
-			Zone: p.cfg.Zone, Label: label, Key: key,
+			Name: name, Key: key,
 			RequestedLease: lease, RequestedKeyLease: keyLease,
 			Server: p.cfg.DoH, Network: client.NetworkDoH, Timeout: p.cfg.Timeout, Send: p.cfg.Send,
 		},
