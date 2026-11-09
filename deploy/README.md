@@ -78,14 +78,24 @@ make promote     # the release staging runs, moved to stable
    the checkout, refusing uncommitted changes (`make deploy ARGS="-e
    sig0lease_allow_dirty=true"` deploys them, as a release whose name ends in `-dirty`), and the
    page (`make web`).
-2. On the registrar: installs nginx and gets the certificate the first time, installs the release
-   in staging beside the ones before it, points staging's `current` at it, and restarts staging.
+2. On the registrar: installs nginx and gets the certificate the first time, and gives staging its
+   user, directories, key and service. Unless staging runs the same release already (below), it
+   installs the release in staging beside the ones before it, points staging's `current` at it, and
+   restarts staging.
 3. Checks, on the registrar: staging runs the release; each of its zones is answered from its
    authoritative server over UDP, TCP, DNS-over-TLS and DNS-over-HTTPS; any other name is
    refused. When a check fails, staging goes back to the release before (on its first release,
    it stops), and the play fails with the failed release's journal.
 4. Checks from this machine that staging's plain DNS port answers and its page is served. A
    failure here leaves the release running: something between the two machines blocks them.
+
+Staging runs the same release already when the release it runs holds the same files, byte for
+byte (the proxy, the page, `config.base.yaml`, and staging's config made from it), and its proxy
+started after the last change to anything it starts with: that release's program and config,
+`current`, staging's key and the service unit. `make deploy` then says so, and installs, restarts
+and checks nothing (`make deploy-check` runs step 3's checks). Otherwise it says what differs.
+The same code and Go build the same proxy and page, byte for byte, so a commit that changes
+neither, nor `config.yaml`, deploys nothing. Neither records the commit: the release's name does.
 
 `make deploy` installs on staging only. Try the release there: the demos take staging's zones
 (docs/demo.md, "Against a shared registrar"), and its page is at `https://<registrar>:8444/`.
@@ -101,6 +111,9 @@ Then `make promote`:
    `config.base.yaml`, points stable's `current` at it, and restarts stable. Nothing is built:
    stable runs the very files staging was checked with.
 3. Checks stable as in steps 3 and 4, going back to stable's release before when a check fails.
+
+When stable runs the same release already, as `make deploy` tells for staging, `make promote`
+says so after step 1, and installs, restarts and checks nothing.
 
 Each instance keeps the 5 releases before the one it runs.
 

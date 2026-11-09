@@ -210,10 +210,10 @@ run-server: build
 # The community registrar, from this machine, with Ansible (deploy/README.md). It runs two
 # instances: staging, where deploy builds this checkout's proxy and page, installs them as a
 # release and checks it; and stable, where promote moves the release staging runs, and checks it.
-# Either goes back to its release before when a check fails. deploy-check checks the release an
-# instance runs, deploy-rollback takes it back one release: INSTANCE, staging or stable, default
-# staging. ARGS goes to ansible-playbook, e.g. ARGS="-e sig0lease_allow_dirty=true" or
-# ARGS="--tags nginx".
+# Neither installs anything in an instance that runs the same release already. Either goes back
+# to its release before when a check fails. deploy-check checks the release an instance runs,
+# deploy-rollback takes it back one release: INSTANCE, staging or stable, default staging. ARGS
+# goes to ansible-playbook, e.g. ARGS="-e sig0lease_allow_dirty=true" or ARGS="--tags nginx".
 INSTANCE ?= staging
 
 deploy:

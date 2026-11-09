@@ -1,6 +1,6 @@
 # make promote (deploy/README.md): the release staging runs, checked on staging again, made the
-# one stable runs, with stable's config, and checked there; when it fails its checks, stable goes
-# back to the release before. Nothing is built.
+# one stable runs, with stable's config, and checked there, unless stable runs the same release
+# already; when it fails its checks, stable goes back to the release before. Nothing is built.
 - name: Promote staging's release to stable
   hosts: registrar
   vars:
