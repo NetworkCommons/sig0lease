@@ -31,18 +31,22 @@ build-client:
 # WebAssembly, gzipped (a quarter of the size; the page unzips it), and beside it the page and
 # Go's loader for it. The DNS library does not build for
 # WebAssembly as released, so the program is built against a copy of it patched with
-# docs/miekg-dns-wasm-build.patch, in a temporary directory, with go.mod and go.sum left as
-# they are (docs/siglease_rfc9664.md, "The library does not build for WebAssembly").
+# docs/miekg-dns-wasm-build.patch, in ./bin/web-dns while it builds, with go.mod and go.sum left
+# as they are (docs/siglease_rfc9664.md, "The library does not build for WebAssembly"). The same
+# code and Go build the same page, byte for byte: the program records the copy's path, the same
+# relative one on every build, and neither the commit nor where it was built; gzip records no
+# time.
 web:
-	@set -e; W=$$(mktemp -d); trap 'rm -rf "$$W"' EXIT; \
+	@set -e; W=$$(mktemp -d); D=bin/web-dns; trap 'rm -rf "$$W" "$$D"' EXIT; \
 	go mod download codeberg.org/miekg/dns; \
-	cp -R "$$(go list -m -f '{{.Dir}}' codeberg.org/miekg/dns)" "$$W/dns"; chmod -R u+w "$$W/dns"; \
-	git -C "$$W/dns" apply "$(CURDIR)/docs/miekg-dns-wasm-build.patch"; \
+	rm -rf "$$D"; mkdir -p bin; \
+	cp -R "$$(go list -m -f '{{.Dir}}' codeberg.org/miekg/dns)" "$$D"; chmod -R u+w "$$D"; \
+	git apply --directory="$$D" docs/miekg-dns-wasm-build.patch; \
 	cp go.mod go.sum "$$W/"; \
-	go mod edit -modfile="$$W/go.mod" -replace codeberg.org/miekg/dns="$$W/dns"; \
-	GOOS=js GOARCH=wasm go build -modfile="$$W/go.mod" -ldflags="-s -w" -o "$$W/sig0lease-web.wasm" ./cmd/sig0lease-web; \
+	go mod edit -modfile="$$W/go.mod" -replace codeberg.org/miekg/dns="./$$D"; \
+	GOOS=js GOARCH=wasm go build -trimpath -buildvcs=false -modfile="$$W/go.mod" -ldflags="-s -w" -o "$$W/sig0lease-web.wasm" ./cmd/sig0lease-web; \
 	mkdir -p ./bin/web; \
-	gzip -9 -c "$$W/sig0lease-web.wasm" > ./bin/web/sig0lease-web.wasm.gz; \
+	gzip -9 -n -c "$$W/sig0lease-web.wasm" > ./bin/web/sig0lease-web.wasm.gz; \
 	cp "$$(go env GOROOT)/lib/wasm/wasm_exec.js" demo/web/index.html ./bin/web/
 
 # Cross-compile server for multiple platforms. The macOS builds need cgo for syslog
