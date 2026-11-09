@@ -1,0 +1,40 @@
+# The community registrar (deploy/README.md), make deploy: nginx in front, with the registrar's
+# Let's Encrypt certificate, then the proxy, built from this checkout, installed on staging as a
+# release and checked, unless staging runs the same release already; a release that fails its
+# checks is replaced by the one before it. It reaches stable only through make promote
+# (promote.yml).
+- name: Community registrar, staging
+  hosts: registrar
+  pre_tasks:
+    - name: The release goes to staging
+      ansible.builtin.assert:
+        that: registrar_instance == 'staging'
+        fail_msg: >-
+          make deploy installs a release on staging, not on {{ registrar_instance }}; make promote
+          moves the release staging runs to stable (deploy/README.md).
+        quiet: true
+
+    - name: The registrar has a public name
+      ansible.builtin.assert:
+        that:
+          - registrar_name is match('^[a-z0-9]([a-z0-9.-]*[a-z0-9])?$')
+          - "'.' in registrar_name"
+          - registrar_name is not match('^[0-9.]+$')
+          - registrar_name != inventory_hostname
+        fail_msg: >-
+          ssh -G {{ inventory_hostname }} gives "{{ registrar_name }}" as its HostName: give the
+          alias the registrar's DNS name in ~/.ssh/config (deploy/README.md), or set
+          -e registrar_name=<name>.
+        quiet: true
+
+    - name: The registrar runs Debian
+      ansible.builtin.assert:
+        that: ansible_facts.distribution == 'Debian'
+        fail_msg: "The roles install Debian packages; this host runs {{ ansible_facts.distribution }}."
+        quiet: true
+
+  roles:
+    - role: nginx
+      tags: [nginx]
+    - role: sig0lease
+      tags: [sig0lease]

@@ -1,0 +1,65 @@
+# What an instance needs on the registrar before a release: dig for the checks, the user that runs
+# its proxy, its directories, its key (config.yml found it) and the service, sig0lease@<instance>.
+
+- name: Install dig, for the checks
+  ansible.builtin.apt:
+    name: bind9-dnsutils
+    state: present
+
+- name: Add the user who runs the proxy of {{ registrar_instance }}
+  ansible.builtin.user:
+    name: "{{ sig0lease_user }}"
+    system: true
+    shell: /usr/sbin/nologin
+    home: "{{ sig0lease_state }}"
+    create_home: false
+
+- name: Make the directories
+  ansible.builtin.file:
+    path: "{{ item.path }}"
+    state: directory
+    owner: "{{ item.owner }}"
+    group: "{{ item.owner }}"
+    mode: "{{ item.mode }}"
+  loop:
+    - {path: "{{ sig0lease_root }}/releases", owner: root, mode: "0755"}
+    - {path: "{{ sig0lease_etc }}", owner: root, mode: "0755"}
+    - {path: "{{ sig0lease_keystore | dirname }}", owner: root, mode: "0755"}
+    - {path: "{{ sig0lease_keystore }}", owner: "{{ sig0lease_user }}", mode: "0700"}
+    - {path: "{{ sig0lease_state_root }}", owner: root, mode: "0755"}
+    - {path: "{{ sig0lease_state }}", owner: "{{ sig0lease_user }}", mode: "0700"}
+  loop_control:
+    label: "{{ item.path }}"
+
+- name: Copy the instance's key, from keystore/server on this machine
+  ansible.builtin.copy:
+    src: "{{ item }}"
+    dest: "{{ sig0lease_keystore }}/{{ item | basename }}"
+    owner: "{{ sig0lease_user }}"
+    group: "{{ sig0lease_user }}"
+    mode: "0600"
+  loop: "{{ sig0lease_key_files }}"
+  loop_control:
+    label: "{{ item | basename }}"
+
+- name: Find what else the instance's keystore holds
+  ansible.builtin.find:
+    paths: "{{ sig0lease_keystore }}"
+    file_type: any
+    hidden: true
+  register: sig0lease_keystore_found
+
+- name: Remove it, a key replaced included
+  ansible.builtin.file:
+    path: "{{ item }}"
+    state: absent
+  loop: >-
+    {{ sig0lease_keystore_found.files | map(attribute='path')
+       | reject('in', sig0lease_key_files | map('basename') | map('regex_replace', '^', sig0lease_keystore ~ '/') | list)
+       | list }}
+
+- name: Install the service, one per instance
+  ansible.builtin.template:
+    src: sig0lease@.service.j2
+    dest: "{{ sig0lease_unit }}"
+    mode: "0644"

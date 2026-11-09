@@ -1,0 +1,54 @@
+# What both roles use.
+
+# The registrar's public name, for its certificate and its web server: the HostName that
+# ~/.ssh/config gives the inventory's alias (ssh -G prints it). -e registrar_name=<name> sets it
+# instead.
+registrar_name: '{{ lookup("ansible.builtin.pipe", "ssh -G " ~ inventory_hostname ~ " | sed -n s/^hostname.//p") }}'
+
+# The registrar's instances (deploy/README.md): stable, which the zones' discovery records name,
+# and staging, reached by its address only, where make deploy installs a release before make
+# promote moves it to stable. Each is a proxy of its own, sig0lease@<instance>.service, with its
+# zones, ports and lease stores; only releases move between them. Every zone the registrar serves
+# is set here, none taken from config.yaml:
+#   zones        each handler's upstream_zone, by the handler's name in config.yaml; the page
+#                served at https_port shows the update handler's zone and the SRP domain
+#   port         plain DNS, UDP and TCP, for everyone; nginx passes DNS-over-TLS to it
+#   dot_port     DNS-over-TLS, in nginx
+#   https_port   the page and /dns-query (DNS-over-HTTPS), in nginx
+#   doh_address  the proxy's DNS-over-HTTPS listener, in plain HTTP, which only nginx reaches
+#   key          the name of the instance's key in keystore/server, K<key>+<algorithm>+<tag>,
+#                at its zones or above them, the only key it is given (deploy/README.md, "The
+#                zones' keys")
+# Each instance's zones lie outside the other's (deploy/README.md).
+registrar_instances:
+  stable:
+    zones:
+      update: dev.zenr.io.
+      srp_handler: srp.dev.zenr.io.
+    key: dev.zenr.io.
+    port: 8053
+    dot_port: 853
+    https_port: 443
+    doh_address: 127.0.0.1:8443
+  staging:
+    zones:
+      update: stg.zenr.io.
+      srp_handler: srp.stg.zenr.io.
+    key: stg.zenr.io.
+    port: 8054
+    dot_port: 8853
+    https_port: 8444
+    doh_address: 127.0.0.1:8445
+
+# The instance a play works on, -e registrar_instance=<instance> (make INSTANCE=<instance>):
+# make deploy installs on staging only, make promote on stable only.
+registrar_instance: staging
+registrar_settings: "{{ registrar_instances[registrar_instance] }}"
+
+# Where each instance's releases are: <instance>/releases/<release>/, and <instance>/current, a
+# link to the one it runs.
+registrar_root: /opt/sig0lease
+
+# Whether nginx offers DNS-over-TLS (RFC 7858), at each instance's dot_port, with the registrar's
+# certificate.
+registrar_dot: true

@@ -13,7 +13,7 @@ BUILD_DIR := ./bin/$(OS)
 RELEASE_DIR := ./bin/release
 CLIENT_KEYSTORE_DIR ?=
 
-.PHONY: all build build-all build-client build-client-all clean clean-binary deps docs fmt lint release run-server test-unit test-register test-update test-update-local test-srp test-agent test-mdnsresponder-interop vet web
+.PHONY: all build build-all build-client build-client-all clean clean-binary deploy deploy-check deploy-rollback deps docs fmt lint promote release run-server test-unit test-register test-update test-update-local test-srp test-agent test-mdnsresponder-interop vet web
 
 all: build build-client test
 
@@ -207,3 +207,23 @@ test-mdnsresponder-interop:
 run-server: build
 	./$(BUILD_DIR)/$(BINARY_NAME) ./config.yaml
 
+# The community registrar, from this machine, with Ansible (deploy/README.md). It runs two
+# instances: staging, where deploy builds this checkout's proxy and page, installs them as a
+# release and checks it; and stable, where promote moves the release staging runs, and checks it.
+# Neither installs anything in an instance that runs the same release already. Either goes back
+# to its release before when a check fails. deploy-check checks the release an instance runs,
+# deploy-rollback takes it back one release: INSTANCE, staging or stable, default staging. ARGS
+# goes to ansible-playbook, e.g. ARGS="-e sig0lease_allow_dirty=true" or ARGS="--tags nginx".
+INSTANCE ?= staging
+
+deploy:
+	cd deploy/ansible && ansible-playbook site.yml $(ARGS)
+
+promote:
+	cd deploy/ansible && ansible-playbook promote.yml $(ARGS)
+
+deploy-check:
+	cd deploy/ansible && ansible-playbook check.yml -e registrar_instance=$(INSTANCE) $(ARGS)
+
+deploy-rollback:
+	cd deploy/ansible && ansible-playbook rollback.yml -e registrar_instance=$(INSTANCE) $(ARGS)

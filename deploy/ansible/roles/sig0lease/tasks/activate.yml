@@ -1,0 +1,150 @@
+# The release sig0lease_release, in the instance's releases/ with its files, made the one the
+# instance runs: its config written (sig0lease_config, config.yml), then current pointed at it,
+# the proxy restarted, nginx serving the instance, and the release checked, once nothing else
+# holds the instance's port. A release that fails its checks is replaced by the one before it,
+# or, on the instance's first release, stopped; either way the play fails. deploy (main.yml) and
+# promote (promote.yml) end here.
+
+- name: Write into the release the config of {{ registrar_instance }}
+  ansible.builtin.copy:
+    content: "{{ sig0lease_config_text }}"
+    dest: "{{ sig0lease_root }}/releases/{{ sig0lease_release }}/config.yaml"
+    mode: "0644"
+
+- name: Find the release running now in {{ registrar_instance }}
+  ansible.builtin.stat:
+    path: "{{ sig0lease_root }}/current"
+  register: sig0lease_current
+
+- name: Remember it, to go back to
+  ansible.builtin.set_fact:
+    sig0lease_previous: >-
+      {{ sig0lease_current.stat.lnk_source | basename
+         if sig0lease_current.stat.islnk | default(false) else '' }}
+
+# The old proxy, started by hand, holds port 8053 until its operators stop it, with its names
+# removed from the zone first (deploy/README.md, "The first promote").
+- name: List what else holds the instance's port
+  ansible.builtin.shell: |
+    set -uo pipefail
+    main="$(systemctl show -p MainPID --value {{ sig0lease_service }}.service)"
+    for pid in $(ss -Hlnptu "sport = :{{ sig0lease_port }}" | grep -o 'pid=[0-9]*' | cut -d= -f2 | sort -u); do
+        [ "$pid" = "$main" ] || echo "$pid $(readlink "/proc/$pid/exe" || echo '(exe unknown)')"
+    done
+  args:
+    executable: /bin/bash
+  register: sig0lease_port_holders
+  changed_when: false
+
+- name: Nothing else holds the port
+  ansible.builtin.assert:
+    that: sig0lease_port_holders.stdout == ''
+    fail_msg: |-
+      Port {{ sig0lease_port }} is held by another process, which {{ sig0lease_service }} would
+      not replace (pid, program):
+      {{ sig0lease_port_holders.stdout }}
+      The proxy started by hand? Remove its names from the zone and stop it first
+      (deploy/README.md, "The first promote").
+    quiet: true
+
+- name: Switch to the release and check it, in {{ registrar_instance }}
+  block:
+    - name: Point current at the release
+      ansible.builtin.file:
+        src: "{{ sig0lease_root }}/releases/{{ sig0lease_release }}"
+        dest: "{{ sig0lease_root }}/current"
+        state: link
+        force: true
+
+    - name: Restart the proxy, and start it at boot
+      ansible.builtin.systemd_service:
+        name: "{{ sig0lease_service }}"
+        state: restarted
+        enabled: true
+        daemon_reload: true
+
+    - name: Have nginx serve the instance
+      ansible.builtin.include_role:
+        name: nginx
+        tasks_from: sites.yml
+
+    - name: Check the release
+      ansible.builtin.include_tasks: check.yml
+
+  rescue:
+    - name: Keep what failed
+      ansible.builtin.set_fact:
+        sig0lease_failure: "{{ ansible_failed_task.name }}: {{ ansible_failed_result.msg | default('') }}"
+
+    - name: Read the failed release's journal
+      ansible.builtin.command: journalctl -u {{ sig0lease_service }} -n 40 --no-pager
+      register: sig0lease_journal
+      changed_when: false
+
+    - name: Go back to the release before it
+      when: sig0lease_previous != ''
+      block:
+        - name: Point current at the release before
+          ansible.builtin.file:
+            src: "{{ sig0lease_root }}/releases/{{ sig0lease_previous }}"
+            dest: "{{ sig0lease_root }}/current"
+            state: link
+            force: true
+
+        - name: Restart the proxy with the release before
+          ansible.builtin.systemd_service:
+            name: "{{ sig0lease_service }}"
+            state: restarted
+
+    - name: Stop the proxy, as no release came before it
+      ansible.builtin.systemd_service:
+        name: "{{ sig0lease_service }}"
+        state: stopped
+      when: sig0lease_previous == ''
+
+    - name: Fail the play
+      ansible.builtin.fail:
+        msg: |-
+          Release {{ sig0lease_release }} failed on {{ registrar_instance }}: {{ sig0lease_failure }}
+          {{ (registrar_instance ~ ' runs ' ~ sig0lease_previous ~ ' again (not checked: make deploy-check INSTANCE=' ~ registrar_instance ~ ').')
+             if sig0lease_previous else registrar_instance ~ ' is stopped: no release came before it.' }}
+          The failed release's journal:
+          {{ sig0lease_journal.stdout }}
+
+- name: Find the instance's releases
+  ansible.builtin.find:
+    paths: "{{ sig0lease_root }}/releases"
+    file_type: directory
+  register: sig0lease_releases
+
+- name: Remove all but the newest ones
+  ansible.builtin.file:
+    path: "{{ item }}"
+    state: absent
+  loop: >-
+    {{ (sig0lease_releases.files | map(attribute='path') | sort)[:-(sig0lease_keep_releases + 1)]
+       | reject('equalto', sig0lease_root ~ '/releases/' ~ sig0lease_release) | list }}
+
+- name: Check from this machine that the instance answers, and serves the page
+  delegate_to: localhost
+  run_once: true
+  block:
+    - name: Ask the instance's port for its first zone's SOA, from this machine
+      ansible.builtin.command: >-
+        dig +norec +time=3 +tries=2 @{{ registrar_name }} -p {{ sig0lease_port }}
+        {{ sig0lease_zones[0] }} SOA
+      register: sig0lease_outside
+      changed_when: false
+      failed_when: "sig0lease_outside.stdout is not search('flags: qr aa[ ;]')"
+
+    - name: Fetch the page, from this machine
+      ansible.builtin.uri:
+        url: https://{{ registrar_name }}:{{ registrar_settings.https_port }}/
+  rescue:
+    - name: Report what this machine could not reach
+      ansible.builtin.fail:
+        msg: |-
+          Release {{ sig0lease_release }} passed its checks on the registrar, and {{ registrar_instance }}
+          keeps it, but this machine cannot reach it: {{ ansible_failed_task.name }}:
+          {{ ansible_failed_result.stdout | default(ansible_failed_result.msg | default('')) }}
+          A firewall on the way, or this machine's network?

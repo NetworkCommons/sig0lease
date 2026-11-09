@@ -1,0 +1,24 @@
+# The release the instance runs, as sig0lease_release, and its config, as sig0lease_config.
+
+- name: Find the release running now in {{ registrar_instance }}
+  ansible.builtin.stat:
+    path: "{{ sig0lease_root }}/current"
+  register: sig0lease_current
+
+- name: A release is installed
+  ansible.builtin.assert:
+    that: sig0lease_current.stat.islnk | default(false)
+    fail_msg: >-
+      {{ sig0lease_root }}/current is no link to a release: {{ registrar_instance }} has none yet
+      ({{ 'make promote' if registrar_instance == 'stable' else 'make deploy' }}).
+    quiet: true
+
+- name: Read its config
+  ansible.builtin.slurp:
+    src: "{{ sig0lease_root }}/current/config.yaml"
+  register: sig0lease_current_config
+
+- name: Remember the release and its config
+  ansible.builtin.set_fact:
+    sig0lease_release: "{{ sig0lease_current.stat.lnk_source | basename }}"
+    sig0lease_config: "{{ sig0lease_current_config.content | b64decode | from_yaml }}"

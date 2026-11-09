@@ -1,0 +1,41 @@
+# The instance back to the release installed before the one it runs (make deploy-rollback), then
+# its checks. The release's config goes with it; the instance's lease stores stay.
+
+- name: Find the release running now
+  ansible.builtin.include_tasks: current.yml
+
+- name: Find the instance's releases
+  ansible.builtin.find:
+    paths: "{{ sig0lease_root }}/releases"
+    file_type: directory
+  register: sig0lease_releases
+
+- name: Pick the one before the running one
+  ansible.builtin.set_fact:
+    sig0lease_rollback_to: >-
+      {{ sig0lease_releases.files | map(attribute='path') | map('basename') | sort
+         | select('lt', sig0lease_release) | list | last | default('') }}
+
+- name: A release came before it
+  ansible.builtin.assert:
+    that: sig0lease_rollback_to != ''
+    fail_msg: "{{ sig0lease_release }} is {{ registrar_instance }}'s oldest release: there is none to go back to."
+    quiet: true
+
+- name: Point current at {{ sig0lease_rollback_to }}
+  ansible.builtin.file:
+    src: "{{ sig0lease_root }}/releases/{{ sig0lease_rollback_to }}"
+    dest: "{{ sig0lease_root }}/current"
+    state: link
+    force: true
+
+- name: Restart the proxy
+  ansible.builtin.systemd_service:
+    name: "{{ sig0lease_service }}"
+    state: restarted
+
+- name: Find the release running now, again
+  ansible.builtin.include_tasks: current.yml
+
+- name: Check it
+  ansible.builtin.include_tasks: check.yml

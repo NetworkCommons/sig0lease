@@ -1,0 +1,46 @@
+# {{ ansible_managed }}: deploy/ansible, roles/sig0lease (deploy/README.md).
+# One proxy per instance of the registrar (%i: stable, staging), each from its own releases.
+[Unit]
+Description=sig0lease %i, the community registrar's proxy (RFC 9664, RFC 9665)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=sig0lease-%i
+Group=sig0lease-%i
+ExecStart={{ registrar_root }}/%i/current/sig0lease {{ registrar_root }}/%i/current/config.yaml
+WorkingDirectory={{ sig0lease_state_root }}/%i
+# SIGTERM: the proxy stops its handlers and saves its lease stores once more.
+TimeoutStopSec=30
+Restart=on-failure
+RestartSec=5
+
+# It reads its release, its config and its key, and writes only its own lease stores. Its
+# port is no privileged one, and nginx ends TLS for it.
+UMask=0077
+ReadWritePaths={{ sig0lease_state_root }}/%i
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+NoNewPrivileges=yes
+CapabilityBoundingSet=
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX AF_NETLINK
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+
+[Install]
+WantedBy=multi-user.target

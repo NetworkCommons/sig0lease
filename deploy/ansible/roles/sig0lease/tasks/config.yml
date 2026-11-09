@@ -1,0 +1,80 @@
+# The instance's config, as sig0lease_config: sig0lease_base_config, the repository's config.yaml
+# at the release's commit, with sig0lease_config_overrides merged in, and as sig0lease_config_text,
+# the release's config.yaml that activate.yml writes; and its key, as sig0lease_key_files, the .key
+# and .private files in keystore/server on this machine, which prepare.yml copies. Changes nothing
+# anywhere.
+
+- name: The instances serve zones apart, and each a zone for every handler config.yaml has
+  ansible.builtin.assert:
+    that:
+      - registrar_instance in registrar_instances
+      - sig0lease_unknown_handlers == []
+      - sig0lease_zones_given | sort == sig0lease_base_config.handlers.keys() | sort
+      - sig0lease_all_zones | length == sig0lease_all_zones | unique | length
+    fail_msg: >-
+      registrar_instances (group_vars/all.yml) and config.yaml disagree: the instance
+      "{{ registrar_instance }}" of {{ registrar_instances.keys() | list }} gives zones for the
+      handlers {{ sig0lease_zones_given }}, its config changes {{ sig0lease_config_overrides.handlers.keys() | list }},
+      config.yaml has {{ sig0lease_base_config.handlers.keys() | list }}; every zone of every
+      instance: {{ sig0lease_all_zones }}, each to be served by one only.
+    quiet: true
+  vars:
+    sig0lease_zones_given: "{{ registrar_settings.zones.keys() | list }}"
+    sig0lease_unknown_handlers: >-
+      {{ sig0lease_config_overrides.handlers.keys() | difference(sig0lease_base_config.handlers.keys()) }}
+    sig0lease_all_zones: >-
+      {{ registrar_instances.values() | map(attribute='zones') | map('dict2items') | flatten
+         | map(attribute='value') | map('lower') | map('regex_replace', '[.]$', '') | list }}
+
+- name: Find the instance's key in keystore/server on this machine
+  ansible.builtin.set_fact:
+    sig0lease_key_files: >-
+      {{ query('ansible.builtin.fileglob', sig0lease_repo ~ '/keystore/server/K' ~ registrar_settings['key'] ~ '+*') | sort }}
+
+- name: The instance has one key, a .key and a .private file
+  ansible.builtin.assert:
+    that:
+      - registrar_settings['key'] is string and registrar_settings['key'] is match('^([A-Za-z0-9_-]+[.])+$')
+      - sig0lease_key_files | length == 2
+      - sig0lease_key_files[0] is match('.*[.]key$')
+      - sig0lease_key_files[1] == sig0lease_key_files[0] | regex_replace('[.]key$', '.private')
+    fail_msg: >-
+      The key of {{ registrar_instance }} is K<key>+<algorithm>+<tag>.key and .private in
+      {{ sig0lease_repo }}/keystore/server, with key {{ registrar_settings['key'] | default('(none)') | string }}
+      (registrar_instances.{{ registrar_instance }}.key, a name ending in a dot); keystore/server
+      has {{ sig0lease_key_files | map('basename') | list }} for it.
+    quiet: true
+
+- name: Merge the instance's changes into config.yaml
+  ansible.builtin.set_fact:
+    sig0lease_config: "{{ sig0lease_base_config | combine(sig0lease_config_overrides, recursive=true) }}"
+
+- name: Every handler serves the instance's zone for it, with its key and lease store where the registrar keeps them
+  ansible.builtin.assert:
+    that:
+      - item.value.upstream_zone == registrar_settings.zones[item.key]
+      - item.value.upstream_zone is string and item.value.upstream_zone is match('^([A-Za-z0-9_-]+[.])+$')
+      - ('.' ~ item.value.upstream_zone | lower).endswith('.' ~ registrar_settings['key'] | lower)
+      - item.value.keystore_dir == sig0lease_keystore
+      - item.value.storage.type == 'file'
+      - item.value.storage.path is match('/')
+    fail_msg: >-
+      handlers.{{ item.key }} of the instance's config has upstream_zone
+      {{ item.value.upstream_zone | string }}, for the zone {{ registrar_settings.zones[item.key] | string }} of
+      registrar_instances.{{ registrar_instance }}, whose key is {{ registrar_settings['key'] }}, keystore_dir
+      {{ item.value.keystore_dir | default('(none)') }} and storage {{ item.value.storage | default('(none)') }}:
+      want a zone name ending in a dot, at the key's name or below it, keystore_dir
+      {{ sig0lease_keystore }} and a file store at an absolute path (sig0lease_config_overrides).
+    quiet: true
+  loop: "{{ sig0lease_config.handlers | dict2items }}"
+  loop_control:
+    label: "{{ item.key }}"
+
+- name: Write out the instance's config.yaml
+  ansible.builtin.set_fact:
+    sig0lease_config_text: |
+      # The config of the registrar's {{ registrar_instance }} instance: config.base.yaml, the
+      # repository's config.yaml at the release's commit, with sig0lease_config_overrides and
+      # registrar_instances.{{ registrar_instance }} (deploy/ansible). Made by every deploy and
+      # promote: change those instead.
+      {{ sig0lease_config | to_nice_yaml(indent=2, sort_keys=false) }}

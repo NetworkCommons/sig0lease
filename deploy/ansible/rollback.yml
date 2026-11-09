@@ -1,0 +1,10 @@
+# Takes an instance (-e registrar_instance=<instance>, make deploy-rollback INSTANCE=<instance>)
+# back to the release installed in it before the one it runs, and checks it. The release's config
+# goes with it; the instance's lease stores stay.
+- name: Roll an instance back
+  hosts: registrar
+  tasks:
+    - name: Go back one release
+      ansible.builtin.include_role:
+        name: sig0lease
+        tasks_from: rollback.yml

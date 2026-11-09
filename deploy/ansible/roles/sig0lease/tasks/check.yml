@@ -1,0 +1,48 @@
+# The checks of the release an instance runs, on the registrar: make deploy, promote,
+# deploy-check and deploy-rollback run them. sig0lease_release is the release, sig0lease_config
+# its config. Each check is tried for up to 10 s, while the proxy starts.
+
+- name: The instance runs {{ sig0lease_release }}
+  ansible.builtin.shell: readlink "/proc/$(systemctl show -p MainPID --value {{ sig0lease_service }})/exe"
+  register: sig0lease_exe
+  changed_when: false
+  until: sig0lease_exe.stdout == sig0lease_root ~ '/releases/' ~ sig0lease_release ~ '/sig0lease'
+  retries: 10
+  delay: 1
+
+# Each zone's own authoritative server answers, as the aa flag shows (opcode 0 rule): NOERROR,
+# or NXDOMAIN for a zone with no names yet.
+- name: Each zone is answered from its authoritative server, over UDP and TCP
+  ansible.builtin.command: >-
+    dig +norec +time=2 +tries=1 {{ '+tcp' if item.1 == 'tcp' else '+notcp' }}
+    @127.0.0.1 -p {{ sig0lease_port }} {{ item.0 }} SOA
+  loop: "{{ sig0lease_zones | product(['udp', 'tcp']) | list }}"
+  register: sig0lease_soa
+  changed_when: false
+  until: "sig0lease_soa.stdout is search('status: (NOERROR|NXDOMAIN),') and sig0lease_soa.stdout is search('flags: qr aa[ ;]')"
+  retries: 10
+  delay: 1
+
+- name: Nothing else is answered (server.forward off)
+  ansible.builtin.command: dig +time=2 +tries=1 @127.0.0.1 -p {{ sig0lease_port }} example.com. A
+  register: sig0lease_refused
+  changed_when: false
+  failed_when: "sig0lease_refused.stdout is not search('status: REFUSED,')"
+  when: not (sig0lease_config.server.forward | default(false))
+
+- name: Each zone is answered over DNS-over-TLS, through nginx
+  ansible.builtin.command: dig +tls +norec +time=2 +tries=1 @127.0.0.1 -p {{ registrar_settings.dot_port }} {{ item }} SOA
+  loop: "{{ sig0lease_zones }}"
+  register: sig0lease_dot
+  changed_when: false
+  failed_when: "sig0lease_dot.stdout is not search('flags: qr aa[ ;]')"
+  when: registrar_dot | bool
+
+- name: Each zone is answered over DNS-over-HTTPS, through nginx
+  ansible.builtin.command: >-
+    dig +https +norec +time=2 +tries=1 +tls-hostname={{ registrar_name }}
+    @127.0.0.1 -p {{ registrar_settings.https_port }} {{ item }} SOA
+  loop: "{{ sig0lease_zones }}"
+  register: sig0lease_doh
+  changed_when: false
+  failed_when: "sig0lease_doh.stdout is not search('flags: qr aa[ ;]')"
