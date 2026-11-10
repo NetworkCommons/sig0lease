@@ -1,6 +1,6 @@
 #!/bin/bash
 # demo/chat.sh [label...] -- D5 of docs/demo.md: an XMPP server (Prosody) for each label, serving
-# guests at <label>.dev.zenr.io and their rooms at rooms.<label>.dev.zenr.io, and the agent
+# guests at <label>.<UPDATE_DOMAIN> and their rooms at rooms.<label>.<UPDATE_DOMAIN>, and the agent
 # publishing each name's addresses, SRV records and TLSA record through the proxy on this
 # machine. The servers find each other by the SRV records and authenticate each other by the
 # TLSA records alone (DANE): their certificates are self-signed. Phones open the page a server
@@ -13,25 +13,24 @@
 #
 # The demo runs it on two machines, with a label each (default chat); a rehearsal, on one
 # machine with two labels.
-#   ROOM     the room every page joins; default meet@rooms.<first label>.dev.zenr.io. On the
-#            second machine, the first one's.
+#   ROOM     the room every page joins; default meet@rooms.<first label>.<UPDATE_DOMAIN>. On
+#            the second machine, the first one's.
 #   PROSODY  docker: the prosodyim/prosody:13.0 image (default on macOS); native: Prosody 13
 #            with luaunbound, installed (default elsewhere).
 #   ADDRESS  the address to publish for the servers; default, all of this machine's (auto).
-#   NS, ZONE as for watch.sh; ZONE is also where the agent registers.
+#   NS, UPDATE_DOMAIN, SRP_DOMAIN  as for watch.sh; UPDATE_DOMAIN is also where the agent
+#            registers, and with SRP_DOMAIN what the proxy serves (demo/lib.sh).
 #   REGISTRAR, TRANSPORT  the registrar the agent uses instead of a proxy this script starts
 #            (demo/lib.sh).
-# Each label's certificate and key stay in demo/chat/servers/<label>.<zone>/ from one run to
-# the next, and so does its TLSA record.
+# Each label's certificate and key stay in demo/chat/servers/<label>.<UPDATE_DOMAIN>/ from one
+# run to the next, and so does its TLSA record.
 
 cd "$(dirname "$0")/.." || exit 1
 . demo/lib.sh
 B="./bin/$(uname -s | tr A-Z a-z)"
-ns="${NS:-ns1.free2air.org}"
-zone="${ZONE:-dev.zenr.io}"
 labels=("$@")
 [ ${#labels[@]} -gt 0 ] || labels=(chat)
-room="${ROOM:-meet@rooms.${labels[0]}.$zone}"
+room="${ROOM:-meet@rooms.${labels[0]}.$update_domain}"
 image=prosodyim/prosody:13.0
 
 for label in "${labels[@]}"; do
@@ -77,7 +76,7 @@ trap 'exit 130' INT TERM
 c2s_port() { echo $(( 5222 + 10 * $1 )); }
 s2s_port() { echo $(( 5269 + 10 * $1 )); }
 http_port() { echo $(( 5280 + 10 * $1 )); }
-server_dir() { echo "$PWD/demo/chat/servers/${labels[$1]}.$zone"; }
+server_dir() { echo "$PWD/demo/chat/servers/${labels[$1]}.$update_domain"; }
 
 # cert <dir> <domain> -- a self-signed certificate (cert.pem) for the domain and rooms.<domain>,
 # and its key (key.pem), unless dir has them. Prosody checks a certificate's names even when its
@@ -103,7 +102,7 @@ page() { curl -sf -o /dev/null "http://127.0.0.1:$1/"; }
 
 # server <i> -- starts label i's Prosody, as PROSODY says, with demo/chat/prosody.cfg.lua.
 server() {
-    local domain="${labels[$1]}.$zone" dir c2s s2s http
+    local domain="${labels[$1]}.$update_domain" dir c2s s2s http
     dir="$(server_dir "$1")" c2s="$(c2s_port "$1")" s2s="$(s2s_port "$1")" http="$(http_port "$1")"
     if [ "$PROSODY" = docker ]; then
         start "server_$1" "${labels[$1]}-prosody.log" docker run --rm --name "sig0lease-$domain" \
@@ -136,7 +135,7 @@ registrars:
 EOF
     for i in "${!labels[@]}"; do
         cat << EOF
-      - name: ${labels[$i]}.$zone.
+      - name: ${labels[$i]}.$update_domain.
         addresses: [${ADDRESS:-auto}]
         services:
           - {type: xmpp-client, port: $(c2s_port "$i")}
@@ -145,10 +144,11 @@ EOF
     done
 } > "$log/chat.yaml"
 template "$log/chat.yaml" "$log/chat.yaml"
+proxy_config
 
 cat << EOF
-XMPP servers for ${labels[*]/%/.$zone}, run by $PROSODY Prosody, published on the live $zone zone
-$via. Logs: $log
+XMPP servers for ${labels[*]/%/.$update_domain}, run by $PROSODY Prosody, published in the live
+zone, in $update_domain, $via. Logs: $log
 Answers are asked of $ns, the zone's authoritative server.
 EOF
 
@@ -157,18 +157,18 @@ for i in "${!labels[@]}"; do
     # Prosody goes on running without a port it cannot have.
     for port in "$(c2s_port "$i")" "$(s2s_port "$i")" "$(http_port "$i")"; do
         if in_use "$port"; then
-            echo "Port $port, for ${labels[$i]}.$zone's server, is in use: another XMPP server? (On Debian: sudo systemctl stop prosody)" >&2
+            echo "Port $port, for ${labels[$i]}.$update_domain's server, is in use: another XMPP server? (On Debian: sudo systemctl stop prosody)" >&2
             exit 1
         fi
     done
-    cert "$(server_dir "$i")" "${labels[$i]}.$zone" || exit 1
+    cert "$(server_dir "$i")" "${labels[$i]}.$update_domain" || exit 1
 done
 start_proxy
 for i in "${!labels[@]}"; do server "$i"; done
-for i in "${!labels[@]}"; do wait_until "${labels[$i]}.$zone serves its page" page "$(http_port "$i")"; done
+for i in "${!labels[@]}"; do wait_until "${labels[$i]}.$update_domain serves its page" page "$(http_port "$i")"; done
 start agent agent.log "$B/sig0lease-agent" run -probe-interval 5s "$log/chat.yaml"
 for i in "${!labels[@]}"; do
-    domain="${labels[$i]}.$zone"
+    domain="${labels[$i]}.$update_domain"
     wait_until "$domain has its SRV records" answers SRV "_xmpp-server._tcp.$domain"
     wait_until "rooms.$domain has its SRV records" answers SRV "_xmpp-server._tcp.rooms.$domain"
     wait_until "$domain has its TLSA record" is "3 1 1 $(spki "$(server_dir "$i")/cert.pem")" tlsa "_$(s2s_port "$i")._tcp.$domain"
@@ -177,14 +177,14 @@ done
 echo
 echo "What anyone can run:"
 for i in "${!labels[@]}"; do
-    domain="${labels[$i]}.$zone"
+    domain="${labels[$i]}.$update_domain"
     echo "  dig +short SRV _xmpp-server._tcp.$domain"
     echo "  dig +short SRV _xmpp-server._tcp.rooms.$domain"
     echo "  dig +short TLSA _$(s2s_port "$i")._tcp.$domain"
 done
 echo "Every page joins $room."
 for i in "${!labels[@]}"; do
-    domain="${labels[$i]}.$zone"
+    domain="${labels[$i]}.$update_domain"
     address="$(ask A "$domain" | head -n 1)"
     url="http://$address:$(http_port "$i")/?domain=$domain&room=$room"
     echo

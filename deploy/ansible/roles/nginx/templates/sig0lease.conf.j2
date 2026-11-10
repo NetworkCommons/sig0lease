@@ -48,7 +48,7 @@ server {
     # The page, asked for with no parameters, opens on this instance's zones.
     location = / {
         if ($args = "") {
-            return 302 "/?zone={{ instance.zones['update'] | regex_replace('\.$', '') }}&domain={{ instance.zones['srp_handler'] | regex_replace('\.$', '') }}";
+            return 302 "/?update_domain={{ instance.zones['update'] | regex_replace('\.$', '') }}&srp_domain={{ instance.zones['srp_handler'] | regex_replace('\.$', '') }}";
         }
         try_files /index.html =404;
     }

@@ -8,16 +8,13 @@
 # printed at the start. On a Mac it writes demo/mac.yaml, D2's template,
 # when there is none. It builds the proxy and the clients first (make build build-client).
 #
-# NS, DOMAIN, ZONE and NAME change what it asks, as for watch.sh; DOMAIN and ZONE are also where
-# the agents register (demo/lib.sh, template). REGISTRAR sends the agents' updates to that
-# registrar instead, and starts no proxy (demo/lib.sh).
+# NS and NAME change what it asks, as for watch.sh. UPDATE_DOMAIN and SRP_DOMAIN are where the
+# agents register (demo/lib.sh, template), and what the proxy serves (proxy_config). REGISTRAR
+# sends the agents' updates to that registrar instead, and starts no proxy (demo/lib.sh).
 
 cd "$(dirname "$0")/.." || exit 1
 . demo/lib.sh
 B="./bin/$(uname -s | tr A-Z a-z)"
-ns="${NS:-ns1.free2air.org}"
-domain="${DOMAIN:-srp.dev.zenr.io}"
-zone="${ZONE:-dev.zenr.io}"
 name="${NAME:-demo}"
 instance="$name\\032http"         # "demo http", as browsing lists it
 renamed="$name\\032http-2"        # the second key's
@@ -36,7 +33,7 @@ if [ "$(uname -s)" = Darwin ]; then
 keystore: keys-mac
 registrars:
   - protocol: srp
-    domain: $domain.
+    domain: $srp_domain.
     server: 127.0.0.1:8053
     lease: 10m
     on_stop: release
@@ -71,27 +68,28 @@ trap 'exit 130' INT TERM
 # mirrored <type> -- whether an instance of <type> on this Mac's host is listed.
 mirrored() {
     local instance
-    for instance in $(ask PTR "$1.$domain"); do
-        ask SRV "$instance" | grep -qiF " $machost.$domain." && return 0
+    for instance in $(ask PTR "$1.$srp_domain"); do
+        ask SRV "$instance" | grep -qiF " $machost.$srp_domain." && return 0
     done
     return 1
 }
 
+proxy_config
 template demo/demo.yaml "$log/demo.yaml"
 template demo/conflict.yaml "$log/conflict.yaml"
 [ -z "$machost" ] || template demo/mac.yaml "$log/mac.yaml"
 
 cat << EOF
-This machine publishes itself on the live $zone zone, $via.
+This machine publishes itself in the live zone, in $update_domain and $srp_domain, $via.
 Logs: $log
 Answers are asked of $ns, the zone's authoritative server.
 
 What anyone can run meanwhile:
-  dig +short TXT $name.$zone
-  dig +short $name.$zone
-  dns-sd -B _http._tcp $domain                (a Mac)
-  avahi-browse -d $domain. -r _http._tcp      (Linux)
-and, on this network, open http://$name.$domain:8000/
+  dig +short TXT $name.$update_domain
+  dig +short $name.$update_domain
+  dns-sd -B _http._tcp $srp_domain                (a Mac)
+  avahi-browse -d $srp_domain. -r _http._tcp      (Linux)
+and, on this network, open http://$name.$srp_domain:8000/
 EOF
 
 step "1. Start ${our_proxy}the site and the agent."
@@ -99,7 +97,7 @@ start_proxy
 start_site
 start agent agent.log "$B/sig0lease-agent" run -probe-interval 5s "$log/demo.yaml"
 wait_until "\"$name http\" is listed" listed "$instance"
-wait_until "$name.$zone has its records" answers TXT "$name.$zone"
+wait_until "$name.$update_domain has its records" answers TXT "$name.$update_domain"
 echo
 demo/watch.sh once
 
@@ -137,20 +135,20 @@ L="$line" awk '
     !done && /^ *# - '\''hello TXT / { sub(/# - .*/, ""); print $0 ENVIRON["L"]; done = 1; next }
     { print }' "$log/demo.yaml" > "$log/demo.yaml.new" && mv "$log/demo.yaml.new" "$log/demo.yaml" || exit 1
 echo "  $line"
-stamped() { ask TXT "hello.$name.$zone" | grep -qF "($stamp)"; }
-wait_until "hello.$name.$zone has your text" stamped
-echo "  dig +short TXT hello.$name.$zone: $(ask TXT "hello.$name.$zone")"
+stamped() { ask TXT "hello.$name.$update_domain" | grep -qF "($stamp)"; }
+wait_until "hello.$name.$update_domain has your text" stamped
+echo "  dig +short TXT hello.$name.$update_domain: $(ask TXT "hello.$name.$update_domain")"
 
 step "4. A second key wants the same names (demo/conflict.yaml)."
 start other other-agent.log "$B/sig0lease-agent" run -probe-interval 5s "$log/conflict.yaml"
 wait_until "its host is renamed: \"$name http-2\" is listed" listed "$renamed"
-wait_until "it is refused $name.$zone" grep -q "held by another key" "$log/other-agent.log"
+wait_until "it is refused $name.$update_domain" grep -q "held by another key" "$log/other-agent.log"
 echo
 demo/watch.sh once
 step "   Stop the second agent: it frees what it got (on_stop: release), and leaves $name alone."
 stop other
 wait_until "\"$name http-2\" is gone" not listed "$renamed"
-echo "  dig +short TXT $name.$zone: $(ask TXT "$name.$zone")"
+echo "  dig +short TXT $name.$update_domain: $(ask TXT "$name.$update_domain")"
 
 if [ -n "$machost" ]; then
     step "5. This Mac's own services: a second agent (demo/mac.yaml) publishes what macOS advertises on the local network for $machost.local: Remote Login, File Sharing, Screen Sharing."

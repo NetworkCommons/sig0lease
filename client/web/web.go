@@ -39,10 +39,10 @@ type Storage interface {
 
 // Config configures New.
 type Config struct {
-	DoH     string  // the proxy's DNS-over-HTTPS server, "http://host:port"
-	Zone    string  // the zone names are claimed in, and Names lists: the proxy's RFC 9664 handler's
-	Domain  string  // the DNS-SD domain Browse reads, which Names leaves out
-	Storage Storage // required
+	DoH          string  // the proxy's DNS-over-HTTPS server, "http://host:port"
+	UpdateDomain string  // where names are claimed, and Names lists: the proxy's RFC 9664 handler's subtree
+	SRPDomain    string  // the DNS-SD domain Browse reads, which Names leaves out: its SRP handler's subtree
+	Storage      Storage // required
 	// Fallback is the DNS-over-HTTPS server asked the questions DoH refuses as names it does
 	// not serve (browse.Fallback), as a URL with no path, which a page may ask from any
 	// origin: a public resolver, such as https://dns.google. Default: none, and those
@@ -94,13 +94,13 @@ func New(cfg Config) (*Page, error) {
 			return nil, fmt.Errorf("web: Fallback: %w", err)
 		}
 	}
-	if cfg.Zone == "" || cfg.Domain == "" {
-		return nil, errors.New("web: Zone and Domain are required")
+	if cfg.UpdateDomain == "" || cfg.SRPDomain == "" {
+		return nil, errors.New("web: UpdateDomain and SRPDomain are required")
 	}
 	if cfg.Storage == nil {
 		return nil, errors.New("web: Storage is required")
 	}
-	cfg.Zone, cfg.Domain = dnsutil.Fqdn(cfg.Zone), dnsutil.Fqdn(cfg.Domain)
+	cfg.UpdateDomain, cfg.SRPDomain = dnsutil.Fqdn(cfg.UpdateDomain), dnsutil.Fqdn(cfg.SRPDomain)
 	if cfg.Logf == nil {
 		cfg.Logf = func(string, ...any) {}
 	}
@@ -117,15 +117,15 @@ func New(cfg Config) (*Page, error) {
 	return &Page{cfg: cfg, query: query}, nil
 }
 
-// Browse reads the domain (browse.Browse).
+// Browse reads SRPDomain (browse.Browse).
 func (p *Page) Browse(ctx context.Context) (*browse.Domain, error) {
-	return browse.Browse(ctx, p.query, p.cfg.Domain)
+	return browse.Browse(ctx, p.query, p.cfg.SRPDomain)
 }
 
-// Names lists the names in the zone, outside the domain (browse.Names): the zone must be
+// Names lists the names in UpdateDomain, outside SRPDomain (browse.Names): the zone must be
 // signed with NSEC.
 func (p *Page) Names(ctx context.Context) ([]browse.Name, error) {
-	return browse.Names(ctx, p.query, p.cfg.Zone, p.cfg.Domain)
+	return browse.Names(ctx, p.query, p.cfg.UpdateDomain, p.cfg.SRPDomain)
 }
 
 // Message returns the strings of the TXT records at label's name, as their octets: none when
@@ -233,13 +233,13 @@ func (p *Page) stop() {
 	p.name, p.label = nil, ""
 }
 
-// nameOf returns label's name in the zone: label must be a host name label, as the name is
+// nameOf returns label's name in UpdateDomain: label must be a host name label, as the name is
 // typed and linked.
 func (p *Page) nameOf(label string) (string, error) {
 	if !dnsname.IsHostLabel(label) {
 		return "", fmt.Errorf("%q: a name is letters, digits and hyphens, not starting or ending with a hyphen, at most 63", label)
 	}
-	return label + "." + p.cfg.Zone, nil
+	return label + "." + p.cfg.UpdateDomain, nil
 }
 
 // nameConfig configures the Name of label's name, with the name's key from the browser's

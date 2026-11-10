@@ -44,14 +44,39 @@ once, and how to rehearse it.
    dig +tcp +short SOA zenr.io @ns1.free2air.org
    ```
 
-3. Choose the registrar the agents use: the proxy each script starts on the laptop, by default,
-   or a shared one ("Against a shared registrar").
+3. Choose the registrar the agents use, the proxy each script starts on the laptop by default or
+   a shared one ("Against a shared registrar"), and the subtrees the names go in ("Where the
+   names go").
 
 4. Record the rehearsal: if the venue's network blocks port 53, the recording is the demo.
 
 A script that stops frees its demo's names (`on_stop: release` in every registrar of the demo's
 templates), so someone else may take them between the rehearsal and the day: check them again
 on the day, as each demo's section says.
+
+### Where the names go
+
+The zone is `zenr.io.`. The demos' names go in two subtrees of it, one for each of the proxy's
+handlers:
+
+- `UPDATE_DOMAIN`: names a key holds, with any records (RFC 9664, `update_handler`), such as
+  D1's `demo.$UPDATE_DOMAIN`.
+- `SRP_DOMAIN`: hosts and the services they register, which DNS-SD browses (RFC 9665,
+  `srp_handler`), such as D1's `demo.$SRP_DOMAIN`; by default `srp.$UPDATE_DOMAIN`. It may be
+  elsewhere in the zone, but not at or above `UPDATE_DOMAIN`: D6's page lists the names in
+  `UPDATE_DOMAIN` outside `SRP_DOMAIN`.
+
+The scripts take both from the environment, and this document writes the names with them, so
+its commands run as written once they are exported, here with the scripts' defaults:
+
+```bash
+export UPDATE_DOMAIN=dev.zenr.io SRP_DOMAIN=srp.dev.zenr.io
+```
+
+A script that starts the proxy on the laptop gives it these two subtrees. The proxy signs its
+updates for each with the key in `keystore/server` at the closest name at or above it, and does
+not start without one. With `REGISTRAR`, they are the registrar's, and a script stops without
+`UPDATE_DOMAIN` ("Against a shared registrar").
 
 ### Demos on two machines
 
@@ -62,32 +87,29 @@ phones reach, unless `ADDRESS` gives the host's and the container publishes the 
 
 ## Against a shared registrar
 
-Every script takes `REGISTRAR`, the address of a registrar that serves the demo's zones, such as
-the public one: the agents send their updates there, in place of the proxy the script otherwise
+Every script takes `REGISTRAR`, the address of a registrar that serves the demo's subtrees, such
+as the public one: the agents send their updates there, in place of the proxy the script otherwise
 starts on the laptop, and the script starts no proxy and checks no ports for it. Its host name is
 not in this repository; its operators give it.
 
 ```bash
-REGISTRAR=<registrar>:8053 demo/run.sh
-REGISTRAR=<registrar>:853 TRANSPORT=tls demo/ipfs.sh member     # over DNS-over-TLS
+REGISTRAR=<registrar>:8053 UPDATE_DOMAIN=<its subtree> demo/run.sh
+REGISTRAR=<registrar>:853 TRANSPORT=tls UPDATE_DOMAIN=<its subtree> demo/ipfs.sh member     # over DNS-over-TLS
 ```
 
 - `TRANSPORT` is how the agents reach it: `tcp`, their default, `udp`, `tls`, or `doh` with
   `REGISTRAR=https://<registrar>`.
-- The demo's zones are `ZONE`, where the names are, and `DOMAIN`, the SRP domain (`ipfs.sh`
-  takes `srp.<ZONE>`); by default `dev.zenr.io` and `srp.dev.zenr.io`, the ones `config.yaml`
-  gives the laptop's proxy. A registrar that serves other zones takes them:
-  `REGISTRAR=<registrar>:<port> ZONE=<zone> DOMAIN=srp.<zone> demo/run.sh`.
-- D3: each node's peer list names the other's name in `ZONE`:
-  `/dnsaddr/site.<zone>/p2p/<B's ID>` on A, `/dnsaddr/a.<zone>/p2p/<A's ID>` on B.
+- `UPDATE_DOMAIN`, and `SRP_DOMAIN` unless it is `srp.$UPDATE_DOMAIN`, are the registrar's
+  subtrees ("Where the names go"), which its operators give with its address.
 - The scripts copy each template they run (`demo/demo.yaml`, `demo/conflict.yaml`,
   `demo/mac.yaml`, and the ones `ipfs.sh` and `chat.sh` write) into their log directory, with
-  each srp registrar's `domain:` the demo's, each rfc9664 name's first label in the demo's
-  zone, and `server: 127.0.0.1:8053` replaced by `REGISTRAR`; the files in `demo/` stay as they are.
+  each srp registrar's `domain:` `SRP_DOMAIN`, each rfc9664 name's first label in
+  `UPDATE_DOMAIN`, and `server: 127.0.0.1:8053` replaced by `REGISTRAR`; the files in `demo/`
+  stay as they are.
 - D6: the page, still served by the laptop, asks the registrar's web server,
   `https://<registrar>/dns-query`, over DNS-over-HTTPS; `DOH=<url>` names another. The phones then
   need the internet, not the laptop's proxy. The registrar serves the page too, at
-  `https://<registrar>/`; its staging instance, on zones of its own, at `https://<registrar>:8444/`
+  `https://<registrar>/`; its staging instance, on subtrees of its own, at `https://<registrar>:8444/`
   (deploy/README.md).
 - Other people use the same registrar: a name another key holds stays theirs ("When something
   fails"), and the registrar's own lease limits apply.
@@ -99,8 +121,9 @@ REGISTRAR=<registrar>:853 TRANSPORT=tls demo/ipfs.sh member     # over DNS-over-
 
 **Needs**: the laptop. Check that the names are free, before the rehearsal and on the day:
 `demo/watch.sh once` shows no `demo` instance, and `(no records)` under the name `demo`. If
-another key holds them, change the label `demo` in `demo/demo.yaml` (the host `demo` and the
-name `demo.dev.zenr.io.`) and run `watch.sh` with `NAME=<the new label>`.
+another key holds them, change the label `demo` in `demo/demo.yaml` (the host `demo`, and the
+name `demo.dev.zenr.io.`, whose first label the scripts put in `UPDATE_DOMAIN`) and run
+`watch.sh` with `NAME=<the new label>`.
 
 **Rehearsal**: `demo/run.sh`, as on the day.
 
@@ -111,23 +134,27 @@ hand instead, use these terminals:
 
 | | Command | What it is |
 |---|---|---|
-| 1 | `$B/sig0lease` | the proxy, on 127.0.0.1:8053: `srp_handler` for `srp.dev.zenr.io.`, `update_handler` for `dev.zenr.io.`, signing upstream with `keystore/server` |
+| 1 | `$B/sig0lease` | the proxy, on 127.0.0.1:8053, with `config.yaml`: `srp_handler` for `srp.dev.zenr.io.`, `update_handler` for `dev.zenr.io.`, signing upstream with `keystore/server` |
 | 2 | `python3 -m http.server 8000 -d demo/site` | the site |
 | 3 | `$B/sig0lease-agent run -probe-interval 5s demo/demo.yaml` | the agent: host `demo`, its services and the name `demo` |
 | 4 | `demo/watch.sh` | what anyone can see, asked of `ns1.free2air.org` every 2 s |
 
+By hand, the subtrees are the ones `config.yaml` and `demo/demo.yaml` give, `dev.zenr.io` and
+`srp.dev.zenr.io`: export them as `UPDATE_DOMAIN` and `SRP_DOMAIN`, or change both files.
+
 What the audience can run:
 
 ```bash
-dig +short demo.dev.zenr.io                         # any machine
-dig +short TXT demo.dev.zenr.io
-dns-sd -B _http._tcp srp.dev.zenr.io                # a Mac: browse
-dns-sd -L "demo http" _http._tcp srp.dev.zenr.io    #        resolve one instance
-avahi-browse -d srp.dev.zenr.io. -r _http._tcp      # Linux with avahi-daemon
+dig +short demo.$UPDATE_DOMAIN                      # any machine
+dig +short TXT demo.$UPDATE_DOMAIN
+dns-sd -B _http._tcp $SRP_DOMAIN                    # a Mac: browse
+dns-sd -L "demo http" _http._tcp $SRP_DOMAIN        #        resolve one instance
+avahi-browse -d $SRP_DOMAIN. -r _http._tcp          # Linux with avahi-daemon
 ```
 
-and, on the same network as the laptop, open `http://demo.srp.dev.zenr.io:8000/`. The addresses
-the agent publishes are the laptop's on that network.
+and, on the same network as the laptop, open `http://demo.$SRP_DOMAIN:8000/`. The addresses
+the agent publishes are the laptop's on that network. `demo/run.sh` prints these with the
+subtrees written out.
 
 Ask the audience to look only once the name is published: a resolver that was told "no such
 name" keeps that answer for up to 6 minutes (the zone's SOA TTL). `@ns1.free2air.org` always
@@ -145,7 +172,7 @@ gives the current answer.
    template every 10 s):
 
    ```bash
-   dig +short TXT hello.demo.dev.zenr.io @ns1.free2air.org
+   dig +short TXT hello.demo.$UPDATE_DOMAIN @ns1.free2air.org
    ```
 
 4. Someone else wants the same names. In a fifth terminal:
@@ -181,11 +208,11 @@ a small always-on machine in real life), keeps every version of it and serves it
 
 | Record | Published by | Changes when |
 |---|---|---|
-| `_dnslink.a.dev.zenr.io` | A | A's folder changes: the folder's CID, read from A's node |
-| `_dnsaddr.a.dev.zenr.io` | A | A's node's addresses change; withdrawn while the node is down |
-| `_dnslink.site.dev.zenr.io` | B | B's node has pinned all of a new version of `a`'s folder |
-| `_dnsaddr.site.dev.zenr.io` | B | B's node's addresses change |
-| `b ipfs-gateway` in `srp.dev.zenr.io` | B | B's gateway starts or stops answering |
+| `_dnslink.a.$UPDATE_DOMAIN` | A | A's folder changes: the folder's CID, read from A's node |
+| `_dnsaddr.a.$UPDATE_DOMAIN` | A | A's node's addresses change; withdrawn while the node is down |
+| `_dnslink.site.$UPDATE_DOMAIN` | B | B's node has pinned all of a new version of `a`'s folder |
+| `_dnsaddr.site.$UPDATE_DOMAIN` | B | B's node's addresses change |
+| `b ipfs-gateway` in `$SRP_DOMAIN` | B | B's gateway starts or stops answering |
 
 B's agent reads `a`'s folder through its proxy, which answers from `ns1.free2air.org`: B follows
 each change as soon as the zone has it.
@@ -199,7 +226,7 @@ each change as soon as the zone has it.
   `sudo apt install qrencode` on Linux.
 - Phones on the network, which reach B's port 8080.
 - The names `a` and `site` free, before the rehearsal and on the day:
-  `dig +short KEY a.dev.zenr.io @ns1.free2air.org` answers nothing, and so for `site`.
+  `dig +short KEY a.$UPDATE_DOMAIN @ns1.free2air.org` answers nothing, and so for `site`.
 
 Once, on each node: quit IPFS Desktop, or stop `ipfs daemon`, then
 
@@ -222,8 +249,8 @@ printf '/key/swarm/psk/1.0.0/\n/base16/\n%s\n' "$(openssl rand -hex 32)" > ~/.ip
 ```
 
 Each node's peer list is the other's name, whose addresses the agents publish:
-`ipfs bootstrap add /dnsaddr/site.dev.zenr.io/p2p/<B's ID>` on A,
-`ipfs bootstrap add /dnsaddr/a.dev.zenr.io/p2p/<A's ID>` on B. Start the nodes again:
+`ipfs bootstrap add /dnsaddr/site.$UPDATE_DOMAIN/p2p/<B's ID>` on A,
+`ipfs bootstrap add /dnsaddr/a.$UPDATE_DOMAIN/p2p/<A's ID>` on B. Start the nodes again:
 `ipfs daemon` says "Swarm is limited to private network of peers with the swarm key", and,
 until the agents publish those names, "failed to bootstrap (no peers found)": it tries again by
 itself. On A, make the folder, `ipfs files mkdir /community` (IPFS Desktop: Files, New folder),
@@ -241,11 +268,13 @@ ipfs init
 ipfs config Addresses.API /ip4/127.0.0.1/tcp/5002
 ipfs config --json Addresses.Swarm '["/ip4/0.0.0.0/tcp/4002", "/ip4/0.0.0.0/udp/4002/quic-v1"]'
 cp ~/.ipfs/swarm.key ~/.ipfs-b/                    # A's key
-ipfs bootstrap add /dnsaddr/a.dev.zenr.io/p2p/<A's ID>
+ipfs bootstrap add /dnsaddr/a.$UPDATE_DOMAIN/p2p/<A's ID>
 ipfs daemon
 ```
 
-and A's peer list gets B's ID as above. Then, each in a terminal of its own:
+and A's peer list gets B's ID as above. Then, each in a terminal of its own, with
+`UPDATE_DOMAIN` and `SRP_DOMAIN` exported as the subtrees of `config.yaml`, which the proxy
+started by hand serves (`dev.zenr.io` and `srp.dev.zenr.io`):
 
 ```bash
 $B/sig0lease                                       # the proxy both use
@@ -263,19 +292,19 @@ On the day:
    `demo/ipfs.sh community`: B's node reaches A's at `_dnsaddr.a`'s addresses (A's Peers now
    lists B, its only peer), pins the folder, and `_dnslink.site` appears. B's script then prints
    the address of B's gateway, with a QR code:
-   `http://b.srp.dev.zenr.io:8080/ipns/site.dev.zenr.io/`.
+   `http://b.$SRP_DOMAIN:8080/ipns/site.$UPDATE_DOMAIN/`.
 3. Phones scan it: the folder's files.
 4. Drag a photo into `/community` on A (IPFS Desktop, Files). Within about 15 s `_dnslink.a`
    changes; B pins the new version, and `_dnslink.site` follows, again within about 15 s: each
    agent asks its node, and B's asks for `a`, every 10 s. A phone's reload shows the photo
    within about a minute: B's gateway asks for `site` again once its TTL, 30 s, is over.
-5. `https://dweb.link/ipns/site.dev.zenr.io/`, a public gateway, reads the name but cannot find
+5. `https://dweb.link/ipns/site.$UPDATE_DOMAIN/`, a public gateway, reads the name but cannot find
    the folder: no node outside the private swarm has it.
 6. A leaves: Enter in A's `ipfs.sh`, and quit IPFS Desktop. `a`'s records go; `site` stays, and
    phones still load the folder from B.
 
 B's node keeps the last version pinned after the demo, under the name
-`sig0lease-agent site.dev.zenr.io.` (`ipfs pin ls --type=recursive --names`), and the next start
+`sig0lease-agent site.$UPDATE_DOMAIN.` (`ipfs pin ls --type=recursive --names`), and the next start
 gives it as `site` until `a` publishes again.
 
 Why a DNS record, and not IPNS, IPFS's own name for content that changes: an IPNS name is the
@@ -291,19 +320,19 @@ its TTL.
 ## D4: an audience Mac finds them without being told where
 
 **Needs**: a Mac in the audience, whose owner may run `sudo`, and a demo running whose agent
-registers `_http._tcp` services in `srp.dev.zenr.io`: D1 or D6.
+registers `_http._tcp` services in `$SRP_DOMAIN`: D1 or D6.
 
 **Rehearsal**: on any Mac, the laptop itself included, while `demo/run.sh` runs.
 
 On a Mac in the audience:
 
 ```bash
-sudo networksetup -setsearchdomains Wi-Fi srp.dev.zenr.io
-dns-sd -B _http._tcp          # no domain: the local. and srp.dev.zenr.io. instances together
+sudo networksetup -setsearchdomains Wi-Fi $SRP_DOMAIN
+dns-sd -B _http._tcp          # no domain: the local. and $SRP_DOMAIN. instances together
 sudo networksetup -setsearchdomains Wi-Fi Empty                # undo
 ```
 
-The proxy publishes `lb._dns-sd._udp.srp.dev.zenr.io. PTR srp.dev.zenr.io.` (within 30 s of
+The proxy publishes `lb._dns-sd._udp.$SRP_DOMAIN. PTR $SRP_DOMAIN.` (within 30 s of
 starting, and it stays when the proxy stops); mDNSResponder looks for that record in each search
 domain and browses what it names (RFC 6763 §11). This works with `dns-sd` on macOS 26.7; whether
 Finder and Screen Sharing list the instances too has not been tried. Setting the search domain
@@ -313,7 +342,7 @@ or a resolver on the network: `docs/dns-sd-records.md`, "Browsing".
 ## D5: two communities meet in one chat room
 
 Two machines, A and B, each run an XMPP server (Prosody) for a community: A's guests get
-addresses at `chat-a.dev.zenr.io` and its rooms are at `rooms.chat-a.dev.zenr.io`; B's, at
+addresses at `chat-a.$UPDATE_DOMAIN` and its rooms are at `rooms.chat-a.$UPDATE_DOMAIN`; B's, at
 `chat-b`. The agent on each publishes its server's addresses, the SRV records that tell other
 servers where it listens (`_xmpp-server._tcp`, for the name and for `rooms`) and clients where to
 log in (`_xmpp-client._tcp`), and a TLSA record with the hash of the server's key. The
@@ -330,12 +359,12 @@ nobody makes an account.
 - Ports 5222, 5269 and 5280 open to the network on each.
 - Phones on the network, which also reach the internet, for Converse.js.
 - The names `chat-a` and `chat-b` free, before the rehearsal and on the day:
-  `dig +short KEY chat-a.dev.zenr.io @ns1.free2air.org` answers nothing, and so for `chat-b`.
+  `dig +short KEY chat-a.$UPDATE_DOMAIN @ns1.free2air.org` answers nothing, and so for `chat-b`.
 
 **Rehearsal**: on one machine, `demo/chat.sh chat-a chat-b`, which gives the second server ports
 10 above: 5232, 5279, 5290.
 
-1. On A, `demo/chat.sh chat-a`; on B, `ROOM=meet@rooms.chat-a.dev.zenr.io demo/chat.sh chat-b`.
+1. On A, `demo/chat.sh chat-a`; on B, `ROOM=meet@rooms.chat-a.$UPDATE_DOMAIN demo/chat.sh chat-b`.
    Each starts its proxy, its server (in Docker on a Mac, Prosody installed on Linux;
    `PROSODY=docker` or `native` chooses) and its agent, waits until `ns1.free2air.org` has the
    records, and prints the address of the page its server serves, and its QR code. On a Mac,
@@ -344,12 +373,12 @@ nobody makes an account.
 2. Show what the other server reads:
 
    ```bash
-   dig +short SRV _xmpp-server._tcp.rooms.chat-a.dev.zenr.io     # 0 0 5269 chat-a.dev.zenr.io.
-   dig +dnssec TLSA _5269._tcp.chat-a.dev.zenr.io @8.8.8.8      # the ad flag: validated
+   dig +short SRV _xmpp-server._tcp.rooms.chat-a.$UPDATE_DOMAIN   # 0 0 5269 chat-a.<UPDATE_DOMAIN>.
+   dig +dnssec TLSA _5269._tcp.chat-a.$UPDATE_DOMAIN @8.8.8.8    # the ad flag: validated
    ```
 
 3. Half the room scans A's QR code, half B's. The page (Converse.js) logs each phone in as a
-   guest of that server and joins `meet@rooms.chat-a.dev.zenr.io`; the first one in creates the
+   guest of that server and joins `meet@rooms.chat-a.$UPDATE_DOMAIN`; the first one in creates the
    room. B's guests' messages reach A's room over a connection between the servers that each end
    authenticated by the other's TLSA record.
 4. Enter, or Ctrl-C, in `chat.sh` stops the agent first, which frees the names, then the server
@@ -359,19 +388,19 @@ Phones talk to their server over plain HTTP on the venue's network, so the guest
 not encrypted there; the servers talk to each other over TLS. Each server keeps its certificate
 and key in `demo/chat/servers/<name>/`, so its TLSA record is the same at every run; delete the
 directory for a new key. A server whose key its TLSA record does not match is refused
-("certificate does not match any DANE TLSA records" in the other server's log), as the
-rehearsal on `dev.zenr.io` checked.
+("certificate does not match any DANE TLSA records" in the other server's log), as a rehearsal
+checked.
 
 ## D6: the zone in a browser
 
 The page has a DNS client in it: this repository's client code, built for WebAssembly
 (`make web`). It sends every question and every update to the laptop's proxy over
 DNS-over-HTTPS, the one DNS transport a browser has, and the proxy answers the questions about
-its zones from the zone's own server: the page sees a change as soon as `ns1.free2air.org` has
-it, not what a resolver cached. A question about a name outside the zones, such as the address
+its subtrees from the zone's own server: the page sees a change as soon as `ns1.free2air.org`
+has it, not what a resolver cached. A question about a name outside them, such as the address
 of a service's host elsewhere, the proxy refuses, as it is no resolver, and the page asks
-Google's DNS-over-HTTPS resolver instead, over the internet. The names in the zone, which are
-typed rather than browsed, the page finds by the zone's NSEC records (the zone is signed with
+Google's DNS-over-HTTPS resolver instead, over the internet. The names in `UPDATE_DOMAIN`, which
+are typed rather than browsed, the page finds by the zone's NSEC records (the zone is signed with
 NSEC): each one names the next name in the zone, and the types of records at its own.
 
 **Needs**: the laptop, with `qrencode`, as for D3, and D1's names free; phones on the same
@@ -386,18 +415,18 @@ the address it prints.
    DNS-over-HTTPS listener on (port 8443, plain HTTP); a site and an agent that registers it as
    the service `demo http`, as in D1 (`demo/demo.yaml`); and the page, on port 8090. It prints
    the page's address and its QR code.
-2. Phones scan the code. The page lists the services in `srp.dev.zenr.io`, read every 3
-   seconds, and the names in `dev.zenr.io` outside it, read every 10: each name a key holds,
-   such as `demo.dev.zenr.io`, with its records and those of the names below it, and the
+2. Phones scan the code. The page lists the services in `$SRP_DOMAIN`, read every 3
+   seconds, and the names in `$UPDATE_DOMAIN` outside it, read every 10: each name a key holds,
+   such as `demo.$UPDATE_DOMAIN`, with its records and those of the names below it, and the
    zone's other names, marked `no key`. At the next Enter, `web.sh` stops the site, and after
    three failed probes, about 15 s, the phones show `demo http` leave, struck through; at the
    one after, it starts the site again, and `demo http` comes back, lit up.
 3. Someone picks a name and writes a message. The browser makes a key and keeps it, and the page
-   claims `<name>.dev.zenr.io` with the message as its TXT record. The badge turns `published`
+   claims `<name>.$UPDATE_DOMAIN` with the message as its TXT record. The badge turns `published`
    once the zone's server has it, within a few seconds, and anyone can check:
 
    ```bash
-   dig +short TXT <name>.dev.zenr.io @ns1.free2air.org
+   dig +short TXT <name>.$UPDATE_DOMAIN @ns1.free2air.org
    ```
 
    Within 10 s every phone lists the name, marked `yours` on the phone that holds it. A second
@@ -427,6 +456,10 @@ nobody can forge one, but anyone there can read them.
 
 - A script stops at once: "Port 8053, for this demo's proxy, is in use". Another demo still runs,
   or the proxy of D1's terminal 1: stop it, then start the script again.
+- The proxy stops at once: "the lease store of `<handler>` holds `<name>`, which it does not
+  serve" in `proxy.log`. Its lease stores, in `data/`, hold names from a run with other
+  subtrees, which an earlier run did not free: D6's phones' claims stay up to 30 minutes, or a
+  script was killed. Run a demo with those subtrees until their leases are over, then stop it.
 - The proxy logs errors reaching `ns1.free2air.org`: the network blocks port 53. Use a phone's
   hotspot, or the recording.
 - The agent logs a name held by another key: change the label `demo` (D1, "Needs").
@@ -434,7 +467,7 @@ nobody can forge one, but anyone there can read them.
   nobody: both `ipfs daemon` logs show the same swarm key fingerprint? B's resolver may have
   answered "no such name" for `_dnsaddr.a` before A published it, and keeps that answer for up
   to 6 minutes: connect by hand, `ipfs swarm connect <address>`, with an address from
-  `dig +short TXT _dnsaddr.a.dev.zenr.io @ns1.free2air.org`. The log in the directory B's script
+  `dig +short TXT _dnsaddr.a.$UPDATE_DOMAIN @ns1.free2air.org`. The log in the directory B's script
   printed says what B's agent waits for (`agent.log`).
 - D3: phones get no answer from B's gateway: it listens on 127.0.0.1 only (`Addresses.Gateway`,
   D3's "Needs"), and then `b ipfs-gateway` is not registered either.
@@ -459,5 +492,5 @@ nobody can forge one, but anyone there can read them.
   `web.sh` printed a Docker or VPN address, give the venue's with `ADDRESS=<address>`.
 - D6: a claim stays `waiting` with no other message shown: the log under the page says why.
 - D6: the page cannot read the names, as the zone "has no NSEC record": it is not signed with
-  NSEC, as `ZONE` may not be ("Against a shared registrar"). The services and the claims still
-  work.
+  NSEC, as a shared registrar's zone may not be ("Against a shared registrar"). The services and
+  the claims still work.
