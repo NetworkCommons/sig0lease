@@ -4,16 +4,12 @@
 # instances browsing finds in the SRP domain, and the records the demo names have. Ctrl-C stops
 # it.
 #
-# NS, DOMAIN, ZONE and NAME change what it asks; defaults: ns1.free2air.org, srp.dev.zenr.io,
-# dev.zenr.io, demo. NAME may list several names, as D3's "a site".
+# NS, UPDATE_DOMAIN and SRP_DOMAIN change what it asks, as for the other scripts (demo/lib.sh);
+# NAME, the names' labels, default demo, may list several, as D3's "a site".
 
-ns="${NS:-ns1.free2air.org}"
-domain="${DOMAIN:-srp.dev.zenr.io}"
-zone="${ZONE:-dev.zenr.io}"
+. "$(dirname "$0")/lib.sh"
 read -r -a names <<< "${NAME:-demo}"
 every="${1:-2}"
-
-ask() { dig +short +time=2 +tries=1 "@$ns" "$@"; }
 
 # line <label> <answers> -- one record set, if there is one.
 line() {
@@ -23,10 +19,10 @@ line() {
 show() {
     echo "$(date +%H:%M:%S), asked of $ns"
     echo
-    echo "Browsing $domain (RFC 6763, registered over RFC 9665):"
+    echo "Browsing $srp_domain (RFC 6763, registered over RFC 9665):"
     local type instance label srv target found=
-    for type in $(ask PTR "_services._dns-sd._udp.$domain" | sort); do
-        echo "  ${type%".$domain."}"
+    for type in $(ask PTR "_services._dns-sd._udp.$srp_domain" | sort); do
+        echo "  ${type%".$srp_domain."}"
         for instance in $(ask PTR "$type" | sort); do
             found=1
             label="${instance%".$type"}"
@@ -40,14 +36,14 @@ show() {
     local name records
     for name in "${names[@]}"; do
         echo
-        echo "Name $name.$zone (RFC 9664):"
+        echo "Name $name.$update_domain (RFC 9664):"
         records="$(
-            line "KEY" "$(ask KEY "$name.$zone" | cut -c1-40)"
-            line "A, AAAA" "$(ask A "$name.$zone"; ask AAAA "$name.$zone")"
-            line "TXT" "$(ask TXT "$name.$zone")"
-            line "_dnslink TXT" "$(ask TXT "_dnslink.$name.$zone")"
-            line "_dnsaddr TXT" "$(ask TXT "_dnsaddr.$name.$zone")"
-            line "hello TXT" "$(ask TXT "hello.$name.$zone")"
+            line "KEY" "$(ask KEY "$name.$update_domain" | cut -c1-40)"
+            line "A, AAAA" "$(ask A "$name.$update_domain"; ask AAAA "$name.$update_domain")"
+            line "TXT" "$(ask TXT "$name.$update_domain")"
+            line "_dnslink TXT" "$(ask TXT "_dnslink.$name.$update_domain")"
+            line "_dnsaddr TXT" "$(ask TXT "_dnsaddr.$name.$update_domain")"
+            line "hello TXT" "$(ask TXT "hello.$name.$update_domain")"
         )"
         echo "${records:-  (no records)}"
     done

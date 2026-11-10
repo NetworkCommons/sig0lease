@@ -101,9 +101,9 @@ neither, nor `config.yaml`, deploys nothing. Neither records the commit: the rel
 (docs/demo.md, "Against a shared registrar"), and its page is at `https://<registrar>:8444/`.
 
 ```bash
-REGISTRAR=<registrar>:8054 ZONE=stg.zenr.io DOMAIN=srp.stg.zenr.io demo/run.sh
-REGISTRAR=<registrar>:8054 ZONE=stg.zenr.io DOMAIN=srp.stg.zenr.io DOH=https://<registrar>:8444 demo/web.sh
-REGISTRAR=<registrar>:8054 ZONE=stg.zenr.io demo/ipfs.sh member     # community on B
+REGISTRAR=<registrar>:8054 UPDATE_DOMAIN=stg.zenr.io SRP_DOMAIN=srp.stg.zenr.io demo/run.sh
+REGISTRAR=<registrar>:8054 UPDATE_DOMAIN=stg.zenr.io SRP_DOMAIN=srp.stg.zenr.io DOH=https://<registrar>:8444 demo/web.sh
+REGISTRAR=<registrar>:8054 UPDATE_DOMAIN=stg.zenr.io demo/ipfs.sh member     # community on B
 ```
 
 `demo/web.sh` takes staging's DNS-over-HTTPS with `DOH`: without it, the page asks

@@ -7,9 +7,9 @@
 <!-- D6 of docs/demo.md: make web builds this page into bin/web, beside sig0lease-web.wasm.gz (cmd/sig0lease-web)
      and Go's wasm_exec.js; demo/web.sh serves it. Query parameters: doh, the proxy's DNS-over-HTTPS server
      (default the page's own origin, as on the registrar, whose web server serves both; demo/web.sh
-     always gives it); zone, where names are claimed, and whose names are listed, by its NSEC chain
-     (default dev.zenr.io); domain, the DNS-SD domain shown, left out of the names (default
-     srp.dev.zenr.io); ns, a server for the dig commands shown (default none). -->
+     always gives it); update_domain, where names are claimed, and whose names are listed, by the
+     zone's NSEC chain (required); srp_domain, the DNS-SD domain shown, left out of the names
+     (default srp.<update_domain>); ns, a server for the dig commands shown (default none). -->
 <style>
   :root { --fg: #222; --bg: #fafafa; --muted: #666; --line: #ddd; --code: #eee; --card: #fff;
           --new: #d7f5dd; --gone: #f9dcdc; --ok: #1a7f37; --wait: #9a6700; --err: #c62828; }
@@ -58,7 +58,7 @@
   <form id="claim-form">
     <input id="label" required autocomplete="off" autocapitalize="none" spellcheck="false" placeholder="yourname"
            pattern="[a-z0-9]([a-z0-9\-]{0,61}[a-z0-9])?" title="letters, digits and hyphens">
-    <span>.<span class="zone"></span></span>
+    <span>.<span class="update-domain"></span></span>
     <input id="message" maxlength="140" placeholder="a short message">
     <button id="claim" disabled>Claim</button>
   </form>
@@ -72,13 +72,13 @@
 </section>
 
 <section>
-  <h2>Services in <code id="domain"></code></h2>
+  <h2>Services in <code id="srp-domain"></code></h2>
   <p class="muted" id="browse-status"></p>
   <ul class="types" id="types"></ul>
 </section>
 
 <section>
-  <h2>Names in <code class="zone"></code></h2>
+  <h2>Names in <code class="update-domain"></code></h2>
   <p class="muted">Typed rather than browsed: each name a key holds, as yours does, with its records, and the
   zone's other names.</p>
   <p class="muted" id="names-status"></p>
@@ -89,7 +89,7 @@
   <h2>Look up a name</h2>
   <form id="lookup-form">
     <input id="lookup-label" required autocomplete="off" autocapitalize="none" spellcheck="false" placeholder="name">
-    <span>.<span class="zone"></span></span>
+    <span>.<span class="update-domain"></span></span>
     <button id="lookup" disabled>Look up</button>
   </form>
   <p id="lookup-result"></p>
@@ -104,10 +104,11 @@
 <script>
 "use strict";
 const params = new URLSearchParams(location.search);
+const updateDomain = params.get("update_domain") || "";
 const cfg = {
   doh: params.get("doh") || location.origin,
-  zone: params.get("zone") || "dev.zenr.io",
-  domain: params.get("domain") || "srp.dev.zenr.io",
+  updateDomain,
+  srpDomain: params.get("srp_domain") || (updateDomain && `srp.${updateDomain}`),
 };
 const ns = params.get("ns");
 const every = 3000; // ms between two readings of the services, and of the name claimed
@@ -129,8 +130,8 @@ function log(line) {
 
 function dig(type, name) { return `dig +short ${type} ${name}` + (ns ? ` @${ns}` : ""); }
 
-for (const z of document.querySelectorAll(".zone")) z.textContent = cfg.zone;
-$("domain").textContent = cfg.domain;
+for (const z of document.querySelectorAll(".update-domain")) z.textContent = cfg.updateDomain;
+$("srp-domain").textContent = cfg.srpDomain;
 
 // board returns the function that draws a list into ul, reading after reading. A reading is a
 // list of groups {key, head, items}, each item {key, li}: head() makes the group's heading, and
@@ -202,7 +203,7 @@ async function browseLoop() {
     $("browse-status").textContent = `Read at ${new Date().toLocaleTimeString()}, every ${every / 1000} s.`;
     $("browse-status").className = "muted";
   } catch (e) {
-    $("browse-status").textContent = `Could not read ${cfg.domain}: ${e.message}`;
+    $("browse-status").textContent = `Could not read ${cfg.srpDomain}: ${e.message}`;
     $("browse-status").className = "err";
   }
   setTimeout(browseLoop, every);
@@ -215,7 +216,7 @@ function nameHead(n) {
   const d = el("div");
   d.append(el("span", "name", n.name.replace(/\.$/, "")));
   if (!n.key) d.append(" ", el("span", "badge muted", "no key"));
-  if (mine && sameName(n.name, `${mine.label}.${cfg.zone}`)) d.append(" ", el("span", "badge ok", "yours"));
+  if (mine && sameName(n.name, `${mine.label}.${cfg.updateDomain}`)) d.append(" ", el("span", "badge ok", "yours"));
   if (!n.records.length) d.append(el("div", "muted", "no records"));
   return d;
 }
@@ -245,7 +246,7 @@ async function namesLoop() {
     $("names-status").textContent = `Read at ${new Date().toLocaleTimeString()}, every ${namesEvery / 1000} s.`;
     $("names-status").className = "muted";
   } catch (e) {
-    $("names-status").textContent = `Could not read the names in ${cfg.zone}: ${e.message}`;
+    $("names-status").textContent = `Could not read the names in ${cfg.updateDomain}: ${e.message}`;
     $("names-status").className = "err";
   }
   setTimeout(namesLoop, namesEvery);
@@ -257,7 +258,7 @@ let mine = null; // {label, message} while a name is claimed
 function showMine() {
   $("mine").hidden = !mine;
   if (!mine) return;
-  const name = `${mine.label}.${cfg.zone}`;
+  const name = `${mine.label}.${cfg.updateDomain}`;
   $("mine-name").textContent = name;
   $("mine-dig").textContent = dig("TXT", name);
   $("mine-state").textContent = "waiting";
@@ -332,7 +333,7 @@ $("lookup-form").addEventListener("submit", async (ev) => {
   out.textContent = "…";
   try {
     const got = await sig0lease.message(label);
-    out.textContent = got.length ? got.join(" ") : `${label}.${cfg.zone} has no message.`;
+    out.textContent = got.length ? got.join(" ") : `${label}.${cfg.updateDomain} has no message.`;
     if (!got.length) out.className = "muted";
   } catch (e) {
     out.textContent = e.message;
@@ -348,6 +349,7 @@ $("lookup-form").addEventListener("submit", async (ev) => {
     const wasm = await new Response(resp.body.pipeThrough(new DecompressionStream("gzip"))).arrayBuffer();
     const { instance } = await WebAssembly.instantiate(wasm, go.importObject);
     go.run(instance); // sets the global sig0lease, then waits for calls
+    if (!cfg.updateDomain) throw new Error("the page's address gives no update_domain");
     await sig0lease.start({ ...cfg, log });
     $("status").textContent = `A DNS client running in this page asks the proxy at ${cfg.doh}, over DNS-over-HTTPS. The proxy answers from the zone's own server.`;
     $("claim").disabled = $("lookup").disabled = false;
@@ -364,7 +366,7 @@ $("lookup-form").addEventListener("submit", async (ev) => {
       await sig0lease.claim(c.label, c.message);
       mine = c;
       showMine();
-      log(`resumed the claim of ${c.label}.${cfg.zone}`);
+      log(`resumed the claim of ${c.label}.${cfg.updateDomain}`);
     }
   } catch (e) {
     claimError(e);

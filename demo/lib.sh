@@ -1,7 +1,6 @@
-# demo/lib.sh -- what the demo's scripts (run.sh, chat.sh, web.sh, ipfs.sh) share, sourced by
-# them. They set B, the binaries' directory, log, the directory for the programs' logs, ns, the
-# server ask() asks, zone, the RFC 9664 zone, and domain, the SRP domain, if they have one, before
-# using these.
+# demo/lib.sh -- what the demo's scripts (run.sh, chat.sh, web.sh, ipfs.sh, watch.sh) share,
+# sourced by them. It sets ns, update_domain and srp_domain, below; the scripts set B, the
+# binaries' directory, and log, the directory for the programs' logs, before using the rest.
 #
 # REGISTRAR, when set, is the registrar the agents send their updates to, in place of the proxy
 # each demo otherwise starts on this machine, at 127.0.0.1:8053: a shared one, as the public
@@ -16,6 +15,23 @@ fi
 
 # remote -- whether the demo uses REGISTRAR, and starts no proxy.
 remote() { [ -n "${REGISTRAR:-}" ]; }
+
+# NS, ns: the server ask() asks, the zone's authoritative one; default ns1.free2air.org.
+# UPDATE_DOMAIN and SRP_DOMAIN, update_domain and srp_domain: the two subtrees of the zone where
+# the demo's names go (docs/demo.md, "Where the names go"): names a key holds, with any records
+# (RFC 9664, the proxy's update_handler), and hosts with the services they register (RFC 9665,
+# srp_handler). Without REGISTRAR, they are what the proxy the demo starts serves (proxy_config),
+# UPDATE_DOMAIN by default dev.zenr.io. With REGISTRAR, they are the registrar's, and
+# UPDATE_DOMAIN has to be given. SRP_DOMAIN is srp.<UPDATE_DOMAIN> by default.
+ns="${NS:-ns1.free2air.org}"
+if remote && [ -z "${UPDATE_DOMAIN:-}" ]; then
+    echo "UPDATE_DOMAIN is where REGISTRAR takes the demo's names, and SRP_DOMAIN its hosts, if not srp.<UPDATE_DOMAIN>: give them (docs/demo.md, \"Against a shared registrar\")" >&2
+    exit 1
+fi
+update_domain="${UPDATE_DOMAIN:-dev.zenr.io}"
+update_domain="${update_domain%.}"
+srp_domain="${SRP_DOMAIN:-srp.$update_domain}"
+srp_domain="${srp_domain%.}"
 
 # via -- how the demo's updates reach the zone, for the scripts' messages; our_proxy -- "the
 # proxy, " when the demo starts one, for the steps that list what they start and stop.
@@ -86,35 +102,54 @@ build() {
     make -s "${targets[@]}" || exit 1
 }
 
-# start_proxy [config] -- starts this demo's proxy, with config.yaml or the config given; with
-# REGISTRAR, nothing.
+# proxy_config -- writes $log/config.yaml, the config of the proxy the demo starts: config.yaml,
+# with srp_handler's upstream_zone SRP_DOMAIN and update_handler's UPDATE_DOMAIN. The proxy signs
+# its updates for each with the key in keystore/server at the closest name at or above it, and
+# does not start without one. With REGISTRAR, nothing.
+proxy_config() {
+    remote && return 0
+    awk -v srp="$srp_domain." -v update="$update_domain." '
+        /^[^ #]/ { handlers = /^handlers:/ }
+        handlers && /^  [a-z_]+:/ { block = $1 }
+        handlers && /^    upstream_zone:/ && (block == "srp_handler:" || block == "update:") {
+            sub(/upstream_zone: .*/, "upstream_zone: \"" (block == "update:" ? update : srp) "\"")
+            n++
+        }
+        { print }
+        END { exit n != 2 }' config.yaml > "$log/config.yaml" || {
+        echo "Could not give the proxy the demo's subtrees in $log/config.yaml: config.yaml no longer has one upstream_zone line in handlers.srp_handler and one in handlers.update" >&2
+        exit 1
+    }
+}
+
+# start_proxy -- starts this demo's proxy, with $log/config.yaml (proxy_config); with REGISTRAR,
+# nothing.
 start_proxy() {
     remote && return 0
-    start proxy proxy.log "$B/sig0lease" "$@"
+    start proxy proxy.log "$B/sig0lease" "$log/config.yaml"
 }
 
 # template <file> <copy> -- copies an agent template for this run (the copy may be the file): a
 # relative keystore made absolute, as the agent takes it relative to the template's directory;
-# each srp registrar's domain the demo's (DOMAIN), and each rfc9664 name, given in full on one
-# "- name:" line, its first label in the demo's ZONE; and with REGISTRAR each registrar's server,
-# this machine's proxy (127.0.0.1:8053), replaced by REGISTRAR, with TRANSPORT.
+# each srp registrar's domain SRP_DOMAIN, and each rfc9664 name, given in full on one "- name:"
+# line, its first label in UPDATE_DOMAIN; and with REGISTRAR each registrar's server, this
+# machine's proxy (127.0.0.1:8053), replaced by REGISTRAR, with TRANSPORT.
 template() {
     local dir
     dir="$(cd "$(dirname "$1")" && pwd)" || exit 1
     awk -v dir="$dir" -v server="${REGISTRAR:-}" -v transport="${TRANSPORT:-}" \
-        -v zone="${zone:-}" -v domain="${domain:-}" '
-        BEGIN { sub(/[.]$/, "", zone); sub(/[.]$/, "", domain) }
+        -v update="$update_domain" -v srp="$srp_domain" '
         /^keystore: [^\/ #]/ { sub(/^keystore: /, "keystore: " dir "/") }
         /^ *- protocol: / { names = /protocol: rfc9664/ }
-        zone != "" && names && match($0, /^ *- name: [^ .#]+[.][^ #]*/) {
+        names && match($0, /^ *- name: [^ .#]+[.][^ #]*/) {
             head = substr($0, 1, RSTART + RLENGTH - 1)
             label = head
             sub(/^ *- name: /, "", label)
             sub(/[.].*/, "", label)
-            sub(/name: .*/, "name: " label "." zone ".", head)
+            sub(/name: .*/, "name: " label "." update ".", head)
             $0 = head substr($0, RSTART + RLENGTH)
         }
-        domain != "" && /^ *domain: / { sub(/domain: [^ #]*/, "domain: " domain ".") }
+        /^ *domain: / { sub(/domain: [^ #]*/, "domain: " srp ".") }
         server != "" && /^ *server: 127\.0\.0\.1:8053/ {
             indent = $0
             sub(/[^ ].*/, "", indent)
@@ -155,8 +190,8 @@ wait_until() {
 }
 
 # D1's site, which D6 (web.sh) starts too: demo/demo.yaml's host registers it as "<name> http",
-# in the SRP domain, while it answers. listed uses domain, which the script sets.
+# in SRP_DOMAIN, while it answers.
 start_site() { start site site.log python3 -m http.server 8000 -d demo/site; }
 
-# listed <instance> -- whether browsing the domain's HTTP services lists the instance.
-listed() { ask PTR "_http._tcp.$domain" | grep -qF "$1._http._tcp.$domain."; }
+# listed <instance> -- whether browsing SRP_DOMAIN's HTTP services lists the instance.
+listed() { ask PTR "_http._tcp.$srp_domain" | grep -qF "$1._http._tcp.$srp_domain."; }

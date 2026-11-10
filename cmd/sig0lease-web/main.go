@@ -3,12 +3,14 @@
 // Command sig0lease-web is the program of the demo's browser page (docs/demo.md, D6): a
 // client/web Page, as the global object sig0lease, whose functions all return a Promise:
 //
-//	sig0lease.start({doh, zone, domain, log})  starts the Page (web.Config): the proxy's DoH
-//	                                           server, the zone names are claimed in, the
-//	                                           DNS-SD domain browsed, and a function that takes
+//	sig0lease.start({doh, updateDomain, srpDomain, log})
+//	                                           starts the Page (web.Config): the proxy's DoH
+//	                                           server, where names are claimed (the RFC 9664
+//	                                           handler's subtree), the DNS-SD domain browsed
+//	                                           (the SRP handler's), and a function that takes
 //	                                           each log line
-//	sig0lease.browse()                          the domain: {domain, types, instances}
-//	sig0lease.names()                           the names in the zone, outside the domain:
+//	sig0lease.browse()                          the SRP domain: {domain, types, instances}
+//	sig0lease.names()                           the names in updateDomain, outside srpDomain:
 //	                                           [{name, key, records: [{owner, type, data}]}]
 //	sig0lease.message(label)                    the strings of the TXT records at the name
 //	sig0lease.claimed()                         the claim the browser keeps, {label, message},
@@ -75,7 +77,7 @@ func start(args []js.Value) (err error) {
 		return errors.New("sig0lease is started already")
 	}
 	if len(args) != 1 || args[0].Type() != js.TypeObject {
-		return errors.New("start takes one object: {doh, zone, domain, log}")
+		return errors.New("start takes one object: {doh, updateDomain, srpDomain, log}")
 	}
 	o := args[0]
 	log := o.Get("log")
@@ -87,12 +89,12 @@ func start(args []js.Value) (err error) {
 		return err
 	}
 	page, err = web.New(web.Config{
-		DoH:      field(o, "doh"),
-		Zone:     field(o, "zone"),
-		Domain:   field(o, "domain"),
-		Storage:  storage,
-		Fallback: fallback,
-		Logf:     func(format string, a ...any) { log.Invoke(fmt.Sprintf(format, a...)) },
+		DoH:          field(o, "doh"),
+		UpdateDomain: field(o, "updateDomain"),
+		SRPDomain:    field(o, "srpDomain"),
+		Storage:      storage,
+		Fallback:     fallback,
+		Logf:         func(format string, a ...any) { log.Invoke(fmt.Sprintf(format, a...)) },
 	})
 	return err
 }

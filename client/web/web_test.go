@@ -126,7 +126,7 @@ func (p *proxy) none(t *testing.T) {
 
 func newPage(t *testing.T, p *proxy, s Storage) *Page {
 	t.Helper()
-	page, err := New(Config{DoH: "http://proxy:8443", Zone: "dev.zenr.io", Domain: "srp.dev.zenr.io", Storage: s, Send: p.send, Logf: t.Logf})
+	page, err := New(Config{DoH: "http://proxy:8443", UpdateDomain: "dev.zenr.io", SRPDomain: "srp.dev.zenr.io", Storage: s, Send: p.send, Logf: t.Logf})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -301,12 +301,12 @@ func TestNew_Refused(t *testing.T) {
 		cfg     Config
 		wantErr string
 	}{
-		{Config{DoH: "proxy:8443", Zone: "z.", Domain: "d.", Storage: s}, "DoH"},
-		{Config{DoH: "http://proxy:8443/dns-query", Zone: "z.", Domain: "d.", Storage: s}, "DoH"},
-		{Config{DoH: "http://proxy:8443", Domain: "d.", Storage: s}, "Zone and Domain"},
-		{Config{DoH: "http://proxy:8443", Zone: "z.", Storage: s}, "Zone and Domain"},
-		{Config{DoH: "http://proxy:8443", Zone: "z.", Domain: "d."}, "Storage"},
-		{Config{DoH: "http://proxy:8443", Zone: "z.", Domain: "d.", Storage: s, Fallback: "dns.google"}, "Fallback"},
+		{Config{DoH: "proxy:8443", UpdateDomain: "u.", SRPDomain: "s.", Storage: s}, "DoH"},
+		{Config{DoH: "http://proxy:8443/dns-query", UpdateDomain: "u.", SRPDomain: "s.", Storage: s}, "DoH"},
+		{Config{DoH: "http://proxy:8443", SRPDomain: "s.", Storage: s}, "UpdateDomain and SRPDomain"},
+		{Config{DoH: "http://proxy:8443", UpdateDomain: "u.", Storage: s}, "UpdateDomain and SRPDomain"},
+		{Config{DoH: "http://proxy:8443", UpdateDomain: "u.", SRPDomain: "s."}, "Storage"},
+		{Config{DoH: "http://proxy:8443", UpdateDomain: "u.", SRPDomain: "s.", Storage: s, Fallback: "dns.google"}, "Fallback"},
 	} {
 		if _, err := New(c.cfg); err == nil || !strings.Contains(err.Error(), c.wantErr) {
 			t.Errorf("New(%+v) = %v, want an error containing %q", c.cfg, err, c.wantErr)
@@ -354,8 +354,8 @@ func (s *servers) send(ctx context.Context, addr string, network client.Network,
 
 func (s *servers) page(t *testing.T) *Page {
 	t.Helper()
-	page, err := New(Config{DoH: "http://proxy:8443", Fallback: "https://dns.google", Zone: "dev.zenr.io",
-		Domain: "srp.dev.zenr.io", Storage: newMemStorage(), Send: s.send})
+	page, err := New(Config{DoH: "http://proxy:8443", Fallback: "https://dns.google", UpdateDomain: "dev.zenr.io",
+		SRPDomain: "srp.dev.zenr.io", Storage: newMemStorage(), Send: s.send})
 	if err != nil {
 		t.Fatal(err)
 	}
