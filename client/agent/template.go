@@ -11,8 +11,9 @@
 // An rfc9664 one holds names, each given in full, with its own key, its addresses, its records and its
 // services, which SRV records find at the name (RFC 2782), with a TLSA record for a TLS one
 // (DANE) (client/rfc9664); "ipfs", a name's ipfs:, publishes an IPFS node at the name: its
-// addresses, and a folder of its files or the one another name publishes (client/kubo). See
-// docs/sig0lease-agent.md.
+// addresses, and a folder of its files or one holding the folders of a community's members
+// (client/kubo); a host's service's ipfs: gives a folder of its node's files in its TXT record.
+// See docs/sig0lease-agent.md.
 package agent
 
 import (
@@ -68,8 +69,8 @@ var complexTypes = map[string]complexType{
 		mirror: true,
 	},
 	"ipfs": {
-		does:  "publishes a kubo node's addresses at the name (_dnsaddr), and a folder of its files, or the one another name publishes once the node has pinned it, as the name's site (_dnslink)",
-		where: "as an rfc9664 registrar's name's ipfs:",
+		does:  "publishes a kubo node's addresses at the name (_dnsaddr), and as the name's site (_dnslink) a folder of its files, or one with an entry for each member of a community, the folder its TXT record gives once the node has pinned it; on a host's service, the TXT record gives a folder of the node's files (dnslink=)",
+		where: "as an rfc9664 registrar's name's ipfs:, or an srp host's service's",
 	},
 }
 
@@ -182,6 +183,10 @@ type Service struct {
 	Type     string                   // the type's name: a preset or one the template defines
 	Instance clientsrp.InstanceConfig // a name's: its ServiceType and Port alone
 	Probe    Probe
+	// A host's only: the node whose folder (IPFS.Publish) its TXT record gives, as
+	// "dnslink=/ipfs/<CID>", which a community's node follows (IPFS.Follow); nil: none. The
+	// instance is registered once the folder is read.
+	IPFS *IPFS
 	// A name's only. Subdomains are names below the name, relative to it, that the service is
 	// also offered for; TLSA is the certificate file, absolute, whose key a TLSA record at
 	// "_<port>._<proto>.<name>" gives (TLSARecord), or "".
@@ -261,12 +266,38 @@ type Name struct {
 // IPFS is the kubo node a name publishes (client/kubo): its addresses, as the name's _dnsaddr
 // TXT records, which a node given /dnsaddr/<name> connects to, and a site, as its _dnslink TXT
 // record (DNSLink), which IPFS gateways and nodes open by the name: a path in the node's files
-// (Publish), or the site another name publishes, once the node holds all of it (Follow).
-// With neither, the name publishes the node's addresses alone.
+// (Publish), or a folder with the folders of a community's members, each once the node holds
+// all of it (Follow). With neither, the name publishes the node's addresses alone. A host's
+// service publishes a path in the node's files alone, in its TXT record (Service.IPFS).
+//
+// A community and its members share a swarm key (SwarmKey): a member's TXT record gives, with
+// its folder, the swarm-mac= that key makes of its KEY and its folder (swarmKey.mac), and the
+// community counts as members only the instances whose swarm-mac= it makes too.
 type IPFS struct {
-	API     string // the node's RPC API, "http://host:port"
-	Publish string // a path in the node's files (MFS), such as /community
-	Follow  string // a name, fully qualified, whose site the node pins and the name publishes
+	API      string  // the node's RPC API, "http://host:port"
+	Publish  string  // a path in the node's files (MFS), such as /community
+	Follow   *Follow // nil: none
+	SwarmKey string  // the swarm key file, absolute: a community's and a member's; "" a name's site
+}
+
+// Follow is the community whose members' folders a name's node keeps: the instances of a
+// service type in an SRP domain listed under a subtype of it (RFC 6763 S7.1), each a member's
+// node giving its folder in its TXT record (Service.IPFS). Each member is its Instance label,
+// held by the member's key (RFC 9665's First-Come First-Served naming): the node pins each
+// folder a member gives, and the name's site is a folder with an entry per member, by its
+// label, giving the member's folder last pinned. A member gone from the listing for
+// RevokeAfter, or whose label another key holds, has its entry removed and its folder unpinned.
+type Follow struct {
+	ServiceType string        // such as _ipfs-member._tcp
+	Subtype     string        // a label: the name's first one unless the template gives it
+	Domain      string        // the SRP domain, fully qualified
+	RevokeAfter time.Duration // more than 0
+}
+
+// Members returns the name whose PTR records list the members' instances:
+// "<subtype>._sub.<service type>.<domain>".
+func (f Follow) Members() string {
+	return f.Subtype + "._sub." + dnssd.BrowsingOwnerName(f.ServiceType, f.Domain)
 }
 
 // dnsaddrOwner and dnslinkOwner return where a name publishes its node's addresses and its
@@ -342,6 +373,7 @@ type serviceDoc struct {
 	TXT        map[string]*string `yaml:"txt"`
 	Subtypes   []string           `yaml:"subtypes"`
 	Probe      *probeDoc          `yaml:"probe"`
+	IPFS       *ipfsDoc           `yaml:"ipfs"`
 	Subdomains []string           `yaml:"subdomains"`
 	TLSA       string             `yaml:"tlsa"`
 }
@@ -367,11 +399,17 @@ type nameDoc struct {
 }
 
 type ipfsDoc struct {
-	API     string `yaml:"api"`
-	Publish *struct {
+	API      string `yaml:"api"`
+	SwarmKey string `yaml:"swarm_key"`
+	Publish  *struct {
 		MFS string `yaml:"mfs"`
 	} `yaml:"publish"`
-	Follow string `yaml:"follow"`
+	Follow *struct {
+		Type        string `yaml:"type"`
+		Subtype     string `yaml:"subtype"`
+		Domain      string `yaml:"domain"`
+		RevokeAfter string `yaml:"revoke_after"`
+	} `yaml:"follow"`
 }
 
 type mirrorDoc struct {
@@ -578,15 +616,15 @@ func Parse(data []byte, path string) (*Plan, error) {
 }
 
 // unused returns a warning for each field the registrars give that does nothing in this
-// template: the resolvers of an rfc9664 registrar none of whose names follows a site. Such a
-// field is no problem: removing the last name that uses it would otherwise make the template
-// invalid until the field went too.
+// template: the resolvers of an rfc9664 registrar none of whose names follows a community.
+// Such a field is no problem: removing the last name that uses it would otherwise make the
+// template invalid until the field went too.
 func unused(registrars []Registrar) []string {
 	var warnings []string
 	for i, r := range registrars {
-		follows := slices.ContainsFunc(r.Names, func(n Name) bool { return n.IPFS != nil && n.IPFS.Follow != "" })
+		follows := slices.ContainsFunc(r.Names, func(n Name) bool { return n.IPFS != nil && n.IPFS.Follow != nil })
 		if r.Protocol == RFC9664 && len(r.Resolvers) > 0 && !follows {
-			warnings = append(warnings, fmt.Sprintf("registrars[%d] (%s %s): resolvers: unused: none of its names follows a site (ipfs: {follow:})", i, r.Protocol, r.place()))
+			warnings = append(warnings, fmt.Sprintf("registrars[%d] (%s %s): resolvers: unused: none of its names follows a community (ipfs: {follow:})", i, r.Protocol, r.place()))
 		}
 	}
 	return warnings
@@ -660,7 +698,7 @@ func parseRegistrar(d registrarDoc, types map[string]typeDef, dir, where string,
 	}
 	r.Lifetime = parseLifetime(d.Lease, d.KeyLease, d.OnStop, defaultLifetime, where, problems)
 	if r.Protocol == SRP {
-		parseHosts(&r, d.Hosts, types, where, problems)
+		parseHosts(&r, d.Hosts, types, dir, where, problems)
 		for i, md := range d.Mirrors {
 			if m, ok := parseMirror(md, r.Hosts, fmt.Sprintf("%s: mirrors[%d]", where, i), problems); ok {
 				r.Mirrors = append(r.Mirrors, m)
@@ -700,8 +738,8 @@ func hostLabels(name string) bool {
 	return len(labels) > 0 && !slices.ContainsFunc(labels, func(l string) bool { return !dnsname.IsHostLabel(l) })
 }
 
-// parseHosts validates an srp registrar's hosts into r.
-func parseHosts(r *Registrar, docs []hostDoc, types map[string]typeDef, where string, problems *[]string) {
+// parseHosts validates an srp registrar's hosts into r; dir is the template's directory.
+func parseHosts(r *Registrar, docs []hostDoc, types map[string]typeDef, dir, where string, problems *[]string) {
 	hostNames := map[string]bool{}
 	instances := map[string]string{} // folded instance name -> the host it is on
 	for i, hd := range docs {
@@ -723,7 +761,7 @@ func parseHosts(r *Registrar, docs []hostDoc, types map[string]typeDef, where st
 		h.Auto, h.Addresses = parseAddresses(hd.Addresses, hwhere, problems)
 		h.Lifetime = parseLifetime(hd.Lease, hd.KeyLease, hd.OnStop, r.Lifetime, hwhere, problems)
 		for j, sd := range hd.Services {
-			s, ok := parseService(sd, hd.Name, false, "", types, fmt.Sprintf("%s: services[%d]", hwhere, j), problems)
+			s, ok := parseService(sd, hd.Name, false, dir, types, fmt.Sprintf("%s: services[%d]", hwhere, j), problems)
 			if !ok {
 				continue
 			}
@@ -767,9 +805,12 @@ func parseName(d nameDoc, r Registrar, types map[string]typeDef, dir, where stri
 		by[slot(rr.Header().Name, dns.RRToType(rr))] = fmt.Sprintf("records[%d]", j)
 	}
 	if d.IPFS != nil {
-		n.IPFS = parseIPFS(*d.IPFS, owner, where+": ipfs", problems)
+		n.IPFS = parseIPFS(*d.IPFS, owner, types, dir, where+": ipfs", problems)
+		if n.IPFS.Follow == nil && n.IPFS.SwarmKey != "" {
+			*problems = append(*problems, where+": ipfs: swarm_key: a community's (follow:) or a member's (a host's service's ipfs:); a name's site is no member")
+		}
 		owners := []string{dnsaddrOwner(owner)}
-		if n.IPFS.Publish != "" || n.IPFS.Follow != "" {
+		if n.IPFS.Publish != "" || n.IPFS.Follow != nil {
 			owners = append(owners, dnslinkOwner(owner))
 		}
 		for _, o := range owners {
@@ -810,9 +851,14 @@ func parseName(d nameDoc, r Registrar, types map[string]typeDef, dir, where stri
 	return n
 }
 
-// parseIPFS validates d, the ipfs: of the name owner, at where.
-func parseIPFS(d ipfsDoc, owner, where string, problems *[]string) *IPFS {
-	ip := &IPFS{API: d.API}
+// parseIPFS validates d, the ipfs: of the name owner, at where; types are the template's, the
+// one a community's members are instances of among them, and a relative swarm_key is relative
+// to dir. A community (follow:) needs swarm_key; what else does is the caller's to check.
+func parseIPFS(d ipfsDoc, owner string, types map[string]typeDef, dir, where string, problems *[]string) *IPFS {
+	ip := &IPFS{API: d.API, SwarmKey: d.SwarmKey}
+	if ip.SwarmKey != "" && !filepath.IsAbs(ip.SwarmKey) {
+		ip.SwarmKey = filepath.Join(dir, ip.SwarmKey)
+	}
 	if ip.API == "" {
 		ip.API = kubo.DefaultAPI
 	}
@@ -825,19 +871,32 @@ func parseIPFS(d ipfsDoc, owner, where string, problems *[]string) *IPFS {
 			*problems = append(*problems, fmt.Sprintf("%s: publish: mfs: %q: want a path in the node's files, such as /community", where, ip.Publish))
 		}
 	}
-	if d.Follow != "" {
-		ip.Follow = strings.TrimSuffix(d.Follow, ".") + "."
-		labels := dnsname.Labels(ip.Follow)
-		labels = labels[:len(labels)-1] // the root's
-		switch {
-		case len(labels) < 2 || slices.ContainsFunc(labels, func(l string) bool { return !dnsname.IsHostLabel(l) }):
-			*problems = append(*problems, fmt.Sprintf("%s: follow: %q: want the name of another site, such as a.dev.zenr.io", where, d.Follow))
-		case dnsname.EqualFold(ip.Follow, owner):
-			*problems = append(*problems, fmt.Sprintf("%s: follow: %s is this name", where, d.Follow))
+	if fd := d.Follow; fd != nil {
+		where := where + ": follow"
+		f := &Follow{Subtype: fd.Subtype}
+		if def, ok := types[fd.Type]; ok {
+			f.ServiceType = def.service
+		} else {
+			*problems = append(*problems, fmt.Sprintf("%s: type %q: want the type the members' services are, a preset or one the template defines, such as ipfs-member", where, fd.Type))
 		}
+		if f.Subtype == "" {
+			f.Subtype, _, _ = dnsname.CutFirstLabel(owner)
+		} else if !dnsname.IsHostLabel(f.Subtype) {
+			*problems = append(*problems, fmt.Sprintf("%s: subtype %q: want a label of letters, digits and hyphens", where, fd.Subtype))
+		}
+		f.Domain = parseDomain(fd.Domain, "domain", where, problems)
+		if fd.RevokeAfter == "" {
+			*problems = append(*problems, where+": revoke_after is required: how long a member may be gone before its entry is removed, such as 10m")
+		} else if f.RevokeAfter, _ = time.ParseDuration(fd.RevokeAfter); f.RevokeAfter <= 0 {
+			*problems = append(*problems, fmt.Sprintf("%s: revoke_after %q: want a duration, such as 10m", where, fd.RevokeAfter))
+		}
+		ip.Follow = f
 	}
-	if d.Publish != nil && d.Follow != "" {
+	if d.Publish != nil && d.Follow != nil {
 		*problems = append(*problems, where+": publish: and follow: are two sites for one name; give one")
+	}
+	if d.Follow != nil && d.SwarmKey == "" {
+		*problems = append(*problems, where+": swarm_key is required with follow: the swarm key file its node and the members' share, such as the swarm.key in its node's repository, which the members' swarm-mac= are checked with")
 	}
 	return ip
 }
@@ -938,8 +997,8 @@ func parseAddresses(addrs []string, where string, problems *[]string) (auto bool
 }
 
 // parseService validates d, a service of the host or name labelled label (onName): a DNS-SD
-// instance on a host, the SRV records that find it on a name (Service). A relative tlsa is
-// relative to dir, the template's directory.
+// instance on a host, the SRV records that find it on a name (Service). A relative tlsa or
+// swarm_key is relative to dir, the template's directory.
 func parseService(d serviceDoc, label string, onName bool, dir string, types map[string]typeDef, where string, problems *[]string) (Service, bool) {
 	if d.Type == "" {
 		*problems = append(*problems, fmt.Sprintf("%s: type is required", where))
@@ -974,7 +1033,7 @@ func parseService(d serviceDoc, label string, onName bool, dir string, types map
 	theirs := []field{{"subdomains", d.Subdomains != nil}, {"tlsa", d.TLSA != ""}}
 	why := "a name's service has it, not a host's: SRP registers a host's services in the domain's service types"
 	if onName {
-		theirs = []field{{"instance", d.Instance != ""}, {"txt", d.TXT != nil}, {"subtypes", d.Subtypes != nil}}
+		theirs = []field{{"instance", d.Instance != ""}, {"txt", d.TXT != nil}, {"subtypes", d.Subtypes != nil}, {"ipfs", d.IPFS != nil}}
 		why = "a host's service has it, not a name's, which SRV records alone find"
 	}
 	for _, f := range theirs {
@@ -993,6 +1052,24 @@ func parseService(d serviceDoc, label string, onName bool, dir string, types map
 		txt[k] = v
 	}
 	checkTXT(d.TXT, where, problems)
+	var ip *IPFS
+	if d.IPFS != nil {
+		ip = parseIPFS(*d.IPFS, label, types, dir, where+": ipfs", problems)
+		switch {
+		case ip.Follow != nil:
+			*problems = append(*problems, where+": ipfs: follow: is a name's; a host's service gives a folder of its node's files, with publish:")
+		case ip.Publish == "":
+			*problems = append(*problems, where+": ipfs: publish: is required: the folder of its node's files that its TXT record gives")
+		}
+		if ip.SwarmKey == "" {
+			*problems = append(*problems, where+": ipfs: swarm_key is required: the swarm key file of the community's private swarm, such as the swarm.key in its node's repository, whose swarm-mac= its TXT record gives")
+		}
+		for _, k := range sortedKeys(txt) {
+			if strings.EqualFold(k, "dnslink") || strings.EqualFold(k, swarmMACKey) {
+				*problems = append(*problems, fmt.Sprintf("%s: txt %s: ipfs: gives the TXT record's %s", where, k, strings.ToLower(k)))
+			}
+		}
+	}
 	subtypes := def.subtypes
 	if d.Subtypes != nil {
 		subtypes = d.Subtypes
@@ -1022,6 +1099,7 @@ func parseService(d serviceDoc, label string, onName bool, dir string, types map
 			TXT:         strs,
 		},
 		Probe: probe,
+		IPFS:  ip,
 	}, true
 }
 

@@ -1,6 +1,7 @@
 // Package kubo asks a kubo node -- the IPFS daemon, which IPFS Desktop runs -- through its RPC
 // API (docs.ipfs.tech/reference/kubo/rpc/): its peer ID and addresses, the CID of a path in its
-// files (MFS, IPFS Desktop's Files), and its pins.
+// files (MFS, IPFS Desktop's Files), the entries of a folder there, which it adds and removes,
+// and its pins.
 package kubo
 
 import (
@@ -9,7 +10,6 @@ import (
 	"fmt"
 	"net/http"
 	"net/url"
-	"slices"
 	"time"
 )
 
@@ -68,6 +68,40 @@ func (c *Client) MFSCID(ctx context.Context, path string) (string, error) {
 	return out.Hash, nil
 }
 
+// MakeFolder makes the folder path in the node's files, with the folders above it, unless it is
+// there.
+func (c *Client) MakeFolder(ctx context.Context, path string) error {
+	return c.call(ctx, c.timeout, "files/mkdir", url.Values{"arg": {path}, "parents": {"true"}}, nil)
+}
+
+// Entries returns the entries of the folder path in the node's files: each one's CID, by name.
+func (c *Client) Entries(ctx context.Context, path string) (map[string]string, error) {
+	var out struct {
+		Entries []struct{ Name, Hash string }
+	}
+	if err := c.call(ctx, c.timeout, "files/ls", url.Values{"arg": {path}, "long": {"true"}}, &out); err != nil {
+		return nil, err
+	}
+	entries := map[string]string{}
+	for _, e := range out.Entries {
+		if e.Hash == "" {
+			return nil, fmt.Errorf("kubo files/ls %s: no hash for %s in the answer", path, e.Name)
+		}
+		entries[e.Name] = e.Hash
+	}
+	return entries, nil
+}
+
+// Add puts cid at path in the node's files, linking to it: nothing is fetched.
+func (c *Client) Add(ctx context.Context, cid, path string) error {
+	return c.call(ctx, c.timeout, "files/cp", url.Values{"arg": {"/ipfs/" + cid, path}}, nil)
+}
+
+// Remove removes path, and what is below it, from the node's files.
+func (c *Client) Remove(ctx context.Context, path string) error {
+	return c.call(ctx, c.timeout, "files/rm", url.Values{"arg": {path}, "recursive": {"true"}}, nil)
+}
+
 // Pin pins cid and everything it links to under name, fetching from other nodes what the node
 // does not hold, which lasts until the node holds it all or ctx ends. It returns the CID as
 // the node writes it.
@@ -82,22 +116,20 @@ func (c *Client) Pin(ctx context.Context, cid, name string) (string, error) {
 	return out.Pins[0], nil
 }
 
-// PinsNamed returns the CIDs pinned with everything they link to under name, sorted.
-func (c *Client) PinsNamed(ctx context.Context, name string) ([]string, error) {
+// Pins returns the CIDs the node has pinned with everything they link to, each with its pin's
+// name, "" none: a CID has one such pin, and pinning it again under another name renames it.
+func (c *Client) Pins(ctx context.Context) (map[string]string, error) {
 	var out struct {
 		Keys map[string]struct{ Name string }
 	}
 	if err := c.call(ctx, c.timeout, "pin/ls", url.Values{"type": {"recursive"}, "names": {"true"}}, &out); err != nil {
 		return nil, err
 	}
-	var cids []string
+	pins := map[string]string{}
 	for cid, p := range out.Keys {
-		if p.Name == name {
-			cids = append(cids, cid)
-		}
+		pins[cid] = p.Name
 	}
-	slices.Sort(cids)
-	return cids, nil
+	return pins, nil
 }
 
 // Unpin removes cid's pin. What it pinned stays in the node until kubo's garbage collector

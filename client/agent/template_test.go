@@ -4,13 +4,16 @@ import (
 	"errors"
 	"net/netip"
 	"path/filepath"
+	"reflect"
 	"slices"
 	"strings"
 	"testing"
+	"time"
 
 	baseclient "github.com/NetworkCommons/sig0lease/client"
 	"github.com/NetworkCommons/sig0lease/client/mdnsresponder"
 	"github.com/NetworkCommons/sig0lease/client/rfc9664"
+	clientsrp "github.com/NetworkCommons/sig0lease/client/srp"
 	"github.com/NetworkCommons/sig0lease/pkg/keyrec"
 )
 
@@ -253,8 +256,8 @@ registrars:
 	}
 }
 
-// An rfc9664 registrar's resolvers, with no name that follows a site, do nothing: a warning,
-// not a problem, so that removing the last follower leaves the template valid.
+// An rfc9664 registrar's resolvers, with no name that follows a community, do nothing: a
+// warning, not a problem, so that removing the last follower leaves the template valid.
 func TestParse_UnusedResolvers(t *testing.T) {
 	p := mustParse(t, `
 registrars:
@@ -264,15 +267,18 @@ registrars:
     names:
       - {name: a.dev.test., ipfs: {publish: {mfs: /community}}}
 `)
-	want := []string{"registrars[0] (rfc9664 192.0.2.1:53): resolvers: unused: none of its names follows a site (ipfs: {follow:})"}
+	want := []string{"registrars[0] (rfc9664 192.0.2.1:53): resolvers: unused: none of its names follows a community (ipfs: {follow:})"}
 	if !slices.Equal(p.Warnings, want) {
 		t.Errorf("warnings = %q, want %q", p.Warnings, want)
 	}
 }
 
-// A name's ipfs: publishes a path in its node's files or follows another name's site, or
-// gives the node's addresses alone; the node's RPC API defaults to kubo's. The registrar's
-// resolvers are what a follower asks for a site the registrar does not serve.
+// A name's ipfs: publishes a path in its node's files or follows a community, or gives the
+// node's addresses alone; the node's RPC API defaults to kubo's. A community is the instances
+// of a type, by its service type, listed under a subtype, by default the name's first label,
+// in an SRP domain, checked with a swarm key file, relative to the template; a name's site has
+// none. The registrar's resolvers are what a follower asks for what the registrar does not
+// serve.
 func TestParse_NameIPFS(t *testing.T) {
 	p := mustParse(t, `
 registrars:
@@ -281,25 +287,30 @@ registrars:
     resolvers: [192.0.2.53:53]
     names:
       - {name: a.dev.test., ipfs: {publish: {mfs: /community}}}
-      - {name: site.dev.test., ipfs: {api: "http://127.0.0.1:5002", follow: a.dev.test}}
+      - {name: site.dev.test., ipfs: {api: "http://127.0.0.1:5002", swarm_key: swarm.key, follow: {type: ipfs-member, domain: srp.test, revoke_after: 10m}}}
       - {name: b.dev.test., ipfs: {}}
+      - {name: club.dev.test., ipfs: {swarm_key: /var/kubo/swarm.key, follow: {type: ipfs-member, subtype: friends, domain: srp.test., revoke_after: 90s}}}
 `)
 	r := p.Registrars[0]
 	if !slices.Equal(r.Resolvers, []string{"192.0.2.53:53"}) {
 		t.Errorf("resolvers = %v, want 192.0.2.53:53", r.Resolvers)
 	}
 	if w := p.Warnings; w != nil {
-		t.Errorf("warnings = %q, want none: a name follows a site", w)
+		t.Errorf("warnings = %q, want none: a name follows a community", w)
 	}
 	n := r.Names
 	for i, want := range []IPFS{
 		{API: "http://127.0.0.1:5001", Publish: "/community"},
-		{API: "http://127.0.0.1:5002", Follow: "a.dev.test."},
+		{API: "http://127.0.0.1:5002", SwarmKey: "/etc/agent/swarm.key", Follow: &Follow{ServiceType: "_ipfs-member._tcp", Subtype: "site", Domain: "srp.test.", RevokeAfter: 10 * time.Minute}},
 		{API: "http://127.0.0.1:5001"},
+		{API: "http://127.0.0.1:5001", SwarmKey: "/var/kubo/swarm.key", Follow: &Follow{ServiceType: "_ipfs-member._tcp", Subtype: "friends", Domain: "srp.test.", RevokeAfter: 90 * time.Second}},
 	} {
-		if n[i].IPFS == nil || *n[i].IPFS != want {
+		if n[i].IPFS == nil || !reflect.DeepEqual(*n[i].IPFS, want) {
 			t.Errorf("%s's ipfs = %+v, want %+v", n[i].Name, n[i].IPFS, want)
 		}
+	}
+	if got := n[1].IPFS.Follow.Members(); got != "site._sub._ipfs-member._tcp.srp.test." {
+		t.Errorf("Members() = %q", got)
 	}
 
 	got := problems(t, `
@@ -308,30 +319,83 @@ registrars:
   - protocol: rfc9664
     server: 192.0.2.1:53
     names:
-      - {name: both.dev.test., ipfs: {publish: {mfs: /x}, follow: a.dev.test}}
+      - {name: both.dev.test., ipfs: {swarm_key: k, publish: {mfs: /x}, follow: {type: ipfs-member, domain: srp.test, revoke_after: 1m}}}
       - {name: badapi.dev.test., ipfs: {api: "https://127.0.0.1:5001/api"}}
       - {name: badmfs.dev.test., ipfs: {publish: {mfs: community}}}
-      - {name: self.dev.test., ipfs: {follow: self.dev.test.}}
-      - {name: badfollow.dev.test., ipfs: {follow: a}}
+      - {name: badtype.dev.test., ipfs: {swarm_key: k, follow: {type: nosuch, domain: srp.test, revoke_after: 1m}}}
+      - {name: badsub.dev.test., ipfs: {swarm_key: k, follow: {type: ipfs-member, subtype: "my site", domain: srp.test, revoke_after: 1m}}}
+      - {name: nodomain.dev.test., ipfs: {swarm_key: k, follow: {type: ipfs-member, revoke_after: 1m}}}
+      - {name: norevoke.dev.test., ipfs: {swarm_key: k, follow: {type: ipfs-member, domain: srp.test}}}
+      - {name: badrevoke.dev.test., ipfs: {swarm_key: k, follow: {type: ipfs-member, domain: srp.test, revoke_after: "-1m"}}}
       - {name: twice.dev.test., records: ['_dnslink TXT "dnslink=/ipfs/x"'], ipfs: {publish: {mfs: /x}}}
       - {name: addrs.dev.test., records: ['_dnsaddr TXT "dnsaddr=/ip4/192.0.2.1/tcp/4001/p2p/x"'], ipfs: {}}
+      - {name: nokey.dev.test., ipfs: {follow: {type: ipfs-member, domain: srp.test, revoke_after: 1m}}}
+      - {name: sitekey.dev.test., ipfs: {swarm_key: k, publish: {mfs: /x}}}
 `)
 	for _, want := range []string{
 		"names[0] (both.dev.test.): ipfs: publish: and follow: are two sites for one name; give one",
 		`names[1] (badapi.dev.test.): ipfs: api: "https://127.0.0.1:5001/api": want http://host:port`,
 		`names[2] (badmfs.dev.test.): ipfs: publish: mfs: "community": want a path in the node's files`,
-		"names[3] (self.dev.test.): ipfs: follow: self.dev.test. is this name",
-		`names[4] (badfollow.dev.test.): ipfs: follow: "a": want the name of another site`,
-		"names[5] (twice.dev.test.): ipfs: registers the TXT records at _dnslink.twice.dev.test., which records[0] registers too",
-		"names[6] (addrs.dev.test.): ipfs: registers the TXT records at _dnsaddr.addrs.dev.test., which records[0] registers too",
+		`names[3] (badtype.dev.test.): ipfs: follow: type "nosuch": want the type the members' services are`,
+		`names[4] (badsub.dev.test.): ipfs: follow: subtype "my site": want a label of letters, digits and hyphens`,
+		"names[5] (nodomain.dev.test.): ipfs: follow: domain is required",
+		"names[6] (norevoke.dev.test.): ipfs: follow: revoke_after is required",
+		`names[7] (badrevoke.dev.test.): ipfs: follow: revoke_after "-1m": want a duration`,
+		"names[8] (twice.dev.test.): ipfs: registers the TXT records at _dnslink.twice.dev.test., which records[0] registers too",
+		"names[9] (addrs.dev.test.): ipfs: registers the TXT records at _dnsaddr.addrs.dev.test., which records[0] registers too",
+		"names[10] (nokey.dev.test.): ipfs: swarm_key is required with follow:",
+		"names[11] (sitekey.dev.test.): ipfs: swarm_key: a community's (follow:) or a member's",
 	} {
 		wantProblem(t, got, want)
 	}
-	if len(got) != 7 {
-		t.Errorf("%d problems, want 7:\n%s", len(got), strings.Join(got, "\n"))
+	if len(got) != 12 {
+		t.Errorf("%d problems, want 12:\n%s", len(got), strings.Join(got, "\n"))
 	}
 	wantProblem(t, problems(t, srpYAML("", "    mirrors: [{type: ipfs, all_hosts: true}]\n")), `"ipfs" is not a complex type that makes hosts (known: mdns)`)
-	wantProblem(t, problems(t, srpYAML("", "    hosts: [{name: box, addresses: [auto], services: [{type: ipfs}]}]\n")), "ipfs is a complex type, not a service's; use it as an rfc9664 registrar's name's ipfs:")
+	wantProblem(t, problems(t, srpYAML("", "    hosts: [{name: box, addresses: [auto], services: [{type: ipfs}]}]\n")), "ipfs is a complex type, not a service's; use it as an rfc9664 registrar's name's ipfs:, or an srp host's service's")
+}
+
+// A host's service's ipfs: gives a folder of its node's files in its TXT record, with the
+// swarm-mac= of its swarm key file, relative to the template; it publishes with publish: alone,
+// and its TXT record's dnslink and swarm-mac are its own. A name's service has none.
+func TestParse_ServiceIPFS(t *testing.T) {
+	p := mustParse(t, srpYAML("", `    hosts:
+      - name: alice
+        addresses: [auto]
+        services:
+          - {type: ipfs-member, instance: alice, subtypes: [site], ipfs: {swarm_key: swarm.key, publish: {mfs: /community}}}
+`))
+	s := p.Registrars[0].Hosts[0].Services[0]
+	want := clientsrp.InstanceConfig{Label: "alice", ServiceType: "_ipfs-member._tcp", Subtypes: []string{"site"}, Port: 4001, TXT: []string{}}
+	if !reflect.DeepEqual(s.Instance, want) || s.Probe != (Probe{Kind: ProbeTCP}) || !reflect.DeepEqual(s.IPFS, &IPFS{API: "http://127.0.0.1:5001", Publish: "/community", SwarmKey: "/etc/agent/swarm.key"}) {
+		t.Errorf("service = %+v, ipfs %+v; want %+v, a tcp probe, the folder /community, the swarm key /etc/agent/swarm.key", s, s.IPFS, want)
+	}
+
+	got := problems(t, srpYAML("", `    hosts:
+      - name: alice
+        addresses: [auto]
+        services:
+          - {type: ipfs-member, ipfs: {}}
+          - {type: ipfs-member, instance: two, ipfs: {swarm_key: k, follow: {type: ipfs-member, domain: srp.test, revoke_after: 1m}}}
+          - {type: ipfs-member, instance: three, txt: {DNSLink: x}, ipfs: {swarm_key: k, publish: {mfs: /c}}}
+          - {type: ipfs-member, instance: four, txt: {Swarm-MAC: x}, ipfs: {swarm_key: k, publish: {mfs: /c}}}
+`))
+	for _, want := range []string{
+		"services[0]: ipfs: publish: is required",
+		"services[0]: ipfs: swarm_key is required",
+		"services[1]: ipfs: follow: is a name's",
+		"services[2]: txt DNSLink: ipfs: gives the TXT record's dnslink",
+		"services[3]: txt Swarm-MAC: ipfs: gives the TXT record's swarm-mac",
+	} {
+		wantProblem(t, got, want)
+	}
+	wantProblem(t, problems(t, `
+keystore: keys
+registrars:
+  - protocol: rfc9664
+    server: 192.0.2.1:53
+    names: [{name: a.dev.test., addresses: [192.0.2.1], services: [{type: http, ipfs: {publish: {mfs: /c}}}]}]
+`), "services[0]: ipfs: a host's service has it, not a name's")
 }
 
 // A name's service is the SRV records that find it at the name and its subdomains, pointing

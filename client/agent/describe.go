@@ -115,6 +115,10 @@ func Describe(w io.Writer, plan *Plan, interfaces func() ([]netip.Addr, error), 
 				if len(in.Subtypes) > 0 {
 					p("    subtypes: %s", strings.Join(in.Subtypes, " "))
 				}
+				if ip := s.IPFS; ip != nil {
+					p("    ipfs:     the node at %s; %s in its files, in the TXT record as dnslink=, with the %s= of the host's KEY and that folder, registered once both are read", ip.API, ip.Publish, swarmMACKey)
+					p("    swarm:    %s", describeSwarmKey(ip.SwarmKey))
+				}
 			}
 		}
 
@@ -161,8 +165,10 @@ func Describe(w io.Writer, plan *Plan, interfaces func() ([]netip.Addr, error), 
 				switch {
 				case ip.Publish != "":
 					p("    site:     %s in its files, at %s", ip.Publish, dnslinkOwner(owner))
-				case ip.Follow != "":
-					p("    site:     %s's, once the node has pinned it, at %s", ip.Follow, dnslinkOwner(owner))
+				case ip.Follow != nil:
+					p("    site:     a folder with an entry for each member, the folder it gives once the node has pinned it, at %s", dnslinkOwner(owner))
+					p("    members:  the %s instances in %s that %s lists, whose %s= the swarm key makes; an entry goes once its member is not listed for %s", ip.Follow.ServiceType, ip.Follow.Domain, ip.Follow.Members(), swarmMACKey, ip.Follow.RevokeAfter)
+					p("    swarm:    %s", describeSwarmKey(ip.SwarmKey))
 				}
 			}
 			if n.Lifetime != r.Lifetime {
@@ -190,4 +196,12 @@ func joinAddrs(addrs []netip.Addr) string {
 		s[i] = a.String()
 	}
 	return strings.Join(s, ", ")
+}
+
+// describeSwarmKey says whether the swarm key file at path can be read now.
+func describeSwarmKey(path string) string {
+	if _, err := readSwarmKey(path); err != nil {
+		return fmt.Sprintf("%v; read again at each check", err)
+	}
+	return path + ", read now and at each check"
 }

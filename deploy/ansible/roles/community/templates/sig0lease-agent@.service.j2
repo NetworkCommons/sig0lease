@@ -1,0 +1,45 @@
+# {{ ansible_managed }}: deploy/ansible, roles/community (deploy/README.md, "The community node").
+# The agent of each instance's community node (%i: stable, staging), the release's
+# sig0lease-agent, which registers through the instance's proxy.
+[Unit]
+Description=sig0lease-agent %i, the agent of the registrar's %i community node
+After=network-online.target sig0lease@%i.service kubo@%i.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=sig0lease-agent-%i
+Group=sig0lease-agent-%i
+ExecStart={{ registrar_root }}/%i/current/sig0lease-agent run {{ community_agent_template | dirname | dirname }}/%i/{{ community_agent_template | basename }}
+WorkingDirectory={{ community_agent_keystore | dirname }}/%i
+TimeoutStopSec=30
+Restart=on-failure
+RestartSec=5
+
+# It reads its release, its template and its swarm key, and writes only its keystore.
+UMask=0077
+ReadWritePaths={{ community_agent_keystore | dirname }}/%i
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+NoNewPrivileges=yes
+CapabilityBoundingSet=
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX AF_NETLINK
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+
+[Install]
+WantedBy=multi-user.target

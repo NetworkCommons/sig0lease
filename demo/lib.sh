@@ -4,7 +4,7 @@
 #
 # REGISTRAR, when set, is the registrar the agents send their updates to, in place of the proxy
 # each demo otherwise starts on this machine, at 127.0.0.1:8053: a shared one, as the public
-# registrar (docs/demo.md, "Against a shared registrar"). It is what the agents' templates take
+# registrar (docs/demo.md, "Running a demo"). It is what the agents' templates take
 # as server: host:port, or an https URL with TRANSPORT=doh. TRANSPORT, with REGISTRAR only, is how
 # they reach it: tcp (the agents' default), udp, tls or doh.
 
@@ -25,7 +25,7 @@ remote() { [ -n "${REGISTRAR:-}" ]; }
 # UPDATE_DOMAIN has to be given. SRP_DOMAIN is srp.<UPDATE_DOMAIN> by default.
 ns="${NS:-ns1.free2air.org}"
 if remote && [ -z "${UPDATE_DOMAIN:-}" ]; then
-    echo "UPDATE_DOMAIN is where REGISTRAR takes the demo's names, and SRP_DOMAIN its hosts, if not srp.<UPDATE_DOMAIN>: give them (docs/demo.md, \"Against a shared registrar\")" >&2
+    echo "UPDATE_DOMAIN is where REGISTRAR takes the demo's names, and SRP_DOMAIN its hosts, if not srp.<UPDATE_DOMAIN>: give them (docs/demo.md, \"Running a demo\")" >&2
     exit 1
 fi
 update_domain="${UPDATE_DOMAIN:-dev.zenr.io}"

@@ -12,6 +12,11 @@
         fail_msg: "make promote moves staging's release to stable, not to {{ registrar_instance }}."
         quiet: true
   tasks:
+    - name: Prepare stable's community node, if it has one
+      ansible.builtin.include_role:
+        name: community
+      when: registrar_settings.community is defined
+
     - name: Promote it
       ansible.builtin.include_role:
         name: sig0lease

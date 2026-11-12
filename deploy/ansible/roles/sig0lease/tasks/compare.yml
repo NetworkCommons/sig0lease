@@ -4,7 +4,9 @@
 # sig0lease_differences. It does when the release current points at holds the same files, byte
 # for byte, with the instance's config (sig0lease_config_text) as its config.yaml, and its proxy
 # runs, started after current, the program and config.yaml current points at, the instance's key
-# and the service unit last changed. Changes nothing.
+# and the service unit last changed; and so does the community node's agent, for an instance that
+# has one, after the release's agent, its template and its unit (roles/community, compare.yml).
+# Changes nothing.
 
 - name: Find the release running in {{ registrar_instance }}
   ansible.builtin.stat:
@@ -48,6 +50,12 @@
   register: sig0lease_running_files
   when: sig0lease_running.stat.islnk | default(false)
 
+- name: Find what changed since the community node's agent started
+  ansible.builtin.include_role:
+    name: community
+    tasks_from: compare.yml
+  when: registrar_settings.community is defined and sig0lease_running.stat.islnk | default(false)
+
 - name: Compare the two
   ansible.builtin.set_fact:
     sig0lease_differences: "{{ sig0lease_found }}"
@@ -70,6 +78,7 @@
     sig0lease_found: >-
       {{ [registrar_instance ~ ' has no release yet'] if not sig0lease_running.stat.islnk | default(false) else
          sig0lease_since_start.stdout_lines
+         + (community_changes if registrar_settings.community is defined else [])
          + ([(sig0lease_running.stat.lnk_source | basename) ~ ' differs in ' ~ sig0lease_files_differing | join(', ')]
             if sig0lease_files_differing else []) }}
 

@@ -1,0 +1,47 @@
+# {{ ansible_managed }}: deploy/ansible, roles/community (deploy/README.md, "The community node").
+# The community node of each instance of the registrar that has one (%i: stable, staging): kubo,
+# in the instance's private swarm, with its repository in {{ community_kubo_repo | dirname }}/%i.
+[Unit]
+Description=kubo %i, the community node of the registrar's %i instance
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=notify
+User=kubo-%i
+Group=kubo-%i
+Environment=IPFS_PATH={{ community_kubo_repo | dirname }}/%i
+# Without the swarm key, kubo refuses to start rather than join the public network.
+Environment=LIBP2P_FORCE_PNET=1
+ExecStart={{ community_kubo_bin }} daemon --migrate
+TimeoutStopSec=60
+Restart=on-failure
+RestartSec=5
+
+# It writes only its repository; its swarm port is no privileged one.
+UMask=0077
+ReadWritePaths={{ community_kubo_repo | dirname }}/%i
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+NoNewPrivileges=yes
+CapabilityBoundingSet=
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX AF_NETLINK
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+
+[Install]
+WantedBy=multi-user.target

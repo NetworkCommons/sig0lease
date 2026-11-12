@@ -8,8 +8,8 @@ a template, a YAML file listing registrars and what each registers, and register
 - names and their records through this project's proxy with `update_handler` (RFC 9664 with
   `fcfs_naming`): names people type or link, such as a web address, a DNSLink path or a Matrix
   ID, and the services found at a name by SRV records, such as an XMPP server, with a TLSA
-  record for its certificate (DANE), or an IPFS node's addresses and a folder it keeps, or
-  follows (DNSLink).
+  record for its certificate (DANE), or an IPFS node's addresses and a folder it keeps, its own
+  or one with the folders of a community's members (DNSLink).
 
 It then keeps the registrations alive, follows the template as it changes, and deregisters
 everything when it stops. Services are described by type: a template names a built-in preset
@@ -20,7 +20,7 @@ the same libraries, as their flags say; the agent keeps a template's worth, and 
 
 Code: `client/agent` (template, run loop, probes, state), `cmd/sig0lease-agent`; each host is
 a `client/srp` `Host`, each name a `client/rfc9664` `Name` (both on `client.Keeper`), the
-`mdns` mirror is `client/mdnsbridge`, a name's IPFS node is asked through `client/kubo`.
+`mdns` mirror is `client/mdnsbridge`, an IPFS node is asked through `client/kubo`.
 Tests: `go test -race ./client/agent` and `make test-agent` (`tests/test_agent.sh`, against the
 proxy and a local BIND 9).
 
@@ -28,7 +28,7 @@ proxy and a local BIND 9).
 
 | Command | Does |
 |---|---|
-| `sig0lease-agent validate <template>` | Checks the template and lists every problem at once; exit 1 if there is any. It also warns of what the template gives that does nothing in it, such as an `rfc9664` registrar's `resolvers` with no name that follows a site: a warning is no problem, and `plan` and `run` (in its log, at the start and with each change) give it too. |
+| `sig0lease-agent validate <template>` | Checks the template and lists every problem at once; exit 1 if there is any. It also warns of what the template gives that does nothing in it, such as an `rfc9664` registrar's `resolvers` with no name that follows a community: a warning is no problem, and `plan` and `run` (in its log, at the start and with each change) give it too. |
 | `sig0lease-agent plan <template>` | Validates, then shows what `run` would register, registrar by registrar: hosts with their addresses (`auto` resolved now) and services with their TXT, subtypes and probes; names with their addresses and records; which keys exist, and the names from an earlier run that `run` frees: those an earlier rename holds, and those of hosts and names the template no longer registers. Writes nothing. |
 | `sig0lease-agent run [-poll-interval=10s] [-probe-interval=30s] <template>` | Validates (and refuses to start on any problem), then registers and keeps registered until Ctrl-C or SIGTERM, which deregister everything. |
 | `sig0lease-agent types` | Lists the presets, with their fields, and the complex types. |
@@ -96,7 +96,7 @@ An `rfc9664` registrar also takes:
 
 | Field | Default | Meaning |
 |---|---|---|
-| `resolvers` | `8.8.8.8:53`, `8.8.4.4:53` | As for `srp`, asked for a site one of its names follows (`ipfs: {follow:}`) when the proxy refuses it as a name it does not serve. Unused without such a name, which `validate` warns of. |
+| `resolvers` | `8.8.8.8:53`, `8.8.4.4:53` | As for `srp`, asked for the members of a community one of its names follows (`ipfs: {follow:}`) when the proxy refuses them as names it does not serve. Unused without such a name, which `validate` warns of. |
 | `names` | none | What it registers (below). |
 
 A domain has one srp registrar, and a proxy (`server`) one rfc9664 registrar. A name is given
@@ -131,6 +131,7 @@ instances of a type:
 | `instance` | A host's: the instance name. Default `"<host> <type>"`, e.g. `myhost ssh`. Free text, without `.`. |
 | `port`, `probe` | Override the type's. |
 | `txt`, `subtypes` | A host's: override the type's. |
+| `ipfs` | A host's: a folder of an IPFS node's files, which its TXT record gives (see "A community's member"). |
 | `subdomains`, `tlsa` | A name's (see "names"). |
 
 A service takes every field of its type and overrides what it gives. `txt` merges key by key
@@ -149,6 +150,7 @@ The presets (`sig0lease-agent types` lists them; they are `client/agent/presets.
 | `http` | `_http._tcp` | 80 | | TCP |
 | `https` | `_https._tcp` | 443 | | TCP |
 | `ipfs-gateway` | `_http._tcp` | 8080 | `path=/ipfs/`, subtype `_ipfs` | TCP |
+| `ipfs-member` | `_ipfs-member._tcp` | 4001 | | TCP |
 | `activitypub` | `_activitypub._tcp` | 443 | | TCP |
 | `ipp` | `_ipp._tcp` | 631 | `txtvers=1`, `rp=ipp/print` | TCP |
 | `xmpp-client` | `_xmpp-client._tcp` | 5222 | | TCP |
@@ -216,7 +218,7 @@ KEY and the records added, on the registrar's leases.
 | `addresses` | `auto`, IP addresses, or both, as a host's: registered as A and AAAA records at the name. Optional. |
 | `records` | `"<owner> <type> <data>"`, the owner `@` for the name itself or relative to it (`_dnslink`, `www`), the data in zone-file format. At or below the name, class IN, no KEY or SIG, no A or AAAA at the name (`addresses:` has those). Each once. |
 | `services` | Services found at the name by SRV records (below). They need `addresses:`, which the SRV records point at. |
-| `ipfs` | An IPFS node whose addresses, and a folder it keeps or follows, the name publishes (see "A name's IPFS node"). |
+| `ipfs` | An IPFS node whose addresses, and a folder it keeps, its own or a community's, the name publishes (see "A name's IPFS node"). |
 | `lease`, `key_lease`, `on_stop` | As in the registrar, for this name only. Left out: the registrar's. |
 
 A name needs an address, a record or `ipfs:`. With only `auto` and no address to publish, the
@@ -272,12 +274,14 @@ old one leaked, changes it.
 
 ```yaml
     names:
-      - name: a.dev.zenr.io.          # a member: its folder, as the site of a.dev.zenr.io
+      - name: files.dev.zenr.io.      # a node's folder, as the site of files.dev.zenr.io
         ipfs:
           api: http://127.0.0.1:5001  # the node's RPC API: the default, IPFS Desktop's too
-          publish: {mfs: /community}  # _dnslink.a TXT "dnslink=/ipfs/<the folder's CID>"
-      - name: site.dev.zenr.io.       # a community node: a's site, once its node holds it all
-        ipfs: {follow: a.dev.zenr.io}
+          publish: {mfs: /community}  # _dnslink.files TXT "dnslink=/ipfs/<the folder's CID>"
+      - name: site.dev.zenr.io.       # a community node: an entry for each member of site
+        ipfs:
+          swarm_key: /home/me/.ipfs/swarm.key  # the community's private swarm's
+          follow: {type: ipfs-member, domain: srp.dev.zenr.io, revoke_after: 10m}
 ```
 
 `ipfs` is a complex type: code, run against a kubo node (IPFS Desktop runs one) through its RPC
@@ -292,43 +296,142 @@ and nodes open as `/ipns/<name>`:
 |---|---|
 | `api` | The node's RPC API, `http://host:port`. Default `http://127.0.0.1:5001`. |
 | `publish: {mfs: <path>}` | A path in the node's files (MFS, IPFS Desktop's Files): the site is its CID, which changes with anything in it. |
-| `follow: <name>` | Another name's site, its `_dnslink` record, asked of the registrar (or of its `resolvers`, below): the node pins each new one, fetching what it lacks, and the name gives it once the node holds it all; the node's earlier pins of it are then removed. Only a site given as `/ipfs/<CID>` can be followed. |
+| `follow` | A community (below): the site is a folder with an entry for each member, the member's folder, once the node holds it all. |
+| `swarm_key` | With `follow`, required: the swarm key file of the community's private swarm (`swarm.key` in the node's repository), which the members' `swarm-mac=` are checked with (below). Relative to the template. Not with `publish`: a name's site is no member. |
 
 With neither, the name publishes the node's addresses alone; not both. Nothing else at the name
 may be at `_dnslink` or `_dnsaddr`.
 
 The node is asked again at every poll, each request lasting at most the probe timeout; a pin
-lasts as long as it takes, in the background, and a newer site replaces a pin still running.
+lasts as long as it takes, in the background, and a newer folder replaces a pin still running.
 While the node does not answer, the name withdraws its addresses and keeps its site, which other
 nodes may hold; a path that cannot be read keeps the site too, and each failure is logged once.
-A name with `ipfs:` registers nothing until its node has been asked once.
+A name with `ipfs:` registers nothing until its node has been asked once. The swarm key file is
+read again at every poll too, so a new key or a file fixed counts without a restart.
 
-A follower's pins are named `sig0lease-agent <name>` (`ipfs pin ls --type=recursive --names`).
-At the start, until a pin completes, the name gives what its node pinned under that name
-before: the followed name may give nothing then. The pins stay when the agent stops or the name
-leaves the template; `ipfs pin rm` removes them.
+#### A community's member: a host's service
 
-The followed name's site is asked of the registrar. This project's proxy, with the `opcode: 0`
-rule of `config.yaml`, answers it from the zone's authoritative server, so a follower sees a
-change as soon as the zone has it. A name outside the proxy's zones it does not answer for:
-with `server.forward` off, as in `config.yaml`, it refuses it, `REFUSED` with Extended DNS Error
-20 (Not Authoritative), and the follower asks the registrar's `resolvers` instead
+```yaml
+    hosts:
+      - name: myhost
+        addresses: [auto]
+        services:
+          - type: ipfs-member         # the node's swarm port, probed over TCP
+            instance: myhost          # its entry in the community's folder
+            subtypes: [site]          # the community: site.dev.zenr.io's
+            ipfs:
+              swarm_key: /home/me/.ipfs/swarm.key
+              publish: {mfs: /community}  # TXT "dnslink=/ipfs/<the folder's CID>" "swarm-mac=<MAC>"
+```
+
+A host's service with `ipfs: {publish: {mfs: <path>}, swarm_key: <file>}` gives the path's CID
+in its TXT record, `dnslink=/ipfs/<CID>`, as it changes, with `swarm-mac=<MAC>`, which shows the
+community's node that the member has the community's swarm key (below). It is registered once
+the path and the swarm key file have been read, and withdrawn while the file cannot be read.
+`publish` and `swarm_key` are required; `api` is as a name's; `txt` may not give `dnslink` or
+`swarm-mac`. It publishes no addresses: a member's node finds the community's in its peer list
+(`/dnsaddr/<community's name>/p2p/<ID>`), and the community's node fetches the folder from it.
+
+A community's members are the instances of one service type listed under one subtype, the
+community's (RFC 6763 §7.1): the preset `ipfs-member` (`_ipfs-member._tcp`, port 4001, the swarm
+port) with the subtype `site`, for `site.dev.zenr.io`, as above. A member is its instance label,
+its entry's name: letters, digits and hyphens, so give `instance:` (the default
+`myhost ipfs-member` is not one). The host's key holds it: stopping with `on_stop: keep`, the
+default, the label stays the host's for `key_lease`, and the host comes back to it, as the same
+member, when it registers again.
+
+#### Who is a member: `swarm-mac=`
+
+The nodes of a community are a private swarm: they share its swarm key, and no other node can
+connect to them. Anyone can register an instance under the community's subtype, but only a
+node of the swarm can make its `swarm-mac=`:
+
+- **The key** is derived from the swarm key's 32 bytes with HKDF-SHA256 (RFC 5869), with no salt
+  and the info `sig0lease swarm-mac`, so that the swarm key itself, which encrypts the swarm's
+  connections, is used for nothing else.
+- **The MAC** is HMAC-SHA256, under that key, of `<protocol> <algorithm> <public key> <CID>`:
+  the KEY at the instance's name, its protocol and algorithm in decimal and its public key in
+  base64 as the record gives it, and the CID that the `dnslink=` gives. `swarm-mac=` gives it in
+  base64url, with no padding (43 characters).
+
+The KEY's three fields are the ones the registrar tells keys apart by, and the registrar puts
+at an instance's name only the KEY of the key that signed the update (SRP checks each update's
+signature against the KEY it carries). So:
+
+- An instance with a key of its own and no swarm key cannot make a `swarm-mac=` for its KEY.
+- A member's `dnslink=` and `swarm-mac=` copied to another instance do not match the KEY there,
+  which is the copier's: they cannot put the member's KEY at a name without the member's
+  private key. The same holds at the member's own label, taken by another key once the
+  member's `key_lease` ran out.
+- A `swarm-mac=` given with another CID does not match it.
+
+The instance's label is not in it: the label is the KEY's holder's already, and a label held by
+another key is renamed (`myhost` to `myhost-2`) after the TXT record is made. An instance that
+is not a member is still listed: the community's node asks for its KEY and TXT record at every
+poll, logs it once, and pins nothing.
+
+#### A community's node: `follow`
+
+| Field | Meaning |
+|---|---|
+| `type` | The members' type: a preset or one of the template's `types:`, `ipfs-member` say. Required. |
+| `subtype` | The community's subtype, a label. Default: the name's first label (`site` for `site.dev.zenr.io`). |
+| `domain` | The SRP domain the members register in. Required. |
+| `revoke_after` | How long a member may be unlisted before its entry is removed, such as `10m`. Required. |
+
+At every poll the node lists the members: the instances the PTR records at
+`<subtype>._sub.<service>.<domain>` give, each with the KEY and the TXT record at its name. Each
+member has an entry, by its label, in a folder of the node's files,
+`/sig0lease-agent/<name>` (`/sig0lease-agent/site.dev.zenr.io`), and the name's site is that
+folder: `/ipns/<name>/<member>/` opens a member's folder. The node pins each new folder a
+member's TXT record gives, fetching what it lacks, and the entry gives it once the node holds it
+all: the folder changes then, without waiting for the next poll. A pin that fails is tried again
+at the next poll.
+
+- An instance is not a member, which is logged once, when its label is not letters, digits and
+  hyphens, its name has no KEY or several, or its TXT record gives no folder as `/ipfs/<CID>`,
+  no `swarm-mac=`, or one the swarm key does not make of its KEY and that CID. A member whose
+  instance turns into such a one is no longer listed.
+- A member no longer listed (its agent stopped, its probe failed, its lease ran out) keeps its
+  entry for `revoke_after`, and carries on if it is listed again within it; after it, its entry
+  is removed.
+- A label another key holds now is another member: the entry of the one before is removed at
+  once.
+- While the swarm key file cannot be read, the members are not listed, so none is unlisted for
+  it, and the folder stays as it is; logged once.
+- The folder is the agent's, read at every poll: a member's entry removed or changed there by
+  hand is put back, as is the folder, and an entry made there by hand is one whose member is not
+  listed, removed after `revoke_after` unless it is.
+
+The keys are not kept across the agent's restarts: after one, each entry in the folder is a
+member not listed since, removed after `revoke_after` unless it is, and the key listed first at
+its label, with a `swarm-mac=` that checks, is its member's.
+
+The node's pins of the members' folders are named `sig0lease-agent <name>` (`ipfs pin ls
+--type=recursive --names`); those no entry gives, a member's folders before and those of members
+removed, are unpinned at every poll. A folder the node has pinned already under another name,
+or none, is its owner's pin: kubo keeps one pin of a CID, so the agent leaves it as it is, its
+name too, and never unpins it. The pins and the folder stay when the agent stops or the name
+leaves the template; `ipfs pin rm` and `ipfs files rm -r` remove them.
+
+The members are asked of the registrar. This project's proxy, with the `opcode: 0` rule of
+`config.yaml`, answers from the zone's authoritative server, so the node sees a member come and
+go as soon as the zone has it. A domain outside the proxy's zones it does not answer for: with
+`server.forward` off, as in `config.yaml`, it refuses it, `REFUSED` with Extended DNS Error 20
+(Not Authoritative), and the node asks the registrar's `resolvers` instead
 (`docs/siglease_rfc9664.md`, "Requests No Handler Takes"); with it on, it asks its upstream
-resolvers itself. Resolvers may answer from their cache, for up to the record's TTL, and a "no
-such name" for up to the zone's negative TTL. A `_dnslink` record that is a CNAME into another
-zone, as a hosting service's often is, is followed there. The TTL of a site in the proxy's
-zones, its `record_ttl_sec` (30 s in `config.yaml`), is also how long gateways and resolvers may
-keep a site that changed. [demo.md](demo.md), D3, is a member and a community node in a
-private swarm.
+resolvers itself. Resolvers may answer from their cache, for up to the records' TTL, and a "no
+such name" for up to the zone's negative TTL. The TTL of a site in the proxy's zones, its
+`record_ttl_sec` (30 s in `config.yaml`), is also how long gateways and resolvers may keep a
+site that changed. [demo.md](demo.md), D3, is members and a community node in a private swarm.
 
-For a site outside the zones whose changes a follower should see at once, list the
-authoritative server of the site's zone first, by address, then resolvers:
+For a domain outside the zones whose changes the node should see at once, list the
+authoritative server of the domain's zone first, by address, then resolvers:
 `resolvers: [192.0.2.53:53, 8.8.8.8:53]`, with the address of a server `dig +short NS
 example.org` names. They are asked in turn, and one that does not answer, or refuses the name,
 as an authoritative server refuses a name outside its zones (BIND with recursion off), is passed
-over for the next: the resolvers answer the rest, such as a CNAME's target in another zone. A
-server given by host name is asked at one of its addresses only, which may be one it does not
-answer on.
+over for the next: the resolvers answer the rest. A server given by host name is asked at one of
+its addresses only, which may be one it does not answer on.
 
 ## Running
 
@@ -451,8 +554,10 @@ Run one agent per keystore.
 
 - RFC 9664 names need this project's proxy: the lease is RFC 9664's, but a name held by its key
   (`fcfs_naming`) is the proxy's.
-- `ipfs`: a site given as `/ipns/...`, or as a path below a CID, cannot be followed; a follow
-  removed from the template leaves its pins.
+- `ipfs`: a member's folder given as `/ipns/...`, or as a path below a CID, is not pinned; a
+  follow removed from the template leaves its pins and its folder; a community node keeps its
+  members' keys in memory only, so after a restart it takes the key it lists first at each
+  entry's label.
 - Probes are plain TCP and HTTP.
 - A key change announced ahead (RFC 7671 §8.1): `tlsa` takes one certificate, so a name's TLSA
   record follows a new key instead of coming before it (see "names").

@@ -19,6 +19,7 @@ import (
 	"github.com/NetworkCommons/sig0lease/client/rfc9664"
 	clientsrp "github.com/NetworkCommons/sig0lease/client/srp"
 	"github.com/NetworkCommons/sig0lease/logging"
+	"github.com/NetworkCommons/sig0lease/pkg/dnsmsg"
 	"github.com/NetworkCommons/sig0lease/pkg/dnsname"
 	"github.com/NetworkCommons/sig0lease/pkg/keyrec"
 )
@@ -47,8 +48,8 @@ type Options struct {
 	Interfaces func() ([]netip.Addr, error)
 	// Send, Query and Sleep are every SRP client's (clientsrp.Config), Send and Sleep every
 	// RFC 9664 client's too (rfc9664.Config); nil: the clients' own. Query also asks what a
-	// name that follows a site asks the resolvers (watchIPFS); nil: the registrar's resolvers
-	// (clientsrp.LiveDNSQuery).
+	// name that follows a community asks the resolvers (watchIPFS); nil: the registrar's
+	// resolvers (clientsrp.LiveDNSQuery).
 	Send  baseclient.Transport
 	Query clientsrp.DNSQuery
 	Sleep func(context.Context, time.Duration) error
@@ -190,7 +191,7 @@ func Run(ctx context.Context, path string, opts Options) error {
 		case e := <-a.mirrorEnded:
 			a.mirrorStopped(e)
 		case r := <-a.ipfsReports:
-			a.ipfsReported(r)
+			r.deliver(r.w, r.state)
 		case <-probes.C:
 			for _, hr := range a.hosts {
 				for _, s := range hr.services {
@@ -240,6 +241,7 @@ type agent struct {
 type hostRun struct {
 	registrar Registrar // its registrar's connection (Registrar.connection)
 	host      Host
+	key       *dns.KEY // its signing key's, which the registrar puts at its names
 	worker    *clientsrp.Host
 	services  []*serviceRun
 	set       bool
@@ -264,6 +266,7 @@ type holder interface {
 	label() string                   // what its log lines start with
 	addresses(a *agent) []netip.Addr // now: its services are probed there
 	publish(a *agent)                // hands what is registered now to its worker, if it changed
+	registrarOf() Registrar          // its registrar's connection
 }
 
 // serviceRun is one service and its probes.
@@ -278,10 +281,39 @@ type serviceRun struct {
 	// cannot be read (readCertificate), and the last such error, logged once.
 	tlsa    *dns.TLSA
 	tlsaErr string
+	// A host's service with ipfs: its node's watch; the folder its TXT record gives, "" until
+	// the node gives one; and the swarm key its swarm-mac= is made with, nil until read.
+	ipfs  *ipfsWatch
+	site  string
+	swarm swarmKey
 }
 
-// registered reports whether s is registered: up, and with a TLSA, its certificate read.
-func (s *serviceRun) registered() bool { return s.up && (s.svc.TLSA == "" || s.tlsa != nil) }
+// registered reports whether s is registered: up, with a TLSA its certificate read, and with
+// ipfs: its folder and its swarm key read.
+func (s *serviceRun) registered() bool {
+	return s.up && (s.svc.TLSA == "" || s.tlsa != nil) && (s.svc.IPFS == nil || (s.site != "" && s.swarm != nil))
+}
+
+// instance returns s's instance as registered now by a host whose KEY is key: with ipfs:, its
+// TXT record gives its node's folder, and the swarm-mac= of key and the folder.
+func (s *serviceRun) instance(key *dns.KEY) clientsrp.InstanceConfig {
+	in := s.svc.Instance
+	if s.svc.IPFS != nil {
+		in.TXT = append(slices.Clone(in.TXT),
+			dnsmsg.EscapeTXT("dnslink=/ipfs/"+s.site),
+			dnsmsg.EscapeTXT(swarmMACKey+"="+s.swarm.mac(key, s.site)))
+	}
+	return in
+}
+
+// drop marks s gone, no longer registered by the template, and stops watching its node.
+func (s *serviceRun) drop() {
+	s.gone = true
+	if s.ipfs != nil {
+		s.ipfs.stop()
+		s.ipfs = nil
+	}
+}
 
 func (s *serviceRun) String() string { return s.on.label() + ": " + s.svc.String() }
 
@@ -385,7 +417,7 @@ func (a *agent) srpConfig(r savedRegistrar) clientsrp.Config {
 
 // resolverQuery is how the agent asks a registrar's resolvers, given in its template (nil:
 // client/srp's default ones): an SRP client, for discovery and KEY lookups, and a name that
-// follows a site, for a name its registrar does not serve.
+// follows a community, for the names of members its registrar does not serve.
 func (a *agent) resolverQuery(resolvers []string) clientsrp.DNSQuery {
 	if a.opts.Query != nil {
 		return a.opts.Query
@@ -506,15 +538,13 @@ func (a *agent) startHost(r Registrar, h Host) error {
 	if err != nil {
 		return err
 	}
-	hr := &hostRun{registrar: r.connection(), host: h, worker: w}
+	hr := &hostRun{registrar: r.connection(), host: h, key: key.PublicKey, worker: w}
 	for _, svc := range h.Services {
 		hr.services = append(hr.services, newService(hr, svc))
 	}
 	a.hosts[owner] = hr
 	hr.publish(a)
-	for _, s := range hr.services {
-		a.probe(s)
-	}
+	a.startServices(hr, hr.services)
 	return nil
 }
 
@@ -540,19 +570,28 @@ func (a *agent) startName(r Registrar, n Name) error {
 		nr.services = append(nr.services, newService(nr, svc))
 	}
 	if n.IPFS != nil {
-		nr.ipfs = a.watchIPFS(nr)
+		a.watchName(nr)
 	}
 	a.names[owner] = nr
 	a.readCertificates(nr)
 	nr.publish(a)
-	for _, s := range nr.services {
-		a.probe(s)
-	}
+	a.startServices(nr, nr.services)
 	return nil
 }
 
 func newService(on holder, svc Service) *serviceRun {
 	return &serviceRun{on: on, svc: svc, up: svc.Probe.Kind == ProbeNone}
+}
+
+// startServices starts watching the node of each of services, of on, that has ipfs:, and
+// probing each of them.
+func (a *agent) startServices(on holder, services []*serviceRun) {
+	for _, s := range services {
+		if s.svc.IPFS != nil {
+			a.watchService(s, on.registrarOf())
+		}
+		a.probe(s)
+	}
 }
 
 // addresses returns a host's or name's addresses now: its literal ones, then this machine's
@@ -571,6 +610,8 @@ func (a *agent) addresses(auto bool, literal []netip.Addr) []netip.Addr {
 
 func (hr *hostRun) label() string { return hr.host.Name }
 
+func (hr *hostRun) registrarOf() Registrar { return hr.registrar }
+
 func (hr *hostRun) addresses(a *agent) []netip.Addr {
 	return a.addresses(hr.host.Auto, hr.host.Addresses)
 }
@@ -581,7 +622,7 @@ func (hr *hostRun) publish(a *agent) {
 	var insts []clientsrp.InstanceConfig
 	for _, s := range hr.services {
 		if s.registered() {
-			insts = append(insts, s.svc.Instance)
+			insts = append(insts, s.instance(hr.key))
 		}
 	}
 	if hr.set && slices.Equal(addrs, hr.addrs) && reflect.DeepEqual(insts, hr.instances) {
@@ -595,6 +636,8 @@ func (hr *hostRun) publish(a *agent) {
 }
 
 func (nr *nameRun) label() string { return nr.name.Name }
+
+func (nr *nameRun) registrarOf() Registrar { return nr.registrar }
 
 func (nr *nameRun) addresses(a *agent) []netip.Addr {
 	return a.addresses(nr.name.Auto, nr.name.Addresses)
@@ -916,9 +959,7 @@ func (a *agent) updateHost(hr *hostRun, h Host) {
 	var added []*serviceRun
 	hr.services, added = moveServices(hr, hr.services, h.Services)
 	hr.publish(a)
-	for _, s := range added {
-		a.probe(s)
-	}
+	a.startServices(hr, added)
 }
 
 // updateName moves nr to n, the same name with the same lifetime in a new template
@@ -937,7 +978,7 @@ func (a *agent) updateName(nr *nameRun, n Name) {
 			nr.ipfs = nil
 		}
 		if n.IPFS != nil {
-			nr.ipfs = a.watchIPFS(nr)
+			a.watchName(nr)
 		} else {
 			nr.ipfsRecords = nil
 		}
@@ -946,15 +987,13 @@ func (a *agent) updateName(nr *nameRun, n Name) {
 	nr.services, added = moveServices(nr, nr.services, n.Services)
 	a.readCertificates(nr)
 	nr.publish(a)
-	for _, s := range added {
-		a.probe(s)
-	}
+	a.startServices(nr, added)
 }
 
 // moveServices returns the services svcs of on, a host or name in a new template, from those
-// running, and those of them added, to be probed. One whose instance name, service type, port
-// and probe are unchanged keeps its probes' state; any other starts over, registered once a
-// probe passes. The others are gone.
+// running, and those of them added, to be started (startServices). One whose instance name,
+// service type, port, probe and ipfs: are unchanged keeps its probes' and its node's state;
+// any other starts over, registered once a probe passes. The others are dropped.
 func moveServices(on holder, running []*serviceRun, svcs []Service) (services, added []*serviceRun) {
 	key := func(s Service) string {
 		return dnsname.Fold(s.Instance.Label) + "\x00" + dnsname.Fold(s.Instance.ServiceType)
@@ -966,11 +1005,11 @@ func moveServices(on holder, running []*serviceRun, svcs []Service) (services, a
 	for _, svc := range svcs {
 		s := old[key(svc)]
 		delete(old, key(svc))
-		if s != nil && s.svc.Instance.Port == svc.Instance.Port && s.svc.Probe == svc.Probe {
+		if s != nil && s.svc.Instance.Port == svc.Instance.Port && s.svc.Probe == svc.Probe && reflect.DeepEqual(s.svc.IPFS, svc.IPFS) {
 			s.svc = svc
 		} else {
 			if s != nil {
-				s.gone = true
+				s.drop()
 			}
 			s = newService(on, svc)
 			added = append(added, s)
@@ -978,7 +1017,7 @@ func moveServices(on holder, running []*serviceRun, svcs []Service) (services, a
 		services = append(services, s)
 	}
 	for _, s := range old {
-		s.gone = true
+		s.drop()
 	}
 	return services, added
 }
@@ -1133,13 +1172,13 @@ func stop(hosts []*hostRun, names []*nameRun, restart bool) {
 	}
 	for _, hr := range hosts {
 		for _, s := range hr.services {
-			s.gone = true
+			s.drop()
 		}
 		workers = append(workers, hr.worker)
 	}
 	for _, nr := range names {
 		for _, s := range nr.services {
-			s.gone = true
+			s.drop()
 		}
 		if nr.ipfs != nil {
 			nr.ipfs.stop()
