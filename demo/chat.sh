@@ -11,8 +11,8 @@
 # then the servers and the proxy. The logs and the agent's template go to a temporary directory,
 # printed at the start.
 #
-# The demo runs it on two machines, with a label each (default chat); a rehearsal, on one
-# machine with two labels.
+# The demo runs it on two machines, with a label each (default chat), or on one machine with
+# two labels.
 #   ROOM     the room every page joins; default meet@rooms.<first label>.<UPDATE_DOMAIN>. On
 #            the second machine, the first one's.
 #   PROSODY  docker: the prosodyim/prosody:13.0 image (default on macOS); native: Prosody 13

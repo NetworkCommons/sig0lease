@@ -1,0 +1,63 @@
+# The checks of the instance's community node, part of the release's (the sig0lease role's
+# check.yml): community_agent_exe is the agent the release has. The node runs, the agent is the
+# release's, the community's site name gives the node's addresses at the zone's authoritative
+# server, with its folder, and nginx passes the gateway on. Each check is tried for a while, as the
+# agent starts.
+
+- name: The community node runs
+  ansible.builtin.systemd_service:
+    name: "{{ community_kubo_service }}"
+  register: community_kubo_active
+  until: community_kubo_active.status.ActiveState == 'active'
+  retries: 10
+  delay: 1
+
+- name: The node answers, with its ID
+  ansible.builtin.uri:
+    url: "http://{{ community_settings.api_address }}/api/v0/id"
+    method: POST
+  register: community_kubo_id
+  until: community_kubo_id.status == 200
+  retries: 10
+  delay: 1
+
+- name: The community node's agent is the release's
+  ansible.builtin.shell: readlink "/proc/$(systemctl show -p MainPID --value {{ community_agent_service }})/exe"
+  register: community_agent_running
+  changed_when: false
+  until: community_agent_running.stdout == community_agent_exe
+  retries: 10
+  delay: 1
+
+# The agent asks its node every 10 s, then registers; the instance's proxy answers from the
+# zone's authoritative server.
+- name: The community's site name gives the node's addresses, {{ community_site }}
+  ansible.builtin.command: >-
+    dig +short +norec +time=2 +tries=1 @127.0.0.1 -p {{ registrar_settings.port }} TXT _dnsaddr.{{ community_site }}
+  register: community_dnsaddr
+  changed_when: false
+  until: ('/p2p/' ~ community_kubo_id.json.ID ~ '"') in community_dnsaddr.stdout
+  retries: 30
+  delay: 2
+
+# The agent makes the community's folder at its start, members or none.
+- name: The community's site name gives its folder, {{ community_site }}
+  ansible.builtin.command: >-
+    dig +short +norec +time=2 +tries=1 @127.0.0.1 -p {{ registrar_settings.port }} TXT _dnslink.{{ community_site }}
+  register: community_dnslink
+  changed_when: false
+  until: community_dnslink.stdout is match('^"dnslink=/ipfs/[^"/]+"$')
+  retries: 30
+  delay: 2
+
+# The empty folder: in every node's repository, so the gateway serves it with Gateway.NoFetch.
+# The uri module cannot ask 127.0.0.1 and check the certificate for the registrar's name.
+- name: The node's gateway is served by nginx  # noqa: command-instead-of-module
+  ansible.builtin.command: >-
+    curl -sf -o /dev/null --resolve {{ registrar_name }}:{{ registrar_settings.https_port }}:127.0.0.1
+    https://{{ registrar_name }}:{{ registrar_settings.https_port }}/ipfs/bafybeiczsscdsbs7ffqz55asqdf3smv6klcw3gofszvwlyarci47bgf354/
+  register: community_gateway
+  changed_when: false
+  until: community_gateway.rc == 0
+  retries: 10
+  delay: 1

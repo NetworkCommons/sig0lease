@@ -51,7 +51,7 @@
         src: "{{ registrar_root }}/staging/releases/{{ sig0lease_release }}/{{ item }}"
         dest: "{{ sig0lease_root }}/releases/{{ sig0lease_release }}/{{ item }}"
         mode: preserve
-      loop: [sig0lease, config.base.yaml, web/]
+      loop: [sig0lease, sig0lease-agent, config.base.yaml, web/]
 
     - name: Make it the release stable runs
       ansible.builtin.include_tasks: activate.yml

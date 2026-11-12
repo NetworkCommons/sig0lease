@@ -1,0 +1,16 @@
+# The community node's agent, with the release current points at: community_agent_state, restarted
+# or stopped. The sig0lease role includes it where it restarts or stops the proxy. A release from
+# before the agent came with releases has none: the agent is stopped then, and the instance's
+# checks fail (check.yml).
+
+- name: Whether the release has the agent
+  ansible.builtin.stat:
+    path: "{{ registrar_root }}/{{ registrar_instance }}/current/sig0lease-agent"
+  register: community_agent_bin
+
+- name: The community node's agent, {{ community_agent_state }}
+  ansible.builtin.systemd_service:
+    name: "{{ community_agent_service }}"
+    state: "{{ community_agent_state if community_agent_bin.stat.exists else 'stopped' }}"
+    enabled: "{{ community_agent_bin.stat.exists and community_agent_state != 'stopped' }}"
+    daemon_reload: true

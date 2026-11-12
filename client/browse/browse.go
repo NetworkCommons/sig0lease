@@ -131,7 +131,7 @@ func cnameTarget(answer []dns.RR, owner string, qtype uint16) string {
 // answers for a name outside its zones when it forwards no queries (server.forward off). q
 // would be the proxy, for its zones' answers from their authoritative server, and other
 // resolvers, for every other name, such as the target of an SRV record outside the zones: the
-// browser page's, and a sig0lease-agent name's that follows a site. Any other answer, or
+// browser page's, and a sig0lease-agent name's that follows a community. Any other answer, or
 // failure, is q's.
 func Fallback(q, other Query) Query {
 	return func(ctx context.Context, name string, qtype uint16) ([]dns.RR, error) {
@@ -192,16 +192,14 @@ func Browse(ctx context.Context, q Query, domain string) (*Domain, error) {
 	g.SetLimit(parallel)
 	for _, t := range d.Types {
 		g.Go(func() error {
-			ptrs, err := q(gctx, dnssd.BrowsingOwnerName(t, domain), dns.TypePTR)
+			labels, err := InstanceLabels(gctx, q, dnssd.BrowsingOwnerName(t, domain), t, domain)
 			if err != nil {
 				return err
 			}
 			mu.Lock()
 			defer mu.Unlock()
-			for _, name := range ptrTargets(ptrs) {
-				if label, rest, ok := dnsname.CutFirstLabel(name); ok && dnsname.EqualFold(rest, dnssd.BrowsingOwnerName(t, domain)) {
-					d.Instances = append(d.Instances, Instance{Name: label, Type: t, TXT: []string{}, Addresses: []string{}})
-				}
+			for _, label := range labels {
+				d.Instances = append(d.Instances, Instance{Name: label, Type: t, TXT: []string{}, Addresses: []string{}})
 			}
 			return nil
 		})
@@ -252,6 +250,25 @@ func Browse(ctx context.Context, q Query, domain string) (*Domain, error) {
 		return strings.Compare(a.Type+" "+a.Name, b.Type+" "+b.Name)
 	})
 	return d, nil
+}
+
+// InstanceLabels returns the Instance labels of the instances of the service type t in domain
+// that the PTR records at owner point at: owner is t's browsing name, "<t>.<domain>", or one of
+// its subtypes', "<subtype>._sub.<t>.<domain>" (RFC 6763 S7.1). A PTR record that points at
+// anything but an instance of t in domain is left out: it lists nothing a client can resolve
+// as one.
+func InstanceLabels(ctx context.Context, q Query, owner, t, domain string) ([]string, error) {
+	ptrs, err := q(ctx, owner, dns.TypePTR)
+	if err != nil {
+		return nil, err
+	}
+	var labels []string
+	for _, name := range ptrTargets(ptrs) {
+		if label, rest, ok := dnsname.CutFirstLabel(name); ok && dnsname.EqualFold(rest, dnssd.BrowsingOwnerName(t, domain)) {
+			labels = append(labels, label)
+		}
+	}
+	return labels, nil
 }
 
 func ptrTargets(rrs []dns.RR) []string {

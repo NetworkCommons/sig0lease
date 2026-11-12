@@ -1,7 +1,9 @@
 package agent
 
 import (
+	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"net/netip"
 	"reflect"
@@ -17,47 +19,60 @@ import (
 	"github.com/NetworkCommons/sig0lease/pkg/dnsmsg"
 )
 
-// ipfsWatch is the goroutine watching the node of a name with ipfs: (watchIPFS).
+// ipfsWatch is the goroutine watching the node of a name's or a host's service's ipfs:
+// (watchIPFS).
 type ipfsWatch struct {
 	cancel   context.CancelFunc
 	done     chan struct{}
 	reported bool // the agent's loop has its first report; owned by the loop
 }
 
-// ipfsReport is what a name's node gives it now: its site's and its addresses' records.
-type ipfsReport struct {
-	nr      *nameRun
-	w       *ipfsWatch
-	records []dns.RR
+// ipfsState is what a node gives now: its site, a CID, "" none; its addresses to publish
+// (dnsaddrs), nil while it does not answer; and with SwarmKey the key its swarm-mac= is made
+// with, nil while the file cannot be read.
+type ipfsState struct {
+	site  string
+	addrs []string
+	swarm swarmKey
 }
 
-// watchIPFS starts watching nr's node (ipfsNode.run), each kubo request lasting at most
-// ProbeTimeout. The followed name's site is asked of nr's registrar, which answers as soon
-// as the zone has it when it is this project's proxy, and of the registrar's resolvers when
-// the registrar refuses it as a name it does not serve (browse.Fallback): a proxy that
-// forwards no queries refuses every name outside its zones. nr registers nothing until the
-// first report.
-func (a *agent) watchIPFS(nr *nameRun) *ipfsWatch {
+// ipfsReport is a watch's report, which deliver hands, on the agent's loop, to what the watch
+// is for.
+type ipfsReport struct {
+	w       *ipfsWatch
+	state   ipfsState
+	deliver func(*ipfsWatch, ipfsState)
+}
+
+// watchIPFS starts watching the node cfg gives (ipfsNode.run), for owner, what its log lines
+// start with, each kubo request lasting at most ProbeTimeout; deliver gets each report. A
+// community (Follow) is listed by asking r, which answers as soon as the zone has it when it
+// is this project's proxy, and r's resolvers what r refuses as a name it does not serve
+// (browse.Fallback): a proxy that forwards no queries refuses every name outside its zones.
+func (a *agent) watchIPFS(owner string, cfg IPFS, r Registrar, deliver func(*ipfsWatch, ipfsState)) *ipfsWatch {
 	ctx, cancel := context.WithCancel(context.Background())
 	w := &ipfsWatch{cancel: cancel, done: make(chan struct{})}
-	send := a.opts.Send
-	if send == nil {
-		send = baseclient.LiveTransport(a.opts.ProbeTimeout)
-	}
 	n := &ipfsNode{
-		owner: nr.label(),
-		cfg:   *nr.name.IPFS,
-		kubo:  kubo.New(nr.name.IPFS.API, a.opts.ProbeTimeout),
-		query: browse.Fallback(
-			browse.Querier(send, nr.registrar.Server, nr.registrar.Transport),
-			browse.Answers(a.resolverQuery(nr.registrar.Resolvers))),
+		owner:    owner,
+		cfg:      cfg,
+		kubo:     kubo.New(cfg.API, a.opts.ProbeTimeout),
 		logf:     a.opts.Logf,
 		interval: a.opts.PollInterval,
 		failed:   map[string]string{},
 	}
-	report := func(records []dns.RR) bool {
+	if cfg.Follow != nil {
+		send := a.opts.Send
+		if send == nil {
+			send = baseclient.LiveTransport(a.opts.ProbeTimeout)
+		}
+		query := browse.Fallback(
+			browse.Querier(send, r.Server, r.Transport),
+			browse.Answers(a.resolverQuery(r.Resolvers)))
+		n.community = newCommunity(n, *cfg.Follow, query)
+	}
+	report := func(st ipfsState) bool {
 		select {
-		case a.ipfsReports <- ipfsReport{nr: nr, w: w, records: records}:
+		case a.ipfsReports <- ipfsReport{w: w, state: st, deliver: deliver}:
 			return true
 		case <-ctx.Done():
 			return false
@@ -70,118 +85,149 @@ func (a *agent) watchIPFS(nr *nameRun) *ipfsWatch {
 	return w
 }
 
-// stop stops the watch and waits for its goroutine, a pin it runs cancelled.
+// stop stops the watch and waits for its goroutine, the pins it runs cancelled.
 func (w *ipfsWatch) stop() {
 	w.cancel()
 	<-w.done
 }
 
-// ipfsReported hands r to its name, unless the name or its watch is gone since.
-func (a *agent) ipfsReported(r ipfsReport) {
-	if a.names[r.nr.label()] != r.nr || r.nr.ipfs != r.w {
-		return
+// watchName starts watching nr's node: each report gives nr the records its node gives it,
+// unless nr or its watch is gone since. nr registers nothing until the first report.
+func (a *agent) watchName(nr *nameRun) {
+	nr.ipfs = a.watchIPFS(nr.label(), *nr.name.IPFS, nr.registrar, func(w *ipfsWatch, st ipfsState) {
+		if a.names[nr.label()] != nr || nr.ipfs != w {
+			return
+		}
+		w.reported = true
+		nr.ipfsRecords = ipfsRecords(nr.label(), st)
+		nr.publish(a)
+	})
+}
+
+// watchService starts watching the node of s, a host's service registering through r: each
+// report gives s its node's folder and its swarm key, which its TXT record gives the folder
+// and its swarm-mac= with, unless s or its watch is gone since. s is not registered until both
+// are read (serviceRun.registered).
+func (a *agent) watchService(s *serviceRun, r Registrar) {
+	s.ipfs = a.watchIPFS(s.String(), *s.svc.IPFS, r, func(w *ipfsWatch, st ipfsState) {
+		if s.gone || s.ipfs != w {
+			return
+		}
+		w.reported = true
+		if st.site != s.site || !bytes.Equal(st.swarm, s.swarm) {
+			s.site, s.swarm = st.site, st.swarm
+			s.on.publish(a)
+		}
+	})
+}
+
+// ipfsRecords returns the records a node's state gives the name owner: its site's, then its
+// addresses'.
+func ipfsRecords(owner string, st ipfsState) []dns.RR {
+	var rrs []dns.RR
+	if st.site != "" {
+		rrs = append(rrs, txtRecord(dnslinkOwner(owner), "dnslink=/ipfs/"+st.site))
 	}
-	r.w.reported = true
-	r.nr.ipfsRecords = r.records
-	r.nr.publish(a)
+	for _, a := range st.addrs {
+		rrs = append(rrs, txtRecord(dnsaddrOwner(owner), "dnsaddr="+a))
+	}
+	return rrs
 }
 
 // ipfsNode is what a watch knows of the node, owned by the watch's goroutine.
 type ipfsNode struct {
-	owner    string // the name, fully qualified
-	cfg      IPFS
-	kubo     *kubo.Client
-	query    browse.Query // the registrar's, and the resolvers' for a name it does not serve
-	logf     func(format string, args ...any)
-	interval time.Duration
+	owner     string // what its log lines start with
+	cfg       IPFS
+	kubo      *kubo.Client
+	community *community // with Follow
+	logf      func(format string, args ...any)
+	interval  time.Duration
 
 	id     string            // the node's peer ID, once it answered
 	addrs  []string          // its addresses to publish (dnsaddrs); nil while it does not answer
-	site   string            // the CID the name gives at _dnslink; "" none
-	pinned string            // Follow: the followed site last pinned; "" none yet
-	tried  string            // Follow: the followed site last pinned or tried, logged once
+	site   string            // the CID it gives as its site; "" none
+	swarm  swarmKey          // with SwarmKey, read from it; nil while it cannot be read
 	failed map[string]string // the last failure logged, by check, so that it is logged once
 }
 
-type pinResult struct {
-	cid, got string // the CID asked for, and as kubo writes it
-	err      error
-}
-
-// run checks the node every interval until ctx ends or report fails, reporting the records it
-// gives the name after the first check and whenever they change. While the node does not
-// answer, the name withdraws its addresses and keeps its site: other nodes may hold the site.
+// run checks the node now and every interval (check) until ctx ends or report fails, reporting
+// its state after the first check and whenever it changes. While the node does not answer, it
+// withdraws its addresses and keeps its site: other nodes may hold the site.
 //
 // With Publish, the site is the path's CID in the node's files, which changes with anything
-// in it. With Follow, it is the followed name's site once the node has pinned it all, so that
-// the name only ever gives a site its node can serve whole. The node pins each new one in the
-// background, under the pin name pinName, and then unpins the others under that name; a
-// newer one replaces a pin still running. At the start, until a pin completes, the name gives
-// what the node pinned under that name before, as the followed name may give nothing then.
-func (n *ipfsNode) run(ctx context.Context, report func([]dns.RR) bool) {
-	pins := make(chan pinResult, 1)
-	pinning, cancelPin := "", context.CancelFunc(func() {})
-	stopPin := func() {
-		if pinning != "" {
-			cancelPin()
-			<-pins
-			pinning = ""
-		}
+// in it. With Follow, it is the community's folder (community.check), which changes as each
+// member's folder is pinned, and as members are removed. A pin that ends changes the folder at
+// once (community.pinDone), with no check: the members are listed every interval, however many
+// pins end, and a pin that fails is tried again at the next check, not at once.
+func (n *ipfsNode) run(ctx context.Context, report func(ipfsState) bool) {
+	var pins <-chan pinResult
+	if n.community != nil {
+		defer n.community.stop()
+		pins = n.community.pins
 	}
-	defer stopPin()
 	tick := time.NewTicker(n.interval)
 	defer tick.Stop()
-	var last []dns.RR
+	n.check(ctx)
+	var last ipfsState
 	for first := true; ; first = false {
-		if n.checkNode(ctx) {
-			switch {
-			case n.cfg.Publish != "":
-				n.checkPublished(ctx)
-			case n.cfg.Follow != "":
-				if n.site == "" && pinning == "" {
-					n.resume(ctx)
-				}
-				if cid := n.followed(ctx); cid != "" && cid != n.pinned && cid != pinning {
-					stopPin()
-					if cid != n.tried {
-						n.tried = cid
-						n.logf("%s: pinning %s, the site %s gives", n.owner, cid, n.cfg.Follow)
-					}
-					pinning, cancelPin = cid, n.startPin(ctx, cid, pins)
-				}
-			}
-		}
-		if records := n.records(); first || !reflect.DeepEqual(records, last) {
-			if !report(records) {
+		if st := (ipfsState{site: n.site, addrs: n.addrs, swarm: n.swarm}); first || !reflect.DeepEqual(st, last) {
+			if !report(st) {
 				return
 			}
-			last = records
+			last = st
 		}
 		select {
 		case <-ctx.Done():
 			return
 		case r := <-pins:
-			pinning = ""
-			cancelPin()
-			n.pinDone(ctx, r)
+			n.community.pinDone(ctx, r)
 		case <-tick.C:
+			n.check(ctx)
 		}
 	}
 }
 
-// startPin pins cid in the background, until it is done or ctx ends, and sends the result to
-// pins. The function it returns cancels it.
-func (n *ipfsNode) startPin(ctx context.Context, cid string, pins chan<- pinResult) context.CancelFunc {
-	ctx, cancel := context.WithCancel(ctx)
-	go func() {
-		got, err := n.kubo.Pin(ctx, cid, n.pinName())
-		pins <- pinResult{cid: cid, got: got, err: err}
-	}()
-	return cancel
+// check reads the swarm key file, with SwarmKey, and asks the node for its addresses and, if
+// it answers, for its site; a community's members are listed only with the swarm key read.
+func (n *ipfsNode) check(ctx context.Context) {
+	if !n.readSwarm() && n.community != nil {
+		return
+	}
+	if !n.checkNode(ctx) {
+		return
+	}
+	switch {
+	case n.cfg.Publish != "":
+		n.checkPublished(ctx)
+	case n.community != nil:
+		n.community.check(ctx)
+	}
 }
 
-// pinName is the name the node's pins of the followed sites have.
-func (n *ipfsNode) pinName() string { return "sig0lease-agent " + n.owner }
+// readSwarm reads the swarm key file, with SwarmKey, at each check, so that a new key or a file
+// fixed counts without a restart. It reports whether the key is read, or none is needed. While
+// the file cannot be read, a member is not registered (its swarm-mac= cannot be made) and a
+// community does not list its members.
+func (n *ipfsNode) readSwarm() bool {
+	if n.cfg.SwarmKey == "" {
+		return true
+	}
+	k, err := readSwarmKey(n.cfg.SwarmKey)
+	if err != nil {
+		what := "not registered until it can be read"
+		if n.community != nil {
+			what = "the members are not listed until it can be read; keeping the folder as it is"
+		}
+		n.fail("swarm key", fmt.Errorf("%w; %s", err, what))
+		n.swarm = nil
+		return false
+	}
+	if n.ok("swarm key") {
+		n.logf("%s: swarm key %s read", n.owner, n.cfg.SwarmKey)
+	}
+	n.swarm = k
+	return true
+}
 
 // checkNode asks the node for its addresses, reporting whether it answered.
 func (n *ipfsNode) checkNode(ctx context.Context) bool {
@@ -216,7 +262,7 @@ func dnsaddrs(id string, addrs []string) []string {
 	return slices.Compact(out)
 }
 
-// checkPublished reads the CID of the path the name publishes.
+// checkPublished reads the CID of the path the node publishes.
 func (n *ipfsNode) checkPublished(ctx context.Context) {
 	cid, err := n.kubo.MFSCID(ctx, n.cfg.Publish)
 	if err != nil {
@@ -224,110 +270,23 @@ func (n *ipfsNode) checkPublished(ctx context.Context) {
 		return
 	}
 	n.ok("publish")
+	n.give(cid, fmt.Sprintf("%s in its node's files", n.cfg.Publish))
+}
+
+// give makes cid, what is, the site, logging it if it is new.
+func (n *ipfsNode) give(cid, what string) {
 	if cid != n.site {
-		n.logf("%s: %s in its node's files is %s; the name gives it", n.owner, n.cfg.Publish, cid)
+		n.logf("%s: %s is %s; giving it", n.owner, what, cid)
 		n.site = cid
 	}
 }
 
-// resume gives the site the node pinned under pinName before, if there is one.
-func (n *ipfsNode) resume(ctx context.Context) {
-	cids, err := n.kubo.PinsNamed(ctx, n.pinName())
-	switch {
-	case err != nil:
-		n.fail("resume", fmt.Errorf("listing its node's pins: %w", err))
-	case len(cids) == 1:
-		n.ok("resume")
-		n.site = cids[0]
-		n.logf("%s: giving %s, which its node pinned before, until %s's site is pinned", n.owner, n.site, n.cfg.Follow)
-	case len(cids) > 1:
-		n.fail("resume", fmt.Errorf("its node has %d pins named %q: giving none until %s's site is pinned", len(cids), n.pinName(), n.cfg.Follow))
-	}
-}
-
-// followed returns the CID of the site the followed name gives now, its _dnslink record's
-// "dnslink=/ipfs/<CID>"; "" when it gives none, or none that can be followed.
-func (n *ipfsNode) followed(ctx context.Context) string {
-	owner := dnslinkOwner(n.cfg.Follow)
-	rrs, err := n.query(ctx, owner, dns.TypeTXT)
-	if err != nil {
-		n.fail("follow", fmt.Errorf("reading %s's site: %w; %s", n.cfg.Follow, err, n.keeping()))
-		return ""
-	}
-	var links []string
-	for _, rr := range rrs {
-		if v, ok := strings.CutPrefix(strings.Join(dnsmsg.TXTStrings(rr.(*dns.TXT)), ""), "dnslink="); ok {
-			links = append(links, v)
-		}
-	}
-	switch len(links) {
-	case 0:
-		n.fail("follow", fmt.Errorf("%s gives no site (no dnslink= record at %s); %s", n.cfg.Follow, owner, n.keeping()))
-		return ""
-	case 1:
-	default:
-		n.fail("follow", fmt.Errorf("%s gives %d sites at %s, not one; %s", n.cfg.Follow, len(links), owner, n.keeping()))
-		return ""
-	}
-	cid, ok := strings.CutPrefix(links[0], "/ipfs/")
-	if !ok || cid == "" || strings.Contains(cid, "/") {
-		n.fail("follow", fmt.Errorf("%s gives %q: only a site given as /ipfs/<CID> can be followed; %s", n.cfg.Follow, links[0], n.keeping()))
-		return ""
-	}
-	n.ok("follow")
-	return cid
-}
-
-// pinDone records the end of a pin of the followed site: on success, the name gives the site,
-// and the node's other pins under pinName go. A failed pin is tried again at the next check.
-func (n *ipfsNode) pinDone(ctx context.Context, r pinResult) {
-	if r.err != nil {
-		if ctx.Err() == nil {
-			n.fail("pin", fmt.Errorf("pinning %s: %w; trying again at the next check", r.cid, r.err))
-		}
-		return
-	}
-	n.ok("pin")
-	n.pinned = r.cid
-	if r.got != n.site {
-		n.logf("%s: pinned %s; the name gives it", n.owner, r.got)
-		n.site = r.got
-	}
-	cids, err := n.kubo.PinsNamed(ctx, n.pinName())
-	if err != nil {
-		n.fail("unpin", fmt.Errorf("listing its node's pins, to unpin the sites before: %w", err))
-		return
-	}
-	for _, cid := range cids {
-		if cid == r.got {
-			continue
-		}
-		if err := n.kubo.Unpin(ctx, cid); err != nil {
-			n.fail("unpin", fmt.Errorf("unpinning %s, a site before: %w", cid, err))
-			continue
-		}
-		n.logf("%s: unpinned %s, a site before", n.owner, cid)
-	}
-}
-
-// keeping says what the name gives while its site cannot be read.
+// keeping says what is given while the site cannot be read.
 func (n *ipfsNode) keeping() string {
 	if n.site == "" {
-		return "the name gives no site until then"
+		return "giving no site until then"
 	}
-	return "the name keeps giving " + n.site
-}
-
-// records returns the records the node gives the name: its site's, then its addresses'.
-func (n *ipfsNode) records() []dns.RR {
-	var rrs []dns.RR
-	if n.site != "" {
-		rrs = append(rrs, txtRecord(dnslinkOwner(n.owner), "dnslink=/ipfs/"+n.site))
-	}
-	for _, a := range n.addrs {
-		rrs = append(rrs, txtRecord(dnsaddrOwner(n.owner), "dnsaddr="+a))
-	}
-	return rrs
+	return "still giving " + n.site
 }
 
 // txtRecord returns the TXT record at owner whose strings, joined, are value: a string holds
@@ -342,8 +301,13 @@ func txtRecord(owner, value string) *dns.TXT {
 	return rr
 }
 
-// fail logs err for the check kind, unless it is the failure last logged for it.
+// fail logs err for the check kind, unless it is the failure last logged for it. A request cut
+// short because the watch stops is no failure, and is not logged: every other request ends by
+// its own time limit, which is another error.
 func (n *ipfsNode) fail(kind string, err error) {
+	if errors.Is(err, context.Canceled) {
+		return
+	}
 	if msg := err.Error(); msg != n.failed[kind] {
 		n.failed[kind] = msg
 		n.logf("%s: %s", n.owner, msg)

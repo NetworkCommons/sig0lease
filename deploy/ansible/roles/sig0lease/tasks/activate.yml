@@ -1,7 +1,8 @@
 # The release sig0lease_release, in the instance's releases/ with its files, made the one the
 # instance runs: its config written (sig0lease_config, config.yml), then current pointed at it,
-# the proxy restarted, nginx serving the instance, and the release checked, once nothing else
-# holds the instance's port. A release that fails its checks is replaced by the one before it,
+# the proxy restarted, nginx serving the instance, the community node's agent restarted, for an
+# instance that has one (roles/community), and the release checked, once nothing else holds the
+# instance's port. A release that fails its checks is replaced by the one before it,
 # or, on the instance's first release, stopped; either way the play fails. deploy (main.yml) and
 # promote (promote.yml) end here.
 
@@ -68,6 +69,14 @@
         name: nginx
         tasks_from: sites.yml
 
+    - name: Restart the community node's agent with the release
+      ansible.builtin.include_role:
+        name: community
+        tasks_from: agent.yml
+      vars:
+        community_agent_state: restarted
+      when: registrar_settings.community is defined
+
     - name: Check the release
       ansible.builtin.include_tasks: check.yml
 
@@ -101,6 +110,14 @@
         name: "{{ sig0lease_service }}"
         state: stopped
       when: sig0lease_previous == ''
+
+    - name: Restart the community node's agent with the release before, or stop it
+      ansible.builtin.include_role:
+        name: community
+        tasks_from: agent.yml
+      vars:
+        community_agent_state: "{{ 'restarted' if sig0lease_previous else 'stopped' }}"
+      when: registrar_settings.community is defined
 
     - name: Fail the play
       ansible.builtin.fail:

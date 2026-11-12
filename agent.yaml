@@ -41,6 +41,14 @@ registrars:
             txt: {path: /}
             probe: {http: /}            # registered while GET / answers 2xx or 3xx
           - type: gemini
+          - type: ipfs-member           # the IPFS node's swarm port 4001, probed over TCP
+            instance: myhost            # a community's entry: letters, digits and hyphens
+            subtypes: [site]            # listed for the community whose name is site.<zone> (D3)
+            ipfs:
+              publish: {mfs: /community} # its TXT record: dnslink=/ipfs/<the folder's CID>, and
+              swarm_key: /home/me/.ipfs/swarm.key # swarm-mac=, which shows the community it
+                                        # has its swarm key: relative to this file, read at
+                                        # every poll
       - name: printer
         addresses: [192.0.2.50]
         on_stop: release                # any of lease, key_lease, on_stop, for this host only
@@ -85,5 +93,10 @@ registrars:
           api: http://127.0.0.1:5001    # the node's RPC API: the default, IPFS Desktop's too
           publish: {mfs: /community}    # _dnslink.files: the folder's CID as it changes; and
                                         # _dnsaddr.files: the node's addresses
-          # follow: a.dev.zenr.io       # instead of publish: another name's site, given once the
-                                        # node has pinned all of it
+          # follow:                     # instead of publish: a community, a folder with an entry
+          #   type: ipfs-member         # for each member, the instances of this type listed
+          #   domain: srp.dev.zenr.io   # under the subtype files (the name's first label) in
+          #   revoke_after: 10m         # this domain, each its folder once the node pinned it;
+                                        # an entry goes once its member is not listed for 10m
+          # swarm_key: /home/me/.ipfs/swarm.key # with follow: only the instances whose
+                                        # swarm-mac= this swarm key makes are members

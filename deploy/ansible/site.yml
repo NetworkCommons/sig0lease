@@ -1,5 +1,6 @@
 # The community registrar (deploy/README.md), make deploy: nginx in front, with the registrar's
-# Let's Encrypt certificate, then the proxy, built from this checkout, installed on staging as a
+# Let's Encrypt certificate, staging's community node if it has one, whose agent comes with the
+# release, then the proxy, built from this checkout, installed on staging as a
 # release and checked, unless staging runs the same release already; a release that fails its
 # checks is replaced by the one before it. It reaches stable only through make promote
 # (promote.yml).
@@ -36,5 +37,8 @@
   roles:
     - role: nginx
       tags: [nginx]
+    - role: community
+      tags: [community]
+      when: registrar_settings.community is defined
     - role: sig0lease
       tags: [sig0lease]

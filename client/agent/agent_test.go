@@ -32,25 +32,43 @@ import (
 // registrar records every update the agent's clients send. It answers YXDOMAIN to an update
 // whose host name is in taken, REFUSED to one whose host name is in refused, NOERROR to the
 // rest. taken and refused are set while the agent is not running. It answers a query from
-// the TXT records setTXT gives, without recording it; with zone set, a query outside it gets
-// what the proxy answers when it forwards no queries: REFUSED, with Extended DNS Error 20.
+// the records set and setTXT give, without recording it; with zone set, a query outside it
+// gets what the proxy answers when it forwards no queries: REFUSED, with Extended DNS Error 20.
 type registrar struct {
 	sent    chan *dns.Msg
 	taken   []string
 	refused []string
 	zone    string
 	mu      sync.Mutex
-	txt     map[string][]string // the strings of one TXT record each, by owner
+	records map[string][]dns.RR // by "<owner> <type>"
+}
+
+// set makes the records of type qtype at owner rrs; none removes them.
+func (r *registrar) set(owner string, qtype uint16, rrs ...dns.RR) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.records == nil {
+		r.records = map[string][]dns.RR{}
+	}
+	r.records[owner+" "+dns.TypeToString[qtype]] = rrs
 }
 
 // setTXT makes the TXT records at owner those of values, one each; none removes them.
 func (r *registrar) setTXT(owner string, values ...string) {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	if r.txt == nil {
-		r.txt = map[string][]string{}
+	var rrs []dns.RR
+	for _, v := range values {
+		rrs = append(rrs, txtRR(owner, v))
 	}
-	r.txt[owner] = values
+	r.set(owner, dns.TypeTXT, rrs...)
+}
+
+// txtRR returns the TXT record at owner with one string for each of values.
+func txtRR(owner string, values ...string) *dns.TXT {
+	txt := &dns.TXT{Hdr: dns.Header{Name: owner, Class: dns.ClassINET, TTL: 30}}
+	for _, v := range values {
+		txt.TXT.Txt = append(txt.TXT.Txt, dnsmsg.EscapeTXT(v))
+	}
+	return txt
 }
 
 func (r *registrar) Send(ctx context.Context, addr string, network baseclient.Network, msg *dns.Msg) (*dns.Msg, error) {
@@ -64,11 +82,8 @@ func (r *registrar) Send(ctx context.Context, addr string, network baseclient.Ne
 			dnsmsg.AddEDE(resp, msg, dns.ExtendedErrorNotAuthoritative, "")
 			return resp, nil
 		}
-		for _, v := range r.txt[name] {
-			txt := &dns.TXT{Hdr: dns.Header{Name: name, Class: dns.ClassINET, TTL: 30}}
-			txt.TXT.Txt = []string{dnsmsg.EscapeTXT(v)}
-			resp.Answer = append(resp.Answer, txt)
-			resp.Rcode = dns.RcodeSuccess
+		if rrs := r.records[name+" "+dns.TypeToString[dns.RRToType(msg.Question[0])]]; len(rrs) > 0 {
+			resp.Answer, resp.Rcode = rrs, dns.RcodeSuccess
 		}
 		return resp, nil
 	}
@@ -83,12 +98,13 @@ func (r *registrar) Send(ctx context.Context, addr string, network baseclient.Ne
 	return &dns.Msg{MsgHeader: dns.MsgHeader{Rcode: rcode}}, nil
 }
 
-// rrs is what an update adds, or deletes: addresses, SRV instances, and an RFC 9664 name's
-// other records.
+// rrs is what an update adds, or deletes: addresses, SRV instances and their TXT records, and
+// an RFC 9664 name's other records.
 type rrs struct {
-	addrs     []string
-	instances []string
-	records   []string
+	addrs        []string
+	instances    []string
+	instanceTXTs []string
+	records      []string
 }
 
 func (s *rrs) add(rr dns.RR) {
@@ -102,17 +118,20 @@ func (s *rrs) add(rr dns.RR) {
 	case *dns.TXT:
 		if !strings.Contains(r.Hdr.Name, "._") {
 			s.records = append(s.records, rfc9664.Describe(r))
+		} else {
+			s.instanceTXTs = append(s.instanceTXTs, rfc9664.Describe(r))
 		}
 	case *dns.TLSA:
 		s.records = append(s.records, rfc9664.Describe(r))
 	}
 }
 
-// update is what an update registers: its host name (or RFC 9664 name), the records it adds,
-// those it deletes (class NONE, RFC 2136 S2.5.4), the instances it withdraws, and the leases it
-// asks for.
+// update is what an update registers: its host name (or RFC 9664 name) and KEY, the records
+// it adds, those it deletes (class NONE, RFC 2136 S2.5.4), the instances it withdraws, and the
+// leases it asks for.
 type update struct {
 	host string
+	key  *dns.KEY // the one at the host name
 	rrs
 	deleted         rrs
 	withdrawn       []string
@@ -132,7 +151,7 @@ func summarize(m *dns.Msg) update {
 			u.add(rr)
 		}
 		if k, ok := rr.(*dns.KEY); ok && !strings.Contains(k.Hdr.Name, "._") {
-			u.host = k.Hdr.Name
+			u.host, u.key = k.Hdr.Name, k
 		}
 	}
 	for _, rr := range m.Ns {
@@ -187,12 +206,18 @@ func (l *logs) count(sub string) int {
 
 func (l *logs) waitFor(t *testing.T, sub string) {
 	t.Helper()
+	l.waitN(t, sub, 1)
+}
+
+// waitN waits for n lines containing sub.
+func (l *logs) waitN(t *testing.T, sub string, n int) {
+	t.Helper()
 	deadline := time.Now().Add(5 * time.Second)
-	for l.count(sub) == 0 {
+	for l.count(sub) < n {
 		if time.Now().After(deadline) {
 			l.mu.Lock()
 			defer l.mu.Unlock()
-			t.Fatalf("no log line containing %q in:\n%s", sub, strings.Join(l.lines, "\n"))
+			t.Fatalf("want %d log lines containing %q in:\n%s", n, sub, strings.Join(l.lines, "\n"))
 		}
 		time.Sleep(5 * time.Millisecond)
 	}

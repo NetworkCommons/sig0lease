@@ -1,0 +1,65 @@
+# The instance's community node (group_vars/all.yml, registrar_instances.<instance>.community).
+community_settings: "{{ registrar_settings.community }}"
+community_update_zone: "{{ registrar_settings.zones['update'] }}"  # ends in a dot
+community_srp_zone: "{{ registrar_settings.zones['srp_handler'] }}"  # where the members register
+community_site: "{{ community_settings.site }}.{{ community_update_zone }}"
+
+# kubo, from its GitHub release, checked against the release's SHA-512 sums.
+community_kubo_version: v0.43.1
+community_kubo_sha512:
+  amd64: ff53b2428794fc8cca39505d28c15b4cceaef4b90a09284f291f611fcdc8c06399690575fc89cbd4d85ef71f3652581296c6f2e710386f887c8edf36b6e89d71
+  arm64: 70f082584651ef78fb5b07448be53bb0adf141aadcb7eea15ffa59bd9ca78fed46781c2cf5915b3528c591052f97486067fedb0a7a1415abd5bfd44942921501
+community_kubo_dir: /opt/kubo/{{ community_kubo_version }}
+community_kubo_bin: "{{ community_kubo_dir }}/kubo/ipfs"
+
+# The node: its user, and its repository (IPFS_PATH), which holds its key, its swarm key and what
+# it pins, readable by that user only.
+community_kubo_user: "kubo-{{ registrar_instance }}"
+community_kubo_repo: "/var/lib/kubo/{{ registrar_instance }}"
+community_kubo_service: "kubo@{{ registrar_instance }}"
+community_kubo_unit: /etc/systemd/system/kubo@.service
+
+# The instance's private swarm's key, on this machine (deploy/README.md, "The community node").
+community_swarm_key: "{{ playbook_dir | dirname | dirname }}/keystore/ipfs/{{ registrar_instance }}/swarm.key"
+
+# The agent: the release's sig0lease-agent, as a user of its own, with its template, made here,
+# and its keystore, which holds the site name's key and its state, readable by that user only.
+community_agent_user: "sig0lease-agent-{{ registrar_instance }}"
+community_agent_keystore: "/var/lib/sig0lease-agent/{{ registrar_instance }}"
+community_agent_template: "/etc/sig0lease/{{ registrar_instance }}/community.yaml"
+# The swarm key's copy the agent checks the members' swarm-mac= with, readable by it only.
+community_agent_swarm_key: "{{ community_agent_template | dirname }}/swarm.key"
+community_agent_service: "sig0lease-agent@{{ registrar_instance }}"
+community_agent_unit: /etc/systemd/system/sig0lease-agent@.service
+
+# What the node's config, as ipfs init --profile server,autoconf-off makes it, changes, merged
+# into it (a map into a map; anything else replaced), as docs/demo.md, D3, sets a member's node:
+# no public peers, resolvers or routers (autoconf-off), nothing announced or dialled in private
+# address ranges (server: a hosting provider takes dialling them for a network scan), the
+# private swarm's settings, and the instance's listeners. Its gateway serves only what the node
+# holds, the community's site, and resolves the instance's update zone through the instance's
+# proxy, which answers from the zone's authoritative server: nothing a resolver cached.
+community_kubo_overrides:
+  Addresses:
+    API: "/ip4/{{ community_settings.api_address | split(':') | first }}/tcp/{{ community_settings.api_address | split(':') | last }}"
+    Gateway: "/ip4/{{ community_settings.gateway_address | split(':') | first }}/tcp/{{ community_settings.gateway_address | split(':') | last }}"
+    Swarm:
+      - "/ip4/0.0.0.0/tcp/{{ community_settings.swarm_port }}"
+      - "/ip6/::/tcp/{{ community_settings.swarm_port }}"
+      - "/ip4/0.0.0.0/udp/{{ community_settings.swarm_port }}/quic-v1"
+      - "/ip6/::/udp/{{ community_settings.swarm_port }}/quic-v1"
+  Routing:
+    Type: dht
+  AutoTLS:
+    Enabled: false
+  Swarm:
+    Transports:
+      Network:
+        Websocket: false
+  Discovery:
+    MDNS:
+      Enabled: false
+  Gateway:
+    NoFetch: true
+  DNS:
+    Resolvers: "{{ {community_update_zone: 'http://' ~ registrar_settings.doh_address ~ '/dns-query'} }}"

@@ -5,7 +5,7 @@
 # it.
 #
 # NS, UPDATE_DOMAIN and SRP_DOMAIN change what it asks, as for the other scripts (demo/lib.sh);
-# NAME, the names' labels, default demo, may list several, as D3's "a site".
+# NAME, the names' labels, default demo, may list several, as D5's "chat-a chat-b".
 
 . "$(dirname "$0")/lib.sh"
 read -r -a names <<< "${NAME:-demo}"

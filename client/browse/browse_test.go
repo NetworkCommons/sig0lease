@@ -127,6 +127,31 @@ func TestBrowse_FailedQuestion(t *testing.T) {
 	}
 }
 
+// TestInstanceLabels: a subtype's PTR records list instances of its type, and a PTR record
+// pointing at anything else, in another type or domain, or at the type itself, is left out.
+func TestInstanceLabels(t *testing.T) {
+	z := newZone(t,
+		"site._sub._ipfs-member._tcp.srp.example. PTR alice._ipfs-member._tcp.srp.example.",
+		"site._sub._ipfs-member._tcp.srp.example. PTR Bob._IPFS-member._tcp.SRP.example.",
+		"site._sub._ipfs-member._tcp.srp.example. PTR mallory._http._tcp.srp.example.",
+		"site._sub._ipfs-member._tcp.srp.example. PTR eve._ipfs-member._tcp.elsewhere.example.",
+		"site._sub._ipfs-member._tcp.srp.example. PTR _ipfs-member._tcp.srp.example.",
+		"other._sub._ipfs-member._tcp.srp.example. PTR carol._ipfs-member._tcp.srp.example.",
+	)
+	labels, err := InstanceLabels(context.Background(), z.query, "site._sub._ipfs-member._tcp.srp.example.", "_ipfs-member._tcp", domain)
+	if err != nil {
+		t.Fatal(err)
+	}
+	slices.Sort(labels)
+	if !slices.Equal(labels, []string{"Bob", "alice"}) {
+		t.Errorf("InstanceLabels = %q, want alice and Bob", labels)
+	}
+	z.fail = "site._sub._ipfs-member._tcp.srp.example. PTR"
+	if labels, err := InstanceLabels(context.Background(), z.query, "site._sub._ipfs-member._tcp.srp.example.", "_ipfs-member._tcp", domain); err == nil {
+		t.Errorf("InstanceLabels with its question failing = %q, want an error", labels)
+	}
+}
+
 // TestQuerier: each question carries an OPT RR; the answer's records of the type asked at the
 // name asked; none for NXDOMAIN; a *RcodeError for any other rcode, with the answer's Extended
 // DNS Errors; an error when the exchange fails.

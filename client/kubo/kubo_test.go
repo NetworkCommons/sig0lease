@@ -2,6 +2,7 @@ package kubo
 
 import (
 	"context"
+	"maps"
 	"net/http"
 	"net/http/httptest"
 	"slices"
@@ -47,11 +48,15 @@ func node(t *testing.T, answers map[string]string, asked *[]string) *Client {
 func TestClient(t *testing.T) {
 	var asked []string
 	c := node(t, map[string]string{
-		"/api/v0/id":         `{"ID":"12D3Koo","Addresses":["/ip4/127.0.0.1/tcp/4001/p2p/12D3Koo"],"AgentVersion":"kubo/0.43.1"}`,
-		"/api/v0/files/stat": `{"Hash":"QmFolder","Size":0,"CumulativeSize":4,"Blocks":0,"Type":"directory"}`,
-		"/api/v0/pin/add":    `{"Pins":["QmFolder"]}`,
-		"/api/v0/pin/ls":     `{"Keys":{"QmB":{"Type":"recursive","Name":"site"},"QmA":{"Type":"recursive","Name":"site"},"QmC":{"Type":"recursive","Name":"site 2"},"QmD":{"Type":"recursive","Name":""}}}`,
-		"/api/v0/pin/rm":     `{"Pins":["QmA"]}`,
+		"/api/v0/id":          `{"ID":"12D3Koo","Addresses":["/ip4/127.0.0.1/tcp/4001/p2p/12D3Koo"],"AgentVersion":"kubo/0.43.1"}`,
+		"/api/v0/files/stat":  `{"Hash":"QmFolder","Size":0,"CumulativeSize":4,"Blocks":0,"Type":"directory"}`,
+		"/api/v0/pin/add":     `{"Pins":["QmFolder"]}`,
+		"/api/v0/pin/ls":      `{"Keys":{"QmB":{"Type":"recursive","Name":"site"},"QmA":{"Type":"recursive","Name":"site"},"QmC":{"Type":"recursive","Name":"site 2"},"QmD":{"Type":"recursive","Name":""}}}`,
+		"/api/v0/pin/rm":      `{"Pins":["QmA"]}`,
+		"/api/v0/files/mkdir": ``,
+		"/api/v0/files/ls":    `{"Entries":[{"Name":"alice","Type":1,"Size":0,"Hash":"QmA"},{"Name":"bob","Type":1,"Size":0,"Hash":"QmB"}]}`,
+		"/api/v0/files/cp":    ``,
+		"/api/v0/files/rm":    ``,
 	}, &asked)
 	ctx := context.Background()
 
@@ -64,11 +69,23 @@ func TestClient(t *testing.T) {
 	if got, err := c.Pin(ctx, "QmFolder", "site"); err != nil || got != "QmFolder" {
 		t.Errorf("Pin = %q, %v", got, err)
 	}
-	if cids, err := c.PinsNamed(ctx, "site"); err != nil || !slices.Equal(cids, []string{"QmA", "QmB"}) {
-		t.Errorf("PinsNamed = %q, %v; want the pins named exactly site", cids, err)
+	if pins, err := c.Pins(ctx); err != nil || !maps.Equal(pins, map[string]string{"QmA": "site", "QmB": "site", "QmC": "site 2", "QmD": ""}) {
+		t.Errorf("Pins = %q, %v; want each pin with its name", pins, err)
 	}
 	if err := c.Unpin(ctx, "QmA"); err != nil {
 		t.Errorf("Unpin = %v", err)
+	}
+	if err := c.MakeFolder(ctx, "/sig0lease-agent/site"); err != nil {
+		t.Errorf("MakeFolder = %v", err)
+	}
+	if entries, err := c.Entries(ctx, "/sig0lease-agent/site"); err != nil || len(entries) != 2 || entries["alice"] != "QmA" || entries["bob"] != "QmB" {
+		t.Errorf("Entries = %v, %v", entries, err)
+	}
+	if err := c.Add(ctx, "QmA", "/sig0lease-agent/site/alice"); err != nil {
+		t.Errorf("Add = %v", err)
+	}
+	if err := c.Remove(ctx, "/sig0lease-agent/site/alice"); err != nil {
+		t.Errorf("Remove = %v", err)
 	}
 	want := []string{
 		"/api/v0/id?",
@@ -76,6 +93,10 @@ func TestClient(t *testing.T) {
 		"/api/v0/pin/add?arg=%2Fipfs%2FQmFolder&name=site",
 		"/api/v0/pin/ls?names=true&type=recursive",
 		"/api/v0/pin/rm?arg=%2Fipfs%2FQmA",
+		"/api/v0/files/mkdir?arg=%2Fsig0lease-agent%2Fsite&parents=true",
+		"/api/v0/files/ls?arg=%2Fsig0lease-agent%2Fsite&long=true",
+		"/api/v0/files/cp?arg=%2Fipfs%2FQmA&arg=%2Fsig0lease-agent%2Fsite%2Falice",
+		"/api/v0/files/rm?arg=%2Fsig0lease-agent%2Fsite%2Falice&recursive=true",
 	}
 	if !slices.Equal(asked, want) {
 		t.Errorf("asked\n  %s\nwant\n  %s", strings.Join(asked, "\n  "), strings.Join(want, "\n  "))

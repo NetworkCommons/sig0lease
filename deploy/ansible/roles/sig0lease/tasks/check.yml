@@ -1,6 +1,7 @@
 # The checks of the release an instance runs, on the registrar: make deploy, promote,
 # deploy-check and deploy-rollback run them. sig0lease_release is the release, sig0lease_config
-# its config. Each check is tried for up to 10 s, while the proxy starts.
+# its config. Each check is tried for up to 10 s, while the proxy starts. An instance with a
+# community node has that checked too (roles/community, check.yml).
 
 - name: The instance runs {{ sig0lease_release }}
   ansible.builtin.shell: readlink "/proc/$(systemctl show -p MainPID --value {{ sig0lease_service }})/exe"
@@ -46,3 +47,11 @@
   register: sig0lease_doh
   changed_when: false
   failed_when: "sig0lease_doh.stdout is not search('flags: qr aa[ ;]')"
+
+- name: Check the community node, with the release's agent
+  ansible.builtin.include_role:
+    name: community
+    tasks_from: check.yml
+  vars:
+    community_agent_exe: "{{ sig0lease_root }}/releases/{{ sig0lease_release }}/sig0lease-agent"
+  when: registrar_settings.community is defined

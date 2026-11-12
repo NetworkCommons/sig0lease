@@ -16,8 +16,11 @@
 # holds is tried again rather than renamed, stopping keeps the name and removing it frees it ->
 # with Prosody installed, two XMPP servers on ports only their names' SRV records give federate
 # through what the agent publishes, a stopped one's records are withdrawn and come back ->
-# with kubo installed, a name publishes a node's folder and addresses, and another follows it,
-# its node pinning each version before the name gives it.
+# with kubo installed, hosts' ipfs-member services give their nodes' folders with the
+# swarm-mac= of their swarm key, and a community name's node pins each as its member comes up
+# and gives a folder of them, refusing an instance whose swarm-mac= another key made and
+# keeping an absent member's entry for revoke_after; a name publishes a node's folder and
+# addresses.
 # The probed service is python3's http.server; the other key is sig0lease-srp-client's, and
 # sig0lease-client's for a name.
 
@@ -54,15 +57,18 @@ XMPP_A_PORT="${XMPP_A_PORT:-15269}"
 XMPP_B_PORT="${XMPP_B_PORT:-25269}"
 PROSODY_PID_a=""
 PROSODY_PID_b=""
-# AGENT-TEST 11's two kubo nodes, a and b, each in IPFS_DIR/<node>, in a private swarm of
-# their own: no other node has its key.
+# AGENT-TEST 11's three kubo nodes, the members alice and carol and the community node, each in
+# IPFS_DIR/<node>, in a private swarm of their own: no other node has its key.
 IPFS_DIR="$SRP_RUN_DIR/ipfs"
-IPFS_A_API_PORT="${IPFS_A_API_PORT:-15001}"
-IPFS_A_SWARM_PORT="${IPFS_A_SWARM_PORT:-14001}"
-IPFS_B_API_PORT="${IPFS_B_API_PORT:-25001}"
-IPFS_B_SWARM_PORT="${IPFS_B_SWARM_PORT:-24001}"
-IPFS_PID_a=""
-IPFS_PID_b=""
+IPFS_ALICE_API_PORT="${IPFS_ALICE_API_PORT:-15001}"
+IPFS_ALICE_SWARM_PORT="${IPFS_ALICE_SWARM_PORT:-14001}"
+IPFS_COMMUNITY_API_PORT="${IPFS_COMMUNITY_API_PORT:-25001}"
+IPFS_COMMUNITY_SWARM_PORT="${IPFS_COMMUNITY_SWARM_PORT:-24001}"
+IPFS_CAROL_API_PORT="${IPFS_CAROL_API_PORT:-35001}"
+IPFS_CAROL_SWARM_PORT="${IPFS_CAROL_SWARM_PORT:-34001}"
+IPFS_PID_alice=""
+IPFS_PID_community=""
+IPFS_PID_carol=""
 
 PERFORMED_TESTS=""
 
@@ -173,13 +179,13 @@ agent_log_has() {
     grep -qF -- "$1" "$AGENT_LOG"
 }
 
-# wait_log <text> [count, default 1] -- waits for the agent to have logged count lines
-# containing text.
+# wait_log <text> [count, default 1] [seconds, default CHANGE_TIMEOUT] -- waits, for at most
+# seconds, for the agent to have logged count lines containing text.
 wait_log() {
     local start
     start=$(date +%s)
     until [ "$(grep -cF -- "$1" "$AGENT_LOG")" -ge "${2:-1}" ]; do
-        if [ $(( $(date +%s) - start )) -ge "$CHANGE_TIMEOUT" ]; then
+        if [ $(( $(date +%s) - start )) -ge "${3:-$CHANGE_TIMEOUT}" ]; then
             log_error "the agent did not log \"$1\":"; cat "$AGENT_LOG"; return 1
         fi
         sleep 0.5
@@ -309,7 +315,7 @@ start_kubo() {
     local node="$1" api="$2" swarm="$3" dir="$IPFS_DIR/$1" port
     for port in "$api" "$swarm"; do
         if is_listening "$port"; then
-            log_error "Port $port, for kubo $node, is already in use; set IPFS_A_API_PORT, IPFS_A_SWARM_PORT, IPFS_B_API_PORT or IPFS_B_SWARM_PORT"
+            log_error "Port $port, for kubo $node, is already in use; set IPFS_<ALICE|COMMUNITY|CAROL>_API_PORT or IPFS_<ALICE|COMMUNITY|CAROL>_SWARM_PORT"
             return 1
         fi
     done
@@ -350,10 +356,52 @@ stop_kubo() {
 
 # ipfs_on <node> <ipfs arguments...> -- runs an ipfs command against the running kubo <node>.
 ipfs_on() {
-    local port="$IPFS_A_API_PORT"
-    [ "$1" = a ] || port="$IPFS_B_API_PORT"
+    local port
+    case "$1" in
+    alice) port="$IPFS_ALICE_API_PORT" ;;
+    community) port="$IPFS_COMMUNITY_API_PORT" ;;
+    carol) port="$IPFS_CAROL_API_PORT" ;;
+    esac
     shift
     ipfs --api "/ip4/127.0.0.1/tcp/$port" "$@"
+}
+
+# connect_to_community <node> <name> -- connects kubo <node> to the community node at an address
+# the name's _dnsaddr records give, as /dnsaddr/<name> in its peer list would have it do; kubo
+# reads those through the system's resolver, which does not know the local BIND.
+connect_to_community() {
+    local ma
+    for ma in $(dig_srp "_dnsaddr.$2" TXT | tr -d '"' | sed 's/^dnsaddr=//'); do
+        if ipfs_on "$1" swarm connect "$ma" > /dev/null 2>&1; then return 0; fi
+    done
+    log_error "$1 reached the community node at none of _dnsaddr.$2's addresses: $(dig_srp "_dnsaddr.$2" TXT)"
+    return 1
+}
+
+# wait_ptr <name> <targets> -- waits for the PTR records at name to point at targets, sorted and
+# separated by spaces.
+wait_ptr() {
+    local start got
+    start=$(date +%s)
+    until got="$(dig_srp "$1" PTR | sort | paste -sd ' ' -)" && [ "$got" = "$2" ]; do
+        if [ $(( $(date +%s) - start )) -ge "$CHANGE_TIMEOUT" ]; then
+            log_error "PTR $1 is \"$got\", want \"$2\"; agent log:"; cat "$AGENT_LOG"; return 1
+        fi
+        sleep 0.5
+    done
+}
+
+# wait_entries <folder> <entries> -- waits for the folder in the community node's files to hold
+# entries: each "<name> <CID>", sorted by name and separated by spaces.
+wait_entries() {
+    local start got
+    start=$(date +%s)
+    until got="$(ipfs_on community files ls -l "$1" | awk '{ sub(/\/$/, "", $1); print $1, $2 }' | sort | paste -sd ' ' -)" && [ "$got" = "$2" ]; do
+        if [ $(( $(date +%s) - start )) -ge "$CHANGE_TIMEOUT" ]; then
+            log_error "the community node's $1 holds \"$got\", want \"$2\"; agent log:"; cat "$AGENT_LOG"; return 1
+        fi
+        sleep 0.5
+    done
 }
 
 # wait_txt <name> <text> -- waits for the TXT records at name to be text, as dig +short prints
@@ -367,6 +415,32 @@ wait_txt() {
         fi
         sleep 0.5
     done
+}
+
+# swarm_mac <swarm key file> <instance> <CID> -- the swarm-mac= that the member whose instance
+# is <instance> gives for the folder CID, made here from the KEY at the instance's name as
+# docs/sig0lease-agent.md gives it: HMAC-SHA256, under the key HKDF-SHA256 derives from the
+# swarm key (no salt, info "sig0lease swarm-mac"), of "<protocol> <algorithm> <public key>
+# <CID>", in base64url with no padding.
+swarm_mac() {
+    python3 - "$1" "$(dig_srp "$2" KEY)" "$3" <<'PY'
+import base64, hashlib, hmac, sys
+psk = bytes.fromhex(open(sys.argv[1]).read().split("\n")[2].strip())
+flags, protocol, algorithm, *public = sys.argv[2].split()
+prk = hmac.new(b"\0" * 32, psk, hashlib.sha256).digest()
+key = hmac.new(prk, b"sig0lease swarm-mac\x01", hashlib.sha256).digest()
+msg = f"{protocol} {algorithm} {''.join(public)} {sys.argv[3]}".encode()
+print(base64.urlsafe_b64encode(hmac.new(key, msg, hashlib.sha256).digest()).decode().rstrip("="))
+PY
+}
+
+# wait_member <node> <label> <CID> -- waits for the instance <label> of the node's member to
+# give the folder CID, with the swarm-mac= the node's swarm key makes (swarm_mac).
+wait_member() {
+    local instance="$2._ipfs-member._tcp.${SRP_ZONE}" mac
+    wait_state "$instance" KEY present || return 1
+    mac="$(swarm_mac "$IPFS_DIR/$1/swarm.key" "$instance" "$3")" || return 1
+    wait_txt "$instance" "\"dnslink=/ipfs/$3\" \"swarm-mac=${mac}\""
 }
 
 ################################
@@ -782,7 +856,7 @@ NAMES
 }
 
 test_ipfs() {
-    local log_msg="AGENT-TEST 11: a name publishes a kubo node's folder and addresses; another follows it, its node pinning each version before the name gives it; a node that stops has its addresses withdrawn, and its folder kept"
+    local log_msg="AGENT-TEST 11: hosts' ipfs-member services give their kubo nodes' folders, with the swarm-mac= of their swarm key; a community name's node pins each member's folder as it comes up and gives a folder of them, refuses an instance whose swarm-mac= another swarm key made, keeps an absent member's entry for revoke_after and removes it after; a name publishes a node's folder and addresses, its addresses withdrawn while the node is down"
     log_section "$log_msg"
     if ! command -v ipfs >/dev/null; then
         log_step "kubo (ipfs) is not installed: AGENT-TEST 11 skipped"
@@ -791,68 +865,167 @@ test_ipfs() {
     fi
     require_command openssl || return 1
 
-    start_kubo a "$IPFS_A_API_PORT" "$IPFS_A_SWARM_PORT" || return 1
-    start_kubo b "$IPFS_B_API_PORT" "$IPFS_B_SWARM_PORT" || return 1
-    echo "first" | ipfs_on a files write --create --parents /community/hello.txt
-    local first
-    first="$(ipfs_on a files stat --hash /community)"
-    local z="${NAME_ZONE}" stay
-    stay="$(cat <<HOSTS
+    start_kubo alice "$IPFS_ALICE_API_PORT" "$IPFS_ALICE_SWARM_PORT" || return 1
+    start_kubo community "$IPFS_COMMUNITY_API_PORT" "$IPFS_COMMUNITY_SWARM_PORT" || return 1
+    start_kubo carol "$IPFS_CAROL_API_PORT" "$IPFS_CAROL_SWARM_PORT" || return 1
+    echo "from alice" | ipfs_on alice files write --create --parents /community/hello.txt
+    echo "from carol" | ipfs_on carol files write --create --parents /community/hello.txt
+    local alice1 carol1
+    alice1="$(ipfs_on alice files stat --hash /community)"
+    carol1="$(ipfs_on carol files stat --hash /community)"
+    local z="${NAME_ZONE}" members="site._sub._ipfs-member._tcp.${SRP_ZONE}" folder="/sig0lease-agent/site.${NAME_ZONE%.}"
+    # revoke_after, in seconds: longer than a node takes to stop, start and be listed again.
+    local revoke=30
+    # mallory, on carol's node, has a swarm key of no node: its swarm-mac= is not the
+    # community's.
+    printf '/key/swarm/psk/1.0.0/\n/base16/\n%s\n' "$(openssl rand -hex 32)" > "$IPFS_DIR/other.key"
+    local hosts
+    hosts="$(cat <<HOSTS
 hosts:
   - name: stay
     addresses: [127.0.0.1]
+  - name: alice
+    addresses: [127.0.0.1]
+    services:
+      - type: ipfs-member
+        instance: alice
+        port: ${IPFS_ALICE_SWARM_PORT}
+        subtypes: [site]
+        ipfs: {api: "http://127.0.0.1:${IPFS_ALICE_API_PORT}", swarm_key: "${IPFS_DIR}/alice/swarm.key", publish: {mfs: /community}}
+  - name: carol
+    addresses: [127.0.0.1]
+    services:
+      - type: ipfs-member
+        instance: carol
+        port: ${IPFS_CAROL_SWARM_PORT}
+        subtypes: [site]
+        ipfs: {api: "http://127.0.0.1:${IPFS_CAROL_API_PORT}", swarm_key: "${IPFS_DIR}/carol/swarm.key", publish: {mfs: /community}}
+  - name: mallory
+    addresses: [127.0.0.1]
+    services:
+      - type: ipfs-member
+        instance: mallory
+        port: ${IPFS_CAROL_SWARM_PORT}
+        subtypes: [site]
+        ipfs: {api: "http://127.0.0.1:${IPFS_CAROL_API_PORT}", swarm_key: "${IPFS_DIR}/other.key", publish: {mfs: /community}}
 HOSTS
 )"
-    NAMES_REGISTRAR="$(names_registrar "$(cat <<NAMES
+    local names
+    names="$(cat <<NAMES
 names:
-  - name: a.${z}
-    ipfs: {api: "http://127.0.0.1:${IPFS_A_API_PORT}", publish: {mfs: /community}}
+  - name: alice.${z}
+    ipfs: {api: "http://127.0.0.1:${IPFS_ALICE_API_PORT}", publish: {mfs: /community}}
   - name: site.${z}
-    ipfs: {api: "http://127.0.0.1:${IPFS_B_API_PORT}", follow: a.${z}}
+    ipfs:
+      api: "http://127.0.0.1:${IPFS_COMMUNITY_API_PORT}"
+      swarm_key: "${IPFS_DIR}/community/swarm.key"
+      follow: {type: ipfs-member, domain: ${SRP_ZONE}, revoke_after: ${revoke}s}
 NAMES
-)")"
-    write_template <<< "$stay"
-    wait_txt "_dnslink.a.${z}" "\"dnslink=/ipfs/${first}\"" || return 1
-    wait_state "_dnsaddr.a.${z}" TXT present || return 1
+)"
+    NAMES_REGISTRAR="$(names_registrar "$names")"
+    write_template <<< "$hosts"
+    wait_member alice alice "$alice1" || return 1
+    wait_member carol carol "$carol1" || return 1
+    wait_ptr "$members" "alice._ipfs-member._tcp.${SRP_ZONE} carol._ipfs-member._tcp.${SRP_ZONE} mallory._ipfs-member._tcp.${SRP_ZONE}" || return 1
+    wait_txt "_dnslink.alice.${z}" "\"dnslink=/ipfs/${alice1}\"" || return 1
+    wait_state "_dnsaddr.alice.${z}" TXT present || return 1
+    wait_state "_dnsaddr.site.${z}" TXT present || return 1
 
-    # b reaches a at an address a's _dnsaddr records give, as /dnsaddr/a.<zone> would have it
-    # do; kubo reads those through the system's resolver, which does not know the local BIND.
-    local ma connected=""
-    for ma in $(dig_srp "_dnsaddr.a.${z}" TXT | tr -d '"' | sed 's/^dnsaddr=//'); do
-        if ipfs_on b swarm connect "$ma" > /dev/null 2>&1; then connected="$ma"; break; fi
+    # The members' nodes reach the community's at an address its _dnsaddr records give, as
+    # /dnsaddr/site.<zone> in their peer lists would have them do; kubo reads those through the
+    # system's resolver, which does not know the local BIND. The community's never reaches theirs.
+    local node
+    for node in alice carol; do
+        connect_to_community "$node" "site.${z}" || return 1
     done
-    [ -n "$connected" ] || { log_error "b reached a at none of _dnsaddr.a's addresses: $(dig_srp "_dnsaddr.a.${z}" TXT)"; return 1; }
 
-    wait_txt "_dnslink.site.${z}" "\"dnslink=/ipfs/${first}\"" || return 1
-    [ "$(ipfs_on b --offline cat "/ipfs/${first}/hello.txt")" = first ] || { log_error "b does not hold a's folder"; return 1; }
-    [ "$(ipfs_on b pin ls --type=recursive --names "/ipfs/${first}")" = "${first} recursive sig0lease-agent site.${z}" ] \
-        || { log_error "b's pin of a's folder: $(ipfs_on b pin ls --type=recursive --names)"; return 1; }
+    wait_log "site.${z}: pinned ${alice1}, alice's folder" || return 1
+    wait_log "site.${z}: alice's entry gives ${alice1}" || return 1
+    wait_log "site.${z}: carol's entry gives ${carol1}" || return 1
+    wait_entries "$folder" "alice ${alice1} carol ${carol1}" || return 1
+    wait_log "site.${z}: mallory._ipfs-member._tcp.${SRP_ZONE}: not a member: its swarm-mac= is not the one the community's swarm key makes of its KEY and its folder ${carol1}" || return 1
+    [ "$(ipfs_on community --offline cat "/ipfs/${carol1}/hello.txt")" = "from carol" ] || { log_error "the community node does not hold carol's folder"; return 1; }
+    local pins
+    pins="$(ipfs_on community pin ls --type=recursive --names | grep -F " sig0lease-agent " | sort)"
+    [ "$pins" = "$(printf '%s recursive sig0lease-agent site.%s\n' "$alice1" "$z" "$carol1" "$z" | sort)" ] \
+        || { log_error "the community node's pins: $(ipfs_on community pin ls --type=recursive --names)"; return 1; }
 
-    echo "second" | ipfs_on a files write --create /community/second.txt
-    local second
-    second="$(ipfs_on a files stat --hash /community)"
-    wait_txt "_dnslink.a.${z}" "\"dnslink=/ipfs/${second}\"" || return 1
-    wait_txt "_dnslink.site.${z}" "\"dnslink=/ipfs/${second}\"" || return 1
-    [ "$(ipfs_on b --offline cat "/ipfs/${second}/second.txt")" = second ] || { log_error "b does not hold a's new folder"; return 1; }
-    wait_log "site.${z}: unpinned ${first}, a site before" || return 1
-    if ipfs_on b pin ls --type=recursive "/ipfs/${first}" > /dev/null 2>&1; then
-        log_error "b still pins the first folder"; return 1
-    fi
+    # An entry removed from the folder by hand is put back at the next check.
+    ipfs_on community files rm -r "$folder/carol"
+    wait_log "site.${z}: carol's entry gives ${carol1}" 2 || return 1
+    wait_entries "$folder" "alice ${alice1} carol ${carol1}" || return 1
 
-    stop_kubo a
-    wait_state "_dnsaddr.a.${z}" TXT absent || return 1
-    wait_log "a.${z}: its node does not answer" || return 1
-    [ "$(dig_srp "_dnslink.a.${z}" TXT)" = "\"dnslink=/ipfs/${second}\"" ] || { log_error "a's _dnslink went with its node"; return 1; }
-    [ "$(dig_srp "_dnslink.site.${z}" TXT)" = "\"dnslink=/ipfs/${second}\"" ] || { log_error "site's _dnslink changed when a's node stopped"; return 1; }
+    echo "second" | ipfs_on alice files write --create /community/second.txt
+    local alice2
+    alice2="$(ipfs_on alice files stat --hash /community)"
+    wait_member alice alice "$alice2" || return 1
+    wait_log "site.${z}: alice's entry gives ${alice2}" || return 1
+    wait_entries "$folder" "alice ${alice2} carol ${carol1}" || return 1
+    [ "$(ipfs_on community --offline cat "/ipfs/${alice2}/second.txt")" = second ] || { log_error "the community node does not hold alice's new folder"; return 1; }
+    wait_log "site.${z}: unpinned ${alice1}, which no entry gives" || return 1
+
+    # carol's node stops: its probe withdraws carol (and mallory, on the same node), and its entry
+    # stays; back within revoke_after, it carries on.
+    stop_kubo carol
+    wait_log "site.${z}: carol is not listed; its entry goes in ${revoke}s unless it is again" || return 1
+    wait_ptr "$members" "alice._ipfs-member._tcp.${SRP_ZONE}" || return 1
+    wait_entries "$folder" "alice ${alice2} carol ${carol1}" || return 1
+    start_kubo carol "$IPFS_CAROL_API_PORT" "$IPFS_CAROL_SWARM_PORT" || return 1
+    wait_log "site.${z}: carol is listed again" || return 1
+    wait_entries "$folder" "alice ${alice2} carol ${carol1}" || return 1
+
+    # alice's node stops: alice's name withdraws its addresses and keeps its folder; alice's
+    # instance goes, its entry stays.
+    stop_kubo alice
+    wait_state "_dnsaddr.alice.${z}" TXT absent || return 1
+    wait_log "alice.${z}: its node does not answer" || return 1
+    [ "$(dig_srp "_dnslink.alice.${z}" TXT)" = "\"dnslink=/ipfs/${alice2}\"" ] || { log_error "alice's _dnslink went with its node"; return 1; }
+    wait_log "site.${z}: alice is not listed; its entry goes in ${revoke}s unless it is again" || return 1
+    wait_ptr "$members" "carol._ipfs-member._tcp.${SRP_ZONE} mallory._ipfs-member._tcp.${SRP_ZONE}" || return 1
+
+    # carol leaves for good: its host removed. After revoke_after its entry goes, and its folder is
+    # unpinned; alice's goes too, its node still down.
+    write_template <<< "$(sed '/^  - name: carol$/,$d' <<< "$hosts")"
+    wait_state "carol.${SRP_ZONE}" KEY absent || return 1
+    wait_log "site.${z}: carol is not listed for ${revoke}s: no longer a member" 1 $(( revoke + CHANGE_TIMEOUT )) || return 1
+    wait_log "site.${z}: unpinned ${carol1}, which no entry gives" || return 1
+    wait_log "site.${z}: alice is not listed for ${revoke}s: no longer a member" || return 1
+    wait_log "site.${z}: unpinned ${alice2}, which no entry gives" || return 1
+    wait_entries "$folder" "" || return 1
+    wait_txt "_dnslink.site.${z}" "\"dnslink=/ipfs/$(ipfs_on community files stat --hash "$folder")\"" || return 1
+
+    # alice back: its entry again. Its folder, which the community node still holds and its owner
+    # pinned meanwhile, is the owner's pin, left as it is. The community name removed keeps its
+    # folder and its pins; added again, it takes its entries as members not listed yet, and alice
+    # is listed again.
+    ipfs_on community pin add --name=mine "$alice2" > /dev/null
+    start_kubo alice "$IPFS_ALICE_API_PORT" "$IPFS_ALICE_SWARM_PORT" || return 1
+    connect_to_community alice "site.${z}" || return 1
+    wait_log "site.${z}: its node has ${alice2}, alice's folder, pinned already, not by the agent: that pin is left as it is" || return 1
+    wait_log "site.${z}: alice's entry gives ${alice2}" 2 || return 1
+    wait_entries "$folder" "alice ${alice2}" || return 1
+    [ "$(ipfs_on community pin ls --type=recursive --names | grep -F "$alice2")" = "${alice2} recursive mine" ] \
+        || { log_error "the community node's pins: $(ipfs_on community pin ls --type=recursive --names)"; return 1; }
+    NAMES_REGISTRAR=""
+    write_template <<< "$(sed '/^  - name: carol$/,$d' <<< "$hosts")"
+    wait_state "site.${z}" KEY absent || return 1
+    wait_entries "$folder" "alice ${alice2}" || return 1
+    NAMES_REGISTRAR="$(names_registrar "$names")"
+    write_template <<< "$(sed '/^  - name: carol$/,$d' <<< "$hosts")"
+    wait_log "site.${z}: found alice's entry, giving ${alice2}; it goes in ${revoke}s unless alice is listed" || return 1
+    wait_log "site.${z}: alice is listed again" || return 1
 
     NAMES_REGISTRAR=""
-    write_template <<< "$stay"
-    wait_state "a.${z}" KEY absent || return 1
+    write_template <<< "$(sed '/^  - name: alice$/,$d' <<< "$hosts")"
+    wait_state "alice.${z}" KEY absent || return 1
     wait_state "site.${z}" KEY absent || return 1
-    [ -z "$(dig_srp "_dnslink.site.${z}" TXT)" ] || { log_error "site's _dnslink stayed after site was removed"; return 1; }
-    stop_kubo b
+    wait_state "alice.${SRP_ZONE}" KEY absent || return 1
+    [ -z "$(dig_srp "$members" PTR)" ] || { log_error "members still listed: $(dig_srp "$members" PTR)"; return 1; }
+    stop_kubo alice
+    stop_kubo community
+    stop_kubo carol
 
-    log_success "a gave its folder and addresses; b, reaching a at one of them, pinned each version before site gave it, and unpinned the one before; a's node stopped lost its addresses and kept its folder"
+    log_success "alice and carol, members, gave their folders with the swarm-mac= their swarm key makes; the community node pinned each as it came, alice's new one too, unpinning the one before, and gave a folder of them, with no entry for mallory, whose swarm-mac= another key made; carol, gone and back within revoke_after, kept its entry; gone for good, it lost its entry and pin; an entry removed by hand came back, and a folder the community node's owner had pinned stayed their pin; the community name removed and added again took its folder's entries back; alice's name withdrew its addresses with its node and kept its folder"
     PERFORMED_TESTS="$PERFORMED_TESTS\n  [OK] $log_msg"
 }
 
@@ -864,7 +1037,7 @@ run_all_tests() {
     echo "Real components only: real agent (sig0lease-agent), real proxy process (srp_handler and"
     echo "update_handler), real local BIND 9 authoritative for ${SRP_ZONE} and ${NAME_ZONE}, python3's"
     echo "http.server as the probed service, Prosody, if installed, as two XMPP servers, and kubo, if"
-    echo "installed, as two IPFS nodes."
+    echo "installed, as three IPFS nodes."
     echo ""
 
     trap cleanup EXIT
@@ -918,8 +1091,9 @@ cleanup() {
     stop_http
     stop_prosody a
     stop_prosody b
-    stop_kubo a
-    stop_kubo b
+    stop_kubo alice
+    stop_kubo community
+    stop_kubo carol
     stop_srp_proxy
     stop_bind9
     set -e

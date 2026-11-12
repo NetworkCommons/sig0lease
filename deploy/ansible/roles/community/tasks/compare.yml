@@ -1,0 +1,23 @@
+# What changed since the community node's agent started, of what it starts with: the release's
+# agent, its template and its service unit, as community_changes, for the sig0lease role's
+# compare.yml; or that the agent is not running. Changes nothing.
+
+- name: Find what changed since the community node's agent started, in {{ registrar_instance }}
+  ansible.builtin.shell: |
+    set -euo pipefail
+    if ! systemctl is-active --quiet {{ community_agent_service }}; then
+        echo "{{ community_agent_service }} is not running"
+        exit 0
+    fi
+    find {{ registrar_root }}/{{ registrar_instance }}/current/sig0lease-agent {{ community_agent_template }} \
+        {{ community_agent_unit }} \
+        -newermt "$(systemctl show --timestamp=us+utc -p ExecMainStartTimestamp --value {{ community_agent_service }})" \
+        -printf '%p changed since the agent started\n'
+  args:
+    executable: /bin/bash
+  register: community_since_start
+  changed_when: false
+
+- name: Remember it
+  ansible.builtin.set_fact:
+    community_changes: "{{ community_since_start.stdout_lines }}"

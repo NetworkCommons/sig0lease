@@ -8,6 +8,8 @@ Inside the `server` directory you need to put a key that is registered at a FQDN
 
 Inside the `client` directory you need to put a key that the client uses to sign its requests and that gets inserted in a key record at a particular FQDN under the FQDN defined above.
 
+The registrar's deploy also reads `ipfs/<instance>/swarm.key`, the private swarm key of an instance's community node (deploy/README.md, "The community node").
+
 You can generate the keys with dnssec-keygen, for example:
 
 `dnssec-keygen -a ED25519 -n HOST -T KEY exampleKey.myDNSserver.com`

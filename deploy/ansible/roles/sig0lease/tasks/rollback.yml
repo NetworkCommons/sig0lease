@@ -34,6 +34,14 @@
     name: "{{ sig0lease_service }}"
     state: restarted
 
+- name: Restart the community node's agent with that release
+  ansible.builtin.include_role:
+    name: community
+    tasks_from: agent.yml
+  vars:
+    community_agent_state: restarted
+  when: registrar_settings.community is defined
+
 - name: Find the release running now, again
   ansible.builtin.include_tasks: current.yml
 

@@ -19,6 +19,17 @@ registrar_name: '{{ lookup("ansible.builtin.pipe", "ssh -G " ~ inventory_hostnam
 #   key          the name of the instance's key in keystore/server, K<key>+<algorithm>+<tag>,
 #                at its zones or above them, the only key it is given (deploy/README.md, "The
 #                zones' keys")
+#   community    the instance's community node (deploy/README.md, "The community node";
+#                docs/demo.md, D3), when it has one: a kubo node in a private swarm of its own,
+#                and an agent that keeps a folder of its members' folders, the community's
+#                site, served by nginx at https_port, under /ipns/<site>.<update zone>/:
+#     site             the label of the community's site, in the update zone, and the subtype
+#                      its members' _ipfs-member._tcp instances are listed under in the
+#                      srp_handler zone
+#     revoke_after     how long a member may be unlisted before its entry is removed
+#     swarm_port       the node's swarm, TCP and QUIC, which the members' nodes connect to
+#     api_address      its RPC API, which the agent uses, on 127.0.0.1
+#     gateway_address  its gateway, which only nginx reaches, on 127.0.0.1
 # Each instance's zones lie outside the other's (deploy/README.md).
 registrar_instances:
   stable:
@@ -39,6 +50,12 @@ registrar_instances:
     dot_port: 8853
     https_port: 8444
     doh_address: 127.0.0.1:8445
+    community:
+      site: site
+      revoke_after: 10m
+      swarm_port: 4002
+      api_address: 127.0.0.1:5102
+      gateway_address: 127.0.0.1:8102
 
 # The instance a play works on, -e registrar_instance=<instance> (make INSTANCE=<instance>):
 # make deploy installs on staging only, make promote on stable only.

@@ -15,6 +15,12 @@ nginx_acme_staging: false
 nginx_doh_rate: 50r/s
 nginx_doh_burst: 200
 
+# Requests to an instance's community node's gateway per source address: a phone opening the
+# community's folder loads its listing and each picture in it, and a room's phones may share an
+# address.
+nginx_gateway_rate: 20r/s
+nginx_gateway_burst: 100
+
 # DNS-over-TLS connections one source address may hold open to an instance at once, and how long
 # one may stay idle.
 nginx_dot_connections: 50
