@@ -154,6 +154,39 @@ in_site() {
     [ "$(sed -n 's/.*"Hash":"\([^"]*\)".*/\1/p' <<< "$entry")" = "$mine" ]
 }
 
+# connect_community -- makes the community node a peering peer of the member's node (as
+# Peering.Peers does, until the node stops), at the addresses _dnsaddr.<SITE> gives on the zone's
+# server, and waits up to 10 s for the connection. The community node never connects to a
+# member's. The node's own try, through its peer list, asks a resolver that may still hold "no such
+# name" from before the community node published them, for up to 6 minutes (the zone's negative
+# TTL). And kubo, from 0.36, asks a peer outside the local network for a block only once that
+# peer has had one for it, or if it is a peering peer: the registrar's community node announces no
+# address in the local network, so a member's node, merely connected, never asks it for the
+# community's folder.
+connect_community() {
+    local addrs id args at i
+    addrs="$(ask TXT "_dnsaddr.$site.$update_domain" | grep -o 'dnsaddr=[^" ]*' | sed 's/^dnsaddr=//')"
+    id="$(sed -n 's/.*\/p2p\///p' <<< "$addrs" | sort -u)"
+    args="$(sed 's/^/arg=/' <<< "$addrs" | paste -sd '&' -)"
+    if [ -z "$addrs" ] || [ "$(wc -l <<< "$id")" -ne 1 ]; then
+        echo "  could not connect to the community node: _dnsaddr.$site.$update_domain gives no addresses of one node"
+        return
+    fi
+    if ! curl -sf --max-time 10 -X POST "$api/api/v0/swarm/peering/add?$args" > /dev/null; then
+        echo "  could not connect to the community node: its node, at $api, did not take it as a peering peer"
+        return
+    fi
+    for i in $(seq 10); do
+        at="$(curl -sf --max-time 5 -X POST "$api/api/v0/swarm/peers" | grep -o "\"Addr\":\"[^\"]*\",\"Peer\":\"$id\"" | cut -d '"' -f 4)"
+        if [ -n "$at" ]; then
+            echo "  connected to the community node at $at, a peering peer of its node"
+            return
+        fi
+        sleep 1
+    done
+    echo "  could not connect to the community node within 10 s, at the addresses _dnsaddr.$site.$update_domain gives; its node keeps trying"
+}
+
 # registrar <protocol> [<line>] -- a registrar through this machine's proxy, with <line> (an srp
 # registrar's domain) if given.
 registrar() {
@@ -228,6 +261,7 @@ start_proxy
 start agent agent.log "$B/sig0lease-agent" run -probe-interval 5s "$log/ipfs.yaml"
 if [ "$role" = member ]; then
     wait_until "$member is listed, a member of $site" listed
+    connect_community
     wait_until "the community's folder has $(label)'s, pinned by the community node" in_site
     cat << EOF
 
