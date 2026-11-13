@@ -1,6 +1,7 @@
-# demo/lib.sh -- what the demo's scripts (run.sh, chat.sh, web.sh, ipfs.sh, watch.sh) share,
-# sourced by them. It sets ns, update_domain and srp_domain, below; the scripts set B, the
-# binaries' directory, and log, the directory for the programs' logs, before using the rest.
+# demo/lib.sh -- what the demo's scripts (run.sh, chat.sh, web.sh, ipfs.sh, ipfs-local.sh,
+# watch.sh) share, sourced by them. It sets ns, update_domain and srp_domain, below; the scripts
+# set B, the binaries' directory, and log, the directory for the programs' logs, before using the
+# rest.
 #
 # REGISTRAR, when set, is the registrar the agents send their updates to, in place of the proxy
 # each demo otherwise starts on this machine, at 127.0.0.1:8053: a shared one, as the public
@@ -66,10 +67,16 @@ stop() {
     printf -v "$1" %s ""
 }
 
-# step <text> -- prints the step and waits for Enter.
+# step <text> -- prints the step and waits for the key n (next). Any other key, Enter too, only
+# starts a new line: Enter makes room in what the demo prints, without moving on.
 step() {
-    printf '\n%s\n[Enter] ' "$1"
-    read -r _ || echo
+    local key
+    printf '\n%s\n[n: next] ' "$1"
+    while IFS= read -r -s -n 1 key; do
+        echo
+        [ "$key" != n ] || return 0
+    done
+    echo
 }
 
 # in_use <port> -- whether something on this machine accepts connections on the port.
