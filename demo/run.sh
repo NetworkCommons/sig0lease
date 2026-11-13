@@ -29,11 +29,12 @@ if [ "$(uname -s)" = Darwin ]; then
     if [ ! -e demo/mac.yaml ]; then
         cat > demo/mac.yaml << EOF
 # This Mac's template (docs/demo.md, D2), written by demo/run.sh: the mDNS mirror publishes the
-# sharing services macOS advertises for $machost.local.
+# sharing services macOS advertises for $machost.local. Like demo/demo.yaml, it is written for
+# config.yaml's proxy, for runs by hand; run.sh's copy takes the run's SRP_DOMAIN.
 keystore: keys-mac
 registrars:
   - protocol: srp
-    domain: $srp_domain.
+    domain: srp.dev.zenr.io.
     server: 127.0.0.1:8053
     lease: 10m
     on_stop: release
