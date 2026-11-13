@@ -11,9 +11,13 @@
 read -r -a names <<< "${NAME:-demo}"
 every="${1:-2}"
 
+# rrset <answers> -- a record set's records on one line, sorted: a server gives them in another
+# order at each query (round robin), which would change the line when nothing changed.
+rrset() { printf '%s\n' "$1" | sort | tr '\n' ' '; }
+
 # line <label> <answers> -- one record set, if there is one.
 line() {
-    [ -z "$2" ] || printf '  %-22s %s\n' "$1" "$(printf '%s' "$2" | tr '\n' ' ')"
+    [ -z "$2" ] || printf '  %-22s %s\n' "$1" "$(rrset "$2")"
 }
 
 show() {
@@ -28,8 +32,8 @@ show() {
             label="${instance%".$type"}"
             srv="$(ask SRV "$instance")"
             target="${srv##* }"
-            printf '    %-28s %s port %s  %s\n' "${label//\\032/ }" "$target" "$(cut -d' ' -f3 <<< "$srv")" "$(ask TXT "$instance" | tr '\n' ' ')"
-            printf '    %-28s %s\n' "" "$( (ask A "$target"; ask AAAA "$target") | tr '\n' ' ')"
+            printf '    %-28s %s port %s  %s\n' "${label//\\032/ }" "$target" "$(cut -d' ' -f3 <<< "$srv")" "$(rrset "$(ask TXT "$instance")")"
+            printf '    %-28s %s\n' "" "$(rrset "$(ask A "$target"; ask AAAA "$target")")"
         done
     done
     [ -n "$found" ] || echo "  (no instances)"
