@@ -21,14 +21,15 @@ remote() { [ -n "${REGISTRAR:-}" ]; }
 # the demo's names go (docs/demo.md, "Where the names go"): names a key holds, with any records
 # (RFC 9664, the proxy's update_handler), and hosts with the services they register (RFC 9665,
 # srp_handler). Without REGISTRAR, they are what the proxy the demo starts serves (proxy_config),
-# UPDATE_DOMAIN by default dev.zenr.io. With REGISTRAR, they are the registrar's, and
-# UPDATE_DOMAIN has to be given. SRP_DOMAIN is srp.<UPDATE_DOMAIN> by default.
+# UPDATE_DOMAIN by default local.dev.zenr.io, apart from the registrar's names. With REGISTRAR,
+# they are the registrar's, and UPDATE_DOMAIN has to be given. SRP_DOMAIN is srp.<UPDATE_DOMAIN>
+# by default.
 ns="${NS:-ns1.free2air.org}"
 if remote && [ -z "${UPDATE_DOMAIN:-}" ]; then
     echo "UPDATE_DOMAIN is where REGISTRAR takes the demo's names, and SRP_DOMAIN its hosts, if not srp.<UPDATE_DOMAIN>: give them (docs/demo.md, \"Running a demo\")" >&2
     exit 1
 fi
-update_domain="${UPDATE_DOMAIN:-dev.zenr.io}"
+update_domain="${UPDATE_DOMAIN:-local.dev.zenr.io}"
 update_domain="${update_domain%.}"
 srp_domain="${SRP_DOMAIN:-srp.$update_domain}"
 srp_domain="${srp_domain%.}"
@@ -190,8 +191,22 @@ wait_until() {
 }
 
 # D1's site, which D6 (web.sh) starts too: demo/demo.yaml's host registers it as "<name> http",
-# in SRP_DOMAIN, while it answers.
-start_site() { start site site.log python3 -m http.server 8000 -d demo/site; }
+# in SRP_DOMAIN, while it answers. It serves $log/site, a copy of demo/site whose page lists the
+# run's host and name, $name.$srp_domain and $name.$update_domain (name: the caller's NAME, by
+# default demo), where demo/site/index.html, written like demo/demo.yaml for runs by hand, has
+# demo.srp.dev.zenr.io and demo.dev.zenr.io.
+start_site() {
+    mkdir -p "$log/site" || exit 1
+    awk -v host="$name.$srp_domain" -v nm="$name.$update_domain" '
+        { h += gsub(/<code>demo[.]srp[.]dev[.]zenr[.]io<[/]code>/, "<code>" host "</code>")
+          n += gsub(/<code>demo[.]dev[.]zenr[.]io<[/]code>/, "<code>" nm "</code>")
+          print }
+        END { exit !(h == 1 && n == 1) }' demo/site/index.html > "$log/site/index.html" || {
+        echo "Could not give the site's page this run's names: demo/site/index.html no longer has <code>demo.srp.dev.zenr.io</code> and <code>demo.dev.zenr.io</code> once each" >&2
+        exit 1
+    }
+    start site site.log python3 -m http.server 8000 -d "$log/site"
+}
 
 # listed <instance> -- whether browsing SRP_DOMAIN's HTTP services lists the instance.
 listed() { ask PTR "_http._tcp.$srp_domain" | grep -qF "$1._http._tcp.$srp_domain."; }

@@ -17,7 +17,7 @@ each. D4 adds to D1 or D6 and has no such parts: it is the same both ways.
 |---|---|---|
 | D1: the laptop publishes itself | its site among browse results and under a name; a service leaves when it stops and comes back; a template edit shows within seconds; a second key gets `demo-2`, and is refused the name | the laptop |
 | D2: the Mac's own services | turning on Remote Login or Screen Sharing puts it in the public zone | a Mac |
-| D3: a community folder over IPFS | phones open the members' folders by name from the community node, which finds each member by browsing as it comes up, pins its folder before publishing it, keeps serving it while the member is away, and drops it once the member stays away; the nodes find each other by DNS alone, in a private swarm | machines with IPFS Desktop or kubo, a community node and members, or one machine; or members alone with the registrar's community node; phones |
+| D3: a community folder over IPFS | phones open the members' folders by name from the community node, which finds each member by browsing as it comes up, pins its folder before publishing it, keeps serving it while the member is away, and drops it once the member stays away; the nodes find each other by DNS alone, in a private swarm | the laptop with IPFS Desktop or kubo, or with the registrar, the members' machines; phones |
 | D4: native discovery | an audience Mac lists the laptop's services beside its `local.` ones | a Mac in the audience |
 | D5: two communities meet in one chat room | phones log in as guests of two laptops' XMPP servers and talk in one room; the servers find each other by SRV records and trust each other's self-signed certificates by TLSA records (DANE) | two machines, each with Docker (a Mac) or Prosody 13 (Linux); phones |
 | D6: the zone in a browser | phones watch the services come and go, and the zone's names with their records; they claim a name with a message, held by a key their browser makes, and every phone lists it; `dig` shows it within seconds | the laptop; phones |
@@ -39,22 +39,26 @@ this document use them.
 ### Local test: the laptop's own proxy
 
 ```bash
-REGISTRAR= DOH= UPDATE_DOMAIN=dev.zenr.io SRP_DOMAIN=srp.dev.zenr.io
+REGISTRAR= DOH= UPDATE_DOMAIN=local.dev.zenr.io SRP_DOMAIN=srp.local.dev.zenr.io
 ```
 
-Each script starts its own proxy, on 127.0.0.1:8053, with the config its demo needs, and refuses
-to start while another proxy runs on the machine, another demo's included: run one demo at a
-time. The proxy serves the subtrees `dev.zenr.io` and `srp.dev.zenr.io`, and signs its updates
-for each with the key in `keystore/server` at the closest name at or above it; it does not start
-without one. It ends a lease only while it runs, which is while its script does.
+Each script starts its own proxy, on 127.0.0.1:8053, with the config its demo needs, and refuses to
+start while another proxy runs on the machine, another demo's included: run one demo at a time. The
+proxy serves the block's subtrees, `local.dev.zenr.io` and `srp.local.dev.zenr.io` or any others
+written in it, such as `stg.zenr.io` and `srp.stg.zenr.io`, and signs its updates for each with the
+key in `keystore/server` at the closest name at or above it; it does not start without one. It ends
+a lease only while it runs, which is while its script does.
 
 ### With the registrar
 
-The registrar's staging instance, where `<registrar>` is the registrar's host name, which its
+The registrar's instance, where `<registrar>` is the registrar's host name, which its
 operators give (it is in no file of this repository):
 
 ```bash
 REG=<registrar>
+#Stable:
+REGISTRAR=$REG:8053 DOH= UPDATE_DOMAIN=dev.zenr.io SRP_DOMAIN=srp.dev.zenr.io
+#Staging:
 REGISTRAR=$REG:8054 DOH=https://$REG:8444 UPDATE_DOMAIN=stg.zenr.io SRP_DOMAIN=srp.stg.zenr.io
 ```
 
@@ -77,30 +81,15 @@ checks no ports for one.
   (`server.diagnostics` off): a refusal shows only its Extended DNS Error's code, and
   `demo/leftovers.sh -r` cannot read its stores.
 
-### Commands
+### Reading the commands
 
 A part of a command in `<…>` is optional. The one with the pasted block's variables,
-`<REGISTRAR=$REGISTRAR UPDATE_DOMAIN=$UPDATE_DOMAIN>`, is for the registrar: in a local test,
-leave it out, and a script uses the laptop's own proxy and the subtrees `dev.zenr.io` and
-`srp.dev.zenr.io`; with the registrar, write it without `<` and `>`, and it takes what the pasted
-block gives. `SRP_DOMAIN=$SRP_DOMAIN` goes in it too for subtrees whose `SRP_DOMAIN` is not
-`srp.$UPDATE_DOMAIN`. Any other, such as `<MEMBER=…>`, is written or left out as its demo says,
-either way.
-
-| Demo | Command |
-|---|---|
-| D1 | `<REGISTRAR=$REGISTRAR UPDATE_DOMAIN=$UPDATE_DOMAIN> demo/run.sh` |
-| D2 | the same, on a Mac: its step 5 |
-| D3, on the community node | `<REGISTRAR=$REGISTRAR UPDATE_DOMAIN=$UPDATE_DOMAIN> REVOKE_AFTER=2m demo/ipfs.sh community` |
-| D3, on each member | `<REGISTRAR=$REGISTRAR UPDATE_DOMAIN=$UPDATE_DOMAIN> <MEMBER=…> demo/ipfs.sh member` |
-| D3, with staging's community node | on each member only: `REGISTRAR=$REGISTRAR UPDATE_DOMAIN=$UPDATE_DOMAIN <MEMBER=…> COMMUNITY_GATEWAY=https://$REG:8444 demo/ipfs.sh member` |
-| D3, on one machine | D3's "On one machine" |
-| D4 | D4's commands, on a Mac, while D1 or D6 runs |
-| D5, on A | `<REGISTRAR=$REGISTRAR UPDATE_DOMAIN=$UPDATE_DOMAIN> demo/chat.sh chat-a` |
-| D5, on B | `<REGISTRAR=$REGISTRAR UPDATE_DOMAIN=$UPDATE_DOMAIN> ROOM=meet@rooms.chat-a.$UPDATE_DOMAIN demo/chat.sh chat-b` |
-| D5, on one machine | `<REGISTRAR=$REGISTRAR UPDATE_DOMAIN=$UPDATE_DOMAIN> demo/chat.sh chat-a chat-b` |
-| D6 | `<REGISTRAR=$REGISTRAR UPDATE_DOMAIN=$UPDATE_DOMAIN DOH=$DOH> demo/web.sh` |
-| What anyone can see | `<UPDATE_DOMAIN=$UPDATE_DOMAIN> <NAME=…> demo/watch.sh`, `NAME` the demo's labels ("Before a demo") |
+`<REGISTRAR=$REGISTRAR UPDATE_DOMAIN=$UPDATE_DOMAIN>`, hands the demo's script the block you
+pasted: write it without `<` and `>` for the registrar's block, or for a local one with other
+subtrees than `local.dev.zenr.io`. Left out, the demo's script uses the laptop's own proxy and
+the subtrees `local.dev.zenr.io` and `srp.local.dev.zenr.io`. `SRP_DOMAIN=$SRP_DOMAIN` goes in it
+too for subtrees whose `SRP_DOMAIN` is not `srp.$UPDATE_DOMAIN`. Any other, such as
+`<MEMBER=…>`, is written or left out as its demo says, either way.
 
 ### Where the names go
 
@@ -114,32 +103,50 @@ handlers:
   elsewhere in the zone, but not at or above `UPDATE_DOMAIN`: D6's page lists the names in
   `UPDATE_DOMAIN` outside `SRP_DOMAIN`.
 
-With neither set, the scripts use `dev.zenr.io` and `srp.dev.zenr.io`. A script that starts the
-proxy on the laptop gives it these two subtrees.
+With neither set, the scripts use `local.dev.zenr.io` and `srp.local.dev.zenr.io`, apart from
+the registrar's subtrees, so that a local test's names are free of the names people register
+through the registrar, its own community node's included. `local.dev.zenr.io` itself has a KEY
+of the zone's operator. Without it, anyone registering through the registrar could take that
+name, one label below the registrar's `dev.zenr.io`, and with it write records at every name a
+laptop's proxy puts below it. Check that it has one: `dig +short KEY local.dev.zenr.io
+@ns1.free2air.org`.
 
-The templates in `demo/` are written for the default subtrees and the laptop's proxy:
-`demo/demo.yaml` registers the host `demo` in `srp.dev.zenr.io.` and the name
-`demo.dev.zenr.io.`, at `127.0.0.1:8053`. So that the same files serve any subtrees and any
-registrar, a script never gives the agent a template as it is: it writes a copy of it into the
-run's log directory, the agent runs that copy, and the files in `demo/` stay as they are, for
-runs by hand. In the copy:
+The proxy's config and the agents' templates in the repository are written for `dev.zenr.io` and
+`srp.dev.zenr.io`, for runs by hand: `config.yaml` serves `srp.dev.zenr.io.` and `dev.zenr.io.`, and
+`demo/demo.yaml` registers the host `demo` in `srp.dev.zenr.io.` and the name `demo.dev.zenr.io.`,
+at the laptop's proxy, `127.0.0.1:8053`. So that the same files serve any subtrees and any
+registrar, a script never runs them as they are: it writes a copy of each into the run's log
+directory, starts the proxy and the agents with the copies, and leaves `config.yaml` and the files
+in `demo/` as they are, for runs by hand.
+
+In the copy of `config.yaml`, which a script writes only without `REGISTRAR`, as it then starts
+the proxy:
+
+- `handlers.srp_handler.upstream_zone`, `srp_handler`'s subtree, is `SRP_DOMAIN`;
+- `handlers.update.upstream_zone`, `update_handler`'s, is `UPDATE_DOMAIN`.
+
+In the copy of a template:
 
 - each srp registrar's `domain:` is `SRP_DOMAIN`;
 - each RFC 9664 name keeps its first label, the part before the first dot, and the rest is
   `UPDATE_DOMAIN`: `demo.dev.zenr.io.` becomes `demo.$UPDATE_DOMAIN.`;
 - with `REGISTRAR`, `server: 127.0.0.1:8053` is `REGISTRAR`.
 
-The copy stays beside the run's logs, so it shows what the agent was given. Every template a
-script runs goes through this: `demo/demo.yaml`, `demo/conflict.yaml`, `demo/mac.yaml`, and the
-ones `ipfs.sh` and `chat.sh` write.
+In the copy of D1's site, `demo/site`, which `run.sh` and `web.sh` serve, the page lists the run's
+host and name: `demo.srp.dev.zenr.io` is `$NAME.$SRP_DOMAIN`, and `demo.dev.zenr.io`
+`$NAME.$UPDATE_DOMAIN`.
+
+The copies stay beside the run's logs, so they show what the proxy, the agents and the site were
+given.
+Every script copies in this way each template it runs: `demo/demo.yaml`, `demo/conflict.yaml`,
+`demo/mac.yaml`, and the ones `ipfs.sh` and `chat.sh` write.
 
 ### Demos on two machines
 
-D3 runs on the community node and a machine for each member; D5 on two machines, A and B; all
-on the same network. Each also runs on one machine, as its section says, and D3 with the
-registrar's community node. A Docker container as one of these machines has not been tried: its
-agent would publish the container's own addresses, which neither the other machines nor the
-phones reach, unless `ADDRESS` gives the host's and the container publishes the demo's ports.
+D5 runs on two machines, A and B, on the same network, or on one machine. A Docker container as
+one of them has not been tried: its agent would publish the container's own addresses, which
+neither the other machine nor the phones reach, unless `ADDRESS` gives the host's and the
+container publishes the demo's ports.
 
 ## Before a demo
 
@@ -160,17 +167,15 @@ phones reach, unless `ADDRESS` gives the host's and the container publishes the 
    ```
 
 3. Check that the demo's names are free, before each run: a script that stops frees them
-   (`on_stop: release`), so someone else may take them in between.
-   `<UPDATE_DOMAIN=$UPDATE_DOMAIN> NAME=… demo/watch.sh once`, with the demo's labels as `NAME`,
-   shows `(no records)` under each, and for D1, D2 and D6 no `demo` instance:
+   (`on_stop: release`), so someone else may take them in between. Run
+   `<UPDATE_DOMAIN=$UPDATE_DOMAIN> NAME=… demo/watch.sh once` with the demo's `NAME`:
 
-   | Demo | `NAME` | Another label |
-   |---|---|---|
-   | D1, D2, D6 | `demo`, the default | in `demo/demo.yaml` and `demo/conflict.yaml`, below |
-   | D3 | `site` | `SITE`, on every script and in the members' peer lists; a member's label is `MEMBER` |
-   | D5 | `"chat-a chat-b"` | `chat.sh`'s arguments, and `ROOM` |
-
-   With staging's community node as D3's, `site` is the node's, and stays so.
+   | Demo | `NAME` | What it shows when the names are free | If one is taken, write another label |
+   |---|---|---|---|
+   | D1, D2, D6 | `demo`, the default | `(no records)` under `demo`, and no `demo` instance; the same with the registrar | in `demo/demo.yaml` and `demo/conflict.yaml`, and as `NAME` (below) |
+   | D3, local test | `site` | `(no records)` under `site`, no `community ipfs-gateway` instance, and no `alice` or `carol` instance | as `SITE=…` before the three commands, in the members' peer lists, and as `NAME`; a member's as `MEMBER=…`; the gateway's as `HOST=…` |
+   | D3, with the registrar | `site` | `site` is the registrar's community node's, and stays so: its `KEY`; its `_dnslink TXT`, the community's folder (`QmUNLLsPACCz1vLxQVkXqqLX5R1X345qqfHbsf67hvA3Nn`, an empty folder, while no member was listed in the last 10 minutes); its `_dnsaddr TXT`, the node's addresses. Only the members' labels have to be free: no instance with a member's label | a member's as `MEMBER=…` |
+   | D5 | `"chat-a chat-b"` | `(no records)` under each; the same with the registrar | as `chat.sh`'s arguments, in `ROOM`, and as `NAME` |
 
    For D1, D2 and D6, write the other label, say `demo7`, in place of `demo` in `demo/demo.yaml`
    and `demo/conflict.yaml`, twice in each: the host, `name: demo`, and the first label of the
@@ -183,7 +188,7 @@ phones reach, unless `ADDRESS` gives the host's and the container publishes the 
 
 While a demo runs:
 
-- The projector shows `<UPDATE_DOMAIN=$UPDATE_DOMAIN> NAME=… demo/watch.sh`, with the demo's
+- A screen can show `<UPDATE_DOMAIN=$UPDATE_DOMAIN> NAME=… demo/watch.sh`, with the demo's
   labels as `NAME`: what anyone can see, asked of `ns1.free2air.org` every 2 s.
 - Ask the audience to look only once a name is published: a resolver that was told "no such
   name" keeps that answer for up to 6 minutes (the zone's SOA TTL). `@ns1.free2air.org` always
@@ -245,20 +250,26 @@ the agent publishes are the laptop's on that network.
 
 `run.sh` also starts the proxy, before the agent, and stops it last.
 
-**By hand**, in these terminals:
+**By hand**, from the repository's top directory. The commands use the repository's files as
+they are, so the names go in `dev.zenr.io` and `srp.dev.zenr.io`, not `local.dev.zenr.io`. Check
+first that they are free: `UPDATE_DOMAIN=dev.zenr.io demo/watch.sh once`.
 
-| | Command | What it is |
-|---|---|---|
-| 1 | `$B/sig0lease` | the proxy, on 127.0.0.1:8053, with `config.yaml`: `srp_handler` for `srp.dev.zenr.io.`, `update_handler` for `dev.zenr.io.`, signing upstream with `keystore/server` |
-| 2 | `python3 -m http.server 8000 -d demo/site` | the site |
-| 3 | `$B/sig0lease-agent run -probe-interval 5s demo/demo.yaml` | the agent: host `demo`, its services and the name `demo` |
-| 4 | `demo/watch.sh` | what anyone can see |
+1. Start each of these in a terminal of its own:
 
-The subtrees are then the ones `config.yaml` and `demo/demo.yaml` give, `dev.zenr.io` and
-`srp.dev.zenr.io`. Step 1 is starting terminals 1 to 4; step 2, Ctrl-C in terminal 2, then
-starting it again; step 3, uncommenting the `hello` record in `demo/demo.yaml`, with your text,
-and saving it; step 4, in a fifth terminal, `$B/sig0lease-agent run -probe-interval 5s
-demo/conflict.yaml`, then Ctrl-C.
+   ```bash
+   $B/sig0lease                                               # the proxy
+   python3 -m http.server 8000 -d demo/site                   # the site
+   $B/sig0lease-agent run -probe-interval 5s demo/demo.yaml   # the agent
+   UPDATE_DOMAIN=dev.zenr.io demo/watch.sh                    # what anyone can see
+   ```
+
+2. Ctrl-C in the site's terminal, then start the site again.
+3. In `demo/demo.yaml`, uncomment the `hello` record, change its text if you like, and save.
+4. In a fifth terminal, start the second agent, then Ctrl-C:
+
+   ```bash
+   $B/sig0lease-agent run -probe-interval 5s demo/conflict.yaml
+   ```
 
 ### With the registrar
 
@@ -291,250 +302,219 @@ D1's command with its `<…>` part: the Mac's agent registers through the regist
 
 ## D3: a community folder over IPFS
 
-The members, alice, carol and as many more as come, each keep a folder in their IPFS node; the
-community node (a colleague's laptop here, a small always-on machine in real life) pins each
-member's folder as soon as the member comes up, and keeps a folder with an entry for each
-member, which it serves.
+Members keep a folder each in their IPFS node. A community node finds each member by browsing
+as it comes up, pins its folder, and keeps a folder with an entry for each member, which its
+gateway serves to phones. Two ways to run it:
 
-As a local test, the community node and the members are machines of the demo, each script
-starting a proxy of its own, or one machine, with one proxy for all. With the registrar, the
-community node is either still a machine of the demo, or the registrar's own, with its gateway
-on the internet, and then only the members run a script ("With the registrar").
+- **Local test**: everything on the laptop: the community node and two members, alice and
+  carol, as three IPFS nodes, and one proxy. Phones on the laptop's network open the gateway.
+- **With the registrar**: the registrar's own community node, always on, with its gateway on the
+  internet. Only the members run `demo/ipfs.sh member`, on any machines; phones open the folder
+  from anywhere.
 
 ### Common to both
 
-Each machine runs `demo/ipfs.sh`, which starts an agent; the agents publish:
+What the agents publish, which `<UPDATE_DOMAIN=$UPDATE_DOMAIN> NAME=site demo/watch.sh` shows:
 
 | Record | Published by | Changes when |
 |---|---|---|
-| `alice._ipfs-member._tcp.$SRP_DOMAIN` SRV, and TXT `dnslink=/ipfs/<CID>` `swarm-mac=<MAC>` | each member, under its label (`alice`) | the member's folder changes, read from its node; withdrawn while its node's swarm port does not answer, and when it stops |
-| `site._sub._ipfs-member._tcp.$SRP_DOMAIN` PTR | each member | a member comes or goes: the list of members |
-| `_dnslink.site.$UPDATE_DOMAIN` | the community node | its node has pinned all of a member's new folder, or a member's entry is removed |
-| `_dnsaddr.site.$UPDATE_DOMAIN` | the community node | its node's addresses change |
-| `community ipfs-gateway` in `$SRP_DOMAIN` | the community node | its gateway starts or stops answering |
+| `alice._ipfs-member._tcp.$SRP_DOMAIN` SRV, and TXT `dnslink=/ipfs/<CID>` `swarm-mac=<MAC>` | each member, under its label | its folder changes; withdrawn while its node's swarm port does not answer, and when it stops |
+| `site._sub._ipfs-member._tcp.$SRP_DOMAIN` PTR | each member | a member comes or goes |
+| `_dnslink.site.$UPDATE_DOMAIN` TXT | the community node | it has pinned a member's new folder, or removed a member's entry |
+| `_dnsaddr.site.$UPDATE_DOMAIN` TXT | the community node | its node's addresses change |
+| `community ipfs-gateway` in `$SRP_DOMAIN` | the local test's community node | its gateway starts or stops answering |
 
-The community node's agent lists the members through its registrar, which answers from
-`ns1.free2air.org`: it sees a member come, and pins its folder, as soon as the zone has it.
-`/ipns/site.$UPDATE_DOMAIN/alice/` is `alice`'s folder.
+`/ipns/site.$UPDATE_DOMAIN/alice/` is alice's folder. A member is its label, `MEMBER`, by default
+the machine's name, which its key holds: a member that stops comes back to its label as the same
+member. The community node keeps an absent member's entry for `REVOKE_AFTER`, then removes it and
+unpins its folder. Only nodes with the community's swarm key are members: a member's TXT record
+gives a `swarm-mac=` that the swarm key makes from its KEY and its folder's CID, and the community
+node pins nothing whose `swarm-mac=` it cannot make ([sig0lease-agent.md](sig0lease-agent.md),
+"Who is a member").
 
-A member is its label, `MEMBER`, by default the machine's name, which the member's key holds:
-stopped, it keeps the label, and comes back to it as the same member ("Local test" and "With the
-registrar" say for how long). The community node keeps an absent member's entry for `REVOKE_AFTER`,
-by default 10 minutes, then removes it and unpins its folder. Another key at a member's label is
-another member: the entry before goes at once.
-
-Only nodes of the community's private swarm are members. Each member's TXT record gives, with
-its folder, a `swarm-mac=` that the community's swarm key makes from the member's KEY and the
-folder's CID; the community node pins nothing for an instance whose `swarm-mac=` its copy of
-the key does not make. A `swarm-mac=` copied to another instance does not match the KEY there:
-the registrar puts at a name only the KEY of the key that signed for it
-([sig0lease-agent.md](sig0lease-agent.md), "Who is a member"). Each agent reads its node's
-`swarm.key`, which `ipfs.sh` points it at.
-
-**Needs**:
-
-- The community node, and a machine for each member: alice, the presenter's laptop, and as many
-  others as join. Each has IPFS Desktop, or kubo (`ipfs init`), and kubo's `ipfs` command, which
-  works on IPFS Desktop's node too (its repository is `~/.ipfs`).
-- On the community node, `qrencode`, which prints the QR code the phones scan: `brew install
-  qrencode` on a Mac, `sudo apt install qrencode` on Linux.
-- Phones on the network, which reach the community node's port 8080.
-
-**Once**, on each node: quit IPFS Desktop, or stop `ipfs daemon`, then
+Each IPFS node is configured once, stopped (quit IPFS Desktop, or stop `ipfs daemon`), with
+`IPFS_PATH` set to its repository (left unset for `~/.ipfs`, IPFS Desktop's):
 
 ```bash
 ipfs config profile apply autoconf-off               # no public peers, resolvers or routers
 ipfs config Routing.Type dht
 ipfs config --json AutoTLS.Enabled false
 ipfs config --json Swarm.Transports.Network.Websocket false
-ipfs config --json Discovery.MDNS.Enabled false      # nodes found by DNS alone
-ipfs config Addresses.Gateway /ip4/0.0.0.0/tcp/8080  # community node: the gateway, on the network
-ipfs id -f '<id>\n'                                  # community node: its ID, for the peer lists
+ipfs config --json Discovery.MDNS.Enabled false      # nodes find each other by DNS alone
 ```
 
-The community's nodes are a private swarm: every one of them has the community's key, and no
-other node has it, so the folder reaches no other node. The key is one for the whole community,
-however many nodes it has: the community node and every member's node. It is in each node's
-repository, as `~/.ipfs/swarm.key`. Make it once, on any one node (with the registrar's community
-node, the key is that node's: "With the registrar"):
-
-```bash
-printf '/key/swarm/psk/1.0.0/\n/base16/\n%s\n' "$(openssl rand -hex 32)" > ~/.ipfs/swarm.key
-```
-
-Copy the file to each other node's `~/.ipfs/swarm.key` by hand, and never into DNS or this Git
-repository.
-
-Each member's peer list is the community node's name, whose addresses its agent publishes:
-`ipfs bootstrap add /dnsaddr/site.$UPDATE_DOMAIN/p2p/<the community node's ID>`, which the
-community node's script prints. The community node's peer list stays empty: it never connects to
-a member's node; each member's connects to it, and it fetches the member's folder over that
-connection. Start the nodes again: `ipfs daemon` says "Swarm is limited to private network of
-peers with the swarm key", and on a member, until the community node's agent publishes `site`,
-"failed to bootstrap (no peers found)": it tries again by itself. On
-each member, make the folder, `ipfs files mkdir /community` (IPFS Desktop: Files, New folder),
-and put a first file in it: without an `index.html`, gateways show it as a list of files.
-
-**Run**:
-
-1. The projector shows `<UPDATE_DOMAIN=$UPDATE_DOMAIN> NAME=site demo/watch.sh`: browsing lists
-   the members under `_ipfs-member._tcp`, each with its folder.
-2. On the community node:
-
-   ```bash
-   <REGISTRAR=$REGISTRAR UPDATE_DOMAIN=$UPDATE_DOMAIN> REVOKE_AFTER=2m demo/ipfs.sh community
-   ```
-
-   `_dnslink.site`, an empty folder, and `_dnsaddr.site` appear. Its script prints the command
-   for the members' peer lists, the address of its gateway, with a QR code,
-   `http://community.$SRP_DOMAIN:8080/ipns/site.$UPDATE_DOMAIN/`, and then each member as it
-   comes and goes. `REVOKE_AFTER=2m` removes an absent member within the demo.
-3. On alice's machine, then on each other member's:
-
-   ```bash
-   <REGISTRAR=$REGISTRAR UPDATE_DOMAIN=$UPDATE_DOMAIN> <MEMBER=…> demo/ipfs.sh member
-   ```
-
-   The member appears under `_ipfs-member._tcp`, and its node connects to the community node's
-   (IPFS Desktop's Peers lists it, its only peer). The community node pins its folder and
-   `_dnslink.site` changes: its script says "alice is a member", then "pinned …, alice's folder"
-   and "alice's entry gives …", and the member's script stops waiting once the community's
-   folder has the member's.
-4. Phones scan the QR code: a folder for each member, with its files.
-5. Drag a photo into `/community` on alice's machine (IPFS Desktop, Files). Within about 15 s
-   `alice`'s TXT record changes; the community node pins the new folder, and `_dnslink.site`
-   follows, again within about 15 s: each agent asks its node, and the community node's lists
-   the members, every 10 s. A phone's reload shows the photo within about a minute: the
-   community node's gateway asks for `site` again once its TTL, 30 s, is over.
-6. `https://dweb.link/ipns/site.$UPDATE_DOMAIN/`, a public gateway, reads the name but cannot
-   find the folder: no node outside the private swarm has it.
-7. alice leaves for a while: quit IPFS Desktop on alice's machine (its instance goes within
-   about 15 s, once its swarm port does not answer), or Enter in alice's `ipfs.sh`. The
-   community node says "alice is not listed; its entry goes in 2m0s unless it is again", and
-   phones still load `alice`'s folder from it. alice comes back within that time, IPFS Desktop
-   started again or `ipfs.sh` run again: the community node says "alice is listed again", and
-   the entry stays.
-8. carol leaves for good: Enter in carol's `ipfs.sh`. Two minutes later the community node says
-   "carol is not listed for 2m0s: no longer a member": `carol`'s folder goes from the site and
-   from the community node's pins.
-
-**On one machine**, the community node is a second node beside alice's, and a further member's,
-carol's, a third, each with a repository of its own and other ports. In the community node's
-terminal:
-
-```bash
-export IPFS_PATH=~/.ipfs-community                 # the community node, in this terminal only
-ipfs init
-# the configuration above, its gateway on 8081 instead of 8080, then:
-ipfs config Addresses.API /ip4/127.0.0.1/tcp/5002
-ipfs config --json Addresses.Swarm '["/ip4/0.0.0.0/tcp/4002", "/ip4/0.0.0.0/udp/4002/quic-v1"]'
-cp ~/.ipfs/swarm.key ~/.ipfs-community/            # the community's key
-ipfs daemon
-```
-
-carol's likewise, in a terminal of its own, with `IPFS_PATH=~/.ipfs-carol`, its gateway on 8082, the
-API on 5003 and the swarm on 4003; and like alice's, the community node's name in its peer list and
-the folder `/community`. The three scripts share one registrar, `REGISTRAR` ("Local test" and "With
-the registrar" say which): each would otherwise start a proxy of its own, and refuses to start
-beside another. Each in a terminal of its own:
-
-```bash
-REGISTRAR=$REGISTRAR UPDATE_DOMAIN=$UPDATE_DOMAIN REVOKE_AFTER=2m \
-    IPFS_PATH=~/.ipfs-community IPFS_API=http://127.0.0.1:5002 GATEWAY=8081 demo/ipfs.sh community
-REGISTRAR=$REGISTRAR UPDATE_DOMAIN=$UPDATE_DOMAIN MEMBER=alice demo/ipfs.sh member
-REGISTRAR=$REGISTRAR UPDATE_DOMAIN=$UPDATE_DOMAIN MEMBER=carol \
-    IPFS_PATH=~/.ipfs-carol IPFS_API=http://127.0.0.1:5003 demo/ipfs.sh member
-```
-
-The gateway address the community node's script prints has port 8081.
-
-The community node keeps the community's folder after the demo, in its files at
-`/sig0lease-agent/site.$UPDATE_DOMAIN`, with its members' folders pinned under the name
-`sig0lease-agent site.$UPDATE_DOMAIN.` (`ipfs pin ls --type=recursive --names`). The next start
-gives that folder as `site`, and removes each entry whose member is not listed again within
-`REVOKE_AFTER`. A member's key, which holds its label, is in the member's keystore,
-`demo/keys-ipfs-member-<MEMBER>`.
-
-Why a DNS record, and not IPNS, IPFS's own name for content that changes: an IPNS name is the
-hash of a key (`k51…`), and its record, signed by that key, is published in IPFS's distributed
-hash table, on the peers whose IDs are closest to the name, and over pubsub to the peers
-subscribed to it, which kubo leaves off by default. Publishing or resolving it over the hash
-table can take from tens of seconds to minutes: IPFS's documentation calls it slow, and DNSLink
-"currently much faster than IPNS" ([docs.ipfs.tech/concepts/ipns](https://docs.ipfs.tech/concepts/ipns/)).
-A DNSLink record has a name people can read, is DNSSEC-signed in this zone, and is at the zone's
-servers seconds after the agent's update; a resolver that cached the old one keeps it for up to
-its TTL.
+A node is in one private swarm, whose key is its repository's `swarm.key`: going from the local
+test to the registrar's community node, or back, means replacing `~/.ipfs/swarm.key` and
+restarting the node. The key never goes into DNS or this repository.
 
 ### Local test
 
-Each machine's `ipfs.sh` starts a proxy of its own; the community node's agent lists the members
-through its own. A member's leases are its own proxy's, which ends them only while it runs: a
-member that stops keeps its label until it runs again, however long that is, and one whose
-machine sleeps or leaves the network stays listed, and keeps its entry, until the machine is
-back.
+**Needs**: the laptop, with kubo's `ipfs` command, and IPFS Desktop or `ipfs daemon` for alice's
+node, `~/.ipfs`; `qrencode` (`brew install qrencode` on a Mac, `sudo apt install qrencode` on
+Linux); phones on the laptop's network, which reach its port 8081.
 
-On one machine, the three scripts share the proxy started by hand, which serves `config.yaml`'s
-subtrees, the laptop block's: `$B/sig0lease`, in a terminal of its own, and in each of the three
-terminals, after the laptop's block, `REGISTRAR=127.0.0.1:8053`.
+**Once**:
+
+1. Make the community node's and carol's repositories, and configure all three nodes as above:
+
+   ```bash
+   IPFS_PATH=~/.ipfs-community ipfs init
+   IPFS_PATH=~/.ipfs-carol ipfs init
+   ```
+
+2. Give those two their own ports; the community node's gateway listens on the network, for
+   the phones:
+
+   ```bash
+   IPFS_PATH=~/.ipfs-community ipfs config Addresses.Gateway /ip4/0.0.0.0/tcp/8081
+   IPFS_PATH=~/.ipfs-community ipfs config Addresses.API /ip4/127.0.0.1/tcp/5002
+   IPFS_PATH=~/.ipfs-community ipfs config --json Addresses.Swarm '["/ip4/0.0.0.0/tcp/4002", "/ip4/0.0.0.0/udp/4002/quic-v1"]'
+   IPFS_PATH=~/.ipfs-carol ipfs config Addresses.Gateway /ip4/127.0.0.1/tcp/8082
+   IPFS_PATH=~/.ipfs-carol ipfs config Addresses.API /ip4/127.0.0.1/tcp/5003
+   IPFS_PATH=~/.ipfs-carol ipfs config --json Addresses.Swarm '["/ip4/0.0.0.0/tcp/4003", "/ip4/0.0.0.0/udp/4003/quic-v1"]'
+   ```
+
+3. Make the community's swarm key, and give it to all three:
+
+   ```bash
+   printf '/key/swarm/psk/1.0.0/\n/base16/\n%s\n' "$(openssl rand -hex 32)" > ~/.ipfs/swarm.key
+   cp ~/.ipfs/swarm.key ~/.ipfs-community/
+   cp ~/.ipfs/swarm.key ~/.ipfs-carol/
+   ```
+
+4. Put the community node in the members' peer lists, with the laptop's block pasted:
+
+   ```bash
+   id=$(IPFS_PATH=~/.ipfs-community ipfs id -f '<id>')
+   ipfs bootstrap add /dnsaddr/site.$UPDATE_DOMAIN/p2p/$id
+   IPFS_PATH=~/.ipfs-carol ipfs bootstrap add /dnsaddr/site.$UPDATE_DOMAIN/p2p/$id
+   ```
+
+5. Start the three nodes: IPFS Desktop, or `ipfs daemon`, for alice's, and each of these in a
+   terminal of its own. Each says "Swarm is limited to private network of peers with the swarm
+   key"; the members say "failed to bootstrap (no peers found)": `demo/ipfs.sh member` connects
+   them to the community node, in "Run", step 3.
+
+   ```bash
+   IPFS_PATH=~/.ipfs-community ipfs daemon
+   IPFS_PATH=~/.ipfs-carol ipfs daemon
+   ```
+
+6. Give each member its folder, `/community`, with a first file (IPFS Desktop: Files, New folder,
+   then Import):
+
+   ```bash
+   ipfs files mkdir /community
+   ipfs files cp /ipfs/$(ipfs add -Q photo.jpg) /community/photo.jpg
+   IPFS_PATH=~/.ipfs-carol ipfs files mkdir /community
+   IPFS_PATH=~/.ipfs-carol ipfs files cp /ipfs/$(IPFS_PATH=~/.ipfs-carol ipfs add -Q photo.jpg) /community/photo.jpg
+   ```
+
+**Run**, with the laptop's block pasted in each terminal:
+
+1. A screen shows `NAME=site demo/watch.sh`.
+2. Start the community node, which also starts the proxy:
+
+   ```bash
+   UPDATE_DOMAIN=$UPDATE_DOMAIN REVOKE_AFTER=2m IPFS_PATH=~/.ipfs-community IPFS_API=http://127.0.0.1:5002 GATEWAY=8081 demo/ipfs.sh community
+   ```
+
+   `_dnslink.site`, an empty folder, and `_dnsaddr.site` appear. It prints the gateway's
+   address, `http://community.$SRP_DOMAIN:8081/ipns/site.$UPDATE_DOMAIN/`, with a QR code, then
+   each member as it comes and goes.
+3. Start the members, each in a terminal of its own; they use the community node's proxy:
+
+   ```bash
+   REGISTRAR=127.0.0.1:8053 UPDATE_DOMAIN=$UPDATE_DOMAIN MEMBER=alice demo/ipfs.sh member
+   REGISTRAR=127.0.0.1:8053 UPDATE_DOMAIN=$UPDATE_DOMAIN MEMBER=carol IPFS_PATH=~/.ipfs-carol IPFS_API=http://127.0.0.1:5003 demo/ipfs.sh member
+   ```
+
+   Each appears under `_ipfs-member._tcp`, and `demo/ipfs.sh member` makes the community node a
+   peering peer of the member's node, at the addresses `_dnsaddr.site` gives ("connected to the
+   community node at …, a peering peer of its node"; IPFS Desktop's Peers lists it). The
+   community node says "alice is a member", then "pinned …, alice's folder" and "alice's entry
+   gives …"; `demo/ipfs.sh member` waits until then.
+4. Phones scan the QR code: a folder for each member, with its files.
+5. Drag a photo into `/community` on alice's node (IPFS Desktop, Files). Within about 15 s
+   alice's TXT record changes, and within about 15 s more `_dnslink.site`: each agent reads its
+   node, and the community node lists the members, every 10 s. A phone's reload shows the photo
+   within about a minute, once the gateway's cached `site`, 30 s, is over.
+6. `https://dweb.link/ipns/site.$UPDATE_DOMAIN/`, a public gateway, reads the name but cannot
+   find the folder: no node outside the private swarm has it.
+7. alice leaves for a while: quit IPFS Desktop (alice's instance goes within about 15 s), or
+   Enter in alice's `ipfs.sh`. The community node says "alice is not listed; its entry goes in
+   2m0s unless it is again", and phones still load alice's folder. Start it again within that
+   time: "alice is listed again", and the entry stays.
+8. carol leaves for good: Enter in carol's `ipfs.sh`. Two minutes later the community node says
+   "carol is not listed for 2m0s: no longer a member", and carol's folder goes from the site and
+   from its pins.
+9. Enter in the community node's `ipfs.sh`, last: it stops the proxy too.
+
+A member that stops keeps its label for an hour, its key's lease, as long as the proxy runs. The
+community node keeps the community's folder for the next run, in its files at
+`/sig0lease-agent/site.$UPDATE_DOMAIN`, with the members' folders pinned under
+`sig0lease-agent site.$UPDATE_DOMAIN.`; a member's key is in `demo/keys-ipfs-member-<MEMBER>`.
 
 ### With the registrar
 
-The agents' updates and the community node's reads go to the registrar, which runs all the time:
-a member that stops keeps its label for an hour, its key's lease, and one whose machine sleeps or
-leaves the network is no longer listed about 2 minutes later, when its lease ends; the community
-node's `REVOKE_AFTER` counts from then.
+The registrar runs the community node (deploy/README.md, "The community node"), always on, at a
+public address. It lists the members of `site` in `$SRP_DOMAIN`, keeps the community's folder
+at `site.$UPDATE_DOMAIN`, and serves it at `${DOH:-https://$REG}/ipns/site.$UPDATE_DOMAIN/`. A
+member's node, behind the venue's NAT, connects to it; it never connects to a member's. An absent
+member's entry stays for 10 minutes. A member that stops keeps its label for an hour, its key's
+lease; one whose machine sleeps or leaves the network is no longer listed about 2 minutes later,
+when its instance's lease ends.
 
-Unless the registrar's own community node is used (below), the community node is still a machine of
-the demo, with the commands of "Common to both", whose gateway the phones reach on the venue's
-network. On staging, whose own community node holds `site`, it takes another label: `SITE=…` before
-every command, the community node's and the members', on one machine too, and that label in the
-members' peer lists and as `watch.sh`'s `NAME`. On one machine, the commands take the registrar's
-block as it is.
+**Needs**: on each member's machine, IPFS Desktop or kubo, and `qrencode`; a network that lets
+the members' nodes reach the community node's swarm port, the port in the addresses
+`dig +short TXT _dnsaddr.site.$UPDATE_DOMAIN @ns1.free2air.org` gives; the registrar's block
+pasted.
 
-#### The registrar's community node
+**Once**, on each member's machine:
 
-The registrar's staging instance runs the community node itself (deploy/README.md, "The community
-node"): a node that is always on, at a public address, in a private swarm of its own. It lists the
-members of `site` in `srp.stg.zenr.io`, pins their folders and keeps the community's folder at
-`site.stg.zenr.io`, and serves it at `https://<registrar>:8444/ipns/site.stg.zenr.io/`, so phones
-open it from anywhere, over mobile data too. Only the members run a script: one machine is enough,
-and any number can join. A member's node, behind the venue's NAT, connects to the community node;
-the community node never connects to it. An absent member's entry stays for staging's
-`revoke_after`, 10 minutes.
+1. Configure its node as above.
+2. Put the community's swarm key, which the registrar's operators give
+   (`keystore/ipfs/<instance>/swarm.key` on the machine that deploys the node), in
+   `~/.ipfs/swarm.key`.
+3. Put the community node in its peer list, by its name and the ID at the end of each address
+   `_dnsaddr.site` gives:
 
-**Needs**:
+   ```bash
+   dig +short TXT _dnsaddr.site.$UPDATE_DOMAIN @ns1.free2air.org
+   ipfs bootstrap add /dnsaddr/site.$UPDATE_DOMAIN/p2p/<the ID>
+   ```
 
-- Each member, with IPFS Desktop or kubo, configured once as in "Common to both", and the folder
-  `/community`. Its swarm key is the community's, which is the registrar's node's key: the
-  registrar's operators give it (`keystore/ipfs/staging/swarm.key` on the machine that deploys
-  the node). Its peer list names the community node: `ipfs bootstrap add
-  /dnsaddr/site.stg.zenr.io/p2p/<the node's ID>`, where the ID is the one at the end of each
-  address that `dig +short TXT _dnsaddr.site.stg.zenr.io @ns1.free2air.org` gives.
-- On each member, `qrencode`, as for the community node in "Common to both".
-- A network that lets the members' nodes reach the registrar's port 4002, TCP or UDP.
-- Staging's block pasted ("Running a demo").
+4. Start the node, and make its folder, `/community`, with a first file, as in the local test.
 
 **Run**:
 
-1. The projector shows `UPDATE_DOMAIN=$UPDATE_DOMAIN NAME=site demo/watch.sh`, and IPFS Desktop's
-   Peers on alice's machine, which lists the community node. `site` gives the community's folder: an
-   entry for each member listed in the last 10 minutes.
+1. A screen shows `UPDATE_DOMAIN=$UPDATE_DOMAIN NAME=site demo/watch.sh`, and IPFS Desktop's
+   Peers on alice's machine, which lists the community node.
 2. On alice's machine, then on each other member's:
 
    ```bash
-   REGISTRAR=$REGISTRAR UPDATE_DOMAIN=$UPDATE_DOMAIN <MEMBER=…> COMMUNITY_GATEWAY=https://$REG:8444 demo/ipfs.sh member
+   REGISTRAR=$REGISTRAR UPDATE_DOMAIN=$UPDATE_DOMAIN <MEMBER=…> COMMUNITY_GATEWAY=${DOH:-https://$REG} demo/ipfs.sh member
    ```
 
-   The member appears under `_ipfs-member._tcp`; the community node pins its folder, and
-   `_dnslink.site` gives it, within seconds. The script then prints the address of the member's
-   folder at the registrar, with a QR code; the community's is
-   `https://$REG:8444/ipns/site.stg.zenr.io/`.
-3. Phones scan it, on any network: the folder's files.
+   The member appears under `_ipfs-member._tcp`, and its node connects to the community node,
+   as in the local test; the community node pins its folder, and `_dnslink.site` gives it,
+   within seconds. `demo/ipfs.sh member` prints the address of the member's folder at the
+   registrar, with a QR code.
+3. Phones scan it, on any network: the folder's files. The community's folder is at
+   `${DOH:-https://$REG}/ipns/site.$UPDATE_DOMAIN/`.
 4. Drag a photo into `/community` on alice's machine (IPFS Desktop, Files): a phone's reload
-   shows it within about a minute, as in step 5 of "Common to both".
-5. alice leaves: Enter in alice's `ipfs.sh`, or quit IPFS Desktop. `alice`'s instance goes; its
-   entry stays for 10 minutes, and phones still load its folder from the registrar; back within
-   them, it carries on as the same member.
+   shows it within about a minute.
+5. alice leaves: Enter in alice's `ipfs.sh`, or quit IPFS Desktop. alice's instance goes; its
+   entry stays for 10 minutes, and phones still load its folder; back within them, it carries on
+   as the same member.
+
+### Why DNSLink, not IPNS
+
+An IPNS name is the hash of a key (`k51…`), published in IPFS's distributed hash table, which can
+take from tens of seconds to minutes; IPFS's documentation calls DNSLink "currently much faster
+than IPNS" ([docs.ipfs.tech/concepts/ipns](https://docs.ipfs.tech/concepts/ipns/)). A DNSLink
+record has a name people can read, is DNSSEC-signed in this zone, and is at the zone's servers
+seconds after the agent's update.
 
 ## D4: an audience Mac finds them without being told where
 
@@ -700,8 +680,8 @@ internet, not the laptop's port 8443. `DOH` gives the registrar's DNS-over-HTTPS
 ## After a demo
 
 - Ctrl-C the agents, then the site and the proxy. The records go at once, and so do the names
-  (`on_stop: release`). For D3, Enter in each `demo/ipfs.sh`: a member keeps its label ("Local
-  test" and "With the registrar" of D3 say for how long); for D5, in each `demo/chat.sh`;
+  (`on_stop: release`). For D3, Enter in each `demo/ipfs.sh`, the community node's last: a
+  member keeps its label for an hour; for D5, in each `demo/chat.sh`;
   for D6, in `demo/web.sh` (the names the phones claimed stay theirs for up to 30 minutes).
 - To hold the names for their keys after stopping instead, set `on_stop: keep` in the
   registrars of `demo/demo.yaml` and `demo/mac.yaml`: a host for 14 days and a name for 30
@@ -711,7 +691,8 @@ internet, not the laptop's port 8443. `DOH` gives the registrar's DNS-over-HTTPS
 ## When something fails
 
 - Local test: a script stops at once: "Port 8053, for this demo's proxy, is in use". Another
-  demo still runs, or the proxy of D1's terminal 1: stop it, then start the script again.
+  demo still runs, or a proxy started by hand (D1, "By hand"): stop it, then start the demo's
+  script again.
 - Local test: the proxy stops at once: "the lease store of `<handler>` holds `<name>`, which it
   does not serve" in `proxy.log`. Its lease stores, in `data/`, hold names from a run with other
   subtrees, which an earlier run did not free: D6's phones' claims stay up to 30 minutes, or a
@@ -723,30 +704,23 @@ internet, not the laptop's port 8443. `DOH` gives the registrar's DNS-over-HTTPS
 - Local test: the proxy logs errors reaching `ns1.free2air.org`: the network blocks port 53. Use
   a phone's hotspot, or the recording.
 - The agent logs a name held by another key: choose another label ("Before a demo", step 3).
-- D3: a member's script waits until "alice is listed": its instance is registered once its
-  node's swarm port answers the agent's probe at the addresses it publishes; `agent.log`, in the
-  directory the script printed, says why not. A label another key holds is renamed (`renamed:
-  now host alice-2, "alice" _ipfs-member._tcp as "alice-2"`), and the script follows: that is
-  another member.
-- D3: a member's script waits until the community's folder has the member's: the community node
-  does not reach it. `ipfs swarm peers` on the member lists nobody: do both `ipfs daemon` logs
-  show the same swarm key fingerprint? Does its peer list name the community node, with its ID
-  (the community node's script prints the command)? Its resolver may have answered "no such
-  name" for `_dnsaddr.site` before the community node published it, and keeps that answer for up
-  to 6 minutes: connect by hand, `ipfs swarm connect <address>`, with an address from
-  `dig +short TXT _dnsaddr.site.$UPDATE_DOMAIN @ns1.free2air.org`. The community node's
-  `agent.log` says what its agent waits for.
+- D3: `demo/ipfs.sh member` waits until "alice is listed": the member's instance is registered
+  once its node's swarm port answers the agent's probe at the addresses it publishes;
+  `agent.log`, in the directory `demo/ipfs.sh member` printed, says why not. A label another key
+  holds is renamed (`renamed: now host alice-2, "alice" _ipfs-member._tcp as "alice-2"`), and
+  `demo/ipfs.sh member` follows: that is another member.
+- D3: `demo/ipfs.sh member` says "could not connect to the community node …", and waits until the
+  community's folder has the member's: its node does not reach the community node, and
+  `ipfs swarm peers` on it lists nobody. Is its swarm key the community's (`ipfs daemon` logs the
+  key's fingerprint)? With the registrar, does the network let it out to the community node's
+  swarm port?
 - D3: the community node says "…: not a member: …": an instance under `site`'s subtype whose
   label is not letters, digits and hyphens, whose name has no KEY or several, or whose
   `swarm-mac=` its swarm key does not make: that node's `swarm.key` is not the community's. The
   community node leaves it out.
-- D3 with the registrar's community node: `ipfs.sh` waits until the community's folder has the
-  member's: its node does not reach the community node. `ipfs swarm peers` on it lists nobody:
-  is its swarm key the community's, the registrar node's (`ipfs daemon` says "Swarm is limited
-  to private network")? Does its peer list name the node, with the ID `_dnsaddr.site` gives?
-  Does the network let it out to the registrar's port 4002?
-- D3: phones get no answer from the community node's gateway: it listens on 127.0.0.1 only
-  (`Addresses.Gateway`, D3's "Once"), and then `community ipfs-gateway` is not registered either.
+- D3, local test: phones get no answer from the gateway, and `community ipfs-gateway` is not
+  registered: the community node's gateway listens on 127.0.0.1 only (D3's "Once", step 2), or
+  the laptop's firewall blocks port 8081.
 - `watch.sh` shows a record and the audience does not: their resolver answered "no such name"
   before it was published. Ask `@ns1.free2air.org`, or wait up to 6 minutes.
 - `demo http` is never registered: the probe asks the site at the published addresses

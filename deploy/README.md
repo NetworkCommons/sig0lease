@@ -188,9 +188,7 @@ A member's node finds the community node at `/dnsaddr/site.stg.zenr.io/p2p/<the 
 `dig +short TXT _dnsaddr.site.stg.zenr.io` gives the ID at the end of each address. docs/demo.md,
 D3, "The registrar's community node", runs members alone.
 
-Stable gets one with a `community` entry of its own and a swarm key, at the next promote. Its
-labels should be ones the local demos, which use `dev.zenr.io`, do not: the node holds its site's
-name for good.
+Stable gets one with a `community` entry of its own and a swarm key, at the next promote.
 
 ## Lease stores across releases
 
