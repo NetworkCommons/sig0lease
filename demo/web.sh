@@ -7,8 +7,8 @@
 # proxy_config) with the DoH listener on, in plain HTTP (a page served over plain HTTP may reach
 # it, and a browser refuses a self-signed certificate), D1's site and agent (demo/demo.yaml), whose
 # "<name> http" the page shows, and serves the page, and prints its address and a QR code of it.
-# The next Enters stop the site and start it again, for the phones to see "<name> http" leave
-# and come back. The last Enter, or Ctrl-C, stops the agent first, so it frees its names, then
+# The next n keys stop the site and start it again, for the phones to see "<name> http" leave
+# and come back. The last n, or Ctrl-C, stops the agent first, so it frees its names, then
 # the page, the site and the proxy. The logs and the copy of the config go to a temporary
 # directory, printed at the start.
 #   ADDRESS   the address phones reach this machine at; default, the one it reaches the internet

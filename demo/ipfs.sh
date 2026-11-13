@@ -18,7 +18,7 @@
 #              member. The script waits until the community's folder has the member's.
 # It checks that the node answers and has a swarm key, and for a member that its peer list has
 # the community node, builds the proxy and the agent, starts them, waits until the zone's
-# authoritative server has the records, and waits: Enter, or Ctrl-C, stops the agent, then the
+# authoritative server has the records, and waits: n, or Ctrl-C, stops the agent, then the
 # proxy. The community node's agent frees its names; a member's keeps its label. The logs and
 # the agent's template go to a temporary directory, printed at the start.
 #   MEMBER     the member's label: letters, digits and hyphens; default this machine's name
@@ -87,12 +87,12 @@ for label in "${labels[@]}"; do
     fi
 done
 if [ ! -f "$repo/swarm.key" ]; then
-    echo "$repo has no swarm.key: the demo's nodes are a private swarm (docs/demo.md, D3: Once)" >&2
+    echo "$repo has no swarm.key: the demo's nodes are a private swarm (docs/demo.md, D3; for the local test, demo/ipfs-local.sh start)" >&2
     exit 1
 fi
 swarm_key="$(cd "$repo" && pwd)/swarm.key"
 if ! id="$(curl -sf -X POST "$api/api/v0/id")"; then
-    echo "No IPFS node answers at $api: start IPFS Desktop, or ipfs daemon" >&2
+    echo "No IPFS node answers at $api: start IPFS Desktop, or ipfs daemon; for the local test, demo/ipfs-local.sh start" >&2
     exit 1
 fi
 id="$(sed -n 's/.*"ID":"\([^"]*\)".*/\1/p' <<< "$id")"
@@ -105,7 +105,7 @@ if [ "$role" = member ]; then
         exit 1
     fi
     if ! curl -sf -X POST "$api/api/v0/bootstrap/list" | grep -qF "\"/dnsaddr/$site.$update_domain/p2p/"; then
-        echo "The node's peer list has no /dnsaddr/$site.$update_domain/p2p/<ID>: the community node, which the member's node connects to; add it (docs/demo.md, D3: Once)" >&2
+        echo "The node's peer list has no /dnsaddr/$site.$update_domain/p2p/<ID>: the community node, which the member's node connects to; add it (docs/demo.md, D3; for the local test, demo/ipfs-local.sh start)" >&2
         exit 1
     fi
 fi
@@ -271,7 +271,7 @@ What anyone can run:
   dig +short PTR $site._sub.$type.$srp_domain      # the members
   dig +short TXT $(label).$type.$srp_domain        # this member's folder, and its swarm-mac=
 The community's folder: /ipns/$site.$update_domain/, this member's in it: /ipns/$site.$update_domain/$(label)/
-A file put in $folder, in IPFS Desktop's Files, changes this member's folder within about 15 s,
+A file put in $folder (IPFS Desktop's Files, or ipfs files cp) changes this member's folder within about 15 s,
 and the community's once its node pinned it. Stopped, the member's entry stays for the community
 node's REVOKE_AFTER, and its label for an hour: run again within it to come back as the member.
 EOF

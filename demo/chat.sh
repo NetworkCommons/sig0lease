@@ -7,8 +7,8 @@
 # serves, log in as its guests and meet in one room.
 # It builds the proxy and the clients, starts the proxy, the servers and the agent, waits until
 # the zone's authoritative server has the records, prints each page's address and a QR code of
-# it, and waits: Enter, or Ctrl-C, stops the agent first, so that it frees the names,
-# then the servers and the proxy. The logs and the agent's template go to a temporary directory,
+# it, and waits: n, or Ctrl-C, stops the agent first, so that it frees the names, then
+# the servers and the proxy. The logs and the agent's template go to a temporary directory,
 # printed at the start.
 #
 # The demo runs it on two machines, with a label each (default chat), or on one machine with

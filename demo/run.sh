@@ -1,8 +1,8 @@
 #!/bin/bash
 # demo/run.sh -- D1 of docs/demo.md in one terminal, and D2 on a Mac. It starts the proxy, the
-# site and the agent (demo/demo.yaml), runs the steps, each after Enter, and after each one waits
-# until the zone's authoritative server answers with the change, printing how long that took.
-# The last Enter, or Ctrl-C, stops the agents first, so they deregister what they published, then
+# site and the agent (demo/demo.yaml), runs the steps, each after the key n, and after each one
+# waits until the zone's authoritative server answers with the change, printing how long that
+# took. The last n, or Ctrl-C, stops the agents first, so they deregister what they published, then
 # the site and the proxy. Step 3 asks for the text of the record it adds, and adds the time to it.
 # The logs, and the agent's copy of the template that step 3 edits, go to a temporary directory,
 # printed at the start. On a Mac it writes demo/mac.yaml, D2's template,
