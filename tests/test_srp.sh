@@ -6,23 +6,19 @@
 # instance authoritative for srp.test. -- register -> dig -> refresh -> conflict (YXDOMAIN)
 # -> remove-one -> remove-all -> expiry -> LEASE-only expiry -> registrar discovery -> registrar
 # discovery and update over DNS-over-TLS -> concurrent claims of one name -> foreign-data
-# takeover. Every update is sent by the real requester,
+# takeover -> release -> register and release over DNS-over-HTTPS (plain HTTP, as a browser on
+# the LAN reaches it) -> RFC 6763 S11 domain enumeration following the config, also across a
+# restart. Every update is sent by the real requester,
 # cmd/sig0lease-srp-client (client/srp), in -once mode -- no stubs/mocks.
 
 set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "$SCRIPT_DIR/lib/common.sh"
-source "$SCRIPT_DIR/lib/dns.sh"
-source "$SCRIPT_DIR/lib/bind9.sh"
+# The proxy's config, DoT certificate and log; srp.test.'s SRV records point TESTs 8 and 9 at
+# the proxy (lib/srp.sh).
+SRP_RUN_DIR="$PROXY_RUN_ROOT/srp"
+source "$SCRIPT_DIR/lib/srp.sh"
 
-SRP_ZONE="srp.test."
-SRP_PROXY_ADDR="127.0.0.1"
-SRP_PROXY_PORT="${SRP_PROXY_PORT:-8159}"
-SRP_PROXY_URL="${SRP_PROXY_ADDR}:${SRP_PROXY_PORT}"
-BIND9_SRP_REGISTRAR_PORT="$SRP_PROXY_PORT" # the zone's _dnssd-srp._tcp SRV points TEST 8 here
-SRP_PROXY_TLS_PORT="${SRP_PROXY_TLS_PORT:-8160}" # the proxy's DNS-over-TLS listener
-BIND9_SRP_REGISTRAR_TLS_PORT="$SRP_PROXY_TLS_PORT" # the zone's _dnssd-srp-tls._tcp SRV points TEST 9 here
-SRP_KEYSTORE_DIR="$BIND9_SRP_KEYSTORE_DIR"
 SRP_LEASE_SECONDS="${SRP_LEASE_SECONDS:-30}" # outlasts TESTs 1-5, which assert data is still present
 SRP_KEY_LEASE_SECONDS="${SRP_KEY_LEASE_SECONDS:-1209600}"
 SRP_EXPIRY_LEASE_SECONDS=1
@@ -31,131 +27,34 @@ SRP_EXPIRY_TIMEOUT=40 # covers the 30s reconciliation-retry path (see processExp
                        # the next reconciliation pass rather than corrupting local state)
 SRP_DATA_EXPIRY_LEASE_SECONDS=2
 SRP_DATA_EXPIRY_KEY_LEASE_SECONDS=120 # well past SRP_EXPIRY_TIMEOUT -- see test_lease_expiry_keeps_keys
-SRP_REFUSE_ON_FOREIGN_DATA=true # the default; test_foreign_data_takeover restarts the proxy with false
 
-SRP_PROXY_BIN="${TESTS_DIR}/../bin/${OS}/sig0lease"
 SRP_CLIENT_BIN="${TESTS_DIR}/../bin/${OS}/sig0lease-srp-client"
-SRP_PROXY_LOG="/tmp/sig0lease_srp_proxy.log"
-SRP_TMP_CONFIG=""
-SRP_PROXY_PID=""
 SRP_KEY_DIR=""
-SRP_TLS_DIR="" # the DoT listener's throwaway certificate (make_tls_cert)
 
 PERFORMED_TESTS=""
 
 build_srp_binaries() {
     log_section "BUILD"
-    (cd "$TESTS_DIR/.." && go build -o "$SRP_PROXY_BIN" ./cmd/sig0lease)
+    (cd "$TESTS_DIR/.." && go build -o "$PROXY_BIN" ./cmd/sig0lease)
     (cd "$TESTS_DIR/.." && go build -o "$SRP_CLIENT_BIN" ./cmd/sig0lease-srp-client)
     log_success "Binaries built"
 }
 
-prepare_srp_config() {
-    SRP_TMP_CONFIG="$(mktemp /tmp/sig0lease-srp-client-config.XXXXXX.yaml)"
-    cat > "$SRP_TMP_CONFIG" <<EOF
-server:
-  address: ":${SRP_PROXY_PORT}"
-  networks:
-    - udp
-    - tcp
-    - tls
-  tls:
-    address: ":${SRP_PROXY_TLS_PORT}"
-    cert: "${SRP_TLS_DIR}/cert.pem"
-    key: "${SRP_TLS_DIR}/key.pem"
-upstreams:
-  - address: "8.8.8.8:53"
-    protocol: "udp"
-    timeout: "5s"
-handlers:
-  srp_handler:
-    upstream_zone: "${SRP_ZONE}"
-    keystore_dir: "${SRP_KEYSTORE_DIR}"
-    upstream: "${BIND9_ADDR}:${BIND9_PORT}"
-    allow_udp: true
-    refuse_on_foreign_data: ${SRP_REFUSE_ON_FOREIGN_DATA}
-    lease_policy:
-      min_key_lease_sec: 1
-      max_key_lease_sec: 1209600
-      min_rr_lease_sec: 1
-      max_rr_lease_sec: 7200
-authoritative:
-  max_inflight_updates: ${BIND9_SIG0_QUOTA}
-processing_rules:
-  - opcode: 5
-    modules: ["srp_handler"]
-EOF
-}
-
-start_srp_proxy() {
-    log_section "START: SRP proxy"
-    prepare_srp_config
-
-    if ! [ -x "$SRP_PROXY_BIN" ]; then
-        log_error "Proxy binary not found: $SRP_PROXY_BIN"
-        return 1
-    fi
-
-    # Appended: test_foreign_data_takeover restarts the proxy, and run_all_tests empties the
-    # log once at the start.
-    "$SRP_PROXY_BIN" "$SRP_TMP_CONFIG" >> "$SRP_PROXY_LOG" 2>&1 &
-    SRP_PROXY_PID=$!
-    sleep 1
-
-    if ! kill -0 "$SRP_PROXY_PID" 2>/dev/null; then
-        log_error "SRP proxy failed to start. Log:"
-        cat "$SRP_PROXY_LOG"
-        return 1
-    fi
-    log_success "SRP proxy started (PID $SRP_PROXY_PID) on $SRP_PROXY_URL, DNS-over-TLS on port $SRP_PROXY_TLS_PORT, log: $SRP_PROXY_LOG"
-}
-
-stop_srp_proxy() {
-    if [ -n "${SRP_PROXY_PID:-}" ] && kill -0 "$SRP_PROXY_PID" 2>/dev/null; then
-        log_step "Stopping SRP proxy (PID: $SRP_PROXY_PID)"
-        kill "$SRP_PROXY_PID" || true
-        sleep 1
-    fi
-    SRP_PROXY_PID=""
-    if [ -n "$SRP_TMP_CONFIG" ] && [ -f "$SRP_TMP_CONFIG" ]; then
-        rm -f "$SRP_TMP_CONFIG"
-    fi
-}
-
 # run_srp_client <identity-name> [extra sig0lease-srp-client flags...] -- sends one update
-# (-once) to the proxy. identity-name selects a keystore directory under a scratch dir: -k=13
-# creates a key there on first use and is a no-op after. Pass a never-before-used name for a
-# fresh identity, the same name again to reuse one (refresh / conflict scenarios).
+# (-once, or the -deregister given) to the proxy. identity-name selects a keystore directory
+# under a scratch dir: -k=13 creates a key there on first use and is a no-op after. Pass a
+# never-before-used name for a fresh identity, the same name again to reuse one (refresh /
+# conflict scenarios).
 run_srp_client() {
     local identity="$1"; shift
-    "$SRP_CLIENT_BIN" -server="$SRP_PROXY_URL" -domain="$SRP_ZONE" \
-        -keystore="${SRP_KEY_DIR}/${identity}" -k=13 -once "$@"
-}
-
-# dig_srp <name> <type> -- query BIND directly (not through the proxy), short form.
-dig_srp() {
-    dig_query_short "${BIND9_ADDR}:${BIND9_PORT}" "$1" "$2"
-}
-
-wait_for_srp_state() {
-    local name="$1" rr_type="$2" state="$3" timeout="${4:-10}"
-    local start
-    start=$(date +%s)
-    while true; do
-        local got
-        got="$(dig_srp "$name" "$rr_type")"
-        if [ "$state" = "present" ] && [ -n "$got" ]; then
-            return 0
+    local mode=-once arg
+    for arg in "$@"; do
+        if [ "$arg" = -deregister ]; then
+            mode=
         fi
-        if [ "$state" = "absent" ] && [ -z "$got" ]; then
-            return 0
-        fi
-        if [ $(( $(date +%s) - start )) -ge "$timeout" ]; then
-            log_error "Timed out waiting for $name/$rr_type state=$state (last dig: '$got')"
-            return 1
-        fi
-        sleep 1
     done
+    "$SRP_CLIENT_BIN" -server="$SRP_PROXY_URL" -domain="$SRP_ZONE" \
+        -keystore="${SRP_KEY_DIR}/${identity}" -k=13 ${mode:+"$mode"} "$@"
 }
 
 ################################
@@ -168,7 +67,7 @@ test_register_and_dig() {
 
     local out
     out="$(run_srp_client id1 -host=host1 -addr=192.0.2.1 -instance=Widget:_http._tcp:8080 -txt=Widget:path=/ \
-        -lease="$SRP_LEASE_SECONDS" -keylease="$SRP_KEY_LEASE_SECONDS")"
+        -lease="$SRP_LEASE_SECONDS" -key-lease="$SRP_KEY_LEASE_SECONDS")"
     echo "$out"
     echo "$out" | grep -q "Status: NOERROR (Rcode=0)" || { log_error "registration did not return NOERROR"; return 1; }
 
@@ -194,7 +93,7 @@ test_refresh() {
 
     local out
     out="$(run_srp_client id1 -host=host1 -addr=192.0.2.1 -instance=Widget:_http._tcp:8080 -txt=Widget:path=/ \
-        -lease="$SRP_LEASE_SECONDS" -keylease="$SRP_KEY_LEASE_SECONDS")"
+        -lease="$SRP_LEASE_SECONDS" -key-lease="$SRP_KEY_LEASE_SECONDS")"
     echo "$out"
     echo "$out" | grep -q "Status: NOERROR (Rcode=0)" || { log_error "refresh did not return NOERROR"; return 1; }
 
@@ -208,9 +107,11 @@ test_conflict() {
 
     local out
     out="$(run_srp_client id2-conflict -host=host1 -addr=192.0.2.1 -instance=Gadget:_http._tcp:8080 -txt=Gadget:path=/ \
-        -lease="$SRP_LEASE_SECONDS" -keylease="$SRP_KEY_LEASE_SECONDS")" || true
+        -lease="$SRP_LEASE_SECONDS" -key-lease="$SRP_KEY_LEASE_SECONDS")" || true
     echo "$out"
     echo "$out" | grep -q "Status: YXDOMAIN (Rcode=6)" || { log_error "expected YXDOMAIN for a conflicting registration"; return 1; }
+    # The reason, from the Extended DNS Error: the config turns on server.diagnostics.
+    echo "$out" | grep -q "EDE 18 (Prohibited): name held by a different key" || { log_error "expected Extended DNS Error 18 with the conflict's reason"; return 1; }
 
     # The rejected identity's own instance name must never have landed.
     [ -z "$(dig_srp Gadget._http._tcp.srp.test. SRV)" ] || { log_error "conflicting instance unexpectedly landed at authoritative"; return 1; }
@@ -227,42 +128,42 @@ test_remove_one_instance() {
 
     local out
     out="$(run_srp_client id1 -host=host1 -addr=192.0.2.1 -remove=Widget:_http._tcp \
-        -lease="$SRP_LEASE_SECONDS" -keylease="$SRP_KEY_LEASE_SECONDS")"
+        -lease="$SRP_LEASE_SECONDS" -key-lease="$SRP_KEY_LEASE_SECONDS")"
     echo "$out"
     echo "$out" | grep -q "Status: NOERROR (Rcode=0)" || { log_error "instance removal did not return NOERROR"; return 1; }
 
     wait_for_srp_state Widget._http._tcp.srp.test. SRV absent 10 || return 1
     [ -n "$(dig_srp host1.srp.test. A)" ] || { log_error "host A record disappeared after removing just the instance"; return 1; }
+    # RFC 9665 S3.2.5.5.2: while the host's KEY stays, so does the removed instance's, holding
+    # its name; the registrar adds it back after the instance's Delete All RRsets.
+    [ -n "$(dig_srp Widget._http._tcp.srp.test. KEY)" ] || { log_error "the removed instance's KEY went with it; its name is no longer held"; return 1; }
 
     # RFC 6763 S9: Widget was the only _http._tcp instance registered so far, so removing it
     # must clear the type out of the enumeration record too, not just leave it stale.
     wait_for_srp_state _services._dns-sd._udp.srp.test. PTR absent 10 \
         || { log_error "S9 enumeration record still lists a type with no live instances"; return 1; }
 
-    log_success "Service instance removed; host registration untouched; S9 enumeration record cleared"
+    log_success "Service instance removed, its KEY kept; host registration untouched; S9 enumeration record cleared"
     PERFORMED_TESTS="$PERFORMED_TESTS\n  [OK] $log_msg"
 }
 
 test_remove_all() {
-    # RFC 9665's Host Description Instruction signals "delete this host's registration" by
-    # a Delete All RRsets with ZERO Add operations (S3.3.1.3) -- i.e. no A/AAAA adds, which
-    # is a structural signal, not a LEASE=0 one (that's RFC 9664 Case C; SRP has no direct
-    # analog -- a KEY registration otherwise persists to its own KEY-LEASE, tested
-    # separately by test_expiry). So "remove all" here means the host's address data is
-    # withdrawn while its KEY registration (the reserved name) remains live.
-    local log_msg="TEST 5: Remove all host address data (bare host update, no A/AAAA adds)"
+    # RFC 9665 S3.2.5.5.1: a host is removed by an update with a LEASE of 0, with no address
+    # in its Host Description (S3.3.1.3); with a non-zero KEY-LEASE its KEY stays, holding
+    # the name. No address with a LEASE is not an SRP Update, which the registrar refuses
+    # (handlers' TestSRPHandle_HostWithoutAddressNeedsLeaseZero: this client cannot send one).
+    local log_msg="TEST 5: Remove the host, keeping its name (LEASE 0, KEY-LEASE kept)"
     log_section "$log_msg"
 
     local out
-    out="$(run_srp_client id1 -host=host1 \
-        -lease="$SRP_LEASE_SECONDS" -keylease="$SRP_KEY_LEASE_SECONDS")"
+    out="$(run_srp_client id1 -host=host1 -deregister -keep-names -key-lease="$SRP_KEY_LEASE_SECONDS")"
     echo "$out"
-    echo "$out" | grep -q "Status: NOERROR (Rcode=0)" || { log_error "host address removal did not return NOERROR"; return 1; }
+    echo "$out" | grep -q "Status: NOERROR (Rcode=0)" || { log_error "host removal did not return NOERROR"; return 1; }
 
     wait_for_srp_state host1.srp.test. A absent 10 || return 1
-    [ -n "$(dig_srp host1.srp.test. KEY)" ] || { log_error "host KEY unexpectedly disappeared -- only its address data should be withdrawn"; return 1; }
+    [ -n "$(dig_srp host1.srp.test. KEY)" ] || { log_error "host KEY disappeared -- a removal with a KEY-LEASE keeps it"; return 1; }
 
-    log_success "Host address data withdrawn (A gone); KEY registration (reserved name) persists"
+    log_success "Host removed (A gone); its KEY holds the name"
     PERFORMED_TESTS="$PERFORMED_TESTS\n  [OK] $log_msg"
 }
 
@@ -272,7 +173,7 @@ test_expiry() {
 
     local out
     out="$(run_srp_client id3-expiry -host=host3 -addr=192.0.2.1 -instance=Sprocket:_http._tcp:8080 -txt=Sprocket:path=/ \
-        -lease="$SRP_EXPIRY_LEASE_SECONDS" -keylease="$SRP_EXPIRY_LEASE_SECONDS")"
+        -lease="$SRP_EXPIRY_LEASE_SECONDS" -key-lease="$SRP_EXPIRY_LEASE_SECONDS")"
     echo "$out"
     echo "$out" | grep -q "Status: NOERROR (Rcode=0)" || { log_error "fresh registration for expiry test did not return NOERROR"; return 1; }
     [ -n "$(dig_srp host3.srp.test. A)" ] || { log_error "host A record not found right after registration"; return 1; }
@@ -309,7 +210,7 @@ test_lease_expiry_keeps_keys() {
 
     local out
     out="$(run_srp_client id4-lease-expiry -host=host4 -addr=192.0.2.1 -instance=Gizmo:_http._tcp:8080 -txt=Gizmo:path=/ \
-        -lease="$SRP_DATA_EXPIRY_LEASE_SECONDS" -keylease="$SRP_DATA_EXPIRY_KEY_LEASE_SECONDS")"
+        -lease="$SRP_DATA_EXPIRY_LEASE_SECONDS" -key-lease="$SRP_DATA_EXPIRY_KEY_LEASE_SECONDS")"
     echo "$out"
     echo "$out" | grep -q "Status: NOERROR (Rcode=0)" || { log_error "fresh registration for LEASE expiry test did not return NOERROR"; return 1; }
     wait_for_srp_state _services._dns-sd._udp.srp.test. PTR present 10 \
@@ -343,7 +244,7 @@ test_discovery() {
     out="$("$SRP_CLIENT_BIN" -resolver="${BIND9_ADDR}:${BIND9_PORT}" -domain="$SRP_ZONE" \
         -keystore="${SRP_KEY_DIR}/id5-discovery" -k=13 -once \
         -host=host5 -addr=192.0.2.5 -instance=Doohickey:_http._tcp:8080 -txt=Doohickey:path=/ \
-        -lease="$SRP_LEASE_SECONDS" -keylease="$SRP_KEY_LEASE_SECONDS")"
+        -lease="$SRP_LEASE_SECONDS" -key-lease="$SRP_KEY_LEASE_SECONDS")"
     echo "$out"
     echo "$out" | grep -q "Status: NOERROR (Rcode=0)" || { log_error "registration via discovery did not return NOERROR"; return 1; }
 
@@ -355,20 +256,20 @@ test_discovery() {
 }
 
 test_discovery_tls() {
-    # TEST 8 for a requester that uses TLS (-tls): SOA for srp.test., then the
+    # TEST 8 for a requester that uses TLS (-transport=tls): SOA for srp.test., then the
     # _dnssd-srp-tls._tcp.srp.test. SRV -> proxy.srp.test.:<proxy DoT port> (RFC 9665 S3.1.1),
     # then the update over DNS-over-TLS (S7). That port speaks only TLS, and the plain
     # _dnssd-srp._tcp record points at the proxy's plain-DNS port instead, so a NOERROR shows
     # the client both used the TLS record and completed the TLS handshake. Runs after TEST 7
     # for the same reason as TEST 8.
-    local log_msg="TEST 9: Registrar discovery and update over DNS-over-TLS (-tls, no -server)"
+    local log_msg="TEST 9: Registrar discovery and update over DNS-over-TLS (-transport=tls, no -server)"
     log_section "$log_msg"
 
     local out
-    out="$("$SRP_CLIENT_BIN" -tls -resolver="${BIND9_ADDR}:${BIND9_PORT}" -domain="$SRP_ZONE" \
+    out="$("$SRP_CLIENT_BIN" -transport=tls -resolver="${BIND9_ADDR}:${BIND9_PORT}" -domain="$SRP_ZONE" \
         -keystore="${SRP_KEY_DIR}/id6-discovery-tls" -k=13 -once \
         -host=host6 -addr=192.0.2.6 -instance=Thingamajig:_http._tcp:8080 -txt=Thingamajig:path=/ \
-        -lease="$SRP_LEASE_SECONDS" -keylease="$SRP_KEY_LEASE_SECONDS")"
+        -lease="$SRP_LEASE_SECONDS" -key-lease="$SRP_KEY_LEASE_SECONDS")"
     echo "$out"
     echo "$out" | grep -q "_dnssd-srp-tls._tcp" || { log_error "client did not report discovering via _dnssd-srp-tls._tcp"; return 1; }
     echo "$out" | grep -q "Status: NOERROR (Rcode=0)" || { log_error "registration over DNS-over-TLS did not return NOERROR"; return 1; }
@@ -392,10 +293,10 @@ test_concurrent_claims() {
     out_a="$(mktemp /tmp/sig0lease-srp-race-a.XXXXXX)"
     out_b="$(mktemp /tmp/sig0lease-srp-race-b.XXXXXX)"
     run_srp_client id7-race-a -host=host7 -addr=192.0.2.71 \
-        -lease="$SRP_LEASE_SECONDS" -keylease="$SRP_KEY_LEASE_SECONDS" > "$out_a" 2>&1 &
+        -lease="$SRP_LEASE_SECONDS" -key-lease="$SRP_KEY_LEASE_SECONDS" > "$out_a" 2>&1 &
     pid_a=$!
     run_srp_client id7-race-b -host=host7 -addr=192.0.2.72 \
-        -lease="$SRP_LEASE_SECONDS" -keylease="$SRP_KEY_LEASE_SECONDS" > "$out_b" 2>&1 &
+        -lease="$SRP_LEASE_SECONDS" -key-lease="$SRP_KEY_LEASE_SECONDS" > "$out_b" 2>&1 &
     pid_b=$!
     wait "$pid_a" || true
     wait "$pid_b" || true
@@ -419,7 +320,8 @@ test_foreign_data_takeover() {
     # but no KEY (legacy.srp.test.'s A record, from the zone template), and its UPDATE then
     # carries a "KEY RRset does not exist" prerequisite (RFC 2136 S2.4.3), sent as a generic
     # RR with empty RDATA. BIND must accept it: a malformed prerequisite would be a FORMERR,
-    # and the claim would fail. Runs last: it restarts the proxy with that setting.
+    # and the claim would fail. It restarts the proxy with that setting, which no later test
+    # depends on.
     local log_msg="TEST 11: Foreign-data takeover (refuse_on_foreign_data: false) -> KEY prerequisite accepted by BIND"
     log_section "$log_msg"
 
@@ -432,20 +334,128 @@ test_foreign_data_takeover() {
 
     local out
     out="$(run_srp_client id8-takeover -host=legacy -addr=192.0.2.8 \
-        -lease="$SRP_LEASE_SECONDS" -keylease="$SRP_KEY_LEASE_SECONDS")"
+        -lease="$SRP_LEASE_SECONDS" -key-lease="$SRP_KEY_LEASE_SECONDS")"
     echo "$out"
     echo "$out" | grep -q "Status: NOERROR (Rcode=0)" || { log_error "takeover of non-SRP data did not return NOERROR"; return 1; }
     [ "$(dig_srp legacy.srp.test. A)" = "192.0.2.8" ] || { log_error "expected the claimant's address to replace the non-SRP A record"; return 1; }
     [ -n "$(dig_srp legacy.srp.test. KEY)" ] || { log_error "claimant's KEY not found at legacy.srp.test."; return 1; }
 
     out="$(run_srp_client id8-takeover-late -host=legacy -addr=192.0.2.9 \
-        -lease="$SRP_LEASE_SECONDS" -keylease="$SRP_KEY_LEASE_SECONDS")" || true
+        -lease="$SRP_LEASE_SECONDS" -key-lease="$SRP_KEY_LEASE_SECONDS")" || true
     echo "$out"
     echo "$out" | grep -q "Status: YXDOMAIN (Rcode=6)" || { log_error "a second identity's claim after the takeover should get YXDOMAIN"; return 1; }
 
     log_success "Non-SRP data taken over with the KEY prerequisite; a later claim by another key got YXDOMAIN"
     PERFORMED_TESTS="$PERFORMED_TESTS\n  [OK] $log_msg"
 }
+
+test_release() {
+    # RFC 9665 S3.2.5.5.1: a removal with a KEY-LEASE of 0 frees the names, and is done once
+    # answered: the registrar deletes the KEYs in the removal's own UPDATE, the unlisted
+    # instance's too, leaving nothing for a timer, so a proxy stopped right after the answer
+    # leaves no KEY holding the names. Before, their expiry timers deleted them after it.
+    local log_msg="TEST 12: Release the host, freeing its names (LEASE 0, KEY-LEASE 0) -> KEYs gone once answered"
+    log_section "$log_msg"
+
+    local out
+    out="$(run_srp_client id9-release -host=host9 -addr=192.0.2.9 -instance=Whatsit:_http._tcp:8080 -txt=Whatsit:path=/ \
+        -lease="$SRP_LEASE_SECONDS" -key-lease="$SRP_KEY_LEASE_SECONDS")"
+    echo "$out"
+    echo "$out" | grep -q "Status: NOERROR (Rcode=0)" || { log_error "registration for the release test did not return NOERROR"; return 1; }
+    [ -n "$(dig_srp host9.srp.test. KEY)" ] || { log_error "host KEY not found right after registration"; return 1; }
+    [ -n "$(dig_srp Whatsit._http._tcp.srp.test. KEY)" ] || { log_error "instance KEY not found right after registration"; return 1; }
+
+    out="$(run_srp_client id9-release -host=host9 -deregister)"
+    echo "$out"
+    echo "$out" | grep -q "Status: NOERROR (Rcode=0)" || { log_error "release did not return NOERROR"; return 1; }
+
+    # Asked once, right after the answer: nothing is waited for.
+    local name rr_type
+    for name in host9.srp.test. Whatsit._http._tcp.srp.test.; do
+        for rr_type in KEY A SRV; do
+            [ -z "$(dig_srp "$name" "$rr_type")" ] || { log_error "$name $rr_type still at the authoritative server once the release was answered"; return 1; }
+        done
+    done
+
+    log_success "Release answered with the host's and its instance's KEYs, address and SRV already gone at authoritative"
+    PERFORMED_TESTS="$PERFORMED_TESTS\n  [OK] $log_msg"
+}
+
+test_doh() {
+    # The same requester over DNS-over-HTTPS (RFC 8484), on the proxy's plain-HTTP listener,
+    # as a page served over plain HTTP on the LAN reaches it from a browser: the signed UPDATE
+    # is POSTed as is, its ID and SIG(0) signature intact, and dispatched to srp_handler as
+    # over every other transport. Then the release, over DoH too.
+    local log_msg="TEST 13: Register and release over DNS-over-HTTPS (-transport=doh, plain HTTP)"
+    log_section "$log_msg"
+
+    local out
+    out="$("$SRP_CLIENT_BIN" -transport=doh -server="$SRP_PROXY_DOH_URL" -domain="$SRP_ZONE" \
+        -keystore="${SRP_KEY_DIR}/id10-doh" -k=13 -once \
+        -host=host10 -addr=192.0.2.10 -instance=Doodad:_http._tcp:8080 -txt=Doodad:path=/ \
+        -lease="$SRP_LEASE_SECONDS" -key-lease="$SRP_KEY_LEASE_SECONDS")"
+    echo "$out"
+    echo "$out" | grep -q "Transport: doh" || { log_error "client did not report the doh transport"; return 1; }
+    echo "$out" | grep -q "Status: NOERROR (Rcode=0)" || { log_error "registration over DoH did not return NOERROR"; return 1; }
+    [ "$(dig_srp host10.srp.test. A)" = 192.0.2.10 ] || { log_error "host A record not found at authoritative"; return 1; }
+    [ -n "$(dig_srp Doodad._http._tcp.srp.test. SRV)" ] || { log_error "instance SRV not found at authoritative"; return 1; }
+
+    out="$("$SRP_CLIENT_BIN" -transport=doh -server="$SRP_PROXY_DOH_URL" -domain="$SRP_ZONE" \
+        -keystore="${SRP_KEY_DIR}/id10-doh" -host=host10 -deregister)"
+    echo "$out"
+    echo "$out" | grep -q "Status: NOERROR (Rcode=0)" || { log_error "release over DoH did not return NOERROR"; return 1; }
+    local name rr_type
+    for name in host10.srp.test. Doodad._http._tcp.srp.test.; do
+        for rr_type in KEY A SRV; do
+            [ -z "$(dig_srp "$name" "$rr_type")" ] || { log_error "$name $rr_type still at the authoritative server after the release over DoH"; return 1; }
+        done
+    done
+
+    log_success "Registered and released over DoH: the host's records reached the authoritative server and left it"
+    PERFORMED_TESTS="$PERFORMED_TESTS\n  [OK] $log_msg"
+}
+
+test_domain_enumeration() {
+    # RFC 6763 S11: the browsing-domain records (b/db/lb) follow advertise_browse_domain,
+    # default on, and the registration-domain ones (r/dr) advertise_registration_domain,
+    # default off, whatever is registered; each names the zone itself. A proxy restarted with
+    # the settings flipped deletes what the earlier run published, as it compares the config
+    # with the zone, not with what it remembers writing. The reconciliation pass that writes
+    # them runs 30 s after the proxy starts, then every 30 s. It restarts the proxy, as
+    # TEST 11 does, and runs last.
+    local log_msg="TEST 14: Domain enumeration (RFC 6763 S11) follows the config, also across a restart"
+    log_section "$log_msg"
+    local prefix name
+
+    for prefix in b db lb; do
+        name="$prefix._dns-sd._udp.$SRP_ZONE"
+        wait_for_srp_state "$name" PTR present "$SRP_EXPIRY_TIMEOUT" || { log_error "$name not published with advertise_browse_domain on"; return 1; }
+        [ "$(dig_srp "$name" PTR)" = "$SRP_ZONE" ] || { log_error "$name: expected PTR $SRP_ZONE, got '$(dig_srp "$name" PTR)'"; return 1; }
+    done
+    for prefix in r dr; do
+        name="$prefix._dns-sd._udp.$SRP_ZONE"
+        [ -z "$(dig_srp "$name" PTR)" ] || { log_error "$name published with advertise_registration_domain off"; return 1; }
+    done
+
+    stop_srp_proxy
+    SRP_ADVERTISE_BROWSE_DOMAIN=false
+    SRP_ADVERTISE_REGISTRATION_DOMAIN=true
+    start_srp_proxy || return 1
+
+    for prefix in b db lb; do
+        name="$prefix._dns-sd._udp.$SRP_ZONE"
+        wait_for_srp_state "$name" PTR absent "$SRP_EXPIRY_TIMEOUT" || { log_error "$name, published by the earlier run, not deleted with advertise_browse_domain off"; return 1; }
+    done
+    for prefix in r dr; do
+        name="$prefix._dns-sd._udp.$SRP_ZONE"
+        wait_for_srp_state "$name" PTR present "$SRP_EXPIRY_TIMEOUT" || { log_error "$name not published with advertise_registration_domain on"; return 1; }
+        [ "$(dig_srp "$name" PTR)" = "$SRP_ZONE" ] || { log_error "$name: expected PTR $SRP_ZONE, got '$(dig_srp "$name" PTR)'"; return 1; }
+    done
+
+    log_success "b/db/lb and r/dr follow the config; the restarted proxy deleted the earlier run's b/db/lb"
+    PERFORMED_TESTS="$PERFORMED_TESTS\n  [OK] $log_msg"
+}
+
 
 ################################
 # Top level
@@ -462,13 +472,11 @@ run_all_tests() {
     require_command named
     require_command go
 
+    srp_run_prepare
     SRP_KEY_DIR="$(mktemp -d /tmp/sig0lease-srp-client-identities.XXXXXX)"
-    SRP_TLS_DIR="$(mktemp -d /tmp/sig0lease-srp-tls.XXXXXX)"
-    make_tls_cert "$SRP_TLS_DIR"
 
     build_srp_binaries
     start_bind9
-    : > "$SRP_PROXY_LOG"
     start_srp_proxy
 
     test_register_and_dig
@@ -482,6 +490,9 @@ run_all_tests() {
     test_discovery_tls
     test_concurrent_claims
     test_foreign_data_takeover
+    test_release
+    test_doh
+    test_domain_enumeration
 
     bind9_report_rejections || return 1
     BIND9_REJECTIONS_REPORTED=1
@@ -490,7 +501,10 @@ run_all_tests() {
     echo -e "${GREEN}All SRP integration tests completed successfully!${NC}"
     echo -e "$PERFORMED_TESTS"
     echo ""
-    echo "SRP proxy log: $SRP_PROXY_LOG"
+    if [ "$PROXY_LAUNCH" = auto ]; then
+        echo "SRP proxy log: $SRP_PROXY_LOG"
+    fi
+    echo "SRP proxy config: $SRP_TMP_CONFIG"
     echo "BIND log: ${BIND9_RUNDIR}/named.log"
 }
 
@@ -503,7 +517,6 @@ cleanup() {
     stop_srp_proxy
     stop_bind9
     [ -n "$SRP_KEY_DIR" ] && rm -rf "$SRP_KEY_DIR"
-    [ -n "$SRP_TLS_DIR" ] && rm -rf "$SRP_TLS_DIR"
     set -e
 }
 

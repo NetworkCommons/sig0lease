@@ -3,11 +3,9 @@ package handlers
 import (
 	"context"
 	"math"
-	"strings"
 	"testing"
 
 	"codeberg.org/miekg/dns"
-	"github.com/NetworkCommons/sig0lease/logging"
 	"github.com/NetworkCommons/sig0lease/pkg/dnsname"
 	"github.com/NetworkCommons/sig0lease/pkg/keyrec"
 	leasepkg "github.com/NetworkCommons/sig0lease/pkg/lease"
@@ -47,44 +45,6 @@ func TestParseRecordTTL(t *testing.T) {
 				t.Fatalf("parseRecordTTL(%v) = %d, want an error", tc.raw, got)
 			}
 		})
-	}
-}
-
-// TestSetup_BothHandlersReadRecordTTL: both handlers read record_ttl_sec through
-// parseRecordTTL, and an invalid value stops either one's Setup.
-func TestSetup_BothHandlersReadRecordTTL(t *testing.T) {
-	updateCfg := baseSetupCfg(t)
-	updateCfg["record_ttl_sec"] = 120
-	uh := newTestHandler()
-	if err := uh.Setup(updateCfg); err != nil {
-		t.Fatalf("UpdateHandler.Setup: %v", err)
-	}
-	if uh.recordTTL != 120 {
-		t.Fatalf("UpdateHandler recordTTL = %d, want 120", uh.recordTTL)
-	}
-
-	srpCfg := baseSRPSetupCfg(t)
-	srpCfg["record_ttl_sec"] = 120
-	sh := NewSRPHandler()
-	sh.SetLogger(logging.NewLogger("error"))
-	if err := sh.Setup(srpCfg); err != nil {
-		t.Fatalf("SRPHandler.Setup: %v", err)
-	}
-	if sh.recordTTL != 120 {
-		t.Fatalf("SRPHandler recordTTL = %d, want 120", sh.recordTTL)
-	}
-
-	updateCfg = baseSetupCfg(t)
-	updateCfg["record_ttl_sec"] = 0
-	if err := newTestHandler().Setup(updateCfg); err == nil || !strings.Contains(err.Error(), "record_ttl_sec") {
-		t.Fatalf("UpdateHandler.Setup error = %v, want the record_ttl_sec error", err)
-	}
-	srpCfg = baseSRPSetupCfg(t)
-	srpCfg["record_ttl_sec"] = 0
-	sh = NewSRPHandler()
-	sh.SetLogger(logging.NewLogger("error"))
-	if err := sh.Setup(srpCfg); err == nil || !strings.Contains(err.Error(), "record_ttl_sec") {
-		t.Fatalf("SRPHandler.Setup error = %v, want the record_ttl_sec error", err)
 	}
 }
 
@@ -205,7 +165,7 @@ func TestHandle_WritesRecordTTL(t *testing.T) {
 			}
 			h.upstreamCoordinator = stub
 
-			req := buildSignedLeaseRegistrationForHandleTest(t, loaded, "test.dev.zenr.io.", tc.lease, tc.keyLease)
+			req := buildSignedLeaseUpdateForHandleTest(t, loaded, "test.dev.zenr.io.", leasepkg.Encode8Byte(tc.lease, tc.keyLease), true)
 			res := h.Handle(context.Background(), stubResponseWriter{}, req)
 			if res == nil || res.Message == nil || res.Message.Rcode != dns.RcodeSuccess {
 				t.Fatalf("expected success, got %+v", res)
@@ -234,19 +194,19 @@ func TestHandle_WritesRecordTTL(t *testing.T) {
 	}
 }
 
-// TestHandle_CaseB_ReRegisteredKEYGetsRecordTTL: Case B re-sends the lease store's KEY (the
-// request has no KEY and KEY-LEASE 0). Its TTL is cut to the remaining lease it is
+// TestHandle_RecordsAlone_ReRegisteredKEYGetsRecordTTL: records added alone (no KEY, KEY-LEASE 0)
+// re-send the lease store's KEY when it is missing. Its TTL is cut to the remaining lease it is
 // re-registered with, on the forwarded copy only; the store's record keeps its own.
-func TestHandle_CaseB_ReRegisteredKEYGetsRecordTTL(t *testing.T) {
+func TestHandle_RecordsAlone_ReRegisteredKEYGetsRecordTTL(t *testing.T) {
 	h, loaded := newRecordTTLUpdateHandler(t)
 
 	signerKey := loaded.PublicKey.Clone().(*dns.KEY)
 	signerKey.Hdr.TTL = 3600
-	if err := h.leaseManager.Register(context.Background(), signerKey, 120, 120, "dev.zenr.io."); err != nil {
+	if err := h.leaseManager.Register(signerKey, 120, 120, "dev.zenr.io."); err != nil {
 		t.Fatalf("register signer key in lease store: %v", err)
 	}
 	stub := &stubUpstreamCoordinator{
-		// No KEY at the signer's name: Case B puts the stored one back.
+		// No KEY at the signer's name: the stored one is put back.
 		query: func(ctx context.Context, zoneHint, fqdn string, rrType uint16) ([]dns.RR, error) {
 			return []dns.RR{}, nil
 		},
@@ -254,7 +214,7 @@ func TestHandle_CaseB_ReRegisteredKEYGetsRecordTTL(t *testing.T) {
 	}
 	h.upstreamCoordinator = stub
 
-	req := buildSignedNonKeyOnlyLeaseUpdateForHandleTest(t, loaded, "host.test.dev.zenr.io.", 3600, false)
+	req := buildSignedLeaseUpdateForHandleTest(t, loaded, "host.test.dev.zenr.io.", leasepkg.Encode8Byte(3600, 0), false)
 	res := h.Handle(context.Background(), stubResponseWriter{}, req)
 	if res == nil || res.Message == nil || res.Message.Rcode != dns.RcodeSuccess {
 		t.Fatalf("expected success, got %+v", res)

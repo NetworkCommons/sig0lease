@@ -133,10 +133,9 @@ func TestNodeLocks_AcquireGivesUpAtDeadline(t *testing.T) {
 func TestNodeLocks_AcquireRereadsSubtree(t *testing.T) {
 	store := NewInMemoryManager()
 	defer store.Stop()
-	ctx := context.Background()
 	parent := testKeyRR("parent.dev.zenr.io.", "AAAAPARENT=")
 	child := testKeyRR("child.parent.dev.zenr.io.", "AAAACHILD=")
-	if err := store.RegisterWithParent(ctx, "", parent, 300, 300, "dev.zenr.io."); err != nil {
+	if err := store.RegisterWithParent("", parent, 300, 300, "dev.zenr.io."); err != nil {
 		t.Fatal(err)
 	}
 	parentKey, childKey := NodeKey(parent), NodeKey(child)
@@ -161,7 +160,7 @@ func TestNodeLocks_AcquireRereadsSubtree(t *testing.T) {
 	}()
 	time.Sleep(20 * time.Millisecond) // let the deleter reach its wait (the result doesn't depend on it)
 
-	if err := store.RegisterWithParent(ctx, parentKey, child, 300, 300, "dev.zenr.io."); err != nil {
+	if err := store.RegisterWithParent(parentKey, child, 300, 300, "dev.zenr.io."); err != nil {
 		t.Fatal(err)
 	}
 	reg.Release()

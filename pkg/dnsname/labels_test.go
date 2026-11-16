@@ -68,6 +68,19 @@ func TestCheckLabel(t *testing.T) {
 	}
 }
 
+func TestIsHostLabel(t *testing.T) {
+	for _, ok := range []string{"a", "Demo", "chat-a", "0", "x1-y2", strings.Repeat("a", 63)} {
+		if !IsHostLabel(ok) {
+			t.Errorf("IsHostLabel(%q) = false, want true", ok)
+		}
+	}
+	for _, bad := range []string{"", "-a", "a-", "my printer", "café", "_http", "a.b", strings.Repeat("a", 64)} {
+		if IsHostLabel(bad) {
+			t.Errorf("IsHostLabel(%q) = true, want false", bad)
+		}
+	}
+}
+
 // wireLabels encodes labels in wire format, each preceded by its length octet.
 func wireLabels(labels ...string) []byte {
 	var b []byte

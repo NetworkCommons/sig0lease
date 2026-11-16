@@ -10,10 +10,9 @@ import (
 	"time"
 
 	"codeberg.org/miekg/dns"
-	"github.com/NetworkCommons/sig0lease/logging"
+	"github.com/NetworkCommons/sig0lease/pkg/dnsmsg"
 	"github.com/NetworkCommons/sig0lease/pkg/dnsname"
 	leasepkg "github.com/NetworkCommons/sig0lease/pkg/lease"
-	"github.com/NetworkCommons/sig0lease/pkg/updatecore"
 )
 
 // authorizeKeyRefresh verifies that signerID may refresh the already
@@ -56,14 +55,14 @@ func (h *UpdateHandler) authorizeKeyRefresh(clientKeyRR *dns.KEY, signerID keyID
 }
 
 // effectiveRefreshKeyLease determines the key-lease duration to actually
-// grant a refresh (Case A and Case D share this once ownership has already
-// been authorized via authorizeKeyRefresh): the full requestedKeyLease when
+// grant a refresh of a KEY the request adds, once ownership has already
+// been authorized via authorizeKeyRefresh: the full requestedKeyLease when
 // the key is still published at its authoritative FQDN, or whatever lease
 // time remains locally (floored at 1s so a near-expiry key isn't handed a
 // zero-length lease) when it has disappeared from authoritative DNS and
 // needs to be re-published rather than granted a fresh full-length lease.
-func (h *UpdateHandler) effectiveRefreshKeyLease(ctx context.Context, zone string, keyRR *dns.KEY, existingKey *leasepkg.Record, requestedKeyLease uint32) (effectiveKeyLease uint32, keyAtFQDN bool, err error) {
-	keyAtFQDN, err = h.authoritativeHasKeyAtName(ctx, zone, keyRR.Hdr.Name)
+func (h *UpdateHandler) effectiveRefreshKeyLease(ctx context.Context, keyRR *dns.KEY, existingKey *leasepkg.Record, requestedKeyLease uint32) (effectiveKeyLease uint32, keyAtFQDN bool, err error) {
+	keyAtFQDN, err = h.authoritativeHasKeyAtName(ctx, keyRR.Hdr.Name)
 	if err != nil {
 		return 0, false, err
 	}
@@ -78,14 +77,14 @@ func (h *UpdateHandler) effectiveRefreshKeyLease(ctx context.Context, zone strin
 	return remaining, false, nil
 }
 
-func (h *UpdateHandler) registerKeyLease(ctx context.Context, signerID keyID, keyRR *dns.KEY, leaseDuration uint32, keyLeaseDuration uint32) error {
+func (h *UpdateHandler) registerKeyLease(signerID keyID, keyRR *dns.KEY, leaseDuration uint32, keyLeaseDuration uint32) error {
 	parent := ""
 	signerNodeKey := leasepkg.NodeKeyFromSIG(signerID.Name, signerID.Algorithm, signerID.KeyTag)
 	keyNodeKey := leasepkg.NodeKey(keyRR)
 	if signerNodeKey != keyNodeKey {
 		parent = signerNodeKey
 	}
-	return h.leaseManager.RegisterWithParent(ctx, parent, keyRR, leaseDuration, keyLeaseDuration, h.upstreamZone)
+	return h.leaseManager.RegisterWithParent(parent, keyRR, leaseDuration, keyLeaseDuration, h.upstreamZone)
 }
 
 // nextLeaseEvent returns how long until nodeKey's next lease event -- the earlier of its
@@ -156,8 +155,29 @@ type dueRecord struct {
 	rr    dns.RR
 }
 
+// subtreeDeletes returns the UPDATE instructions that delete, record by record, every KEY and
+// non-KEY record at and below nodeKey (subtreeLeases): what a KEY's delete sends, by an RFC 9664
+// requester or an SRP removal with a KEY-LEASE of 0.
+func subtreeDeletes(store LeaseManager, nodeKey string) []dns.RR {
+	keys, records := subtreeLeases(store, nodeKey)
+	return append(asDeletes(keys...), recordDeletes(records)...)
+}
+
+// forgetSubtree forgets nodeKey and every node below it, and disarms their timers, once the
+// authoritative server has confirmed the UPDATE that deleted them: a KEY's expiry, its
+// delete, or an SRP removal with a KEY-LEASE of 0. DNS has already changed, so a store write
+// that fails panics; event names the deletion in that panic.
+func forgetSubtree(store LeaseManager, timers *expiryTimers, nodeKey, event string) {
+	for _, node := range append([]string{nodeKey}, store.ListSubtreeKeys(nodeKey)...) {
+		timers.disarm(node)
+	}
+	if err := store.DeleteSubtree(nodeKey); err != nil {
+		panic(fmt.Sprintf("%s of %s: %v", event, nodeKey, err))
+	}
+}
+
 // subtreeLeases returns every KEY and non-KEY record at and below nodeKey: what a KEY's
-// expiry, or its Case C delete, takes away.
+// expiry, or its delete, takes away.
 func subtreeLeases(store LeaseManager, nodeKey string) ([]*dns.KEY, []dueRecord) {
 	var keys []*dns.KEY
 	var records []dueRecord
@@ -191,7 +211,7 @@ func ownRecords(store LeaseManager, owner string, due time.Time) []dueRecord {
 func recordDeletes(records []dueRecord) []dns.RR {
 	deletes := make([]dns.RR, 0, len(records))
 	for _, r := range records {
-		deletes = append(deletes, updatecore.AsDelete(r.rr))
+		deletes = append(deletes, dnsmsg.AsDelete(r.rr))
 	}
 	return deletes
 }
@@ -254,12 +274,7 @@ func (e leaseExpirer) expire(ctx context.Context, nodeKey string) bool {
 		if rec := e.store.Get(nodeKey); rec != nil && !rec.IsExpired() {
 			panic(fmt.Sprintf("%s: %s was refreshed while its expiry held its node locks and was deleting it upstream", e.upstream.handler, nodeKey))
 		}
-		for _, descendant := range e.store.ListSubtreeKeys(nodeKey) {
-			e.timers.disarm(descendant)
-		}
-		if err := e.store.DeleteSubtree(nodeKey); err != nil {
-			panic(fmt.Sprintf("%s: lease expiry of %s: %v", e.upstream.handler, nodeKey, err))
-		}
+		forgetSubtree(e.store, e.timers, nodeKey, e.upstream.handler+": lease expiry")
 	} else {
 		for _, r := range records {
 			if err := e.store.RemoveSingleNonKEYRecord(r.owner, r.rrKey); err != nil {
@@ -361,6 +376,18 @@ func (t *expiryTimers) disarm(nodeKey string) {
 	delete(t.failures, nodeKey)
 }
 
+// stopAll stops every pending timer and forgets every node's failure run, for
+// leaseRuntime.Shutdown.
+func (t *expiryTimers) stopAll() {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	for nodeKey, timer := range t.timers {
+		timer.Stop()
+		delete(t.timers, nodeKey)
+	}
+	clear(t.failures)
+}
+
 // armed reports whether nodeKey has a timer in the table, pending or already firing.
 func (t *expiryTimers) armed(nodeKey string) bool {
 	t.mu.Lock()
@@ -369,61 +396,9 @@ func (t *expiryTimers) armed(nodeKey string) bool {
 	return ok
 }
 
-// reconcile arms a timer, for its next lease event, for every lease owner in store that has
-// none: each KEY node, and each owner of non-KEY records, also one without a KEY record of its
-// own (store.ListOwners). fire gives a node's timer callback. Both handlers run it every 30s
-// (startLeaseReconciliation): it is how a store loaded from a snapshot at startup gets its
-// timers, and it catches a node that lost its timer to a bug. It never deletes anything itself:
-// a node already past its lease event gets a timer that fires almost at once, into the same
-// upstream-aware expiry as every other.
-func (t *expiryTimers) reconcile(store LeaseManager, logger *logging.Logger, fire func(nodeKey string) func()) {
-	for _, nodeKey := range store.ListOwners() {
-		if !t.armed(nodeKey) {
-			logger.Debugf("Reconciliation: no active expiry timer for %s, scheduling now", nodeKey)
-			t.schedule(store, nodeKey, fire(nodeKey))
-		}
-	}
-}
-
-func (h *UpdateHandler) scheduleLeaseExpiry(nodeKey string) {
-	h.timers.schedule(h.leaseManager, nodeKey, h.expireFunc(nodeKey))
-}
-
 // expiryTimeout bounds one expiry attempt, both handlers': it holds the node's locks
 // (docs/siglease_rfc9664.md, "Node Locks") while it deletes upstream.
 const expiryTimeout = 10 * time.Second
-
-// expireFunc is nodeKey's timer callback: one lease event (leaseExpirer.run).
-func (h *UpdateHandler) expireFunc(nodeKey string) func() {
-	return func() {
-		ctx, cancel := context.WithTimeout(context.Background(), expiryTimeout)
-		defer cancel()
-		h.expirer().run(ctx, nodeKey)
-	}
-}
-
-// startLeaseReconciliation runs expiryTimers.reconcile every interval, until Shutdown.
-func (h *UpdateHandler) startLeaseReconciliation(interval time.Duration) {
-	h.reconcileTicker = time.NewTicker(interval)
-	go func() {
-		for range h.reconcileTicker.C {
-			h.timers.reconcile(h.leaseManager, h.logger, h.expireFunc)
-		}
-	}()
-}
-
-// Shutdown stops the reconciliation ticker and releases the lease storage
-// backend's own resources (e.g. a file-backed store's periodic-save
-// goroutine, which also performs one final synchronous save here). Safe to
-// call once during server shutdown; overrides BaseHandler's no-op default.
-func (h *UpdateHandler) Shutdown() {
-	if h.reconcileTicker != nil {
-		h.reconcileTicker.Stop()
-	}
-	if h.leaseManager != nil {
-		h.leaseManager.Stop()
-	}
-}
 
 type leaseDumpNode struct {
 	keyRec    *leasepkg.Record
@@ -707,24 +682,10 @@ func (h *UpdateHandler) DumpLeases() string {
 	return h.DumpLeasesLevel("debug")
 }
 
-// upstream is where this handler's UPDATEs go (upstreamTarget.send).
-func (h *UpdateHandler) upstream() upstreamTarget {
-	return upstreamTarget{handler: h.Name(), coordinator: h.upstreamCoordinator, signingKey: h.upstreamKeyRecord, zone: h.upstreamZone, logger: h.logger}
-}
-
-// expirer is how this handler ends leases (leaseExpirer). Its lock ids are NodeKeys and
-// RecordKeys, and RFC 9664 has no data cascade.
+// expirer is how this handler ends leases (leaseExpirer), with its NodeKey lock ids; RFC 9664
+// has no data cascade.
 func (h *UpdateHandler) expirer() leaseExpirer {
-	return leaseExpirer{
-		store:    h.leaseManager,
-		timers:   h.timers,
-		upstream: h.upstream(),
-		fire:     h.expireFunc,
-		locks:    h.nodeLocks,
-		lockIDs: func(nodeKey string) []string {
-			return append([]string{nodeKey}, h.leaseManager.ListSubtreeKeys(nodeKey)...)
-		},
-	}
+	return h.newExpirer(h.upstream(), false)
 }
 
 // Handle processes an UPDATE query and returns a HandlerResult.
@@ -735,18 +696,18 @@ func (h *UpdateHandler) expirer() leaseExpirer {
 //   - If UPDATE-LEASE is absent, packet is not sig0lease relevant → StatusNotRelevant
 //
 // Registration Flow (if UPDATE-LEASE present):
-//  1. Validate message structure (single question for downstream zone)
+//  1. Validate message structure: names this handler serves, a Zone Section enclosing them
 //  2. Parse 8-byte lease EDNS(0) option (RFC 9664)
 //  3. Extract and validate client SIG(0) signature (RFC 2931)
 //  4. Extract KEY RR from update records
-//  5. Register lease in-memory with persistence hook
-//  6. Construct UPDATE for upstream zone
-//  7. Sign UPDATE with upstream key
-//  8. Send to upstream authoritative server
+//  5. Construct UPDATE for upstream zone
+//  6. Sign UPDATE with upstream key
+//  7. Send to upstream authoritative server
+//  8. Record the lease in the lease store once the upstream server has confirmed it
 //  9. Return response to client
 //
 // The DNS UPDATE message format:
-//   - Question section: Downstream zone name and class (typically ClassINET)
+//   - Question section: the Zone Section, any name enclosing the update's names (typically the zone)
 //   - Answer section: Prerequisite records (unused in this implementation)
 //   - Authority section: Update records (typically KEY RRs being registered)
 //   - Additional section: EDNS options (including 8-byte Update Lease and SIG(0))

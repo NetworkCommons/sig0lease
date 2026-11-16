@@ -1,0 +1,27 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>sig0lease demo</title>
+<style>
+  body { font: 18px/1.5 system-ui, sans-serif; max-width: 40rem; margin: 3rem auto; padding: 0 1rem; color: #222; background: #fafafa; }
+  code { background: #eee; padding: 0 .3em; border-radius: 3px; }
+  @media (prefers-color-scheme: dark) { body { color: #ddd; background: #181818; } code { background: #333; } }
+</style>
+</head>
+<body>
+<h1>Published by its own machine</h1>
+<p>This page is served by a laptop. The laptop put its name in the public DNS itself, with its
+own key: no account, no registrar's web form.</p>
+<ul>
+  <li><code>demo.srp.dev.zenr.io</code>, with this site as a browsable service
+  (<a href="https://www.rfc-editor.org/rfc/rfc9665">RFC 9665</a>, DNS-SD Service Registration
+  Protocol);</li>
+  <li><code>demo.dev.zenr.io</code>, a name held by its key
+  (<a href="https://www.rfc-editor.org/rfc/rfc9664">RFC 9664</a>, leases on DNS updates), whose
+  records point here over IPFS too.</li>
+</ul>
+<p>When the laptop goes away, so do its records; its keys keep the names for it.</p>
+</body>
+</html>

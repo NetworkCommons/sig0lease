@@ -1,0 +1,30 @@
+<!doctype html>
+<!-- D5's page (docs/demo.md), served by each XMPP server demo/chat.sh runs: Converse.js logs in
+     as a guest of that server and joins the room.
+     ?domain= the server's XMPP domain; default, the name the page was opened by. demo/chat.sh
+              gives it in the address it prints, for phones that cannot use the name.
+     ?room=   the room to join; default meet@rooms.<domain>. -->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Chat</title>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/converse.js@14.0.1/dist/converse.min.css">
+<script src="https://cdn.jsdelivr.net/npm/converse.js@14.0.1/dist/converse.min.js"></script>
+</head>
+<body>
+<script>
+const params = new URLSearchParams(location.search);
+const domain = params.get('domain') || location.hostname;
+converse.initialize({
+    authentication: 'anonymous',
+    jid: domain,
+    auto_login: true,
+    websocket_url: `${location.protocol === 'https:' ? 'wss' : 'ws'}://${location.host}/xmpp-websocket`,
+    discover_connection_methods: false,
+    auto_join_rooms: [params.get('room') || `meet@rooms.${domain}`],
+    view_mode: 'fullscreen',
+});
+</script>
+</body>
+</html>

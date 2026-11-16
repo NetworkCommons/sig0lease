@@ -55,7 +55,7 @@ func New(cfg *config.Config, logger *logging.Logger) (*Server, error) {
 	}
 
 	// Create router with opcode mappings and resolver
-	router, err := NewRouter(cfg.GetOpcodeMap(), logger, resolver, cfg.Server.RequestTimeout)
+	router, err := NewRouter(cfg.GetOpcodeMap(), logger, resolver, cfg.Server)
 	if err != nil {
 		resolver.Shutdown()
 		return nil, fmt.Errorf("create router: %w", err)
@@ -83,6 +83,10 @@ func (s *Server) Serve() error {
 		s.handleRequest(ctx, w, r)
 	})
 
+	// The handlers' background work, such as lease expiry, starts now, before any query is
+	// served; shutdown stops it.
+	s.router.Start()
+
 	// Set up OS signal interception that automatically cancels ctx on SIGINT/SIGTERM
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
@@ -101,6 +105,8 @@ func (s *Server) Serve() error {
 				return s.serveTCP(ctx, router)
 			case "tls":
 				return s.serveDoT(ctx, router)
+			case "doh":
+				return s.serveDoH(ctx, router)
 			default:
 				return fmt.Errorf("unsupported network: %s", net)
 			}

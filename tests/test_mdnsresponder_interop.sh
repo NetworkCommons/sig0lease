@@ -18,14 +18,25 @@
 # Direction 2: OUR client (client/srp, via cmd/sig0lease-srp-client) against the real
 # srp-mdns-proxy -- both Register and, importantly, Deregister (this project's own new
 # removal capability, added specifically to extend interop coverage past plain registration).
-# srp-mdns-proxy hands what it accepts to mDNSResponder's own daemon (mdnsd, built from the
-# same checkout and started here; needs root), so both calls must return NOERROR, its log
-# must confirm the update, and mDNSResponder's dns-sd must then find (and, after Deregister,
-# no longer find) the service on the local link.
+# srp-mdns-proxy hands what it accepts to the mDNS daemon, so both calls must return NOERROR,
+# its log must confirm the update, and mDNSResponder's dns-sd must then find (and, after
+# Deregister, no longer find) the service on the local link.
+#
+# Direction 3: an application advertises a service through the mDNS daemon (dns-sd -P), and OUR
+# sig0lease-agent, whose template has an mdns mirror that learns it from the daemon's client
+# socket like any DNS-SD application, registers it with OUR registrar (the Direction-1 proxy),
+# so it must appear at BIND. When the application stops advertising, and when the agent stops,
+# the records must go again.
+#
+# The mDNS daemon (lib/mdnsresponder.sh): on Linux, mDNSResponder's own mdnsd, built from the
+# same checkout and started here, which needs root; on macOS, the system's mDNSResponder with
+# /usr/bin/dns-sd, as in the Mac demo, and no root. Either way Directions 2 and 3 advertise their
+# test services on the local network while they run.
 
 set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "$SCRIPT_DIR/lib/common.sh"
+source "$SCRIPT_DIR/lib/proxy.sh"
 source "$SCRIPT_DIR/lib/dns.sh"
 source "$SCRIPT_DIR/lib/bind9.sh"
 source "$SCRIPT_DIR/lib/mdnsresponder.sh"
@@ -37,10 +48,11 @@ D1_PROXY_URL="${D1_PROXY_ADDR}:${D1_PROXY_PORT}"
 D1_KEYSTORE_DIR="${TESTS_DIR}/keystore-srp-bind9-default-arpa"
 D1_MAX_RR_LEASE_SECONDS=7200 # the D1 proxy's max_rr_lease_sec; D1-TEST 1 asks for more
 
-D1_PROXY_BIN="${TESTS_DIR}/../bin/${OS}/sig0lease"
 D2_CLIENT_BIN="${TESTS_DIR}/../bin/${OS}/sig0lease-srp-client"
-D1_PROXY_LOG="/tmp/sig0lease_d1_proxy.log"
-D1_TMP_CONFIG=""
+# The Direction-1 proxy's config and log (lib/proxy.sh's proxy_run_prepare).
+D1_RUN_DIR="$PROXY_RUN_ROOT/mdnsresponder-interop"
+D1_TMP_CONFIG="$D1_RUN_DIR/config.yaml"
+D1_PROXY_LOG="$D1_RUN_DIR/proxy.log"
 D1_PROXY_PID=""
 
 D2_MDNS_PROXY_LOG="/tmp/srp-mdns-proxy_interop.log"
@@ -48,12 +60,24 @@ D2_MDNS_PROXY_PID=""
 D2_MDNS_PROXY_PORT=""
 D2_KEY_DIR=""
 
+D3_HOST="d3-host"
+D3_ADDR="192.0.2.33"
+D3_INSTANCE="Mirror Demo"
+D3_INSTANCE_DNS='Mirror\032Demo' # D3_INSTANCE as dig takes and prints it
+D3_ADVERT_LOG="/tmp/sig0lease_d3_advert.log"
+D3_ADVERT_PID=""
+D3_AGENT_BIN="${TESTS_DIR}/../bin/${OS}/sig0lease-agent"
+D3_AGENT_LOG="/tmp/sig0lease_d3_agent.log"
+D3_AGENT_PID=""
+D3_AGENT_DIR="" # the agent's template, and its keystore under it
+
 PERFORMED_TESTS=""
 
 build_interop_binaries() {
     log_section "BUILD"
-    (cd "$TESTS_DIR/.." && go build -o "$D1_PROXY_BIN" ./cmd/sig0lease)
+    (cd "$TESTS_DIR/.." && go build -o "$PROXY_BIN" ./cmd/sig0lease)
     (cd "$TESTS_DIR/.." && go build -o "$D2_CLIENT_BIN" ./cmd/sig0lease-srp-client)
+    (cd "$TESTS_DIR/.." && go build -o "$D3_AGENT_BIN" ./cmd/sig0lease-agent)
     build_mdnsresponder
     log_success "Binaries ready"
 }
@@ -63,10 +87,10 @@ build_interop_binaries() {
 ################################
 
 prepare_d1_config() {
-    D1_TMP_CONFIG="$(mktemp /tmp/sig0lease-d1-config.XXXXXX.yaml)"
     cat > "$D1_TMP_CONFIG" <<EOF
 server:
   address: ":${D1_PROXY_PORT}"
+  diagnostics: true
   networks:
     - udp
     - tcp
@@ -96,26 +120,14 @@ EOF
 start_d1_proxy() {
     log_section "START: our registrar for ${D1_ZONE} (Direction 1)"
     prepare_d1_config
-
-    "$D1_PROXY_BIN" "$D1_TMP_CONFIG" > "$D1_PROXY_LOG" 2>&1 &
-    D1_PROXY_PID=$!
-    sleep 1
-
-    if ! kill -0 "$D1_PROXY_PID" 2>/dev/null; then
-        log_error "Direction-1 proxy failed to start. Log:"
-        cat "$D1_PROXY_LOG"
-        return 1
-    fi
-    log_success "Direction-1 proxy started (PID $D1_PROXY_PID) on $D1_PROXY_URL"
+    proxy_launch "$D1_TMP_CONFIG" "$D1_PROXY_PORT" "$D1_PROXY_LOG" || return 1
+    D1_PROXY_PID="$LAUNCHED_PROXY_PID"
+    log_success "Direction-1 proxy listening (PID $D1_PROXY_PID) on $D1_PROXY_URL, config $D1_TMP_CONFIG"
 }
 
 stop_d1_proxy() {
-    if [ -n "${D1_PROXY_PID:-}" ] && kill -0 "$D1_PROXY_PID" 2>/dev/null; then
-        kill "$D1_PROXY_PID" || true
-        sleep 1
-    fi
+    proxy_stop "$D1_PROXY_PID"
     D1_PROXY_PID=""
-    [ -n "$D1_TMP_CONFIG" ] && [ -f "$D1_TMP_CONFIG" ] && rm -f "$D1_TMP_CONFIG"
 }
 
 dig_d1() {
@@ -166,7 +178,7 @@ run_srp_client_bg_wait() {
     local scratch
     scratch="$(mktemp -d /tmp/sig0lease-srpclient.XXXXXX)"
     # exec, not a plain call: makes the binary replace the subshell process image, so $! (and
-    # the later `kill "$pid"`) reliably targets the actual srp-client process, not a subshell
+    # the later stop_process) reliably targets the actual srp-client process, not a subshell
     # wrapper that may or may not propagate the signal to its child.
     (cd "$scratch" && exec "$MDNSRESPONDER_SRP_CLIENT_BIN" --server "${D1_PROXY_ADDR}%${D1_PROXY_PORT}" --log-stderr \
         --host-name "$label" --lease-time 3600 "$@") > "$logfile" 2>&1 &
@@ -175,14 +187,14 @@ run_srp_client_bg_wait() {
     start=$(date +%s)
     while ! grep -q "$pattern" "$logfile" 2>/dev/null; do
         if [ $(( $(date +%s) - start )) -ge 10 ]; then
-            kill -9 "$pid" 2>/dev/null || true
+            stop_process "$pid" KILL || true
             log_error "Timed out waiting for ${label}'s expected log line: $pattern"
             cat "$logfile"
             return 1
         fi
         sleep 0.2
     done
-    kill -9 "$pid" 2>/dev/null || true
+    stop_process "$pid" KILL || true
 }
 
 test_d1_register() {
@@ -316,32 +328,35 @@ start_d2_mdns_proxy() {
         return 1
     fi
 
-    require_command ss
-    D2_MDNS_PROXY_PORT="$(ss -tulnp 2>/dev/null | grep "srp-mdns-proxy" | grep -oE ':[0-9]+' | head -1 | tr -d ':')"
-    if [ -z "$D2_MDNS_PROXY_PORT" ]; then
-        log_error "Could not discover srp-mdns-proxy's ephemeral UDP port"
+    # Its SRP listener takes a free UDP port. Its DNS proxy, where it starts, listens on 53: on
+    # macOS it does (an unprivileged process may bind 53 there); on Linux it stops before, for
+    # want of a TLS key.
+    local ports
+    ports="$(listening_ports udp "$D2_MDNS_PROXY_PID" | { grep -vx 53 || true; })"
+    if [ -z "$ports" ] || [ "$ports" != "${ports%%$'\n'*}" ]; then
+        log_error "Expected one UDP port besides 53 for srp-mdns-proxy's SRP listener, found: ${ports:-none}"
         return 1
     fi
+    D2_MDNS_PROXY_PORT="$ports"
     log_success "srp-mdns-proxy started (PID $D2_MDNS_PROXY_PID) on 127.0.0.1:${D2_MDNS_PROXY_PORT}"
 }
 
 stop_d2_mdns_proxy() {
     if [ -n "${D2_MDNS_PROXY_PID:-}" ] && kill -0 "$D2_MDNS_PROXY_PID" 2>/dev/null; then
-        kill "$D2_MDNS_PROXY_PID" || true
-        sleep 1
+        stop_process "$D2_MDNS_PROXY_PID" || true
     fi
     D2_MDNS_PROXY_PID=""
 }
 
 test_d2_register() {
-    local log_msg="D2-TEST 1: Register (our client) -> srp-mdns-proxy -> mdnsd, found with dns-sd"
+    local log_msg="D2-TEST 1: Register (our client) -> srp-mdns-proxy -> mDNS daemon, found with dns-sd"
     log_section "$log_msg"
 
     # -k=13 generates this identity's key on first use (sig0lease-srp-client no longer
     # auto-generates a missing key by default -- see the -k flag doc); the deregister
     # call below reuses the same key without needing -k again.
     local out
-    out="$("$D2_CLIENT_BIN" -domain=default.service.arpa. -host=d2-register -addr=192.0.2.111 -udp \
+    out="$("$D2_CLIENT_BIN" -domain=default.service.arpa. -host=d2-register -addr=192.0.2.111 -transport=udp \
         -server="127.0.0.1:${D2_MDNS_PROXY_PORT}" -instance=Gizmo:_http._tcp:8080 -txt=Gizmo:path=/d2 -once \
         -keystore="${D2_KEY_DIR}/d2-register" -k=13 2>&1)" || { echo "$out"; log_error "register did not succeed"; return 1; }
     echo "$out"
@@ -362,7 +377,7 @@ test_d2_register() {
         || { log_error "dns-sd -L did not resolve Gizmo to d2-register.local.:8080"; return 1; }
     echo "$resolve" | grep -q "path=/d2" || { log_error "dns-sd -L did not show Gizmo's TXT path=/d2"; return 1; }
 
-    log_success "srp-mdns-proxy validated our Register (NOERROR) and mdnsd advertises Gizmo: dns-sd finds and resolves it"
+    log_success "srp-mdns-proxy validated our Register (NOERROR) and the mDNS daemon advertises Gizmo: dns-sd finds and resolves it"
     PERFORMED_TESTS="$PERFORMED_TESTS\n  [OK] $log_msg"
 }
 
@@ -371,7 +386,7 @@ test_d2_deregister() {
     log_section "$log_msg"
 
     local out
-    out="$("$D2_CLIENT_BIN" -domain=default.service.arpa. -host=d2-register -addr=192.0.2.111 -udp \
+    out="$("$D2_CLIENT_BIN" -domain=default.service.arpa. -host=d2-register -addr=192.0.2.111 -transport=udp \
         -server="127.0.0.1:${D2_MDNS_PROXY_PORT}" -instance=Gizmo:_http._tcp:8080 -deregister \
         -keystore="${D2_KEY_DIR}/d2-register" 2>&1)"
     echo "$out"
@@ -380,7 +395,7 @@ test_d2_deregister() {
     grep -q "delete for presumably previously-registered instance which is being withdrawn: Gizmo._http._tcp.default.service.arpa." "$D2_MDNS_PROXY_LOG" \
         || { log_error "srp-mdns-proxy's own log did not confirm the instance delete"; tail -n 40 "$D2_MDNS_PROXY_LOG"; return 1; }
 
-    # A browse started right away may first report Gizmo from mdnsd's cache, then its
+    # A browse started right away may first report Gizmo from the daemon's cache, then its
     # removal about a second later: what counts is the last event dns-sd reports for it.
     local browse last
     browse="$(dnssd_for 4 -B _http._tcp local.)"
@@ -396,12 +411,157 @@ test_d2_deregister() {
 }
 
 ################################
+# Direction 3: the mDNS daemon's advertisement -> sig0lease-agent's mdns mirror -> our registrar
+################################
+
+# dig_d1_until <seconds> <name> <type> <present|absent> -- polls BIND until <name> <type> has
+# an answer (present) or none (absent), and prints the last answer. The mirror needs a few
+# seconds per change: resolve and address lookups, its 1s settle time, and the client's
+# initial 0-3s delay before a registration.
+dig_d1_until() {
+    local seconds="$1" name="$2" rr_type="$3" want="$4"
+    local start got
+    start=$(date +%s)
+    while true; do
+        got="$(dig_d1 "$name" "$rr_type")"
+        if { [ "$want" = present ] && [ -n "$got" ]; } || { [ "$want" = absent ] && [ -z "$got" ]; }; then
+            echo "$got"
+            return 0
+        fi
+        if [ $(( $(date +%s) - start )) -ge "$seconds" ]; then
+            echo "$got"
+            return 1
+        fi
+        sleep 0.5
+    done
+}
+
+# start_d3_advert advertises D3_INSTANCE through the mDNS daemon as an application would.
+# dns-sd -P is a proxy registration: it names its own host, d3-host.local., and address, so
+# what the mirror finds does not depend on this machine's interfaces.
+start_d3_advert() {
+    dnssd_start -P "$D3_INSTANCE" _http._tcp local. 8080 "${D3_HOST}.local." "$D3_ADDR" "path=/d3" \
+        > "$D3_ADVERT_LOG" 2>&1
+    D3_ADVERT_PID=$DNSSD_PID
+    local start
+    start=$(date +%s)
+    while ! grep -q "Got a reply for service ${D3_INSTANCE}._http._tcp.local.: Name now registered and active" "$D3_ADVERT_LOG" 2>/dev/null; do
+        if [ $(( $(date +%s) - start )) -ge 10 ]; then
+            log_error "dns-sd -P did not get ${D3_INSTANCE} registered:"
+            cat "$D3_ADVERT_LOG"
+            return 1
+        fi
+        sleep 0.2
+    done
+}
+
+stop_d3_advert() {
+    if [ -n "${D3_ADVERT_PID:-}" ] && kill -0 "$D3_ADVERT_PID" 2>/dev/null; then
+        stop_process "$D3_ADVERT_PID" || true
+    fi
+    D3_ADVERT_PID=""
+}
+
+# start_d3_agent runs sig0lease-agent on a template with no hosts of its own and one mdns
+# mirror, of D3_HOST's _http._tcp services.
+start_d3_agent() {
+    cat > "$D3_AGENT_DIR/agent.yaml" <<EOF
+keystore: keys
+registrars:
+  - protocol: srp
+    domain: ${D1_ZONE}
+    server: ${D1_PROXY_URL}
+    mirrors:
+      - type: mdns
+        socket: ${MDNSRESPONDER_MDNSD_SOCKET}
+        hosts: [${D3_HOST}.local.]
+        services: [_http._tcp]
+EOF
+    "$D3_AGENT_BIN" run "$D3_AGENT_DIR/agent.yaml" > "$D3_AGENT_LOG" 2>&1 &
+    D3_AGENT_PID=$!
+    sleep 0.5
+    if ! kill -0 "$D3_AGENT_PID" 2>/dev/null; then
+        log_error "sig0lease-agent exited at once:"
+        cat "$D3_AGENT_LOG"
+        return 1
+    fi
+}
+
+# stop_d3_agent stops the agent the way Ctrl-C does and returns its exit status.
+stop_d3_agent() {
+    local status=0
+    if [ -n "${D3_AGENT_PID:-}" ] && kill -0 "$D3_AGENT_PID" 2>/dev/null; then
+        stop_process "$D3_AGENT_PID" || status=$?
+    fi
+    D3_AGENT_PID=""
+    return "$status"
+}
+
+test_d3_mirror() {
+    local log_msg="D3-TEST 1: a service advertised through the mDNS daemon is mirrored by sig0lease-agent's mdns mirror into the zone"
+    log_section "$log_msg"
+
+    start_d3_advert || return 1
+    start_d3_agent || return 1
+
+    local srv a txt ptr
+    srv="$(dig_d1_until 20 "${D3_INSTANCE_DNS}._http._tcp.${D1_ZONE}" SRV present)" \
+        || { log_error "no SRV for ${D3_INSTANCE} at BIND; agent log:"; cat "$D3_AGENT_LOG"; return 1; }
+    echo "SRV: $srv"
+    [ "$srv" = "0 0 8080 ${D3_HOST}.${D1_ZONE}" ] || { log_error "SRV is \"$srv\", want \"0 0 8080 ${D3_HOST}.${D1_ZONE}\""; return 1; }
+    a="$(dig_d1 "${D3_HOST}.${D1_ZONE}" A)"
+    [ "$a" = "$D3_ADDR" ] || { log_error "A ${D3_HOST}.${D1_ZONE} is \"$a\", want $D3_ADDR"; return 1; }
+    txt="$(dig_d1 "${D3_INSTANCE_DNS}._http._tcp.${D1_ZONE}" TXT)"
+    [ "$txt" = '"path=/d3"' ] || { log_error "TXT is $txt, want \"path=/d3\""; return 1; }
+    ptr="$(dig_d1 "_http._tcp.${D1_ZONE}" PTR)"
+    echo "$ptr" | grep -qxF "${D3_INSTANCE_DNS}._http._tcp.${D1_ZONE}" \
+        || { log_error "PTR _http._tcp.${D1_ZONE} does not list ${D3_INSTANCE}: $ptr"; return 1; }
+
+    log_success "the daemon's ${D3_INSTANCE} is at BIND as ${D3_HOST}.${D1_ZONE}:8080, address $D3_ADDR, TXT path=/d3"
+    PERFORMED_TESTS="$PERFORMED_TESTS\n  [OK] $log_msg"
+}
+
+test_d3_withdraw() {
+    local log_msg="D3-TEST 2: the application stops advertising -> the agent deregisters the host"
+    log_section "$log_msg"
+
+    stop_d3_advert
+    dig_d1_until 20 "${D3_INSTANCE_DNS}._http._tcp.${D1_ZONE}" SRV absent > /dev/null \
+        || { log_error "SRV for ${D3_INSTANCE} still at BIND after dns-sd -P stopped; agent log:"; cat "$D3_AGENT_LOG"; return 1; }
+    dig_d1_until 5 "${D3_HOST}.${D1_ZONE}" A absent > /dev/null \
+        || { log_error "A ${D3_HOST}.${D1_ZONE} still at BIND after the host was deregistered"; return 1; }
+    grep -q "${D3_HOST}: deregistered \"${D3_INSTANCE}\" _http._tcp; names kept for its key\$" "$D3_AGENT_LOG" \
+        || { log_error "the agent did not log the deregistration:"; cat "$D3_AGENT_LOG"; return 1; }
+
+    log_success "the instance and its host left the zone when the daemon stopped advertising them"
+    PERFORMED_TESTS="$PERFORMED_TESTS\n  [OK] $log_msg"
+}
+
+test_d3_stop() {
+    local log_msg="D3-TEST 3: the agent stops (SIGTERM) -> it deregisters what it registered and exits 0"
+    log_section "$log_msg"
+
+    start_d3_advert || return 1
+    dig_d1_until 20 "${D3_INSTANCE_DNS}._http._tcp.${D1_ZONE}" SRV present > /dev/null \
+        || { log_error "the agent did not register ${D3_INSTANCE} again; agent log:"; cat "$D3_AGENT_LOG"; return 1; }
+    stop_d3_agent || { log_error "the agent exited non-zero; log:"; cat "$D3_AGENT_LOG"; return 1; }
+    dig_d1_until 5 "${D3_INSTANCE_DNS}._http._tcp.${D1_ZONE}" SRV absent > /dev/null \
+        || { log_error "SRV for ${D3_INSTANCE} still at BIND after the agent stopped"; return 1; }
+    dig_d1_until 5 "${D3_HOST}.${D1_ZONE}" A absent > /dev/null \
+        || { log_error "A ${D3_HOST}.${D1_ZONE} still at BIND after the agent stopped"; return 1; }
+    stop_d3_advert
+
+    log_success "stopping the agent removed ${D3_INSTANCE} and ${D3_HOST} from the zone"
+    PERFORMED_TESTS="$PERFORMED_TESTS\n  [OK] $log_msg"
+}
+
+################################
 # Top level
 ################################
 run_all_tests() {
     log_section "MDNSRESPONDER INTEROP TEST SUITE (RFC 9665 plan S12.3/S14 Option C)"
     echo "Real components only: real proxy process, real client library, and the real,"
-    echo "unmodified mDNSResponder srp-client/srp-mdns-proxy/mdnsd/dns-sd binaries."
+    echo "unmodified mDNSResponder srp-client/srp-mdns-proxy binaries and mDNS daemon."
     echo ""
 
     trap cleanup EXIT
@@ -409,15 +569,15 @@ run_all_tests() {
     require_command dig
     require_command named
     require_command go
-    require_command timeout
-    require_command stdbuf
 
+    proxy_run_prepare "$D1_RUN_DIR" "$D1_PROXY_PORT"
     D2_KEY_DIR="$(mktemp -d /tmp/sig0lease-d2-identities.XXXXXX)"
+    D3_AGENT_DIR="$(mktemp -d /tmp/sig0lease-d3-agent.XXXXXX)"
 
     build_interop_binaries
     start_bind9
     start_d1_proxy
-    start_mdnsd
+    start_mdns_daemon
     start_d2_mdns_proxy
 
     test_d1_register
@@ -430,6 +590,10 @@ run_all_tests() {
     test_d2_register
     test_d2_deregister
 
+    test_d3_mirror
+    test_d3_withdraw
+    test_d3_stop
+
     bind9_report_rejections || return 1
     BIND9_REJECTIONS_REPORTED=1
 
@@ -437,9 +601,13 @@ run_all_tests() {
     echo -e "${GREEN}All mDNSResponder interop tests completed successfully!${NC}"
     echo -e "$PERFORMED_TESTS"
     echo ""
-    echo "Direction-1 proxy log: $D1_PROXY_LOG"
+    if [ "$PROXY_LAUNCH" = auto ]; then
+        echo "Direction-1 proxy log: $D1_PROXY_LOG"
+    fi
+    echo "Direction-1 proxy config: $D1_TMP_CONFIG"
     echo "srp-mdns-proxy log: $D2_MDNS_PROXY_LOG"
-    echo "mdnsd log: $MDNSD_LOG"
+    echo "sig0lease-agent log: $D3_AGENT_LOG"
+    if [ -n "$MDNSD_LOG" ]; then echo "mdnsd log: $MDNSD_LOG"; fi
     echo "BIND log: ${BIND9_RUNDIR}/named.log"
 }
 
@@ -448,12 +616,15 @@ cleanup() {
     log_section "CLEANUP"
     # See test_srp.sh's cleanup: a failed run still shows why named rejected anything.
     [ -z "${BIND9_REJECTIONS_REPORTED:-}" ] && bind9_report_rejections
+    stop_d3_agent
+    stop_d3_advert
     stop_d1_proxy
     stop_d2_mdns_proxy
-    stop_mdnsd
+    stop_mdns_daemon
     stop_bind9
     pkill -f "$MDNSRESPONDER_SRP_CLIENT_BIN" 2>/dev/null
     [ -n "$D2_KEY_DIR" ] && rm -rf "$D2_KEY_DIR"
+    [ -n "$D3_AGENT_DIR" ] && rm -rf "$D3_AGENT_DIR"
     rm -rf /tmp/sig0lease-srpclient.*
     set -e
 }

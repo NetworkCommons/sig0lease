@@ -11,11 +11,10 @@ import (
 
 // fakeStoreView is a minimal, in-test StoreView -- exactly the kind of thing the
 // deliberately narrow StoreView interface exists to make easy.
-type fakeStoreView map[string]*dns.KEY
+type fakeStoreView map[string][]*dns.KEY
 
-func (f fakeStoreView) KeyAtName(name string) (*dns.KEY, bool) {
-	k, ok := f[name]
-	return k, ok
+func (f fakeStoreView) KeysAtName(name string) []*dns.KEY {
+	return f[name]
 }
 
 func fcfsTestKey(pub string) *dns.KEY {
@@ -24,7 +23,10 @@ func fcfsTestKey(pub string) *dns.KEY {
 
 func TestFCFS_StoreHit(t *testing.T) {
 	updateKey := fcfsTestKey("AAAA")
-	store := fakeStoreView{"myhost.example.": updateKey}
+	store := fakeStoreView{
+		"myhost.example.": {updateKey},
+		"shared.example.": {fcfsTestKey("BBBB"), updateKey},
+	}
 
 	t.Run("matching key: proceed", func(t *testing.T) {
 		got, prereq, err := Evaluate(context.Background(), store, nil, "example.", "myhost.example.", fcfsTestKey("AAAA"), true)
@@ -41,6 +43,21 @@ func TestFCFS_StoreHit(t *testing.T) {
 
 	t.Run("mismatched key: conflict", func(t *testing.T) {
 		got, prereq, err := Evaluate(context.Background(), store, nil, "example.", "myhost.example.", fcfsTestKey("BBBB"), true)
+		if err != nil {
+			t.Fatalf("Evaluate: %v", err)
+		}
+		if got != FCFSConflict {
+			t.Fatalf("got %s, want conflict", got)
+		}
+		if prereq != nil {
+			t.Fatalf("expected no prerequisite for a conflict, got %v", prereq)
+		}
+	})
+
+	// S3.3.3: "If any existing KEY record ... does not match", so the update's own key next to
+	// another one does not make the name its.
+	t.Run("matching key beside another: conflict", func(t *testing.T) {
+		got, prereq, err := Evaluate(context.Background(), store, nil, "example.", "shared.example.", fcfsTestKey("AAAA"), true)
 		if err != nil {
 			t.Fatalf("Evaluate: %v", err)
 		}
@@ -75,6 +92,7 @@ func TestFCFS_LiveQueryTriState(t *testing.T) {
 		{name: "NOERROR no KEY, refuse=false: proceed (clobber), no KEY", state: AuthNoKey, refuseOnForeignData: false, want: FCFSProceed, wantPrereqType: dns.TypeKEY},
 		{name: "NOERROR KEY matches: proceed", state: AuthKeyPresent, keys: []*dns.KEY{fcfsTestKey("AAAA")}, want: FCFSProceed},
 		{name: "NOERROR KEY differs: conflict", state: AuthKeyPresent, keys: []*dns.KEY{fcfsTestKey("BBBB")}, want: FCFSConflict},
+		{name: "NOERROR KEY matches beside another: conflict", state: AuthKeyPresent, keys: []*dns.KEY{fcfsTestKey("BBBB"), fcfsTestKey("AAAA")}, want: FCFSConflict},
 	}
 
 	for _, tc := range cases {

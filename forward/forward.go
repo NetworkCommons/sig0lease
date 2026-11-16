@@ -39,11 +39,11 @@ func NewResolver(servers []string, protocol string, timeout time.Duration) (*Res
 	if len(servers) == 0 {
 		return nil, fmt.Errorf("at least one upstream server required")
 	}
-	if protocol == "" {
-		protocol = "udp"
+	if protocol != "udp" && protocol != "tcp" {
+		return nil, fmt.Errorf("upstream protocol must be udp or tcp, got %q", protocol)
 	}
 	if timeout <= 0 {
-		timeout = 5 * time.Second
+		return nil, fmt.Errorf("upstream timeout must be positive, got %s", timeout)
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -122,11 +122,7 @@ func (r *Resolver) exchangeWithContext(ctx context.Context, msg *dns.Msg, server
 
 // exchange performs a single DNS exchange with an upstream server.
 func (r *Resolver) exchange(ctx context.Context, server string, msg *dns.Msg) (*dns.Msg, error) {
-	network := r.protocol
-	if network == "" {
-		network = "udp"
-	}
-	resp, err := dns.Exchange(ctx, msg, network, server)
+	resp, err := dns.Exchange(ctx, msg, r.protocol, server)
 	if err != nil {
 		return nil, fmt.Errorf("exchange to %s failed: %w", server, err)
 	}

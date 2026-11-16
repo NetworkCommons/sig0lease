@@ -116,7 +116,7 @@ func lockTestHandler(t *testing.T, signers ...*keyrec.LoadedKey) (*UpdateHandler
 	}
 	h.upstreamCoordinator = stub
 	for _, k := range signers {
-		if err := h.leaseManager.Register(context.Background(), k.PublicKey.Clone().(*dns.KEY), 120, 120, "dev.zenr.io."); err != nil {
+		if err := h.leaseManager.Register(k.PublicKey.Clone().(*dns.KEY), 120, 120, "dev.zenr.io."); err != nil {
 			t.Fatalf("register signer: %v", err)
 		}
 	}
@@ -134,8 +134,8 @@ func TestNodeLocks_UpdateHandler_SameRecordFromTwoSigners(t *testing.T) {
 	started, release := holdFirstUpdateSend(stub)
 
 	const owner = "client.test.dev.zenr.io."
-	reqA := buildSignedNonKeyOnlyLeaseUpdateForHandleTest(t, a, owner, 120, false)
-	reqB := buildSignedNonKeyOnlyLeaseUpdateForHandleTest(t, b, owner, 120, false)
+	reqA := buildSignedLeaseUpdateForHandleTest(t, a, owner, leasepkg.Encode8Byte(120, 0), false)
+	reqB := buildSignedLeaseUpdateForHandleTest(t, b, owner, leasepkg.Encode8Byte(120, 0), false)
 	resA, resB := raceSecondAgainstFirst(t, h, stubResponseWriter{}, started, release, reqA, reqB)
 
 	if rcodeOf(resA) != dns.RcodeSuccess {
@@ -153,7 +153,7 @@ func TestNodeLocks_UpdateHandler_SameRecordFromTwoSigners(t *testing.T) {
 	}
 }
 
-// A KEY's delete (Case C) while a registration under that KEY is in flight: the delete must
+// A KEY's delete while a registration under that KEY is in flight: the delete must
 // wait, then cascade into the record the registration just attached -- not delete the KEY
 // alone and leave the new record owned by a KEY that no longer exists, still published.
 func TestNodeLocks_UpdateHandler_DeleteWaitsForRegistrationUnderIt(t *testing.T) {
@@ -162,9 +162,9 @@ func TestNodeLocks_UpdateHandler_DeleteWaitsForRegistrationUnderIt(t *testing.T)
 	started, release := holdFirstUpdateSend(stub)
 
 	const owner = "host.test.dev.zenr.io."
-	register := buildSignedNonKeyOnlyLeaseUpdateForHandleTest(t, p, owner, 120, false)
+	register := buildSignedLeaseUpdateForHandleTest(t, p, owner, leasepkg.Encode8Byte(120, 0), false)
 	txt := register.Ns[0]
-	del := buildSignedCaseCDeleteForHandleTest(t, p, p.PublicKey.Clone().(*dns.KEY))
+	del := buildSignedKeyDeleteForHandleTest(t, p, p.PublicKey.Clone().(*dns.KEY))
 	resReg, resDel := raceSecondAgainstFirst(t, h, stubResponseWriter{}, started, release, register, del)
 
 	if rcodeOf(resReg) != dns.RcodeSuccess || rcodeOf(resDel) != dns.RcodeSuccess {
@@ -204,7 +204,7 @@ func TestNodeLocks_UpdateHandler_ExpiryBacksOffWhileRequestHoldsNode(t *testing.
 		t.Fatal(err)
 	}
 
-	res := handleAsync(h, stubResponseWriter{}, buildSignedNonKeyOnlyLeaseUpdateForHandleTest(t, p, "host.test.dev.zenr.io.", 120, false))
+	res := handleAsync(h, stubResponseWriter{}, buildSignedLeaseUpdateForHandleTest(t, p, "host.test.dev.zenr.io.", leasepkg.Encode8Byte(120, 0), false))
 	waitUntil(t, "the first operation to reach its upstream send", started)
 
 	ctx, cancel := context.WithTimeout(context.Background(), expiryTimeout)
@@ -269,7 +269,7 @@ func TestNodeLocks_SRPHandler_ExpiryBacksOffWhileRefreshHoldsNode(t *testing.T) 
 	hostKey := id.keyAt(host)
 	nodeKey := leasepkg.NodeKey(hostKey)
 	// Already past its KEY-LEASE: an expiry that ignored the lock would delete it upstream.
-	if err := h.leaseManager.RegisterWithParent(context.Background(), "", hostKey, 0, 0, srpTestZone); err != nil {
+	if err := h.leaseManager.RegisterWithParent("", hostKey, 0, 0, srpTestZone); err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { h.timers.disarm(nodeKey) })

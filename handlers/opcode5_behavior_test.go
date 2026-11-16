@@ -12,34 +12,12 @@ import (
 	"codeberg.org/miekg/dns"
 	"codeberg.org/miekg/dns/rdata"
 	"github.com/NetworkCommons/sig0lease/logging"
+	"github.com/NetworkCommons/sig0lease/pkg/dnsmsg"
 	"github.com/NetworkCommons/sig0lease/pkg/dnsname"
 	"github.com/NetworkCommons/sig0lease/pkg/keyrec"
 	"github.com/NetworkCommons/sig0lease/pkg/lease"
 	"github.com/NetworkCommons/sig0lease/pkg/sig0"
 )
-
-func TestParseLeaseRegistrationIncludesKeyLease(t *testing.T) {
-	h := newTestHandler()
-	msg := dns.NewMsg("test.dev.zenr.io.", dns.TypeSOA)
-	if msg == nil {
-		t.Fatalf("expected message")
-	}
-	opt := &dns.OPT{Hdr: dns.Header{Name: "."}}
-	opt.SetUDPSize(uint16(dns.DefaultMsgSize))
-	l := lease.Encode8Byte(120, 600)
-	if err := l.Encode(opt); err != nil {
-		t.Fatalf("encode lease: %v", err)
-	}
-	msg.Extra = append(msg.Extra, opt)
-
-	gotLease, gotKeyLease, err := h.parseLease(msg)
-	if err != nil {
-		t.Fatalf("parse lease: %v", err)
-	}
-	if gotLease != 120 || gotKeyLease != 600 {
-		t.Fatalf("unexpected lease values lease=%d key-lease=%d", gotLease, gotKeyLease)
-	}
-}
 
 func TestExtractUpdateRecordsAcceptsMultipleKeys(t *testing.T) {
 	msg := dns.NewMsg("test.dev.zenr.io.", dns.TypeSOA)
@@ -51,7 +29,8 @@ func TestExtractUpdateRecordsAcceptsMultipleKeys(t *testing.T) {
 	key2 := testKeyRR("test.dev.zenr.io.", "AAAATESTKEY222=")
 	msg.Ns = append(msg.Ns, key1, key2)
 
-	keyRRs, _, err := extractUpdateRecords(msg, nil)
+	recs, err := extractUpdateRecords(msg, nil)
+	keyRRs, _ := recs.keyAdds, recs.otherAdds
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -74,7 +53,8 @@ func TestExtractUpdateRecordsAcceptsGenericRRTypes(t *testing.T) {
 		&dns.SRV{Hdr: dns.Header{Name: "_service._tcp.test.dev.zenr.io.", Class: dns.ClassINET, TTL: 120}, SRV: rdata.SRV{Target: "target.test.dev.zenr.io.", Port: 443, Priority: 10, Weight: 20}},
 	)
 
-	keyRR, other, err := extractUpdateRecords(msg, nil)
+	recs, err := extractUpdateRecords(msg, nil)
+	keyRR, other := recs.keyAdds, recs.otherAdds
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -104,7 +84,7 @@ func TestUpstreamUpdateRecordsIncludesNonKeyOnlyRecordsOnce(t *testing.T) {
 	txt := &dns.TXT{Hdr: dns.Header{Name: "test.dev.zenr.io.", Class: dns.ClassINET, TTL: 120}}
 	txt.TXT.Txt = []string{"payload"}
 
-	records := upstreamUpdateRecords([]*dns.KEY{key1, key2}, []dns.RR{txt}, nil)
+	records := upstreamUpdateRecords(nil, []*dns.KEY{key1, key2}, []dns.RR{txt})
 	if len(records) != 3 {
 		t.Fatalf("expected 3 upstream records (2 KEY + 1 TXT), got %d", len(records))
 	}
@@ -118,7 +98,7 @@ func TestUpstreamUpdateRecordsIncludesNonKeyOnlyRecordsOnce(t *testing.T) {
 		t.Fatalf("expected TXT record to appear once, got %d", txtCount)
 	}
 
-	if n := len(upstreamUpdateRecords(nil, []dns.RR{txt}, nil)); n != 1 {
+	if n := len(upstreamUpdateRecords(nil, nil, []dns.RR{txt})); n != 1 {
 		t.Fatalf("expected 1 upstream record for non-KEY-only request, got %d", n)
 	}
 }
@@ -174,12 +154,11 @@ func TestLeasePolicyClamp_PreservesZeroSemantics(t *testing.T) {
 
 func TestNonKeyLeaseExpiresBeforeKeyLease(t *testing.T) {
 	h := newTestHandler()
-	ctx := context.Background()
 	key := testKeyRR("test.dev.zenr.io.", "AAAATESTKEY444=")
 	data := &dns.TXT{Hdr: dns.Header{Name: "test.dev.zenr.io.", Class: dns.ClassINET, TTL: 60}}
 	data.TXT.Txt = []string{"payload"}
 
-	if err := h.leaseManager.Register(ctx, key, 2, 2, "dev.zenr.io."); err != nil {
+	if err := h.leaseManager.Register(key, 2, 2, "dev.zenr.io."); err != nil {
 		t.Fatalf("register key lease: %v", err)
 	}
 	if err := h.leaseManager.UpsertNonKEYRecords(lease.NodeKey(key), []dns.RR{data}, 1, "dev.zenr.io."); err != nil {
@@ -220,7 +199,8 @@ func TestExtractUpdateRecordsWithNoKEYRR(t *testing.T) {
 	txt.TXT.Txt = []string{"payload"}
 	msg.Ns = append(msg.Ns, txt)
 
-	keyRR, other, err := extractUpdateRecords(msg, nil)
+	recs, err := extractUpdateRecords(msg, nil)
+	keyRR, other := recs.keyAdds, recs.otherAdds
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -241,7 +221,8 @@ func TestExtractUpdateRecordsNoKEYRR_NoOtherRecords(t *testing.T) {
 	msg.Opcode = dns.OpcodeUpdate
 	// Empty Ns section — no KEY RR, no other RRs.
 
-	keyRR, other, err := extractUpdateRecords(msg, nil)
+	recs, err := extractUpdateRecords(msg, nil)
+	keyRR, other := recs.keyAdds, recs.otherAdds
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -256,11 +237,10 @@ func TestExtractUpdateRecordsNoKEYRR_NoOtherRecords(t *testing.T) {
 func TestKeyLeaseZeroDeleteKeyNoOtherRecords(t *testing.T) {
 	// Case 2: KEY-LEASE == 0, LEASE != 0, no otherRecords → delete key
 	h := newTestHandler()
-	ctx := context.Background()
 
 	// First, register a key lease.
 	key := testKeyRR("test.dev.zenr.io.", "AAAATESTKEY555=")
-	if err := h.leaseManager.Register(ctx, key, 1, 1, "dev.zenr.io."); err != nil {
+	if err := h.leaseManager.Register(key, 1, 1, "dev.zenr.io."); err != nil {
 		t.Fatalf("register initial lease: %v", err)
 	}
 	h.scheduleLeaseExpiry(lease.NodeKey(key))
@@ -285,11 +265,10 @@ func TestKeyLeaseZeroDeleteKeyNoOtherRecords(t *testing.T) {
 func TestKeyLeaseZeroDeleteKeyAndNonKeyWithOtherRecords(t *testing.T) {
 	// Case 3: KEY-LEASE == 0, LEASE == 0, otherRecords present → delete KEY and non-KEY records
 	h := newTestHandler()
-	ctx := context.Background()
 
 	// Register a key lease with non-KEY records.
 	key := testKeyRR("test.dev.zenr.io.", "AAAATESTKEY666=")
-	if err := h.leaseManager.Register(ctx, key, 1, 1, "dev.zenr.io."); err != nil {
+	if err := h.leaseManager.Register(key, 1, 1, "dev.zenr.io."); err != nil {
 		t.Fatalf("register initial lease: %v", err)
 	}
 	h.scheduleLeaseExpiry(lease.NodeKey(key))
@@ -330,11 +309,10 @@ func TestKeyLeaseZeroDeleteKeyAndNonKeyWithOtherRecords(t *testing.T) {
 func TestKeyLeaseZeroNonKeyOnlyRegistration(t *testing.T) {
 	// Case 1: KEY-LEASE == 0, LEASE != 0, otherRecords present → register non-KEY lease only
 	h := newTestHandler()
-	ctx := context.Background()
 
 	// Register a key lease (existing key).
 	key := testKeyRR("test.dev.zenr.io.", "AAAATESTKEY777=")
-	if err := h.leaseManager.Register(ctx, key, 1, 1, "dev.zenr.io."); err != nil {
+	if err := h.leaseManager.Register(key, 1, 1, "dev.zenr.io."); err != nil {
 		t.Fatalf("register initial lease: %v", err)
 	}
 	h.scheduleLeaseExpiry(lease.NodeKey(key))
@@ -362,10 +340,9 @@ func TestKeyLeaseZeroNonKeyOnlyRegistration(t *testing.T) {
 func TestKeyLeaseZeroDeleteKeyNoOtherRecords_Expires(t *testing.T) {
 	// Full lifecycle test: register, delete key (KEY-LEASE == 0, no otherRecords), verify expiry
 	h := newTestHandler()
-	ctx := context.Background()
 
 	key := testKeyRR("test.dev.zenr.io.", "AAAATESTKEY888=")
-	if err := h.leaseManager.Register(ctx, key, 1, 1, "dev.zenr.io."); err != nil {
+	if err := h.leaseManager.Register(key, 1, 1, "dev.zenr.io."); err != nil {
 		t.Fatalf("register initial lease: %v", err)
 	}
 	h.scheduleLeaseExpiry(lease.NodeKey(key))
@@ -377,7 +354,7 @@ func TestKeyLeaseZeroDeleteKeyNoOtherRecords_Expires(t *testing.T) {
 	}
 
 	// Now register a new lease and immediately delete it (KEY-LEASE == 0, no otherRecords).
-	if err := h.leaseManager.Register(ctx, key, 2, 2, "dev.zenr.io()"); err != nil {
+	if err := h.leaseManager.Register(key, 2, 2, "dev.zenr.io()"); err != nil {
 		t.Fatalf("register new lease: %v", err)
 	}
 	h.scheduleLeaseExpiry(lease.NodeKey(key))
@@ -423,10 +400,9 @@ func TestRecordKey_DistinguishesDifferentPriorities(t *testing.T) {
 
 func TestSetNonKeyLease_StoresMXRecordsWithDifferentPriority(t *testing.T) {
 	h := newTestHandler()
-	ctx := context.Background()
 
 	key := testKeyRR("test.dev.zenr.io.", "AAAAMXPRIORITYKEY=")
-	if err := h.leaseManager.Register(ctx, key, 120, 120, "dev.zenr.io."); err != nil {
+	if err := h.leaseManager.Register(key, 120, 120, "dev.zenr.io."); err != nil {
 		t.Fatalf("register key lease: %v", err)
 	}
 
@@ -460,7 +436,7 @@ func TestFilterDuplicateRegistrations_RejectsDuplicateRecord(t *testing.T) {
 		return []dns.RR{existing}, nil
 	}
 
-	accepted, notes, err := h.filterDuplicateRegistrations(context.Background(), "test.dev.zenr.io.", "test.dev.zenr.io.", []dns.RR{existing, newRec})
+	accepted, notes, err := h.filterDuplicateRegistrations(context.Background(), "test.dev.zenr.io.", []dns.RR{existing, newRec})
 	if err == nil {
 		t.Fatal("expected duplicate registration to be rejected")
 	}
@@ -484,7 +460,7 @@ func TestFilterDuplicateRegistrations_RejectsAuthoritativeDuplicateRecord(t *tes
 		return []dns.RR{record}, nil
 	}
 
-	accepted, notes, err := h.filterDuplicateRegistrations(context.Background(), "test.dev.zenr.io.", "test.dev.zenr.io.", []dns.RR{record})
+	accepted, notes, err := h.filterDuplicateRegistrations(context.Background(), "test.dev.zenr.io.", []dns.RR{record})
 	if err == nil {
 		t.Fatal("expected duplicate registration to be rejected")
 	}
@@ -514,10 +490,9 @@ func TestSetNonKeyLease_SameRecordDifferentTTL_SingleEntry(t *testing.T) {
 	// Per rfc2136 - 1.1 - Comparison Rules: TTL is excluded from RR comparison.
 	// Same record with different TTLs overwrites the previous entry (single entry).
 	h := newTestHandler()
-	ctx := context.Background()
 
 	key := testKeyRR("test.dev.zenr.io.", "AAAATESTKEY999=")
-	if err := h.leaseManager.Register(ctx, key, 2, 2, "dev.zenr.io."); err != nil {
+	if err := h.leaseManager.Register(key, 2, 2, "dev.zenr.io."); err != nil {
 		t.Fatalf("register key lease: %v", err)
 	}
 
@@ -565,7 +540,7 @@ func TestExtractUpdateRecordsRejectsBlacklistedTypes(t *testing.T) {
 		dns.TypeNULL: {},
 	}
 
-	_, _, err := extractUpdateRecords(msg, blacklist)
+	_, err := extractUpdateRecords(msg, blacklist)
 	if err == nil {
 		t.Fatalf("expected error for blacklisted type NULL")
 	}
@@ -593,7 +568,8 @@ func TestExtractUpdateRecordsAllowsNonBlacklistedTypes(t *testing.T) {
 		dns.TypeNXNAME: {},
 	}
 
-	keyRR, other, err := extractUpdateRecords(msg, blacklist)
+	recs, err := extractUpdateRecords(msg, blacklist)
+	keyRR, other := recs.keyAdds, recs.otherAdds
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -627,7 +603,7 @@ func TestExtractUpdateRecordsBlacklistedTypeWithKeyRR(t *testing.T) {
 		dns.TypeNXNAME: {},
 	}
 
-	_, _, err := extractUpdateRecords(msg, blacklist)
+	_, err := extractUpdateRecords(msg, blacklist)
 	if err == nil {
 		t.Fatalf("expected error for blacklisted type NXNAME")
 	}
@@ -668,7 +644,7 @@ func TestUpdateHandlerSetupParsesBlacklistedTypes(t *testing.T) {
 	msg.Opcode = dns.OpcodeUpdate
 	nullRec := &dns.NULL{Hdr: dns.Header{Name: "test.dev.zenr.io.", Class: dns.ClassINET, TTL: 120}, NULL: rdata.NULL{Null: "\x00\x01"}}
 	msg.Ns = append(msg.Ns, nullRec)
-	_, _, err = extractUpdateRecords(msg, h.blacklistedTypes)
+	_, err = extractUpdateRecords(msg, h.blacklistedTypes)
 	if err == nil {
 		t.Fatalf("expected error for blacklisted type NULL")
 	}
@@ -681,7 +657,7 @@ func TestUpdateHandlerSetupParsesBlacklistedTypes(t *testing.T) {
 	msg2.Opcode = dns.OpcodeUpdate
 	nxRec := &dns.NXNAME{Hdr: dns.Header{Name: "test.dev.zenr.io.", Class: dns.ClassINET, TTL: 120}}
 	msg2.Ns = append(msg2.Ns, nxRec)
-	_, _, err = extractUpdateRecords(msg2, h.blacklistedTypes)
+	_, err = extractUpdateRecords(msg2, h.blacklistedTypes)
 	if err == nil {
 		t.Fatalf("expected error for blacklisted type NXNAME")
 	}
@@ -695,7 +671,8 @@ func TestUpdateHandlerSetupParsesBlacklistedTypes(t *testing.T) {
 	msg3.Ns = append(msg3.Ns, testKeyRR("test.dev.zenr.io.", "AAAATESTKEY333="))
 	txtRec := &dns.TXT{Hdr: dns.Header{Name: "test.dev.zenr.io.", Class: dns.ClassINET, TTL: 120}, TXT: rdata.TXT{Txt: []string{"data"}}}
 	msg3.Ns = append(msg3.Ns, txtRec)
-	_, otherRecords, err := extractUpdateRecords(msg3, h.blacklistedTypes)
+	recs, err := extractUpdateRecords(msg3, h.blacklistedTypes)
+	_, otherRecords := recs.keyAdds, recs.otherAdds
 	if err != nil {
 		t.Fatalf("expected TXT (non-blacklisted) to pass, got error: %v", err)
 	}
@@ -734,7 +711,7 @@ func TestUpdateHandlerSetupHandlesUnknownBlacklistedTypes(t *testing.T) {
 	msg.Opcode = dns.OpcodeUpdate
 	nullRec := &dns.NULL{Hdr: dns.Header{Name: "test.dev.zenr.io.", Class: dns.ClassINET, TTL: 120}, NULL: rdata.NULL{Null: "\x00\x01"}}
 	msg.Ns = append(msg.Ns, nullRec)
-	_, _, err = extractUpdateRecords(msg, h.blacklistedTypes)
+	_, err = extractUpdateRecords(msg, h.blacklistedTypes)
 	if err == nil {
 		t.Fatalf("expected error for blacklisted type NULL")
 	}
@@ -744,7 +721,7 @@ func TestUpdateHandlerSetupHandlesUnknownBlacklistedTypes(t *testing.T) {
 	msg2.Opcode = dns.OpcodeUpdate
 	mxRec := &dns.MX{Hdr: dns.Header{Name: "test.dev.zenr.io.", Class: dns.ClassINET, TTL: 120}, MX: rdata.MX{Preference: 10, Mx: "mx.example.com."}}
 	msg2.Ns = append(msg2.Ns, mxRec)
-	_, _, err = extractUpdateRecords(msg2, h.blacklistedTypes)
+	_, err = extractUpdateRecords(msg2, h.blacklistedTypes)
 	if err == nil {
 		t.Fatalf("expected error for blacklisted type MX")
 	}
@@ -778,15 +755,13 @@ func TestUpdateHandlerNoBlacklistAllowsAllTypes(t *testing.T) {
 	}
 }
 
-// TestHandle_CaseD_KeyRefreshWithAccompanyingNonKeyDelete_ForwardsUpstreamAndKeepsUnrelatedRecords
-// covers Case D (KEY-LEASE != 0, LEASE == 0) with an accompanying non-KEY
-// record named for deletion. It previously never forwarded that delete
-// upstream at all (the record stayed published at the authoritative DNS
-// forever) while wiping *every* non-KEY record the key owned locally,
-// including ones the request never named. Both must be fixed: the upstream
-// UPDATE actually sent must contain an RFC 2136 delete for the named record,
-// and an unrelated record under the same key must survive locally.
-func TestHandle_CaseD_KeyRefreshWithAccompanyingNonKeyDelete_ForwardsUpstreamAndKeepsUnrelatedRecords(t *testing.T) {
+// TestHandle_KeyRefreshWithRecordDelete_ForwardsUpstreamAndKeepsUnrelatedRecords
+// covers a KEY refresh that deletes one of the key's non-KEY records (class
+// NONE). The upstream UPDATE actually sent must contain an RFC 2136 delete for
+// the named record, and an unrelated record under the same key must survive
+// locally: a blanket RemoveNonKEYRecords would wipe every non-KEY record the
+// key owned, including ones the request never named.
+func TestHandle_KeyRefreshWithRecordDelete_ForwardsUpstreamAndKeepsUnrelatedRecords(t *testing.T) {
 	serverKeystoreDir, err := createTestKeystore(t)
 	if err != nil {
 		t.Fatalf("setup test keystore: %v", err)
@@ -814,7 +789,7 @@ func TestHandle_CaseD_KeyRefreshWithAccompanyingNonKeyDelete_ForwardsUpstreamAnd
 	}
 
 	ownerRR := owner.PublicKey.Clone().(*dns.KEY)
-	if err := h.leaseManager.Register(context.Background(), ownerRR, 120, 120, "dev.zenr.io."); err != nil {
+	if err := h.leaseManager.Register(ownerRR, 120, 120, "dev.zenr.io."); err != nil {
 		t.Fatalf("register owner key: %v", err)
 	}
 
@@ -826,15 +801,15 @@ func TestHandle_CaseD_KeyRefreshWithAccompanyingNonKeyDelete_ForwardsUpstreamAnd
 		t.Fatalf("upsert non-key records: %v", err)
 	}
 
-	// Case D request: KEY-LEASE != 0 (refresh), LEASE == 0, KEY RR present
-	// plus the one non-KEY record to delete.
+	// The KEY to refresh (KEY-LEASE 300) and the one non-KEY record to delete; no
+	// other record is added, so LEASE is 0.
 	msg := dns.NewMsg(owner.PublicKey.Hdr.Name, dns.TypeSOA)
 	if msg == nil {
 		t.Fatalf("expected message")
 	}
 	msg.Opcode = dns.OpcodeUpdate
 	keyRR := owner.PublicKey.Clone().(*dns.KEY)
-	msg.Ns = append(msg.Ns, keyRR, toDelete)
+	msg.Ns = append(msg.Ns, keyRR, dnsmsg.AsDelete(toDelete))
 
 	opt := &dns.OPT{Hdr: dns.Header{Name: "."}}
 	opt.SetUDPSize(uint16(dns.DefaultMsgSize))
@@ -858,8 +833,7 @@ func TestHandle_CaseD_KeyRefreshWithAccompanyingNonKeyDelete_ForwardsUpstreamAnd
 	}
 
 	// The upstream UPDATE that was actually sent must contain an RFC 2136
-	// delete (class NONE, TTL 0) for the named record -- this is the core of
-	// the bug: it previously never got forwarded upstream at all.
+	// delete (class NONE, TTL 0) for the named record.
 	if len(coordinator.sent) == 0 {
 		t.Fatalf("expected an upstream UPDATE to be sent")
 	}

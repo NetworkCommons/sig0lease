@@ -5,7 +5,7 @@ import (
 	"time"
 
 	"codeberg.org/miekg/dns"
-	leasepkg "github.com/NetworkCommons/sig0lease/pkg/lease"
+	"github.com/NetworkCommons/sig0lease/client/clienttest"
 )
 
 func TestClientUsesServerGrantedLeaseForExpiry(t *testing.T) {
@@ -14,13 +14,7 @@ func TestClientUsesServerGrantedLeaseForExpiry(t *testing.T) {
 	grantedLease := uint32(90)
 	grantedKeyLease := uint32(120)
 
-	resp := &dns.Msg{}
-	opt := &dns.OPT{Hdr: dns.Header{Name: "."}}
-	leaseOpt := leasepkg.Encode8Byte(grantedLease, grantedKeyLease)
-	if err := leaseOpt.Encode(opt); err != nil {
-		t.Fatalf("encode lease option: %v", err)
-	}
-	resp.Extra = append(resp.Extra, opt)
+	resp := clienttest.Granted(grantedLease, grantedKeyLease)
 
 	now := time.Unix(1_700_000_000, 0)
 	effectiveLease, effectiveKeyLease := EffectiveLeaseDuration(resp, requestedLease, requestedKeyLease)
@@ -58,5 +52,49 @@ func TestClientFallsBackToRequestedLeaseWhenResponseHasNoLeaseOption(t *testing.
 	}
 	if keyExpiry.Sub(now) != time.Duration(requestedKeyLease)*time.Second {
 		t.Fatalf("expected key expiry delta %ds, got %s", requestedKeyLease, keyExpiry.Sub(now))
+	}
+}
+
+func TestInterpretResponse(t *testing.T) {
+	cases := []struct {
+		name    string
+		rcode   uint16
+		nilResp bool
+		want    Outcome
+	}{
+		{name: "nil response", nilResp: true, want: OutcomeServerFailure},
+		{name: "NOERROR", rcode: dns.RcodeSuccess, want: OutcomeSuccess},
+		{name: "YXDOMAIN", rcode: dns.RcodeYXDomain, want: OutcomeConflict},
+		{name: "REFUSED", rcode: dns.RcodeRefused, want: OutcomeRefused},
+		{name: "SERVFAIL", rcode: dns.RcodeServerFailure, want: OutcomeServerFailure},
+		{name: "FORMERR (other)", rcode: dns.RcodeFormatError, want: OutcomeOther},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			var resp *dns.Msg
+			if !tc.nilResp {
+				resp = &dns.Msg{MsgHeader: dns.MsgHeader{Rcode: tc.rcode}}
+			}
+			if got := InterpretResponse(resp); got != tc.want {
+				t.Fatalf("InterpretResponse() = %s, want %s", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestGrantedLease_ReadsEchoedOption(t *testing.T) {
+	lease, keyLease, ok := GrantedLease(clienttest.Granted(30, 1209600))
+	if !ok {
+		t.Fatal("expected ok=true")
+	}
+	if lease != 30 || keyLease != 1209600 {
+		t.Fatalf("got lease=%d keyLease=%d, want 30/1209600", lease, keyLease)
+	}
+}
+
+func TestGrantedLease_NoOption(t *testing.T) {
+	resp := &dns.Msg{MsgHeader: dns.MsgHeader{Rcode: dns.RcodeSuccess}}
+	if _, _, ok := GrantedLease(resp); ok {
+		t.Fatal("expected ok=false when the response carries no Update-Lease option")
 	}
 }

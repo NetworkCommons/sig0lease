@@ -24,8 +24,6 @@ source "$SCRIPT_DIR/lib/leasestore.sh"
 source "$SCRIPT_DIR/lib/bind9.sh"
 
 AUTH_BACKEND="${AUTH_BACKEND:-live}"
-# Holds local mode's lease snapshots and client keys; removed by cleanup.
-LOCAL_SCRATCH_DIR=""
 
 # Zones
 case "$AUTH_BACKEND" in
@@ -44,27 +42,29 @@ case "$AUTH_BACKEND" in
         ;;
 esac
 DOWNSTREAM_ZONE="test.${UPSTREAM_ZONE}"
+# The proxy's config, log and, in local mode, lease files and client keys: named after the
+# Makefile target, test-update or test-update-local.
+if [ "$AUTH_BACKEND" = "local" ]; then
+    PROXY_RUN_DIR="$PROXY_RUN_ROOT/update-local"
+else
+    PROXY_RUN_DIR="$PROXY_RUN_ROOT/update"
+fi
 
 ################################
 # Local backend (AUTH_BACKEND=local)
 ################################
 
-# localize_lease_config -- local mode: turns this run's scratch copy of config.yaml
-# (prepare_lease_config, which already set the listen address, the minimum leases and, with
-# PROXY_PROTOCOL=tls, the DoT listener) into a config for the local BIND 9 deployment, by
-# replacing only what names a server, zone, key or file: the upstream resolvers become the
-# local BIND 9, and each handler gets its own zone on it (srp_handler BIND9_ZONE, the update
-# handler BIND9_UPDATE_ZONE), reached through its static "upstream", with that zone's own key
-# and a lease file in LOCAL_SCRATCH_DIR. Everything else -- processing rules, lease policy,
+# localize_lease_config -- local mode: turns this run's copy of config.yaml
+# (prepare_lease_config, which already set the listen address, diagnostics, the minimum leases
+# and, with PROXY_PROTOCOL=tls or doh, the DoT or DoH listener) into a config for the local BIND 9
+# deployment, by replacing only what names a server, zone, key or file: the upstream resolvers
+# become the local BIND 9, and each handler gets its own zone on it (srp_handler BIND9_ZONE,
+# the update handler BIND9_UPDATE_ZONE), reached through its static "upstream", with that
+# zone's own key and a lease file in PROXY_RUN_DIR. Everything else -- processing rules, lease policy,
 # blacklisted types, any setting config.yaml gains later -- stays config.yaml's. Fails if
 # config.yaml has a handler section this doesn't localize, or if any zone, key, file or server
 # config.yaml names is still in the result, so a local run cannot reach a live resource.
 localize_lease_config() {
-    if [ "$REUSED_PROXY" = true ]; then
-        log_error "AUTH_BACKEND=local starts its own proxy, but one already listens on port $PROXY_PORT. Re-run with a free port: PROXY_PORT=18053 AUTH_BACKEND=local tests/test_update.sh run"
-        return 1
-    fi
-
     local handlers
     handlers="$(awk '/^handlers:/ { in_h = 1; next } /^[^ #]/ { in_h = 0 } in_h && /^  [^ #][^ ]*:[ ]*$/ { sub(/^  /, ""); sub(/:.*/, ""); print }' "$CONFIG_FILE")"
     if [ "$(printf '%s\n' "$handlers" | sort | tr '\n' ' ')" != "srp_handler update " ]; then
@@ -72,7 +72,6 @@ localize_lease_config() {
         return 1
     fi
 
-    LOCAL_SCRATCH_DIR="$(mktemp -d /tmp/sig0lease-update-local.XXXXXX)"
     local upstream="${BIND9_ADDR}:${BIND9_PORT}"
     # A handler's block: from "  <name>:" to the next line indented by two spaces or less
     # (the next handler or top-level key), or to the end of the file.
@@ -85,30 +84,30 @@ localize_lease_config() {
         -e "${srp_block} s|^    upstream_zone:.*$|    upstream_zone: \"${BIND9_ZONE}\"|" \
         -e "${srp_block} s|^    # upstream:.*$|    upstream: \"${upstream}\"|" \
         -e "${srp_block} s|^    keystore_dir:.*$|    keystore_dir: \"${BIND9_SRP_KEYSTORE_DIR}\"|" \
-        -e "${srp_block} s|^      path:.*$|      path: \"${LOCAL_SCRATCH_DIR}/srp_lease_snapshot.json\"|" \
+        -e "${srp_block} s|^      path:.*$|      path: \"${PROXY_RUN_DIR}/srp_lease_snapshot.json\"|" \
         -e "${update_block} s|^    upstream_zone:.*$|    upstream_zone: \"${BIND9_UPDATE_ZONE}\"|" \
         -e "${update_block} s|^    # upstream:.*$|    upstream: \"${upstream}\"|" \
         -e "${update_block} s|^    keystore_dir:.*$|    keystore_dir: \"${BIND9_UPDATE_KEYSTORE_DIR}\"|" \
-        -e "${update_block} s|^      path:.*$|      path: \"${LOCAL_SCRATCH_DIR}/lease_snapshot.json\"|" \
-        "$TMP_CONFIG_FILE"
-    rm -f "$TMP_CONFIG_FILE.bak"
+        -e "${update_block} s|^      path:.*$|      path: \"${PROXY_RUN_DIR}/lease_snapshot.json\"|" \
+        "$PROXY_CONFIG_FILE"
+    rm -f "$PROXY_CONFIG_FILE.bak"
 
     local expected
     for expected in \
         "  max_inflight_updates: ${BIND9_SIG0_QUOTA}" \
         "    upstream_zone: \"${BIND9_ZONE}\"" \
         "    keystore_dir: \"${BIND9_SRP_KEYSTORE_DIR}\"" \
-        "      path: \"${LOCAL_SCRATCH_DIR}/srp_lease_snapshot.json\"" \
+        "      path: \"${PROXY_RUN_DIR}/srp_lease_snapshot.json\"" \
         "    upstream_zone: \"${BIND9_UPDATE_ZONE}\"" \
         "    keystore_dir: \"${BIND9_UPDATE_KEYSTORE_DIR}\"" \
-        "      path: \"${LOCAL_SCRATCH_DIR}/lease_snapshot.json\""; do
-        if ! grep -qxF -- "$expected" "$TMP_CONFIG_FILE"; then
-            log_error "Could not localize $TMP_CONFIG_FILE: no line '$expected' after editing -- $CONFIG_FILE no longer has the lines localize_lease_config edits"
+        "      path: \"${PROXY_RUN_DIR}/lease_snapshot.json\""; do
+        if ! grep -qxF -- "$expected" "$PROXY_CONFIG_FILE"; then
+            log_error "Could not localize $PROXY_CONFIG_FILE: no line '$expected' after editing -- $CONFIG_FILE no longer has the lines localize_lease_config edits"
             return 1
         fi
     done
-    if [ "$(grep -cxF -- "    upstream: \"${upstream}\"" "$TMP_CONFIG_FILE")" -ne 2 ]; then
-        log_error "Could not localize $TMP_CONFIG_FILE: each handler section of $CONFIG_FILE needs a commented-out '    # upstream:' line for localize_lease_config to turn on"
+    if [ "$(grep -cxF -- "    upstream: \"${upstream}\"" "$PROXY_CONFIG_FILE")" -ne 2 ]; then
+        log_error "Could not localize $PROXY_CONFIG_FILE: each handler section of $CONFIG_FILE needs a commented-out '    # upstream:' line for localize_lease_config to turn on"
         return 1
     fi
 
@@ -117,20 +116,20 @@ localize_lease_config() {
     local live_value
     for live_value in $(grep -v '^ *#' "$CONFIG_FILE" \
         | sed -n -E 's/^ *(- address|upstream_zone|upstream|keystore_dir|path): *"?([^" #]+).*/\2/p'); do
-        if grep -v '^ *#' "$TMP_CONFIG_FILE" | grep -qF -- "$live_value"; then
-            log_error "Could not localize $TMP_CONFIG_FILE: it still names $live_value from $CONFIG_FILE"
+        if grep -v '^ *#' "$PROXY_CONFIG_FILE" | grep -qF -- "$live_value"; then
+            log_error "Could not localize $PROXY_CONFIG_FILE: it still names $live_value from $CONFIG_FILE"
             return 1
         fi
     done
 }
 
 # make_local_client_keys -- local mode's two client identities: fresh ED25519 KEYs at
-# DOWNSTREAM_ZONE in a scratch keystore, in place of keystore/client's test.dev.zenr.io.
+# DOWNSTREAM_ZONE in PROXY_RUN_DIR/client-keys, in place of keystore/client's test.dev.zenr.io.
 # ones. Different key tags, as the unauthorized-signer tests need. CLIENT_KEYSTORE_DIR is
 # exported because blacklisted_tester (go run) reads it from the environment.
 make_local_client_keys() {
     require_command dnssec-keygen || return 1
-    local dir="${LOCAL_SCRATCH_DIR}/client-keys"
+    local dir="${PROXY_RUN_DIR}/client-keys"
     mkdir "$dir"
     CLIENT_KEY_NAME="$(dnssec-keygen -q -K "$dir" -a ED25519 -n HOST -T KEY "$DOWNSTREAM_ZONE")"
     WRONG_CLIENT_KEY_NAME="$(dnssec-keygen -q -K "$dir" -a ED25519 -n HOST -T KEY "$DOWNSTREAM_ZONE")"
@@ -141,11 +140,9 @@ make_local_client_keys() {
     export CLIENT_KEYSTORE_DIR="$dir"
 }
 
-# Decide up front whether we'll run our own proxy (against a scratch copy of config.yaml with
-# min_*_lease_sec floored to TEST_MIN_LEASE_SECONDS, localized for the local BIND 9 in local
-# mode) or reuse one already listening (whose real policy we read from CONFIG_FILE instead) --
-# must happen before the yaml_get_lease_time calls below, since they read whichever file this
-# settles on.
+# Write the proxy's config (a copy of config.yaml with min_*_lease_sec floored to
+# TEST_MIN_LEASE_SECONDS, localized for the local BIND 9 in local mode) -- before the
+# yaml_get_lease_time calls below, which read it.
 prepare_lease_config
 if [ "$AUTH_BACKEND" = "local" ]; then
     localize_lease_config
@@ -154,6 +151,16 @@ fi
 # Lease times
 POLICY_MIN_RR_LEASE_SECONDS="$(yaml_get_lease_time min_rr_lease_sec)"
 POLICY_MIN_KEY_LEASE_SECONDS="$(yaml_get_lease_time min_key_lease_sec)"
+# Whether the update handler holds names First-Come First-Served; TEST 3 checks the refusal.
+FCFS_NAMING="$(yq -r '.handlers.update.fcfs_naming' "$PROXY_CONFIG_FILE")"
+case "$FCFS_NAMING" in
+    true) ;;
+    false|null) FCFS_NAMING=false ;;
+    *)
+        log_error "Invalid handlers.update.fcfs_naming in $PROXY_CONFIG_FILE: $FCFS_NAMING"
+        exit 1
+        ;;
+esac
 
 LEASE_SECONDS="${LEASE_SECONDS:-$POLICY_MIN_RR_LEASE_SECONDS}"
 KEY_LEASE_SECONDS="${KEY_LEASE_SECONDS:-$POLICY_MIN_KEY_LEASE_SECONDS}"
@@ -230,12 +237,10 @@ make_rr() {
 }
 
 # build_key_nonkey_rr <rr_type> <ttl> -- sets the global array KEY_NONKEY_RRs to
-# the rr-specs needed for a valid Case A (KEY-LEASE!=0 and LEASE!=0)
-# registration/refresh of <rr_type>. Case A always requires an explicit KEY
-# rr-spec in the Update section (even for a pure refresh of an
-# already-managed key) alongside at least one non-KEY rr-spec, so this always
-# includes a KEY rr-spec paired with either a companion TXT record (if
-# rr_type is itself KEY) or the type's own spec.
+# the rr-specs that add the signer's KEY and a record of <rr_type> together
+# (KEY-LEASE!=0 and LEASE!=0): a signer not yet lease-managed may add records
+# only with its KEY in the Update section. The record is a companion TXT if
+# rr_type is itself KEY, the type's own spec otherwise.
 build_key_nonkey_rr() {
     local rr_type="$1"
     local ttl="$2"
@@ -281,20 +286,17 @@ test_blacklisted_type() {
         *)
             rr_spec=$(make_rr "$rr_type" $LEASE_SECONDS)
             log_step "Attempting registration with blacklisted type $rr_type"
-            # Both LEASE and KEY-LEASE nonzero (Case A) requires a companion
-            # KEY rr-spec in the Update section, or the client rejects the
-            # request itself before it ever reaches the proxy.
+            # The signer is not lease-managed yet, so it adds its KEY with the
+            # record: the request is refused for the record's type, not for
+            # the signer.
             reg_out=$(run_client register "$CLIENT_KEY_NAME" $LEASE_SECONDS $KEY_LEASE_SECONDS "$(make_rr KEY $KEY_LEASE_SECONDS)" "$rr_spec" 2>&1) || true
             ;;
     esac
 
-    # Check the response for rejection (should be Rcode=1 FormatError).
-    if echo "$reg_out" | grep -q "Rcode=1\|FormatError\|REGISTRATION FAILED"; then
-        log_success "Proxy correctly rejected blacklisted type $rr_type with format error"
-    else
-        log_error "Proxy should have rejected blacklisted type $rr_type, got: $reg_out"
-        return 1
-    fi
+    # A well-formed request local policy refuses: REFUSED (RFC 2136 S2.2) with
+    # Extended DNS Error 18 (Prohibited).
+    assert_client_reply "$reg_out" REFUSED 18 "is blacklisted for registration"
+    log_success "Proxy refused blacklisted type $rr_type"
 
     # Verify no KEY RR was created (registration should be atomic - all or nothing).
     if rr_at_authoritative KEY $CLIENT_KEY_RR; then
@@ -323,11 +325,10 @@ test_single_rr_register_expire_remove() {
             rr_spec="$(make_rr $rr_type $lease)"
             ;;
         *)
-            # A non-KEY-only registration is Case B, which requires the
-            # signer to already be lease-managed -- not true at this point in
-            # a fresh run. So register via Case A (KEY+non-KEY records
-            # together, both timers equal so they expire together) instead,
-            # mirroring the build_key_nonkey_rr pattern used by Cases 2/2B/3.
+            # Records added alone require the signer to be lease-managed
+            # already -- not true at this point in a fresh run. So add the
+            # KEY with the record (both timers equal so they expire
+            # together), the build_key_nonkey_rr pattern Cases 2/2B/3 use.
             local lease_time=$LEASE_SECONDS
             local key_lease_time=$LEASE_SECONDS
             lease=$lease_time
@@ -363,11 +364,9 @@ test_single_rr_register_expire_remove() {
         log_success "Expired KEY refresh succeeded via re-registration semantics"
     else
         # Both KEY and data expired together above, so the signer is no
-        # longer lease-managed: a non-KEY-only (Case B) refresh attempt must be
-        # refused for that reason, not because "the lease does not exist"
-        # (that message is Case D's validateRefreshOwnership path, which
-        # this request never reaches). Assert on the client-visible Rcode
-        # plus the actual Case B rejection text, not a guessed string.
+        # longer lease-managed: adding the record alone again must be refused
+        # for that reason. Assert on the reply the client got: its Rcode plus
+        # the reason the proxy gives.
         log_step "Attempting refresh after expiry (non-KEY path: expected failure, signer no longer managed)"
         local post_expiry_out
         if post_expiry_out=$(run_client refresh "$CLIENT_KEY_NAME" $LEASE_SECONDS 0 "$rr_spec" 2>&1); then
@@ -375,16 +374,8 @@ test_single_rr_register_expire_remove() {
             echo "$post_expiry_out"
             return 1
         fi
-        if ! echo "$post_expiry_out" | grep -q "Status: REFUSED (Rcode=5)"; then
-            log_error "Expected REFUSED (Rcode=5) for post-expiry non-KEY-only refresh, got:"
-            echo "$post_expiry_out"
-            return 1
-        fi
+        assert_client_reply "$post_expiry_out" REFUSED 18 "signing key must be managed"
         wait_for_rr_state $rr_type "$rr_spec" absent
-        # "requires signing KEY to already be managed" is the *response*
-        # message text (never passed to h.logger), not what actually lands
-        # in the proxy's own log -- assert on the real logged reason instead.
-        assert_proxy_log_contains "signing key not found in lease store"
     fi
 
     expected_min=$((lease + BUFFER))
@@ -397,16 +388,16 @@ test_single_rr_register_expire_remove() {
 test_case_register_refresh_not_prematurely_removed() {
     local rr_type="$1"
 
-    local log_msg="TEST 2: Register -> Refresh -> Not Prematurely Removed (Case A) ($rr_type)"
+    local log_msg="TEST 2: Register -> Refresh -> Not Prematurely Removed ($rr_type)"
     log_section "$log_msg"
 
     local lease_start refresh_start expected_min data_spec data_type
 
     build_key_nonkey_rr "$rr_type" $LEASE_SECONDS
     data_spec="${KEY_NONKEY_RRs[1]}"
-    # build_key_nonkey_rr pairs a KEY registration with a TXT companion (Case
-    # A needs a non-KEY record too), so data_spec's actual RR type is TXT
-    # when rr_type is KEY -- never $rr_type itself in that case.
+    # build_key_nonkey_rr pairs a KEY registration with a TXT companion, so
+    # data_spec's actual RR type is TXT when rr_type is KEY -- never $rr_type
+    # itself in that case.
     if [ "$rr_type" = "KEY" ]; then
         data_type="TXT"
     else
@@ -552,35 +543,37 @@ test_case_unauthorized_refresh_rejected_then_expires() {
 
     log_step "Unauthorized refresh attempt using unregistered different key ($WRONG_CLIENT_KEY_NAME)"
     local unauth_out
-    # Both LEASE and KEY-LEASE nonzero (Case A) requires a companion KEY
-    # rr-spec in the Update section. Include the *original* (CLIENT_KEY_NAME)
-    # KEY rdata here -- not WRONG's -- signed by WRONG_CLIENT_KEY_NAME: this
-    # reproduces the exact scenario the proxy is meant to reject (a
+    # WRONG_CLIENT_KEY_NAME adds the record CLIENT_KEY_NAME registered: a
     # transaction signature from a different, unmanaged key over data it
-    # doesn't own), matching the resolved HANDOFF experiment.
+    # doesn't own, the scenario the proxy is meant to reject.
     if unauth_out=$(run_client refresh "$WRONG_CLIENT_KEY_NAME" $LEASE_SECONDS 0 "$data_spec" 2>&1); then
         log_error "Unauthorized refresh unexpectedly succeeded"
         return 1
     fi
 
-    # WRONG_CLIENT_KEY_NAME is a distinct, never-registered key (different
-    # keytag), so the proxy rejects it via the online-signer-authorization 
-    # path ("signer not authorized for new registration").
-    # Assert on the client-visible Rcode.
-    if ! echo "$unauth_out" | grep -q "Status: REFUSED (Rcode=5)"; then
-        log_error "Expected REFUSED (Rcode=5) for unauthorized refresh, got:"
-        echo "$unauth_out"
-        return 1
-    fi
-
-    assert_proxy_log_contains "signing key not found in lease store"
+    # WRONG_CLIENT_KEY_NAME is a distinct, never-registered key at the same
+    # name as CLIENT_KEY_NAME (different keytag), so the proxy rejects the
+    # record added alone because the signer is not lease-managed.
+    assert_client_reply "$unauth_out" REFUSED 18 "signing key must be managed"
 
     # Now register WRONG_CLIENT_KEY_NAME to test a non-owner rejection
-    # for the refresh operation
-    log_step "Register different key ($WRONG_CLIENT_KEY_NAME)"
+    # for the refresh operation. With fcfs_naming, CLIENT_KEY_NAME holds the
+    # name, so WRONG_CLIENT_KEY_NAME may not register itself there; the holder
+    # registers it instead, which also works without fcfs_naming.
     local wrong_key_rr
     wrong_key_rr="$(make_rr KEY $LEASE_SECONDS 1)"
-    run_client register "$WRONG_CLIENT_KEY_NAME" 0 $LEASE_SECONDS  "$wrong_key_rr"
+    if [ "$FCFS_NAMING" = "true" ]; then
+        log_step "Different key ($WRONG_CLIENT_KEY_NAME) registering itself at the held name is refused (fcfs_naming)"
+        local fcfs_out
+        if fcfs_out=$(run_client register "$WRONG_CLIENT_KEY_NAME" 0 $LEASE_SECONDS "$wrong_key_rr" 2>&1); then
+            log_error "Self-registration at a name another key holds unexpectedly succeeded"
+            echo "$fcfs_out"
+            return 1
+        fi
+        assert_client_reply "$fcfs_out" YXDOMAIN 18 "name held by a different key"
+    fi
+    log_step "Holder ($CLIENT_KEY_NAME) registers different key ($WRONG_CLIENT_KEY_NAME)"
+    run_client register "$CLIENT_KEY_NAME" 0 $LEASE_SECONDS "$wrong_key_rr"
     wait_for_rr_state KEY "$wrong_key_rr" present
     
     log_step "Refresh RR with different non-owner key ($WRONG_CLIENT_KEY_NAME)"
@@ -592,14 +585,7 @@ test_case_unauthorized_refresh_rejected_then_expires() {
     fi
     # WRONG_CLIENT_KEY_NAME is not the owner of the previously registered RR
     # so the proxy rejects it.
-    # Assert on the client-visible Rcode.
-    if ! echo "$nonowner_out" | grep -q "Status: REFUSED (Rcode=5)"; then
-        log_error "Expected REFUSED (Rcode=5) for unauthorized refresh, got:"
-        echo "$nonowner_out"
-        return 1
-    fi
-
-    assert_proxy_log_contains "duplicate registration rejected:"
+    assert_client_reply "$nonowner_out" REFUSED 18 "is already registered under a different key"
 
     log_step "Waiting until original lease expires"
     wait_until_epoch $((lease_start + KEY_LEASE_SECONDS + BUFFER))
@@ -616,94 +602,111 @@ test_case_unauthorized_refresh_rejected_then_expires() {
     PERFORMED_TESTS="$PERFORMED_TESTS\n  [OK] $log_msg"
 }
 
-# test_case_abcd_lease_policy_matrix walks deliberately through all four
-# lease-policy dispatch cases in handlers/opcode5_handle.go, in the order
-# A -> D -> B -> C, using a single KEY (CLIENT_KEY_NAME) and two TXT records
-# so each transition's effect on the other records is directly observable:
-#   A: KEY-LEASE!=0, LEASE!=0 -- full registration (KEY + txt_a together)
-#   D: KEY-LEASE!=0, LEASE=0  -- key-only refresh, must not disturb txt_a
-#   B: KEY-LEASE=0,  LEASE!=0 -- non-KEY-only registration of txt_b under the
-#      already-managed key, coexisting with txt_a
-#   C: KEY-LEASE=0,  LEASE=0  -- delete matrix: first a non-KEY-only delete
-#      (txt_b only), then a KEY delete that cascades and removes txt_a too
-test_case_abcd_lease_policy_matrix() {
-    
-    local log_msg="CASE A/B/C/D: Explicit Lease-Policy Matrix"
+# test_adds_and_deletes_matrix walks through what an Update section can ask
+# of handlers/opcode5_handle.go, with a single KEY (CLIENT_KEY_NAME) and TXT
+# records, so each step's effect on the other records is directly observable.
+# A record is added with class IN and deleted with class NONE, TTL 0 (RFC 2136
+# S2.5.4); LEASE and KEY-LEASE are the leases of the other records and of the
+# KEYs added, 0 for a kind added none of:
+#   1. the KEY and txt_a added together (both leases)
+#   2. the KEY alone refreshed (LEASE 0): txt_a stays
+#   3. txt_b added alone under the already-managed signer (KEY-LEASE 0), next
+#      to txt_a
+#   4. txt_b deleted (both leases 0): the KEY and txt_a stay
+#   5. txt_a replaced by txt_c in one update: txt_c added, txt_a deleted
+#   6. the KEY deleted: its delete takes txt_c too
+test_adds_and_deletes_matrix() {
+
+    local log_msg="ADDS AND DELETES: one KEY, its records added, replaced and deleted"
     log_section "$log_msg"
 
     local case_start
     case_start=$(date +%s)
 
-    local needle_a needle_b txt_a txt_b
-    needle_a="caseA-$(time_tag)"
+    local needle_a needle_b needle_c txt_a txt_b txt_c
+    needle_a="add-a-$(time_tag)"
     txt_a="${DOWNSTREAM_ZONE} ${LEASE_SECONDS} IN TXT \"${needle_a}\""
 
-    log_step "Case A (KEY-LEASE!=0, LEASE!=0): full registration of KEY+TXT"
+    log_step "1. KEY-LEASE!=0, LEASE!=0: the KEY and a TXT added together"
     run_client register "$CLIENT_KEY_NAME" $LEASE_SECONDS $LONG_KEY_LEASE_SECONDS "$(make_rr KEY $LONG_KEY_LEASE_SECONDS)" "$txt_a"
     wait_for_rr_state KEY "$CLIENT_KEY_RR" present
     wait_for_rr_state TXT "$txt_a" present
 
     lease_dump info
-    log_success "Case A: KEY+TXT registered together"
+    log_success "1: KEY+TXT registered together"
 
-    log_step "Case D (KEY-LEASE!=0, LEASE=0): key-only refresh must leave data untouched"
+    log_step "2. KEY-LEASE!=0, LEASE=0: the KEY alone refreshed, the data left untouched"
     run_client refresh "$CLIENT_KEY_NAME" 0 $LONG_KEY_LEASE_SECONDS "$(make_rr KEY $LONG_KEY_LEASE_SECONDS)"
 
     if ! rr_at_authoritative KEY "$CLIENT_KEY_RR"; then
-        log_error "Case D: key-only refresh but key absent at authoritative"
+        log_error "2: KEY refreshed but absent at authoritative"
         return 1
     fi
     if ! rr_at_authoritative TXT "$txt_a"; then
-        log_error "Case D: key-only refresh unexpectedly disturbed the Case A TXT record"
+        log_error "2: the KEY's refresh unexpectedly disturbed txt_a"
         return 1
     fi
-    log_success "Case D: key-only refresh left Case A's TXT record untouched"
+    log_success "2: the KEY's refresh left txt_a untouched"
 
-    needle_b="caseB-$(time_tag)"
+    needle_b="add-b-$(time_tag)"
     txt_b="${DOWNSTREAM_ZONE} ${LEASE_SECONDS} IN TXT \"${needle_b}\""
-    log_step "Case B (KEY-LEASE=0, LEASE!=0): non-KEY-only registration under the already-managed signer"
+    log_step "3. KEY-LEASE=0, LEASE!=0: a TXT added alone under the already-managed signer"
     run_client register "$CLIENT_KEY_NAME" $LEASE_SECONDS 0 "$txt_b"
-    
+
     if ! wait_for_rr_state TXT "$txt_b" present; then
-        log_error "Case B: new non-KEY-only TXT record not found at authoritative"
+        log_error "3: txt_b, added alone, not found at authoritative"
         return 1
     fi
     if ! rr_at_authoritative TXT "$txt_a"; then
-        log_error "Case B: original Case A TXT record disappeared"
+        log_error "3: txt_a disappeared"
         return 1
     fi
     lease_dump debug
-    log_success "Case B: non-KEY-only registration added a second TXT record alongside the first"
+    log_success "3: a second TXT record added alone, next to the first"
 
-    log_step "Case C (KEY-LEASE=0, LEASE=0): non-KEY-only delete removes just txt_b"
-    run_client refresh "$CLIENT_KEY_NAME" 0 0 "$txt_b"
+    log_step "4. both leases 0: txt_b deleted (class NONE), the rest kept"
+    run_client refresh "$CLIENT_KEY_NAME" 0 0 "$(as_delete "$txt_b")"
 
     if ! wait_for_rr_state TXT "$txt_b" absent; then
-        log_error "Case C: targeted TXT delete did not remove txt_b"
+        log_error "4: the delete did not remove txt_b"
         return 1
     fi
     if ! rr_at_authoritative KEY "$CLIENT_KEY_RR"; then
-        log_error "Case C: targeted TXT delete removed KEY"
+        log_error "4: deleting txt_b removed the KEY"
         return 1
     fi
     if ! rr_at_authoritative TXT "$txt_a"; then
-        log_error "Case C: non-KEY-only delete unexpectedly removed txt_a too"
+        log_error "4: deleting txt_b removed txt_a too"
         return 1
     fi
-    
-    log_success "Case C: non-KEY-only delete removed txt_b while KEY and txt_a remained"
+    log_success "4: txt_b deleted while the KEY and txt_a remained"
 
-    log_step "Case C (KEY-LEASE=0, LEASE=0): KEY delete cascades and removes remaining data"
-    run_client refresh "$CLIENT_KEY_NAME" 0 0 "$(make_rr KEY 0)"
+    needle_c="add-c-$(time_tag)"
+    txt_c="${DOWNSTREAM_ZONE} ${LEASE_SECONDS} IN TXT \"${needle_c}\""
+    log_step "5. KEY-LEASE=0, LEASE!=0: txt_a replaced by txt_c in one update"
+    run_client register "$CLIENT_KEY_NAME" $LEASE_SECONDS 0 "$txt_c" "$(as_delete "$txt_a")"
+
+    if ! wait_for_rr_state TXT "$txt_c" present; then
+        log_error "5: txt_c not found at authoritative"
+        return 1
+    fi
+    if ! wait_for_rr_state TXT "$txt_a" absent; then
+        log_error "5: txt_a not deleted"
+        return 1
+    fi
+    log_success "5: txt_c added and txt_a deleted in one update"
+
+    log_step "6. both leases 0: the KEY deleted (class NONE), taking what it registered"
+    run_client refresh "$CLIENT_KEY_NAME" 0 0 "$(as_delete "$(make_rr KEY 0)")"
     wait_for_rr_state KEY "$CLIENT_KEY_RR" absent
-    if rr_at_authoritative TXT "$txt_a"; then
-        log_error "Case C: KEY delete did not cascade-remove remaining txt_a"
+    if rr_at_authoritative TXT "$txt_c"; then
+        log_error "6: the KEY's delete did not remove txt_c"
         return 1
     fi
-    log_success "Case C: KEY delete cascaded and removed the remaining non-KEY lease"
+    log_success "6: the KEY's delete removed the remaining TXT record"
 
-    log_case_timing "case-abcd-matrix" "$case_start" 0
-    log_success "Lease-policy Case A/B/C/D matrix (A -> D -> B -> C) validated end-to-end"
+    log_case_timing "adds-and-deletes-matrix" "$case_start" 0
+    log_success "Adds and deletes (1 -> 6) validated end-to-end"
 
     PERFORMED_TESTS="$PERFORMED_TESTS\n  [OK] $log_msg"
 }
@@ -716,10 +719,9 @@ test_case_abcd_lease_policy_matrix() {
 # online via add_rr, never registered through the proxy at all).
 #
 # Steps 1-3 reuse CLIENT_KEY_NAME across a self-registration (Update) and two
-# non-KEY-only refreshes (Additional, then lease-store), since Case B forbids a
-# KEY rr-spec in the Update section entirely (KEY-LEASE == 0) -- a way to prove
-# Additional/omitted signer resolution (an alternative would have been case D - delete 
-# non-KEY RR, with no KEY in the Update section). Step 4 uses WRONG_CLIENT_KEY_NAME,
+# records added alone (Additional, then lease-store): with KEY-LEASE 0 the
+# Update section adds no KEY, which proves Additional/omitted signer
+# resolution. Step 4 uses WRONG_CLIENT_KEY_NAME,
 # published directly at authoritative and never registered through the
 # proxy, to reach the authoritative-only fallback stage.
 test_case_signer_location_matrix() {
@@ -734,8 +736,8 @@ test_case_signer_location_matrix() {
     needle1="signerloc-update-$(time_tag)"
     txt1="${DOWNSTREAM_ZONE} ${LEASE_SECONDS} IN TXT \"${needle1}\""
 
-    log_step "Signer location 1/4: Update section (self-registration, Case A)"
-    run_client register "$CLIENT_KEY_NAME" $LEASE_SECONDS $LONG_KEY_LEASE_SECONDS "$(make_rr KEY $LONG_KEY_LEASE_SECONDS)" "$txt1" --signer=update
+    log_step "Signer location 1/4: Update section (self-registration)"
+    run_client register "$CLIENT_KEY_NAME" $LEASE_SECONDS $LONG_KEY_LEASE_SECONDS "$(make_rr KEY $LONG_KEY_LEASE_SECONDS)" "$txt1" -signer=update
     wait_for_rr_state KEY "$CLIENT_KEY_RR" present
     if ! rr_at_authoritative TXT "$txt1"; then
         log_error "Signer-location[update]: expected TXT record not found"
@@ -746,8 +748,8 @@ test_case_signer_location_matrix() {
     needle2="signerloc-additional-$(time_tag)"
     txt2="${DOWNSTREAM_ZONE} ${LEASE_SECONDS} IN TXT \"${needle2}\""
     
-    log_step "Signer location 2/4: Additional section (non-KEY-only refresh, Case B)"
-    run_client register "$CLIENT_KEY_NAME" $LEASE_SECONDS 0 "$txt2" --signer=additional
+    log_step "Signer location 2/4: Additional section (a record added alone)"
+    run_client register "$CLIENT_KEY_NAME" $LEASE_SECONDS 0 "$txt2" -signer=additional
     if ! wait_for_rr_state TXT "$txt2" present; then
         log_error "Signer-location[additional]: expected TXT record not found"
         return 1
@@ -757,8 +759,8 @@ test_case_signer_location_matrix() {
     needle3="signerloc-leasestore-$(time_tag)"
     txt3="${DOWNSTREAM_ZONE} ${LEASE_SECONDS} IN TXT \"${needle3}\""
     
-    log_step "Signer location 3/4: omitted from request, resolved via lease store (Case B)"
-    run_client register "$CLIENT_KEY_NAME" $LEASE_SECONDS 0 "$txt3" --signer=none
+    log_step "Signer location 3/4: omitted from request, resolved via lease store (a record added alone)"
+    run_client register "$CLIENT_KEY_NAME" $LEASE_SECONDS 0 "$txt3" -signer=none
     if ! wait_for_rr_state TXT "$txt3" present; then
         log_error "Signer-location[lease-store]: expected TXT record not found"
         return 1
@@ -773,12 +775,11 @@ test_case_signer_location_matrix() {
     
     probe_needle="signerloc-online-$(time_tag)"
     probe_txt_rr="${DOWNSTREAM_ZONE} 60 IN TXT \"${probe_needle}\""
-    # This is a Case C request (LEASE=0, KEY-LEASE=0) for a record the
-    # online-only signer does not own, so it resolves to a harmless no-op
-    # (Rcode=Success, "record not found for delete" note) once SIG(0)
-    # authenticates -- it is not gated by AllowOnlineKeyRegistration, which
-    # only applies to *new registrations* (Case A/D), not Case C deletes.
-    if ! probe_out=$(run_client refresh "$WRONG_CLIENT_KEY_NAME" 0 0 "$probe_txt_rr" --signer=none 2>&1); then
+    # This request deletes (LEASE=0, KEY-LEASE=0) a record the online-only
+    # signer does not own, so it resolves to a harmless no-op (Rcode=Success,
+    # "record not found for delete" note) once SIG(0) authenticates -- it is
+    # not gated by AllowOnlineKeyRegistration, which only applies to adds.
+    if ! probe_out=$(run_client refresh "$WRONG_CLIENT_KEY_NAME" 0 0 "$(as_delete "$probe_txt_rr")" -signer=none 2>&1); then
         log_error "Signer-location[online-only]: request signed by an online-only, never-registered key was unexpectedly rejected"
         echo "$probe_out"
         delete_rr "$wrong_key_payload"
@@ -786,7 +787,7 @@ test_case_signer_location_matrix() {
     fi
     delete_rr "$wrong_key_payload"
     if rr_at_authoritative TXT "$probe_txt_rr"; then
-        log_error "Signer-location[online-only]: Case C no-op unexpectedly created a TXT record"
+        log_error "Signer-location[online-only]: the no-op delete unexpectedly created a TXT record"
         return 1
     fi
     log_success "Signer-location[online-only]: signer KEY resolved from authoritative DNS (never lease-managed)"
@@ -798,7 +799,7 @@ test_case_signer_location_matrix() {
 }
 
 # test_case_multi_rr_combination_registration registers several distinct
-# non-KEY RR types together in a single Update (Case A), verifies all land
+# non-KEY RR types together with the KEY in a single Update, verifies all land
 # correctly, then verifies they all expire together at the LEASE boundary
 # while the KEY (registered with a longer key-lease) persists. Deliberately
 # excludes NULL/NXNAME (no presentation format, see make_rr) and CLA/IPN
@@ -860,7 +861,7 @@ test_case_multi_rr_combination_registration() {
 
 # test_case_refresh_extends_nonkey_not_key_lease inspects actual lease
 # timestamps via the DEBUG dump (not just presence/absence) to confirm a
-# non-KEY-only refresh (Case B) advances the non-KEY record's ExpiresAt while
+# refresh of a record alone (KEY-LEASE 0) advances its ExpiresAt while
 # leaving the KEY's own ExpiresAt untouched.
 test_case_refresh_extends_nonkey_not_key_lease() {
 
@@ -895,7 +896,7 @@ test_case_refresh_extends_nonkey_not_key_lease() {
 
     sleep $BUFFER
 
-    log_step "Refreshing non-KEY-only (Case B: KEY-LEASE=0), same TXT rdata, extending LEASE"
+    log_step "Refreshing the TXT alone (KEY-LEASE=0), same rdata, extending LEASE"
     run_client refresh "$CLIENT_KEY_NAME" $LEASE_SECONDS 0 "$txt_spec_rr"
 
     local dump_after key_expires_after nonkey_expires_after
@@ -905,7 +906,7 @@ test_case_refresh_extends_nonkey_not_key_lease() {
     log_step "After refresh: KEY ExpiresAt=$key_expires_after  Non-KEY ExpiresAt=$nonkey_expires_after"
 
     if [ "$key_expires_after" != "$key_expires_before" ]; then
-        log_error "Refresh-lease-check: KEY ExpiresAt changed from a non-KEY-only (Case B) refresh: $key_expires_before -> $key_expires_after"
+        log_error "Refresh-lease-check: KEY ExpiresAt changed from the TXT's refresh alone: $key_expires_before -> $key_expires_after"
         return 1
     fi
     if [[ ! "$nonkey_expires_after" > "$nonkey_expires_before" ]]; then
@@ -1040,7 +1041,7 @@ run_all_tests() {
         sub(/^ /, "", types)
         print types
         }
-    ' "$LEASE_CONFIG_FILE")
+    ' "$PROXY_CONFIG_FILE")
 
 
     log_step "Black-listed types: $blacklisted_rrs"
@@ -1049,9 +1050,9 @@ run_all_tests() {
     for rr_type in "${rr_types[@]}"; do
         log_section "RR TEST MATRIX: $rr_type"
         # Reset via the shared client KEY, not a per-type rdata: deleting the
-        # KEY lease (Case C) cascades and removes every non-KEY lease under it
-        # (see handlers/opcode5_handle.go Case C subtree cleanup), so this is
-        # the correct pristine-state reset regardless of $rr_type.
+        # KEY cascades and removes every non-KEY lease under it (see
+        # handlers/opcode5_lease.go subtreeDeletes), so this is the correct
+        # pristine-state reset regardless of $rr_type.
         ensure_rr_absent KEY "$CLIENT_KEY_RR"
         if [[ " $blacklisted_rrs " == *" $rr_type "* ]]; then
             test_blacklisted_type $rr_type
@@ -1071,7 +1072,7 @@ run_all_tests() {
     test_case_overlapping_registrations
     ensure_rr_absent KEY "$CLIENT_KEY_RR"
     
-    test_case_abcd_lease_policy_matrix
+    test_adds_and_deletes_matrix
     ensure_rr_absent KEY "$CLIENT_KEY_RR"
     
     test_case_signer_location_matrix
@@ -1097,12 +1098,15 @@ run_all_tests() {
     echo "Summary of what was tested:"
     echo -e "$PERFORMED_TESTS"
     echo ""
-    if [ "$PROXY_PROTOCOL" = "tls" ]; then
-        echo "Proxy process was exercised at $PROXY_TLS_URL over tls"
-    else
-        echo "Proxy process was exercised at $PROXY_URL over $PROXY_PROTOCOL"
+    case "$PROXY_PROTOCOL" in
+        tls) echo "Proxy process was exercised at $PROXY_TLS_URL over tls" ;;
+        doh) echo "Proxy process was exercised at $PROXY_DOH_URL over doh" ;;
+        *) echo "Proxy process was exercised at $PROXY_URL over $PROXY_PROTOCOL" ;;
+    esac
+    if [ "$PROXY_LAUNCH" = auto ]; then
+        echo "Proxy log: $PROXY_LOG_FILE"
     fi
-    echo "Logs: $LOG_FILE"
+    echo "Proxy config: $PROXY_CONFIG_FILE"
     if [ "$AUTH_BACKEND" = "local" ]; then
         echo "BIND log: ${BIND9_RUNDIR}/named.log"
     fi
@@ -1125,14 +1129,6 @@ cleanup() {
         # anything -- often the reason a later wait_for_rr_state timed out.
         [ -z "${BIND9_REJECTIONS_REPORTED:-}" ] && bind9_report_rejections
         stop_bind9
-        [ -n "$LOCAL_SCRATCH_DIR" ] && rm -rf "$LOCAL_SCRATCH_DIR"
-    fi
-
-    if [ -n "$TMP_TLS_DIR" ] && [ -d "$TMP_TLS_DIR" ]; then
-        rm -rf "$TMP_TLS_DIR"
-    fi
-    if [ -n "$TMP_CONFIG_FILE" ] && [ -f "$TMP_CONFIG_FILE" ]; then
-        rm -f "$TMP_CONFIG_FILE"
     fi
 
     set -e

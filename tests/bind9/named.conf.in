@@ -1,10 +1,11 @@
 // Template for the local BIND 9 CI gate (plan S14 Option C). lib/bind9.sh's start_bind9
-// copies this into a scratch runtime directory, substituting @RUNDIR@, before starting
-// named -- so the source tree's own copy (and the zone file template next to it) never
-// gets rewritten by BIND's own dynamic-update journal/zone-dump machinery.
+// copies this into a scratch runtime directory, substituting @RUNDIR@, @ADDR@, @PORT@ and
+// @SIG0_QUOTA@ (BIND9_ADDR, BIND9_PORT, BIND9_SIG0_QUOTA), before starting named -- so the
+// source tree's own copy (and the zone file template next to it) never gets rewritten by
+// BIND's own dynamic-update journal/zone-dump machinery.
 options {
     directory "@RUNDIR@";
-    listen-on port 5300 { 127.0.0.1; };
+    listen-on port @PORT@ { @ADDR@; };
     listen-on-v6 { none; };
     recursion no;
     dnssec-validation no;

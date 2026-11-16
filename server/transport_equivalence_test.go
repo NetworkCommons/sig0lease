@@ -2,12 +2,15 @@
 package server
 
 import (
+	"bytes"
 	"context"
 	"net"
+	"net/http"
 	"testing"
 	"time"
 
 	"codeberg.org/miekg/dns"
+	"codeberg.org/miekg/dns/dnshttp"
 	"github.com/NetworkCommons/sig0lease/client"
 	"github.com/NetworkCommons/sig0lease/config"
 	"github.com/NetworkCommons/sig0lease/logging"
@@ -62,18 +65,40 @@ func waitReady(t *testing.T, addr, protocol string) {
 	t.Fatalf("%s server on %s never became ready", protocol, addr)
 }
 
-// TestUDPTCPTransportEquivalence drives the same inputs through serveUDP
-// and serveTCP -- via the real client package, which already supports both
-// protocols -- and asserts they're handled identically. Both transports
-// run the same dns.Server accept policy (acceptMsg, wired as its
-// MsgAcceptFunc); this pins that they stay in lockstep.
-func TestUDPTCPTransportEquivalence(t *testing.T) {
+// startTransports starts handler behind serveUDP, serveTCP and serveDoH (plain HTTP), each
+// on its own loopback port, waits until each answers, and returns where the client package
+// reaches each protocol. The servers stop when the test ends.
+func startTransports(t *testing.T, handler dns.HandlerFunc) map[string]string {
+	t.Helper()
 	udpAddr := reserveAddr(t, "udp")
 	tcpAddr := reserveAddr(t, "tcp")
+	dohAddr := reserveAddr(t, "tcp")
 
 	logger := logging.NewLogger("debug")
 	udpSrv := &Server{cfg: &config.Config{Server: config.ServerConfig{Address: udpAddr}}, logger: logger}
 	tcpSrv := &Server{cfg: &config.Config{Server: config.ServerConfig{Address: tcpAddr}}, logger: logger}
+	dohSrv := &Server{cfg: &config.Config{Server: config.ServerConfig{DoH: &config.TLSConfig{Address: dohAddr}}}, logger: logger}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	go func() { _ = udpSrv.serveUDP(ctx, handler) }()
+	go func() { _ = tcpSrv.serveTCP(ctx, handler) }()
+	go func() { _ = dohSrv.serveDoH(ctx, handler) }()
+
+	addrs := map[string]string{"udp": udpAddr, "tcp": tcpAddr, "doh": "http://" + dohAddr}
+	for proto, addr := range addrs {
+		waitReady(t, addr, proto)
+	}
+	return addrs
+}
+
+// TestUDPTCPTransportEquivalence drives the same inputs through serveUDP,
+// serveTCP and serveDoH -- via the real client package, which supports each
+// protocol -- and asserts they're handled identically. UDP and TCP run the
+// same dns.Server accept policy (acceptMsg, wired as its MsgAcceptFunc), and
+// DoH's handler calls acceptMsg itself; this pins that they stay in lockstep.
+// Over DoH, "no reply" is an HTTP error, which the client returns as an error.
+func TestUDPTCPTransportEquivalence(t *testing.T) {
 
 	// A handler that always succeeds, so any test case that unexpectedly
 	// reaches it is obvious: its Rcode (Success) never matches the FORMERR/
@@ -86,14 +111,7 @@ func TestUDPTCPTransportEquivalence(t *testing.T) {
 		resp.Rcode = dns.RcodeSuccess
 		resp.WriteTo(w)
 	})
-
-	ctx, cancel := context.WithCancel(context.Background())
-	t.Cleanup(cancel)
-	go func() { _ = udpSrv.serveUDP(ctx, handler) }()
-	go func() { _ = tcpSrv.serveTCP(ctx, handler) }()
-
-	waitReady(t, udpAddr, "udp")
-	waitReady(t, tcpAddr, "tcp")
+	addrs := startTransports(t, handler)
 
 	rcode := func(r uint16) *uint16 { return &r }
 
@@ -148,13 +166,10 @@ func TestUDPTCPTransportEquivalence(t *testing.T) {
 
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			for _, proto := range []string{"udp", "tcp"} {
+			for _, proto := range []string{"udp", "tcp", "doh"} {
 				t.Run(proto, func(t *testing.T) {
-					addr := udpAddr
+					addr := addrs[proto]
 					timeout := 2 * time.Second
-					if proto == "tcp" {
-						addr = tcpAddr
-					}
 					if tc.wantRcode == nil {
 						timeout = 300 * time.Millisecond // fail fast: we expect no reply
 					}
@@ -184,7 +199,7 @@ func TestUDPTCPTransportEquivalence(t *testing.T) {
 	// needs raw sockets to put genuinely malformed bytes on the wire.
 	t.Run("malformed wire bytes are dropped without a reply", func(t *testing.T) {
 		t.Run("udp", func(t *testing.T) {
-			conn, err := net.Dial("udp", udpAddr)
+			conn, err := net.Dial("udp", addrs["udp"])
 			if err != nil {
 				t.Fatalf("dial: %v", err)
 			}
@@ -200,7 +215,7 @@ func TestUDPTCPTransportEquivalence(t *testing.T) {
 		})
 
 		t.Run("tcp", func(t *testing.T) {
-			conn, err := net.Dial("tcp", tcpAddr)
+			conn, err := net.Dial("tcp", addrs["tcp"])
 			if err != nil {
 				t.Fatalf("dial: %v", err)
 			}
@@ -219,6 +234,17 @@ func TestUDPTCPTransportEquivalence(t *testing.T) {
 				t.Fatalf("expected no reply to a malformed TCP frame")
 			}
 		})
+
+		t.Run("doh", func(t *testing.T) {
+			resp, err := http.Post(addrs["doh"]+dnshttp.Path, dnshttp.MimeType, bytes.NewReader([]byte{0xFF, 0xFF, 0xFF, 0xFF}))
+			if err != nil {
+				t.Fatalf("post: %v", err)
+			}
+			resp.Body.Close()
+			if resp.StatusCode != http.StatusBadRequest {
+				t.Fatalf("got HTTP %s, want 400 for a body that is not a DNS message", resp.Status)
+			}
+		})
 	})
 }
 
@@ -233,14 +259,8 @@ func TestUDPTCPTransportEquivalence(t *testing.T) {
 // register/refresh over either transport would look like "UPDATE without
 // UPDATE-LEASE" to the update handler. TestUDPTCPTransportEquivalence above
 // doesn't cover it: none of its cases populate Ns/Extra/Pseudo, since
-// acceptMsg only looks at the header and Question.
+// acceptMsg only looks at the header and Question. DoH is covered too.
 func TestServeTCPPreservesUpdateLeaseOption(t *testing.T) {
-	udpAddr := reserveAddr(t, "udp")
-	tcpAddr := reserveAddr(t, "tcp")
-
-	logger := logging.NewLogger("debug")
-	udpSrv := &Server{cfg: &config.Config{Server: config.ServerConfig{Address: udpAddr}}, logger: logger}
-	tcpSrv := &Server{cfg: &config.Config{Server: config.ServerConfig{Address: tcpAddr}}, logger: logger}
 
 	// One handler serves both transports. It reports, per UPDATE, whether
 	// it saw the option; filtering on the opcode keeps the plain-A
@@ -258,27 +278,16 @@ func TestServeTCPPreservesUpdateLeaseOption(t *testing.T) {
 		resp.Rcode = dns.RcodeSuccess
 		resp.WriteTo(w)
 	})
+	addrs := startTransports(t, handler)
 
-	ctx, cancel := context.WithCancel(context.Background())
-	t.Cleanup(cancel)
-	go func() { _ = udpSrv.serveUDP(ctx, handler) }()
-	go func() { _ = tcpSrv.serveTCP(ctx, handler) }()
-
-	waitReady(t, udpAddr, "udp")
-	waitReady(t, tcpAddr, "tcp")
-
-	for _, proto := range []string{"udp", "tcp"} {
+	for _, proto := range []string{"udp", "tcp", "doh"} {
 		t.Run(proto, func(t *testing.T) {
 			msg, err := dnsmsg.NewLeaseUpdate("lease-test.example.", nil, nil, 0, 0)
 			if err != nil {
 				t.Fatalf("build lease update: %v", err)
 			}
 
-			addr := udpAddr
-			if proto == "tcp" {
-				addr = tcpAddr
-			}
-			c := client.New(addr, proto, 2*time.Second)
+			c := client.New(addrs[proto], proto, 2*time.Second)
 			resp, err := c.Query(msg)
 			if err != nil {
 				t.Fatalf("query failed: %v", err)

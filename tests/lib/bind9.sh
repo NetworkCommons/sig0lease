@@ -49,7 +49,12 @@ start_bind9() {
     require_command named-checkconf
 
     BIND9_RUNDIR="$(mktemp -d /tmp/sig0lease-bind9.XXXXXX)"
-    sed "s#@RUNDIR@#${BIND9_RUNDIR}#g; s#@SIG0_QUOTA@#${BIND9_SIG0_QUOTA}#g" "${BIND9_TEMPLATE_DIR}/named.conf.in" > "${BIND9_RUNDIR}/named.conf"
+    sed "s#@RUNDIR@#${BIND9_RUNDIR}#g; s#@ADDR@#${BIND9_ADDR}#g; s#@PORT@#${BIND9_PORT}#g; s#@SIG0_QUOTA@#${BIND9_SIG0_QUOTA}#g" \
+        "${BIND9_TEMPLATE_DIR}/named.conf.in" > "${BIND9_RUNDIR}/named.conf"
+    if grep -q '@[A-Z0-9_]*@' "${BIND9_RUNDIR}/named.conf"; then
+        log_error "named.conf.in has a placeholder start_bind9 does not fill in: $(grep -o '@[A-Z0-9_]*@' "${BIND9_RUNDIR}/named.conf" | sort -u | tr '\n' ' ')"
+        return 1
+    fi
     sed "s#@SRP_REGISTRAR_PORT@#${BIND9_SRP_REGISTRAR_PORT}#g; s#@SRP_REGISTRAR_TLS_PORT@#${BIND9_SRP_REGISTRAR_TLS_PORT}#g" "${BIND9_TEMPLATE_DIR}/srp.test.zone.in" > "${BIND9_RUNDIR}/srp.test.zone"
     cp "${BIND9_TEMPLATE_DIR}/update.test.zone.in" "${BIND9_RUNDIR}/update.test.zone"
     cp "${BIND9_TEMPLATE_DIR}/default.service.arpa.zone.in" "${BIND9_RUNDIR}/default.service.arpa.zone"
@@ -106,16 +111,19 @@ start_bind9() {
 # bind9_report_rejections lists every request named rejected during this run, with named's
 # own reason, from named.log. Only request-handling categories are matched, so startup noise
 # such as the config category's "rndc.key: permission denied" is not mistaken for a
-# rejection. A SIG(0) quota refusal (named.conf.in's logging comment) is reported but
-# tolerated: the proxy retries it. Any other rejection -- an update-policy denial, an invalid
-# signature, a failed update -- returns 1, even if a later retry hid it from the test's own
-# checks.
+# rejection. The one exception is check-names: named refuses an update with a name that is
+# not a valid host name where one is required (e.g. an A record's owner, BIND's default
+# "check-names primary fail") and logs it once, in the general category, as the zone's
+# "bad owner name (check-names)" or "bad name (check-names)" error. A SIG(0) quota refusal
+# (named.conf.in's logging comment) is reported but tolerated: the proxy retries it. Any other
+# rejection -- an update-policy denial, an invalid signature, a failed update, a check-names
+# failure -- returns 1, even if a later retry hid it from the test's own checks.
 bind9_report_rejections() {
     local log="${BIND9_RUNDIR}/named.log"
     [ -f "$log" ] || return 0
 
     local rejections quota others
-    rejections="$(grep -E ' (client|update|update-security|security): .*(quota reached|denied|invalid signature|update failed|update unsuccessful|refused)' "$log" || true)"
+    rejections="$(grep -E ' (client|update|update-security|security): .*(quota reached|denied|invalid signature|update failed|update unsuccessful|refused)| general: error: zone .*\(check-names\)' "$log" || true)"
     if [ -z "$rejections" ]; then
         log_success "named rejected no requests during this run"
         return 0
@@ -140,9 +148,7 @@ bind9_report_rejections() {
 stop_bind9() {
     if [ -n "${BIND9_PID:-}" ] && kill -0 "$BIND9_PID" 2>/dev/null; then
         log_step "Stopping named (PID: $BIND9_PID)"
-        kill "$BIND9_PID" || true
-        sleep 1
-        kill -0 "$BIND9_PID" 2>/dev/null && kill -9 "$BIND9_PID" 2>/dev/null || true
+        stop_process "$BIND9_PID" || true
         log_success "named stopped"
     fi
     BIND9_PID=""

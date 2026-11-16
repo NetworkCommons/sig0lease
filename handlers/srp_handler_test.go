@@ -6,6 +6,7 @@ import (
 	"crypto/elliptic"
 	"crypto/rand"
 	"encoding/base64"
+	"fmt"
 	"net"
 	"strconv"
 	"strings"
@@ -44,14 +45,18 @@ type fakeSRPCoordinator struct {
 	// simulated in a single goroutine so the test stays deterministic).
 	onSendUpdate func()
 
-	// ptrExists/ptrExistsErr back QueryPTRExists (RFC 6763 S9's "is anything else still
-	// providing this type" check). Defaulting to (false, nil) matches every existing
-	// test's isolated-single-proxy world -- nothing else could possibly still be
-	// providing a type this process's own store has lost track of -- so a type dropping
-	// out of the local store still gets deleted from the enumeration record exactly as
-	// before, without any test needing to configure this explicitly.
-	ptrExists    bool
-	ptrExistsErr error
+	// zonePTRs and ptrQueryErr back QueryRRs, keyed by dnsname.Normalize(name): the PTRs
+	// the authoritative server holds at a name, for RFC 6763 S9's "is anything else still
+	// providing this type" check and S11's comparison with the config, or the error the
+	// query fails with. Empty by default, matching every existing test's
+	// isolated-single-proxy world -- nothing else could possibly still be providing a type
+	// this process's own store has lost track of -- so a type dropping out of the local store
+	// still gets deleted from the enumeration record without any test configuring this.
+	zonePTRs    map[string][]dns.RR
+	ptrQueryErr map[string]error
+
+	// authoritative, if set, answers QueryAuthoritative: the query route's upstream.
+	authoritative func(zoneHint string, req *dns.Msg) (*dns.Msg, error)
 }
 
 func (f *fakeSRPCoordinator) QueryKeyAtName(ctx context.Context, zoneHint, name string) (srp.AuthoritativeKeyState, []*dns.KEY, error) {
@@ -70,8 +75,38 @@ func (f *fakeSRPCoordinator) ResolveAuthoritativeZone(ctx context.Context, zone 
 	return zone, nil
 }
 
-func (f *fakeSRPCoordinator) QueryPTRExists(ctx context.Context, zoneHint, name string) (bool, error) {
-	return f.ptrExists, f.ptrExistsErr
+// QueryRRs answers PTR queries from zonePTRs and ptrQueryErr; the SRP handler asks for no
+// other type, so any other fails the query.
+func (f *fakeSRPCoordinator) QueryRRs(ctx context.Context, zoneHint, name string, rrType uint16) ([]dns.RR, error) {
+	if rrType != dns.TypePTR {
+		return nil, fmt.Errorf("fakeSRPCoordinator: unexpected %s query for %s", dns.TypeToString[rrType], name)
+	}
+	if err := f.ptrQueryErr[dnsname.Normalize(name)]; err != nil {
+		return nil, err
+	}
+	return f.zonePTRs[dnsname.Normalize(name)], nil
+}
+
+// setZonePTRs makes the fake authoritative server hold PTRs at name, one per target.
+func (f *fakeSRPCoordinator) setZonePTRs(name string, targets ...string) {
+	if f.zonePTRs == nil {
+		f.zonePTRs = map[string][]dns.RR{}
+	}
+	var rrs []dns.RR
+	for _, target := range targets {
+		rr := &dns.PTR{Hdr: dns.Header{Name: name, Class: dns.ClassINET, TTL: 3600}}
+		rr.Ptr = target
+		rrs = append(rrs, rr)
+	}
+	f.zonePTRs[dnsname.Normalize(name)] = rrs
+}
+
+// QueryAuthoritative answers with authoritative, or fails if the test gave the fake none.
+func (f *fakeSRPCoordinator) QueryAuthoritative(ctx context.Context, zoneHint string, req *dns.Msg, what string) (*dns.Msg, error) {
+	if f.authoritative == nil {
+		return nil, fmt.Errorf("fakeSRPCoordinator: no authoritative server for %s", what)
+	}
+	return f.authoritative(zoneHint, req)
 }
 
 // stubTCPResponseWriter presents as a TCP peer -- the default test harness's response
@@ -172,7 +207,11 @@ func buildSRPUpdateUnsigned(t *testing.T, zone string, identity *srpTestIdentity
 
 	msg.Ns = append(msg.Ns, srpDeleteAll(host))
 	for _, addr := range addrs {
-		msg.Ns = append(msg.Ns, srpMustRR(t, host+" 3600 IN A "+addr))
+		rrType := "A"
+		if strings.Contains(addr, ":") {
+			rrType = "AAAA"
+		}
+		msg.Ns = append(msg.Ns, srpMustRR(t, host+" 3600 IN "+rrType+" "+addr))
 	}
 	msg.Ns = append(msg.Ns, identity.keyAt(host))
 
@@ -236,7 +275,7 @@ func newSRPTestHandler(t *testing.T) (*SRPHandler, *fakeSRPCoordinator) {
 		keyState: srp.AuthNXDomain,
 		sendResp: &dns.Msg{MsgHeader: dns.MsgHeader{Rcode: dns.RcodeSuccess}},
 	}
-	h.coordinator = coord
+	h.upstreamCoordinator = coord
 	return h, coord
 }
 
@@ -329,6 +368,201 @@ func TestSRPHandle_ForwardsSynthesizedKEYForInstanceThatOmittedIt(t *testing.T) 
 	}
 	if !found {
 		t.Fatalf("expected a synthesized KEY add at the instance's own name (%s) matching the host's key material, got Ns: %+v", inst, coord.sent[0].Ns)
+	}
+}
+
+// TestSRPHandle_RemovalKeepsInstanceKEYUnlessKeyLeaseIsZero pins RFC 9665 S3.2.5.5.1: a
+// removal whose KEY-LEASE is not zero holds the names for the requester ("the SRP registrar
+// MUST NOT delete the KEY records for these service instances"), so the instance's KEY is
+// added back after its Delete All RRsets; with a KEY-LEASE of 0, a permanent removal, it
+// goes with the rest.
+func TestSRPHandle_RemovalKeepsInstanceKEYUnlessKeyLeaseIsZero(t *testing.T) {
+	for _, tt := range []struct {
+		keyLease uint32
+		wantKey  bool
+	}{{1209600, true}, {0, false}} {
+		h, coord := newSRPTestHandler(t)
+		id := newSRPTestIdentity(t)
+		const host = "srptest1r.dev.zenr.io."
+		live := oneWidgetInstance()
+		inst := live[0].name
+
+		register := buildSRPUpdate(t, srpTestZone, id, host, []string{"192.0.2.1"}, live, 30, 1209600, host)
+		if res := h.Handle(context.Background(), stubTCPResponseWriter{}, register); res.Status != StatusProcessed {
+			t.Fatalf("register: expected Processed, got %s: %v", res.Status, res.Error)
+		}
+		removal := buildSRPUpdate(t, srpTestZone, id, host, nil, []srpInstanceSpec{{name: inst, removalShaped: true}}, 0, tt.keyLease, host)
+		sentBefore := len(coord.sent)
+		if res := h.Handle(context.Background(), stubTCPResponseWriter{}, removal); res.Status != StatusProcessed {
+			t.Fatalf("removal with KEY-LEASE %d: expected Processed, got %s: %v", tt.keyLease, res.Status, res.Error)
+		}
+
+		// Every UPDATE the removal sent: the service-type enumeration follows in one of its own.
+		found := false
+		for _, sent := range coord.sent[sentBefore:] {
+			for _, rr := range sent.Ns {
+				if key, ok := rr.(*dns.KEY); ok && key.Hdr.Class != dns.ClassNONE && key.Hdr.Name == inst {
+					found = true
+				}
+			}
+		}
+		if found != tt.wantKey {
+			t.Errorf("removal with KEY-LEASE %d: KEY add at %s forwarded = %v, want %v", tt.keyLease, inst, found, tt.wantKey)
+		}
+	}
+}
+
+// A LEASE of 0 removes the host with its live service instances, listed or not, and their
+// PTRs, keeping their KEYs while KEY-LEASE is not 0 (RFC 9665 S3.2.5.5.1). Adds it carries are
+// dropped, not forwarded or stored: OpenThread's client sends its addresses with every
+// removal. An update with a LEASE leaves the instances it omits alone.
+func TestSRPHandle_HostRemovalRemovesEveryInstance(t *testing.T) {
+	widget := oneWidgetInstance()[0]
+	gadget := srpInstanceSpec{name: "Gadget._ipp._tcp.dev.zenr.io.", port: 631, txt: "rp=x", svctype: "_ipp._tcp.dev.zenr.io."}
+	for _, tt := range []struct {
+		name            string
+		addrs           []string
+		listed          []srpInstanceSpec
+		lease, keyLease uint32
+		removed, keys   bool
+	}{
+		{"removal keeping the names", nil, nil, 0, 1209600, true, true},
+		{"removal freeing the names", nil, nil, 0, 0, true, false},
+		{"removal with an address, as OpenThread's client sends it", []string{"2001:db8::1"}, nil, 0, 1209600, true, true},
+		{"removal listing an instance with its records", []string{"192.0.2.1"}, []srpInstanceSpec{widget}, 0, 1209600, true, true},
+		{"an address, no instance listed", []string{"192.0.2.1"}, nil, 30, 1209600, false, false},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			h, coord := newSRPTestHandler(t)
+			id := newSRPTestIdentity(t)
+			const host = "srptest1u.dev.zenr.io."
+			register := buildSRPUpdate(t, srpTestZone, id, host, []string{"192.0.2.1"}, []srpInstanceSpec{widget, gadget}, 30, 1209600, host)
+			if res := h.Handle(context.Background(), stubTCPResponseWriter{}, register); res.Status != StatusProcessed {
+				t.Fatalf("register: expected Processed, got %s: %v", res.Status, res.Error)
+			}
+			update := buildSRPUpdate(t, srpTestZone, id, host, tt.addrs, tt.listed, tt.lease, tt.keyLease, host)
+			sentBefore := len(coord.sent)
+			if res := h.Handle(context.Background(), stubTCPResponseWriter{}, update); res.Status != StatusProcessed {
+				t.Fatalf("update: expected Processed, got %s: %v", res.Status, res.Error)
+			}
+
+			if tt.lease == 0 {
+				for _, sent := range coord.sent[sentBefore:] {
+					for _, rr := range sent.Ns {
+						switch rr.(type) {
+						case *dns.A, *dns.AAAA, *dns.SRV, *dns.TXT, *dns.PTR:
+							if rr.Header().Class == dns.ClassINET {
+								t.Errorf("a removal forwarded the add %s", rr)
+							}
+						}
+					}
+				}
+				if set := h.leaseManager.GetNonKEYRecordSet(leasepkg.NodeKey(id.keyAt(host))); set != nil && len(set.Records) > 0 {
+					t.Errorf("the removed host's addresses are in the lease store: %v", set.Records)
+				}
+			}
+
+			for _, inst := range []srpInstanceSpec{widget, gadget} {
+				var deleted, keyAdded, ptrDeleted bool
+				for _, sent := range coord.sent[sentBefore:] {
+					for _, rr := range sent.Ns {
+						switch r := rr.(type) {
+						case *dns.ANY:
+							deleted = deleted || (r.Hdr.Class == dns.ClassANY && dnsname.EqualFold(r.Hdr.Name, inst.name))
+						case *dns.KEY:
+							keyAdded = keyAdded || (r.Hdr.Class != dns.ClassNONE && dnsname.EqualFold(r.Hdr.Name, inst.name))
+						case *dns.PTR:
+							ptrDeleted = ptrDeleted || (r.Hdr.Class == dns.ClassNONE && dnsname.EqualFold(r.Ptr, inst.name))
+						}
+					}
+				}
+				if deleted != tt.removed || ptrDeleted != tt.removed || keyAdded != tt.keys {
+					t.Errorf("%s: deleted %v, PTR deleted %v, KEY added %v; want %v, %v, %v", inst.name, deleted, ptrDeleted, keyAdded, tt.removed, tt.removed, tt.keys)
+				}
+				set := h.leaseManager.GetNonKEYRecordSet(leasepkg.NodeKey(id.keyAt(inst.name)))
+				if stored := set != nil && len(set.Records) > 0; stored == tt.removed {
+					t.Errorf("%s: SRV/TXT/PTR in the lease store %v, want %v", inst.name, stored, !tt.removed)
+				}
+			}
+		})
+	}
+}
+
+// A removal with a KEY-LEASE of 0 frees the names (RFC 9665 S3.2.5.5.1) before it is answered,
+// as an RFC 9664 KEY delete does: its one UPDATE deletes every KEY the store holds at and
+// below the host -- also that of an instance no longer advertised that still holds its name,
+// which no Delete All RRsets reaches -- and adds none back, and the store forgets them, leaving
+// no timer to delete anything after the answer. If the authoritative server refuses that
+// UPDATE, nothing is forgotten. Before, the KEYs were stored with a KEY-LEASE of 0 and deleted
+// by their timers after the answer, so a proxy stopped in between left them in the zone.
+func TestSRPHandle_FreeingTheNamesDeletesEveryKEYBeforeTheAnswer(t *testing.T) {
+	widget := oneWidgetInstance()[0]
+	gadget := srpInstanceSpec{name: "Gadget._ipp._tcp.dev.zenr.io.", port: 631, txt: "rp=x", svctype: "_ipp._tcp.dev.zenr.io."}
+	for _, tt := range []struct {
+		name  string
+		rcode int
+	}{{"accepted", dns.RcodeSuccess}, {"refused", dns.RcodeRefused}} {
+		t.Run(tt.name, func(t *testing.T) {
+			h, coord := newSRPTestHandler(t)
+			id := newSRPTestIdentity(t)
+			const host = "srptest1f.dev.zenr.io."
+			register := buildSRPUpdate(t, srpTestZone, id, host, []string{"192.0.2.1"}, []srpInstanceSpec{widget, gadget}, 30, 1209600, host)
+			if res := h.Handle(context.Background(), stubTCPResponseWriter{}, register); res.Status != StatusProcessed {
+				t.Fatalf("register: expected Processed, got %s: %v", res.Status, res.Error)
+			}
+			// The gadget is no longer advertised; its KEY holds its name.
+			withdraw := buildSRPUpdate(t, srpTestZone, id, host, []string{"192.0.2.1"}, []srpInstanceSpec{{name: gadget.name, removalShaped: true}}, 30, 1209600, host)
+			if res := h.Handle(context.Background(), stubTCPResponseWriter{}, withdraw); res.Status != StatusProcessed {
+				t.Fatalf("withdraw: expected Processed, got %s: %v", res.Status, res.Error)
+			}
+
+			coord.sendResp = &dns.Msg{MsgHeader: dns.MsgHeader{Rcode: uint16(tt.rcode)}}
+			sentBefore := len(coord.sent)
+			res := h.Handle(context.Background(), stubTCPResponseWriter{}, buildSRPUpdate(t, srpTestZone, id, host, nil, nil, 0, 0, host))
+			if accepted := tt.rcode == dns.RcodeSuccess; (res.Status == StatusProcessed) != accepted {
+				t.Fatalf("removal: got %s (%v), want processed %v", res.Status, res.Error, accepted)
+			}
+
+			for _, name := range []string{host, widget.name, gadget.name} {
+				node := leasepkg.NodeKey(id.keyAt(name))
+				if tt.rcode != dns.RcodeSuccess {
+					if h.leaseManager.Get(node) == nil {
+						t.Errorf("%s: forgotten, though the authoritative server refused the removal", name)
+					}
+					continue
+				}
+				var deleted bool
+				for _, rr := range coord.sent[sentBefore].Ns {
+					key, ok := rr.(*dns.KEY)
+					if !ok || !dnsname.EqualFold(key.Hdr.Name, name) {
+						continue
+					}
+					if key.Hdr.Class == dns.ClassINET {
+						t.Errorf("%s: the removal added its KEY back", name)
+					}
+					deleted = deleted || key.Hdr.Class == dns.ClassNONE
+				}
+				if !deleted {
+					t.Errorf("%s: the removal's UPDATE did not delete its KEY", name)
+				}
+				if h.leaseManager.Get(node) != nil || h.timers.armed(node) {
+					t.Errorf("%s: in the lease store %v, timer armed %v, after the answer; want neither", name, h.leaseManager.Get(node) != nil, h.timers.armed(node))
+				}
+			}
+		})
+	}
+}
+
+// RFC 9665 S3.3.1.3 allows a Host Description without an address only in a removal (LEASE
+// 0): with a LEASE, the update is not an SRP Update, refused (S3.3.2), and nothing is sent.
+func TestSRPHandle_HostWithoutAddressNeedsLeaseZero(t *testing.T) {
+	h, coord := newSRPTestHandler(t)
+	id := newSRPTestIdentity(t)
+	const host = "srptest1u.dev.zenr.io."
+	res := h.Handle(context.Background(), stubTCPResponseWriter{}, buildSRPUpdate(t, srpTestZone, id, host, nil, nil, 30, 1209600, host))
+	wantErrorReply(t, res, dns.RcodeRefused, dns.ExtendedErrorOther, "no address")
+	if len(coord.sent) != 0 {
+		t.Errorf("sent %d upstream UPDATEs, want none", len(coord.sent))
 	}
 }
 
@@ -481,6 +715,9 @@ func TestSRPHandle_FCFSConflict(t *testing.T) {
 	if res.Status != StatusError || res.Message == nil || res.Message.Rcode != dns.RcodeYXDomain {
 		t.Fatalf("expected YXDOMAIN conflict, got status=%s message=%+v err=%v", res.Status, res.Message, res.Error)
 	}
+	// The name is held by another key: Prohibited, as the RFC 9664 handler answers a record
+	// registered under another key.
+	wantErrorReply(t, res, dns.RcodeYXDomain, dns.ExtendedErrorProhibited, "held by a different key")
 	if len(coord.sent) != sentBefore {
 		t.Fatalf("FCFS conflict must be rejected before any upstream forward (deferred-mutation) -- sent count changed from %d to %d", sentBefore, len(coord.sent))
 	}
@@ -543,7 +780,7 @@ func TestSRPHandle_HijackViaBundledHost_Refused(t *testing.T) {
 
 func TestSRPHandle_ForeignDataRefusedByDefault(t *testing.T) {
 	h, coord := newSRPTestHandler(t)
-	fake := h.coordinator.(*fakeSRPCoordinator)
+	fake := h.upstreamCoordinator.(*fakeSRPCoordinator)
 	fake.keyState = srp.AuthNoKey // simulates an authoritative name with data but no KEY
 	id := newSRPTestIdentity(t)
 	const host = "srptest4.dev.zenr.io."
@@ -553,6 +790,7 @@ func TestSRPHandle_ForeignDataRefusedByDefault(t *testing.T) {
 	if res.Status != StatusError || res.Message == nil || res.Message.Rcode != dns.RcodeRefused {
 		t.Fatalf("expected REFUSED, got status=%s message=%+v", res.Status, res.Message)
 	}
+	wantErrorReply(t, res, dns.RcodeRefused, dns.ExtendedErrorProhibited, "non-SRP data")
 	if len(coord.sent) != 0 {
 		t.Fatalf("expected no upstream forward for a refused request, got %d", len(coord.sent))
 	}
@@ -561,7 +799,7 @@ func TestSRPHandle_ForeignDataRefusedByDefault(t *testing.T) {
 func TestSRPHandle_ForeignDataAllowedWhenConfigured(t *testing.T) {
 	h, _ := newSRPTestHandler(t)
 	h.refuseOnForeignData = false
-	fake := h.coordinator.(*fakeSRPCoordinator)
+	fake := h.upstreamCoordinator.(*fakeSRPCoordinator)
 	fake.keyState = srp.AuthNoKey
 	id := newSRPTestIdentity(t)
 	const host = "srptest5.dev.zenr.io."
@@ -577,7 +815,7 @@ func TestSRPHandle_ForeignDataAllowedWhenConfigured(t *testing.T) {
 
 func TestSRPHandle_UpstreamRejection_NoLocalMutation(t *testing.T) {
 	h, _ := newSRPTestHandler(t)
-	fake := h.coordinator.(*fakeSRPCoordinator)
+	fake := h.upstreamCoordinator.(*fakeSRPCoordinator)
 	fake.sendResp = &dns.Msg{MsgHeader: dns.MsgHeader{Rcode: dns.RcodeServerFailure}}
 	id := newSRPTestIdentity(t)
 	const host = "srptest6.dev.zenr.io."
@@ -587,6 +825,7 @@ func TestSRPHandle_UpstreamRejection_NoLocalMutation(t *testing.T) {
 	if res.Status != StatusError || res.Message == nil || res.Message.Rcode != dns.RcodeServerFailure {
 		t.Fatalf("expected SERVFAIL, got status=%s message=%+v", res.Status, res.Message)
 	}
+	wantErrorReply(t, res, dns.RcodeServerFailure, dns.ExtendedErrorNoReachableAuthority, "upstream UPDATE rejected: rcode=2 (SERVFAIL)")
 
 	if rec := h.leaseManager.Get(leasepkg.NodeKey(id.keyAt(host))); rec != nil {
 		t.Fatalf("deferred-mutation violated: local store was written despite the upstream UPDATE being rejected: %+v", rec)
@@ -816,17 +1055,32 @@ func TestSRPHandle_NotSRPShaped_NotRelevant(t *testing.T) {
 	}
 }
 
-func TestSRPHandle_WrongZone_NotRelevant(t *testing.T) {
-	h, _ := newSRPTestHandler(t)
+// An update for this handler's host whose Zone Section does not enclose its names is answered
+// NOTZONE (RFC 2136 S3.4.1.3), before anything goes upstream.
+func TestSRPHandle_ZoneSectionNotEnclosing_NotZone(t *testing.T) {
+	h, coord := newSRPTestHandler(t)
 	id := newSRPTestIdentity(t)
 	const host = "srptest8.dev.zenr.io."
 
-	msg := buildSRPUpdate(t, srpTestZone, id, host, []string{"192.0.2.1"}, oneWidgetInstance(), 30, 1209600, host)
-	msg.Question[0].Header().Name = "other.example." // not this handler's configured zone
-
+	msg := buildSRPUpdate(t, "other.example.", id, host, []string{"192.0.2.1"}, oneWidgetInstance(), 30, 1209600, host)
 	res := h.Handle(context.Background(), stubTCPResponseWriter{}, msg)
-	if res.Status != StatusNotRelevant {
-		t.Fatalf("expected NotRelevant for a foreign zone, got %s (%s)", res.Status, res.Reason)
+	wantErrorReply(t, res, dns.RcodeNotZone, dns.ExtendedErrorOther, "srptest8.dev.zenr.io. is outside other.example.")
+	if len(coord.sent) != 0 {
+		t.Fatalf("expected nothing sent upstream, got %d UPDATE(s)", len(coord.sent))
+	}
+}
+
+// Any Zone Section enclosing the names will do: the zone apex, as RFC 2136 and RFC 9665 S3.3
+// ask, takes the same path as the handler's own zone.
+func TestSRPHandle_ZoneApexInZoneSection_Processed(t *testing.T) {
+	h, _ := newSRPTestHandler(t)
+	id := newSRPTestIdentity(t)
+	const host = "srptest9.dev.zenr.io."
+
+	msg := buildSRPUpdate(t, "zenr.io.", id, host, []string{"192.0.2.1"}, oneWidgetInstance(), 30, 1209600, host)
+	res := h.Handle(context.Background(), stubTCPResponseWriter{}, msg)
+	if res.Status != StatusProcessed || res.Message == nil || res.Message.Rcode != dns.RcodeSuccess {
+		t.Fatalf("expected Processed/NOERROR, got status=%s message=%+v err=%v", res.Status, res.Message, res.Error)
 	}
 }
 
@@ -1157,7 +1411,7 @@ func TestSRPHandle_RemoveOneInstance(t *testing.T) {
 	}
 
 	// sent[3] is the removal's own RFC 6763 S9 enumeration reconcile: with no other
-	// registrant providing _http._tcp (the fake's default QueryPTRExists = false), it must
+	// registrant providing _http._tcp (the fake holds no PTR there by default), it must
 	// actually delete the now-unused type from the enumeration record.
 	enumOwner := "_services._dns-sd._udp." + srpTestZone
 	foundEnumDelete := false
@@ -1176,7 +1430,7 @@ func TestSRPHandle_RemoveOneInstance(t *testing.T) {
 // dev.zenr.io. zone: a second, independent proxy process (or a restart of the same one)
 // has no local knowledge of a type a DIFFERENT/earlier registrant provided, so removing the
 // one instance THIS process does know about must not blindly delete the shared enumeration
-// entry out from under that other, still-live registrant. QueryPTRExists standing in for
+// entry out from under that other, still-live registrant. A PTR at the browsing name standing in for
 // "yes, something else still answers a real browse for this type" is exactly the live check
 // reconcileServiceEnumeration performs before ever emitting a delete.
 func TestSRPHandle_ServiceEnumeration_KeepsListedWhenAnotherRegistrantStillProvidesType(t *testing.T) {
@@ -1191,7 +1445,7 @@ func TestSRPHandle_ServiceEnumeration_KeepsListedWhenAnotherRegistrantStillProvi
 	}
 
 	// Another registrant this process doesn't manage still answers a browse for the type.
-	coord.ptrExists = true
+	coord.setZonePTRs("_http._tcp."+srpTestZone, "Other._http._tcp."+srpTestZone)
 
 	removal := []srpInstanceSpec{{name: inst, removalShaped: true}}
 	second := buildSRPUpdate(t, srpTestZone, id, host, []string{"192.0.2.1"}, removal, 30, 1209600, host)
@@ -1218,23 +1472,195 @@ func TestSRPHandle_ServiceEnumeration_KeepsListedWhenAnotherRegistrantStillProvi
 	}
 }
 
-// alwaysOnDomainEnumPrefixes are the three RFC 6763 S11 prefixes reconcileServiceEnumeration
-// publishes whenever at least one service type is live, with no config opt-in required --
-// "r"/"dr" (registration domains) are separately gated behind advertiseRegistrationDomain and
-// covered by their own tests below.
-var alwaysOnDomainEnumPrefixes = []string{"b", "db", "lb"}
+// browsePrefixes and registrationPrefixes are the RFC 6763 S11 domain-enumeration prefixes
+// advertise_browse_domain and advertise_registration_domain control.
+var (
+	browsePrefixes       = []string{"b", "db", "lb"}
+	registrationPrefixes = []string{"r", "dr"}
+)
 
-// TestSRPHandle_BrowseDomains_AddedOnRegistrationRemovedWhenZoneEmpties exercises the three
-// always-on RFC 6763 S11 domain-enumeration PTRs (b/db/lb, all self-pointing at the zone)
-// reconcileServiceEnumeration now also maintains alongside the S9 type-enumeration record: a
-// domain-enumeration browse tool (e.g. a "browse everything" inspector) queries one of these
-// FIRST, before it ever asks for the S9 type list -- without them, a zone with perfectly
-// correct S9/S4.1 data is still invisible to such a tool. This pins all three appearing
-// together on the first registration and disappearing together once the zone's only
-// registration is removed (mirroring the S9 type record's own add-then-delete shape, bundled
-// into the same upstream messages).
-func TestSRPHandle_BrowseDomains_AddedOnRegistrationRemovedWhenZoneEmpties(t *testing.T) {
+// domainEnumOwner is prefix's S11 name in srpTestZone.
+func domainEnumOwner(prefix string) string { return prefix + "._dns-sd._udp." + srpTestZone }
+
+// domainEnumChanges returns the PTRs msg's update section adds (class IN) and deletes one by
+// one (class NONE) at prefix's S11 name.
+func domainEnumChanges(msg *dns.Msg, prefix string) (adds, deletes []*dns.PTR) {
+	for _, rr := range msg.Ns {
+		ptr, ok := rr.(*dns.PTR)
+		if !ok || !dnsname.EqualFold(ptr.Hdr.Name, domainEnumOwner(prefix)) {
+			continue
+		}
+		switch ptr.Hdr.Class {
+		case dns.ClassINET:
+			adds = append(adds, ptr)
+		case dns.ClassNONE:
+			deletes = append(deletes, ptr)
+		}
+	}
+	return adds, deletes
+}
+
+// requireSelfPointingAdd fails unless msg adds prefix's S11 PTR, naming the zone itself, and
+// deletes nothing there.
+func requireSelfPointingAdd(t *testing.T, msg *dns.Msg, prefix string) {
+	t.Helper()
+	adds, deletes := domainEnumChanges(msg, prefix)
+	if len(adds) != 1 || !dnsname.EqualFold(adds[0].Ptr, srpTestZone) || len(deletes) != 0 {
+		t.Fatalf("%s: want one add of PTR %s and no delete, got adds %v, deletes %v", prefix, srpTestZone, adds, deletes)
+	}
+}
+
+// requireSelfPointingDelete fails unless msg deletes prefix's S11 PTR naming the zone itself,
+// that record alone, and adds nothing there.
+func requireSelfPointingDelete(t *testing.T, msg *dns.Msg, prefix string) {
+	t.Helper()
+	adds, deletes := domainEnumChanges(msg, prefix)
+	if len(deletes) != 1 || !dnsname.EqualFold(deletes[0].Ptr, srpTestZone) || len(adds) != 0 {
+		t.Fatalf("%s: want one delete of PTR %s and no add, got adds %v, deletes %v", prefix, srpTestZone, adds, deletes)
+	}
+}
+
+// requireUntouched fails if msg changes anything at prefix's S11 name.
+func requireUntouched(t *testing.T, msg *dns.Msg, prefix string) {
+	t.Helper()
+	if adds, deletes := domainEnumChanges(msg, prefix); len(adds) != 0 || len(deletes) != 0 {
+		t.Fatalf("%s: want no change, got adds %v, deletes %v", prefix, adds, deletes)
+	}
+}
+
+// TestDomainEnumeration_PublishedWithNothingRegistered: with the defaults (browse on, register
+// off) and nothing registered, a pass publishes b/db/lb, each naming the zone, and no r/dr.
+// Whether to browse a zone is the operator's choice, not a fact about what is registered.
+func TestDomainEnumeration_PublishedWithNothingRegistered(t *testing.T) {
 	h, coord := newSRPTestHandler(t)
+
+	h.reconcileDomainEnumeration(context.Background())
+
+	if len(coord.sent) != 1 {
+		t.Fatalf("want one UPDATE, got %d", len(coord.sent))
+	}
+	for _, prefix := range browsePrefixes {
+		requireSelfPointingAdd(t, coord.sent[0], prefix)
+	}
+	for _, prefix := range registrationPrefixes {
+		requireUntouched(t, coord.sent[0], prefix)
+	}
+}
+
+// TestDomainEnumeration_RegistrationDomainsWhenOptedIn: advertise_registration_domain on and
+// advertise_browse_domain off publish r/dr and leave b/db/lb absent.
+func TestDomainEnumeration_RegistrationDomainsWhenOptedIn(t *testing.T) {
+	h, coord := newSRPTestHandler(t)
+	h.advertiseBrowseDomain = false
+	h.advertiseRegistrationDomain = true
+
+	h.reconcileDomainEnumeration(context.Background())
+
+	if len(coord.sent) != 1 {
+		t.Fatalf("want one UPDATE, got %d", len(coord.sent))
+	}
+	for _, prefix := range registrationPrefixes {
+		requireSelfPointingAdd(t, coord.sent[0], prefix)
+	}
+	for _, prefix := range browsePrefixes {
+		requireUntouched(t, coord.sent[0], prefix)
+	}
+}
+
+// TestDomainEnumeration_NothingSentWhenTheZoneMatches: a pass that finds the zone already as
+// the config wants it sends no UPDATE.
+func TestDomainEnumeration_NothingSentWhenTheZoneMatches(t *testing.T) {
+	h, coord := newSRPTestHandler(t)
+	for _, prefix := range browsePrefixes {
+		coord.setZonePTRs(domainEnumOwner(prefix), srpTestZone)
+	}
+
+	h.reconcileDomainEnumeration(context.Background())
+
+	if len(coord.sent) != 0 {
+		t.Fatalf("want no UPDATE, got %d: %v", len(coord.sent), coord.sent)
+	}
+}
+
+// TestDomainEnumeration_SettingOffDeletesWhatAnEarlierRunPublished: a handler that has never
+// written anything, as after a restart, with both settings off, finds all five records in
+// the zone and deletes each, record by record. Comparing with its own memory, it would
+// have sent nothing and left them for good.
+func TestDomainEnumeration_SettingOffDeletesWhatAnEarlierRunPublished(t *testing.T) {
+	h, coord := newSRPTestHandler(t)
+	h.advertiseBrowseDomain = false
+	h.advertiseRegistrationDomain = false
+	all := append(append([]string{}, browsePrefixes...), registrationPrefixes...)
+	for _, prefix := range all {
+		coord.setZonePTRs(domainEnumOwner(prefix), srpTestZone)
+	}
+
+	h.reconcileDomainEnumeration(context.Background())
+
+	if len(coord.sent) != 1 {
+		t.Fatalf("want one UPDATE, got %d", len(coord.sent))
+	}
+	for _, prefix := range all {
+		requireSelfPointingDelete(t, coord.sent[0], prefix)
+	}
+}
+
+// TestDomainEnumeration_LeavesAPTRToAnotherDomainAlone: a PTR at an S11 name naming another
+// domain, such as one the zone's operator publishes, is never deleted, with the setting off or
+// on; only the self-pointing record is added or deleted next to it.
+func TestDomainEnumeration_LeavesAPTRToAnotherDomainAlone(t *testing.T) {
+	const other = "other.example."
+
+	t.Run("setting off", func(t *testing.T) {
+		h, coord := newSRPTestHandler(t)
+		h.advertiseBrowseDomain = false
+		coord.setZonePTRs(domainEnumOwner("b"), other, srpTestZone)
+		coord.setZonePTRs(domainEnumOwner("lb"), other)
+
+		h.reconcileDomainEnumeration(context.Background())
+
+		if len(coord.sent) != 1 {
+			t.Fatalf("want one UPDATE, got %d", len(coord.sent))
+		}
+		requireSelfPointingDelete(t, coord.sent[0], "b")
+		requireUntouched(t, coord.sent[0], "lb")
+	})
+
+	t.Run("setting on", func(t *testing.T) {
+		h, coord := newSRPTestHandler(t)
+		coord.setZonePTRs(domainEnumOwner("b"), other)
+
+		h.reconcileDomainEnumeration(context.Background())
+
+		if len(coord.sent) != 1 {
+			t.Fatalf("want one UPDATE, got %d", len(coord.sent))
+		}
+		requireSelfPointingAdd(t, coord.sent[0], "b")
+	})
+}
+
+// TestDomainEnumeration_FailedQueryLeavesThatNameForTheNextPass: a name whose query fails is
+// neither added nor deleted this pass; the others are still brought in line.
+func TestDomainEnumeration_FailedQueryLeavesThatNameForTheNextPass(t *testing.T) {
+	h, coord := newSRPTestHandler(t)
+	coord.ptrQueryErr = map[string]error{dnsname.Normalize(domainEnumOwner("b")): fmt.Errorf("upstream timeout")}
+
+	h.reconcileDomainEnumeration(context.Background())
+
+	if len(coord.sent) != 1 {
+		t.Fatalf("want one UPDATE, got %d", len(coord.sent))
+	}
+	requireUntouched(t, coord.sent[0], "b")
+	requireSelfPointingAdd(t, coord.sent[0], "db")
+	requireSelfPointingAdd(t, coord.sent[0], "lb")
+}
+
+// TestSRPHandle_RegistrationSendsNoDomainEnumeration: a registration and a removal, with both
+// settings on, touch no S11 record. Only the reconciliation pass does: nothing a request
+// changes decides them.
+func TestSRPHandle_RegistrationSendsNoDomainEnumeration(t *testing.T) {
+	h, coord := newSRPTestHandler(t)
+	h.advertiseRegistrationDomain = true
 	id := newSRPTestIdentity(t)
 	const host = "srptest12c.dev.zenr.io."
 	inst := oneWidgetInstance()[0].name
@@ -1243,222 +1669,18 @@ func TestSRPHandle_BrowseDomains_AddedOnRegistrationRemovedWhenZoneEmpties(t *te
 	if res := h.Handle(context.Background(), stubTCPResponseWriter{}, first); res.Status != StatusProcessed {
 		t.Fatalf("fresh registration: expected Processed, got %s: %v", res.Status, res.Error)
 	}
-
-	// sent[0]=registration forward, sent[1]=its RFC 6763 S9/S11 enumeration reconcile.
-	for _, prefix := range alwaysOnDomainEnumPrefixes {
-		owner := prefix + "._dns-sd._udp." + srpTestZone
-		found := false
-		for _, rr := range coord.sent[1].Ns {
-			if ptr, ok := rr.(*dns.PTR); ok && ptr.Hdr.Class == dns.ClassINET && dnsname.Normalize(ptr.Hdr.Name) == dnsname.Normalize(owner) {
-				if dnsname.Normalize(ptr.Ptr) != dnsname.Normalize(srpTestZone) {
-					t.Fatalf("%s: expected the domain-enumeration PTR to point at the zone itself, got %q", prefix, ptr.Ptr)
-				}
-				found = true
-			}
-		}
-		if !found {
-			t.Fatalf("expected the registration's own enumeration reconcile to add the %q domain-enumeration PTR, got Ns: %+v", prefix, coord.sent[1].Ns)
-		}
-	}
-
 	removal := []srpInstanceSpec{{name: inst, removalShaped: true}}
 	second := buildSRPUpdate(t, srpTestZone, id, host, []string{"192.0.2.1"}, removal, 30, 1209600, host)
 	if res := h.Handle(context.Background(), stubTCPResponseWriter{}, second); res.Status != StatusProcessed {
 		t.Fatalf("removal: expected Processed, got %s: %v", res.Status, res.Error)
 	}
 
-	// sent[2]=removal forward, sent[3]=its own enumeration reconcile.
-	for _, prefix := range alwaysOnDomainEnumPrefixes {
-		owner := prefix + "._dns-sd._udp." + srpTestZone
-		found := false
-		for _, rr := range coord.sent[3].Ns {
-			if ptr, ok := rr.(*dns.PTR); ok && ptr.Hdr.Class == dns.ClassNONE && dnsname.Normalize(ptr.Hdr.Name) == dnsname.Normalize(owner) {
-				found = true
-			}
-		}
-		if !found {
-			t.Fatalf("expected the removal's own enumeration reconcile to delete the now-unused %q domain-enumeration PTR, got Ns: %+v", prefix, coord.sent[3].Ns)
-		}
-	}
-}
-
-// TestSRPHandle_BrowseDomains_KeptWhenAnotherRegistrantStillProvidesAType mirrors
-// TestSRPHandle_ServiceEnumeration_KeepsListedWhenAnotherRegistrantStillProvidesType for the
-// always-on S11 domain-enumeration PTRs: removing the only instance THIS process knows about
-// must not delete b/db/lb out from under a different, still-live registrant elsewhere in the
-// same shared zone.
-func TestSRPHandle_BrowseDomains_KeptWhenAnotherRegistrantStillProvidesAType(t *testing.T) {
-	h, coord := newSRPTestHandler(t)
-	id := newSRPTestIdentity(t)
-	const host = "srptest12d.dev.zenr.io."
-	inst := oneWidgetInstance()[0].name
-
-	first := buildSRPUpdate(t, srpTestZone, id, host, []string{"192.0.2.1"}, oneWidgetInstance(), 30, 1209600, host)
-	if res := h.Handle(context.Background(), stubTCPResponseWriter{}, first); res.Status != StatusProcessed {
-		t.Fatalf("fresh registration: expected Processed, got %s: %v", res.Status, res.Error)
-	}
-
-	// Another registrant this process doesn't manage still answers a browse for the type.
-	coord.ptrExists = true
-
-	removal := []srpInstanceSpec{{name: inst, removalShaped: true}}
-	second := buildSRPUpdate(t, srpTestZone, id, host, []string{"192.0.2.1"}, removal, 30, 1209600, host)
-	if res := h.Handle(context.Background(), stubTCPResponseWriter{}, second); res.Status != StatusProcessed {
-		t.Fatalf("removal: expected Processed, got %s: %v", res.Status, res.Error)
-	}
-
-	// Same as the S9 type-enumeration analogue: with the type still live elsewhere, none of
-	// these records has anything to change, so the removal's own enumeration reconcile sends
-	// nothing at all -- only the removal forward itself (sent[2]) is expected.
-	if len(coord.sent) != 3 {
-		t.Fatalf("expected 3 upstream sends (registration forward, its enumeration add, removal forward -- no enumeration send for the removal), got %d", len(coord.sent))
+	if len(coord.sent) == 0 {
+		t.Fatal("want the registration and removal sent upstream")
 	}
 	for _, msg := range coord.sent {
-		for _, rr := range msg.Ns {
-			ptr, ok := rr.(*dns.PTR)
-			if !ok || ptr.Hdr.Class != dns.ClassNONE {
-				continue
-			}
-			for _, prefix := range alwaysOnDomainEnumPrefixes {
-				owner := prefix + "._dns-sd._udp." + srpTestZone
-				if dnsname.Normalize(ptr.Hdr.Name) == dnsname.Normalize(owner) {
-					t.Fatalf("expected no %q domain-enumeration PTR delete while another registrant still provides a service type, got: %s", prefix, ptr.String())
-				}
-			}
-		}
-	}
-}
-
-// TestSRPHandle_RegistrationDomains_OffByDefault confirms "r"/"dr" (RFC 6763 S11's
-// registration-domain records) are never published unless the operator opts in via
-// advertise_registration_domain -- unlike b/db/lb, advertising this zone as an open target
-// for direct RFC 2136 Dynamic Update registration is a deployment policy choice, not implied
-// by SRP working here.
-func TestSRPHandle_RegistrationDomains_OffByDefault(t *testing.T) {
-	h, coord := newSRPTestHandler(t)
-	id := newSRPTestIdentity(t)
-	const host = "srptest12e.dev.zenr.io."
-
-	msg := buildSRPUpdate(t, srpTestZone, id, host, []string{"192.0.2.1"}, oneWidgetInstance(), 30, 1209600, host)
-	if res := h.Handle(context.Background(), stubTCPResponseWriter{}, msg); res.Status != StatusProcessed {
-		t.Fatalf("fresh registration: expected Processed, got %s: %v", res.Status, res.Error)
-	}
-
-	for _, prefix := range []string{"r", "dr"} {
-		owner := prefix + "._dns-sd._udp." + srpTestZone
-		for _, sent := range coord.sent {
-			for _, rr := range sent.Ns {
-				if ptr, ok := rr.(*dns.PTR); ok && dnsname.Normalize(ptr.Hdr.Name) == dnsname.Normalize(owner) {
-					t.Fatalf("expected no %q record without advertise_registration_domain, got: %s", prefix, ptr.String())
-				}
-			}
-		}
-	}
-}
-
-// TestSRPHandle_RegistrationDomains_PublishedWhenOptedIn confirms "r"/"dr" appear, self-
-// pointing at the zone exactly like b/db/lb, once advertiseRegistrationDomain is set.
-func TestSRPHandle_RegistrationDomains_PublishedWhenOptedIn(t *testing.T) {
-	h, coord := newSRPTestHandler(t)
-	h.advertiseRegistrationDomain = true
-	id := newSRPTestIdentity(t)
-	const host = "srptest12f.dev.zenr.io."
-
-	msg := buildSRPUpdate(t, srpTestZone, id, host, []string{"192.0.2.1"}, oneWidgetInstance(), 30, 1209600, host)
-	if res := h.Handle(context.Background(), stubTCPResponseWriter{}, msg); res.Status != StatusProcessed {
-		t.Fatalf("fresh registration: expected Processed, got %s: %v", res.Status, res.Error)
-	}
-
-	// sent[1] is the registration's own enumeration reconcile.
-	for _, prefix := range []string{"r", "dr"} {
-		owner := prefix + "._dns-sd._udp." + srpTestZone
-		found := false
-		for _, rr := range coord.sent[1].Ns {
-			if ptr, ok := rr.(*dns.PTR); ok && ptr.Hdr.Class == dns.ClassINET && dnsname.Normalize(ptr.Hdr.Name) == dnsname.Normalize(owner) {
-				if dnsname.Normalize(ptr.Ptr) != dnsname.Normalize(srpTestZone) {
-					t.Fatalf("%s: expected the registration-domain PTR to point at the zone itself, got %q", prefix, ptr.Ptr)
-				}
-				found = true
-			}
-		}
-		if !found {
-			t.Fatalf("expected the enumeration reconcile to add the %q registration-domain PTR when opted in, got Ns: %+v", prefix, coord.sent[1].Ns)
-		}
-	}
-}
-
-// TestSRPHandle_RegistrationDomains_PublishedWithNoLiveServices confirms "r"/"dr" are
-// published purely off advertiseRegistrationDomain, with no live service type required --
-// unlike b/db/lb (which advertise "there's something to browse," so stay absent on an empty
-// zone), "r"/"dr" advertise "you may register here," a deployment policy choice that holds
-// regardless of current occupancy. A zone that only ever published "r"/"dr" once something
-// registered would be unreachable by exactly the RFC 2136 client that relies on domain
-// enumeration to find where to register in the first place.
-func TestSRPHandle_RegistrationDomains_PublishedWithNoLiveServices(t *testing.T) {
-	h, coord := newSRPTestHandler(t)
-	h.advertiseRegistrationDomain = true
-
-	h.reconcileServiceEnumeration(context.Background())
-
-	if len(coord.sent) != 1 {
-		t.Fatalf("expected one upstream send for the reconcile, got %d: %+v", len(coord.sent), coord.sent)
-	}
-	for _, prefix := range []string{"r", "dr"} {
-		owner := prefix + "._dns-sd._udp." + srpTestZone
-		found := false
-		for _, rr := range coord.sent[0].Ns {
-			if ptr, ok := rr.(*dns.PTR); ok && ptr.Hdr.Class == dns.ClassINET && dnsname.Normalize(ptr.Hdr.Name) == dnsname.Normalize(owner) {
-				if dnsname.Normalize(ptr.Ptr) != dnsname.Normalize(srpTestZone) {
-					t.Fatalf("%s: expected the registration-domain PTR to point at the zone itself, got %q", prefix, ptr.Ptr)
-				}
-				found = true
-			}
-		}
-		if !found {
-			t.Fatalf("expected the %q registration-domain PTR even with no live service type, got Ns: %+v", prefix, coord.sent[0].Ns)
-		}
-	}
-	for _, prefix := range alwaysOnDomainEnumPrefixes {
-		owner := prefix + "._dns-sd._udp." + srpTestZone
-		for _, rr := range coord.sent[0].Ns {
-			if ptr, ok := rr.(*dns.PTR); ok && dnsname.Normalize(ptr.Hdr.Name) == dnsname.Normalize(owner) {
-				t.Fatalf("expected no %q browsing-domain PTR with no live service type, got: %s", prefix, ptr.String())
-			}
-		}
-	}
-}
-
-// TestSRPHandle_RegistrationDomains_StayPublishedWhenZoneEmpties confirms "r"/"dr" are NOT
-// withdrawn when the zone's last live service type disappears, in contrast to b/db/lb (see
-// TestSRPHandle_BrowseDomains_AddedOnRegistrationRemovedWhenZoneEmpties): the operator's
-// advertise_registration_domain policy hasn't changed just because occupancy hit zero, so
-// re-gating "r"/"dr" on anyLive would incorrectly flap them offline.
-func TestSRPHandle_RegistrationDomains_StayPublishedWhenZoneEmpties(t *testing.T) {
-	h, coord := newSRPTestHandler(t)
-	h.advertiseRegistrationDomain = true
-	id := newSRPTestIdentity(t)
-	const host = "srptest12g.dev.zenr.io."
-	inst := oneWidgetInstance()[0].name
-
-	first := buildSRPUpdate(t, srpTestZone, id, host, []string{"192.0.2.1"}, oneWidgetInstance(), 30, 1209600, host)
-	if res := h.Handle(context.Background(), stubTCPResponseWriter{}, first); res.Status != StatusProcessed {
-		t.Fatalf("fresh registration: expected Processed, got %s: %v", res.Status, res.Error)
-	}
-
-	removal := []srpInstanceSpec{{name: inst, removalShaped: true}}
-	second := buildSRPUpdate(t, srpTestZone, id, host, []string{"192.0.2.1"}, removal, 30, 1209600, host)
-	if res := h.Handle(context.Background(), stubTCPResponseWriter{}, second); res.Status != StatusProcessed {
-		t.Fatalf("removal: expected Processed, got %s: %v", res.Status, res.Error)
-	}
-
-	// sent[2]=removal forward, sent[3]=its own enumeration reconcile, which should delete
-	// b/db/lb (asserted elsewhere) but must leave "r"/"dr" untouched.
-	for _, prefix := range []string{"r", "dr"} {
-		owner := prefix + "._dns-sd._udp." + srpTestZone
-		for _, rr := range coord.sent[3].Ns {
-			if ptr, ok := rr.(*dns.PTR); ok && dnsname.Normalize(ptr.Hdr.Name) == dnsname.Normalize(owner) {
-				t.Fatalf("expected no %q registration-domain PTR delete when the zone empties while still opted in, got: %s", prefix, ptr.String())
-			}
+		for _, prefix := range append(append([]string{}, browsePrefixes...), registrationPrefixes...) {
+			requireUntouched(t, msg, prefix)
 		}
 	}
 }
@@ -1663,7 +1885,7 @@ func TestSRPHandle_ExpiryUpstreamRejection_NoLocalMutation(t *testing.T) {
 	h.timers.disarm(leasepkg.NodeKey(id.keyAt(oneWidgetInstance()[0].name)))
 	time.Sleep(1100 * time.Millisecond)
 
-	fake := h.coordinator.(*fakeSRPCoordinator)
+	fake := h.upstreamCoordinator.(*fakeSRPCoordinator)
 	fake.sendResp = &dns.Msg{MsgHeader: dns.MsgHeader{Rcode: dns.RcodeRefused}}
 
 	h.processExpiredNode(context.Background(), hostNodeKey)
@@ -1685,7 +1907,7 @@ func TestSRPHandle_ExpiryRefreshedUnderItsLocks_FailsHard(t *testing.T) {
 	id := newSRPTestIdentity(t)
 	const host = "srptest14f.dev.zenr.io."
 
-	msg := buildSRPUpdate(t, srpTestZone, id, host, nil, nil, 1, 1, host)
+	msg := buildSRPUpdate(t, srpTestZone, id, host, []string{"192.0.2.1"}, nil, 1, 1, host)
 	if res := h.Handle(context.Background(), stubTCPResponseWriter{}, msg); res.Status != StatusProcessed {
 		t.Fatalf("fresh registration: expected Processed, got %s: %v", res.Status, res.Error)
 	}
@@ -1694,9 +1916,9 @@ func TestSRPHandle_ExpiryRefreshedUnderItsLocks_FailsHard(t *testing.T) {
 	h.timers.disarm(hostNodeKey)
 	time.Sleep(1100 * time.Millisecond)
 
-	fake := h.coordinator.(*fakeSRPCoordinator)
+	fake := h.upstreamCoordinator.(*fakeSRPCoordinator)
 	fake.onSendUpdate = func() {
-		if err := h.leaseManager.RenewLease(context.Background(), id.keyAt(host), 3600, 3600); err != nil {
+		if err := h.leaseManager.RenewLease(id.keyAt(host), 3600, 3600); err != nil {
 			t.Errorf("simulated refresh: RenewLease: %v", err)
 		}
 	}
@@ -1730,7 +1952,7 @@ func TestSRPHandle_ExpiryUpstreamFailure_LeavesLocalStateIntact(t *testing.T) {
 	h.timers.disarm(leasepkg.NodeKey(id.keyAt(oneWidgetInstance()[0].name)))
 	time.Sleep(1100 * time.Millisecond)
 
-	fake := h.coordinator.(*fakeSRPCoordinator)
+	fake := h.upstreamCoordinator.(*fakeSRPCoordinator)
 	fake.sendErr = context.DeadlineExceeded // simulate an upstream delete that fails to send
 
 	h.processExpiredNode(context.Background(), hostNodeKey)
@@ -1976,7 +2198,7 @@ func TestSRPHandler_FailsHardWithoutUpstream(t *testing.T) {
 		want  string
 	}{
 		{"no signing key", func(h *SRPHandler) { h.upstreamKeyRecord = nil }, "srp_handler is missing the proxy's signing key"},
-		{"no coordinator", func(h *SRPHandler) { h.coordinator = nil }, "srp_handler is missing an upstream coordinator"},
+		{"no coordinator", func(h *SRPHandler) { h.upstreamCoordinator = nil }, "srp_handler is missing an upstream coordinator"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			h, _ := newSRPTestHandler(t)

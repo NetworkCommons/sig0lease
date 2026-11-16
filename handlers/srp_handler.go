@@ -10,13 +10,12 @@ import (
 	"time"
 
 	"codeberg.org/miekg/dns"
+	"github.com/NetworkCommons/sig0lease/pkg/dnsmsg"
 	"github.com/NetworkCommons/sig0lease/pkg/dnsname"
 	"github.com/NetworkCommons/sig0lease/pkg/dnssd"
-	"github.com/NetworkCommons/sig0lease/pkg/keyrec"
 	leasepkg "github.com/NetworkCommons/sig0lease/pkg/lease"
 	"github.com/NetworkCommons/sig0lease/pkg/sig0"
 	"github.com/NetworkCommons/sig0lease/pkg/srp"
-	"github.com/NetworkCommons/sig0lease/pkg/updatecore"
 )
 
 // SRPHandler implements handlers.Handler for opcode 5 (UPDATE), the RFC 9665 SRP path --
@@ -27,23 +26,11 @@ import (
 // the existing one. See docs/siglease_rfc9665.md for the design
 // this implements; comments below cite RFC 9665 sections as "S<n>".
 type SRPHandler struct {
-	BaseHandler
-
-	upstreamZone string // the one zone this handler instance serves (one zone, one protocol per handler instance)
-	keystoreDir  string
-	leaseManager LeaseManager
-	coordinator  srpCoordinator
-
-	// upstreamKeyRecord is the proxy's own SIG(0) signing key for upstreamZone, resolved
-	// once by Setup and cached for the handler's lifetime (see upstreamTarget.send)
-	// rather than re-read from keystoreDir on every request and every lease-expiry tick.
-	upstreamKeyRecord *keyrec.LoadedKey
+	leaseHandler[srpCoordinator]
 
 	allowUDP                  bool // TCP required unless the zone is flagged allow_udp
 	refuseOnForeignData       bool // RFC 9665 S3.3.3's NOERROR-no-KEY case. Default true.
 	rewriteDefaultServiceARPA bool // accept default.service.arpa. as an alias for upstreamZone
-	LeasePolicy               LeasePolicy
-	recordTTL                 uint32 // TTL of every record this handler writes upstream (applyRecordTTL)
 
 	// serviceTypesMu guards serviceTypes, this process's own tracked view of the RFC 6763
 	// S9 enumeration record's contents -- see reconcileServiceEnumeration. Starts nil/empty
@@ -51,35 +38,21 @@ type SRPHandler struct {
 	// read, so a freshly started (or restarted) process only ever ADDS types it newly
 	// discovers in its own lease store on its own account -- it never blindly deletes a
 	// type it simply hasn't relearned about. A type that drops out of this process's own
-	// local knowledge is only actually removed from the upstream record after a live
-	// QueryPTRExists confirms no other registrant (a different process, or an earlier run
-	// of this same one) still provides it.
+	// local knowledge is only actually removed from the upstream record after a live PTR
+	// query at its browsing name confirms no other registrant (a different process, or an
+	// earlier run of this same one) still provides it.
 	serviceTypesMu sync.Mutex
 	serviceTypes   map[string]bool
 
-	// domainEnumPresent is this process's own last-confirmed-written presence state for each
-	// RFC 6763 S11 domain-enumeration prefix (dnssd.BrowseDomainPrefix and friends) -- see
-	// reconcileServiceEnumeration. Guarded by serviceTypesMu alongside serviceTypes since both
-	// are only ever read/written together, inside the same reconcile pass. Starts nil (every
-	// lookup then defaults to false) on every process start, for the same restart-safety
-	// reason serviceTypes starts nil: a prefix is only removed once a live QueryPTRExists
-	// confirms no service type remains anywhere in the zone, not just gone from this
-	// process's own local view.
-	domainEnumPresent map[string]bool
-
-	// advertiseRegistrationDomain gates the "r"/"dr" prefixes (RFC 6763 S11's registration-
-	// domain records) specifically -- unlike "b"/"db"/"lb" (always published once at least
-	// one service type is live), advertising this zone as an open target for direct RFC 2136
-	// Dynamic Update registration (not just SRP) is a deployment policy choice, not implied
-	// by SRP working here. Default false (config: srp_handler.advertise_registration_domain).
+	// advertiseBrowseDomain and advertiseRegistrationDomain say which RFC 6763 S11
+	// domain-enumeration records the zone has, self-pointing at upstreamZone
+	// (reconcileDomainEnumeration): "b"/"db"/"lb", browse here, and "r"/"dr", register here.
+	// Each is the operator's choice about the zone, not a fact about what is registered now.
+	// Config: srp_handler.advertise_browse_domain (default true) and
+	// srp_handler.advertise_registration_domain (default false): telling domain-enumeration
+	// clients to register here invites plain RFC 2136 updates too, not just SRP.
+	advertiseBrowseDomain       bool
 	advertiseRegistrationDomain bool
-
-	timers *expiryTimers
-
-	// nodeLocks serializes the requests and lease expiries that touch the same hosts and
-	// service instances (docs/siglease_rfc9665.md §5). Ids are names, not NodeKeys:
-	// see lockNames.
-	nodeLocks *leasepkg.NodeLocks
 }
 
 // srpCoordinator is the subset of *updatecore.Coordinator's exported surface Handle and its
@@ -91,43 +64,31 @@ type srpCoordinator interface {
 	QueryKeyAtName(ctx context.Context, zoneHint, name string) (srp.AuthoritativeKeyState, []*dns.KEY, error)
 	updateSender // every UPDATE sent through upstreamTarget.send
 	ResolveAuthoritativeZone(ctx context.Context, zone string) (string, error)
-	// QueryPTRExists reports whether at least one PTR record currently exists live at
-	// name -- used by reconcileServiceEnumeration (RFC 6763 S9) to confirm a type is truly
-	// gone everywhere before removing it from the enumeration record, not just gone from
-	// this process's own local lease-store view.
-	QueryPTRExists(ctx context.Context, zoneHint, name string) (bool, error)
+	// QueryRRs returns the rrType records at name from zoneHint's authoritative server: the
+	// PTRs reconcileServiceEnumeration (RFC 6763 S9) reads to confirm a type is gone
+	// everywhere before removing it from the enumeration record, not just gone from this
+	// process's own lease store, and those reconcileDomainEnumeration (S11) compares with the
+	// config.
+	QueryRRs(ctx context.Context, zoneHint, name string, rrType uint16) ([]dns.RR, error)
+	// QueryAuthoritative sends a query to zoneHint's authoritative server: answerQuery's.
+	QueryAuthoritative(ctx context.Context, zoneHint string, req *dns.Msg, what string) (*dns.Msg, error)
 }
 
 // NewSRPHandler creates a new handler for opcode 5 (UPDATE), RFC 9665 SRP path.
 func NewSRPHandler() *SRPHandler {
-	return &SRPHandler{
-		BaseHandler: BaseHandler{
-			name:    "srp_handler",
-			opcodes: []uint8{dns.OpcodeUpdate},
-		},
-		leaseManager:        NewInMemoryLeaseManager(),
-		refuseOnForeignData: true,
-		recordTTL:           defaultRecordTTL,
-		timers:              newExpiryTimers(),
-		nodeLocks:           leasepkg.NewNodeLocks(),
-	}
-}
-
-// leaseStoreView adapts LeaseManager to srp.StoreView -- the narrow read-only interface
-// Evaluate (S3.3.3 FCFS) needs. Defined here, not in pkg/srp or pkg/updatecore: it's glue
-// specific to how this handler's store is shaped, not shared plumbing.
-type leaseStoreView struct{ store LeaseManager }
-
-func (v leaseStoreView) KeyAtName(name string) (*dns.KEY, bool) {
-	records := v.store.FindByName(name)
-	if len(records) == 0 || records[0].KeyRR == nil {
-		return nil, false
-	}
-	// Multiple distinct KEY nodes at one DNS name (different algorithm/keytag) is
-	// possible in principle but not a shape SRP itself ever produces (S3.2.5.1: one key
-	// governs the whole update) -- taking the first is a deliberate simplification, not
-	// an attempt to disambiguate a case that shouldn't arise from SRP traffic itself.
-	return records[0].KeyRR, true
+	h := &SRPHandler{refuseOnForeignData: true, advertiseBrowseDomain: true}
+	// Every reconciliation pass also recomputes the RFC 6763 S9 enumeration record from the
+	// store, catching anything a missed or raced incremental call (Handle,
+	// processExpiredNode) left stale -- see reconcileServiceEnumeration's doc comment -- and
+	// brings the S11 domain-enumeration records in line with the config, which only the pass
+	// does (reconcileDomainEnumeration).
+	h.leaseHandler = newLeaseHandler[srpCoordinator]("srp_handler",
+		func(nodeKey string) []string { return h.lockNames(nodeKey) },
+		h.processExpiredNode, func(ctx context.Context) {
+			h.reconcileServiceEnumeration(ctx)
+			h.reconcileDomainEnumeration(ctx)
+		})
+	return h
 }
 
 // defaultServiceARPA is the zone name real SRP clients hardcode when they have no other
@@ -135,19 +96,16 @@ func (v leaseStoreView) KeyAtName(name string) (*dns.KEY, bool) {
 // lower-case -- every comparison/rewrite against it below matches on that same shape.
 const defaultServiceARPA = "default.service.arpa."
 
-// zoneEnabled reports whether zone (from the request's own Zone Section) is one this
-// handler instance will accept: the one zone it's configured to serve (one zone, one
-// protocol per handler instance -- enforced here, in each handler's own early checks,
-// rather than by a central dispatcher), or -- when rewriteDefaultServiceARPA is
-// on -- default.service.arpa. as well, an alias Handle rewrites away before anything else
-// sees it. Compared canonically since the request's own casing/trailing dot can't be
-// assumed to match the configured value.
-func (h *SRPHandler) zoneEnabled(zone string) bool {
-	z := dnsname.Normalize(zone)
-	if z == dnsname.Normalize(h.upstreamZone) {
+// takes reports whether an SRP update for host, its Host Description name, is this handler's:
+// host is in the zone it serves (notServed: deepest zone wins), or, with
+// rewriteDefaultServiceARPA, under default.service.arpa., an alias Handle rewrites into that
+// zone before anything else sees it. An update it does not take goes to the next handler. The
+// Zone Section plays no part in it (refuseOutsideZoneSection).
+func (h *SRPHandler) takes(host string) bool {
+	if h.rewriteDefaultServiceARPA && dnsname.IsAtOrBelow(host, defaultServiceARPA) {
 		return true
 	}
-	return h.rewriteDefaultServiceARPA && z == dnsname.Normalize(defaultServiceARPA)
+	return h.notServed(host) == nil
 }
 
 // rewriteDefaultServiceARPA rewrites every name msg.Ns's records carry that ends in
@@ -208,6 +166,9 @@ func (h *SRPHandler) Handle(ctx context.Context, w dns.ResponseWriter, r *dns.Ms
 	if r == nil {
 		return NewErrorResult(nil, "nil message received", fmt.Errorf("nil message"))
 	}
+	if r.Opcode == dns.OpcodeQuery {
+		return h.answerQuery(ctx, r)
+	}
 
 	// Step 1: classify. NotRelevant (not an error) if the message isn't SRP-shaped at
 	// all -- the router falls through to the next handler in the ordered
@@ -218,21 +179,21 @@ func (h *SRPHandler) Handle(ctx context.Context, w dns.ResponseWriter, r *dns.Ms
 		return NewNotRelevantResult(fmt.Sprintf("not an SRP update: %v", err))
 	}
 
-	if len(r.Question) != 1 {
-		return NewNotRelevantResult("not an SRP update: expected exactly one Zone Section entry")
-	}
-	zone := r.Question[0].Header().Name
-	if !h.zoneEnabled(zone) {
-		h.logger.Debugf("SRP handler: zone %s is not the configured zone %s, declining", zone, h.upstreamZone)
-		return NewNotRelevantResult(fmt.Sprintf("zone %s not enabled for SRP on this handler", zone))
+	if !h.takes(cu.Host.Name) {
+		h.logger.Debugf("SRP handler: host %s is not in zone %s, declining", cu.Host.Name, h.upstreamZone)
+		return NewNotRelevantResult(fmt.Sprintf("host %s not in zone %s, which this handler serves", cu.Host.Name, h.upstreamZone))
 	}
 	// From here on the request is this handler's, and everything below needs the upstream.
-	requireUpstream(h.Name(), h.coordinator != nil, h.upstreamKeyRecord != nil)
+	requireUpstream(h.Name(), h.upstreamCoordinator != nil, h.upstreamKeyRecord != nil)
 
 	h.logger.Infof("SRP UPDATE for zone %s: host=%s instances=%d discovery=%d",
-		zone, cu.Host.Name, len(cu.Instances), len(cu.Discovery))
+		h.upstreamZone, cu.Host.Name, len(cu.Instances), len(cu.Discovery))
 
 	if res := refuseDottedLabels(r); res != nil {
+		h.logger.Debugf("SRP handler: %v", res.Error)
+		return res
+	}
+	if res := refuseOutsideZoneSection(r); res != nil {
 		h.logger.Debugf("SRP handler: %v", res.Error)
 		return res
 	}
@@ -243,7 +204,7 @@ func (h *SRPHandler) Handle(ctx context.Context, w dns.ResponseWriter, r *dns.Ms
 	// walks the whole Update section, not a cheap length check).
 	if err := srp.ValidateClassified(r, cu); err != nil {
 		h.logger.Debugf("SRP handler: structural validation failed: %v", err)
-		msg := makeErrorResponse(r, dns.RcodeRefused, err.Error())
+		msg := makeErrorResponse(r, dns.RcodeRefused, dns.ExtendedErrorOther, err.Error())
 		return NewErrorResult(msg, err.Error(), err)
 	}
 
@@ -251,9 +212,9 @@ func (h *SRPHandler) Handle(ctx context.Context, w dns.ResponseWriter, r *dns.Ms
 	// wire the call site, leave the list empty (= allow all) until real filtering is needed.
 	if !h.allowUDP {
 		if _, isUDP := w.RemoteAddr().(*net.UDPAddr); isUDP {
-			h.logger.Debugf("SRP handler: rejecting UDP request for zone %s (allow_udp not set)", zone)
-			msg := makeErrorResponse(r, dns.RcodeRefused, "TCP required for SRP on this zone")
-			return NewErrorResult(msg, "TCP required, got UDP", fmt.Errorf("UDP rejected: allow_udp not set for zone %s", zone))
+			h.logger.Debugf("SRP handler: rejecting UDP request for zone %s (allow_udp not set)", h.upstreamZone)
+			msg := makeErrorResponse(r, dns.RcodeRefused, dns.ExtendedErrorNotSupported, "TCP required for SRP on this zone")
+			return NewErrorResult(msg, "TCP required, got UDP", fmt.Errorf("UDP rejected: allow_udp not set for zone %s", h.upstreamZone))
 		}
 	}
 	// TODO(srp): srp.allowed_source_prefixes source-address allow-list (stub, not yet enforced).
@@ -267,17 +228,17 @@ func (h *SRPHandler) Handle(ctx context.Context, w dns.ResponseWriter, r *dns.Ms
 	// before FCFS reads names that need to already be in their final (rewritten) form.
 	sigRR, err := extractSig0(r)
 	if err != nil {
-		msg := makeErrorResponse(r, dns.RcodeRefused, "missing SIG(0)")
+		msg := makeErrorResponse(r, dns.RcodeRefused, dns.ExtendedErrorProhibited, "missing SIG(0)")
 		return NewErrorResult(msg, err.Error(), err)
 	}
 	if dnsname.Normalize(sigRR.SignerName) != dnsname.Normalize(cu.Host.Name) {
 		err := fmt.Errorf("SIG(0) signer %q does not match Host Description name %q", sigRR.SignerName, cu.Host.Name)
-		msg := makeErrorResponse(r, dns.RcodeRefused, "signer does not match host")
+		msg := makeErrorResponse(r, dns.RcodeRefused, dns.ExtendedErrorProhibited, err.Error())
 		return NewErrorResult(msg, err.Error(), err)
 	}
 	if err := sig0.VerifySignature(r, cu.Host.Key); err != nil {
 		h.logger.Infof("SRP handler: SIG(0) verification failed for %s: %v", cu.Host.Name, err)
-		msg := makeErrorResponse(r, dns.RcodeRefused, "SIG(0) verification failed")
+		msg := makeErrorResponse(r, dns.RcodeRefused, dns.ExtendedErrorProhibited, fmt.Sprintf("SIG(0) verification failed: %v", err))
 		return NewErrorResult(msg, err.Error(), err)
 	}
 
@@ -291,12 +252,11 @@ func (h *SRPHandler) Handle(ctx context.Context, w dns.ResponseWriter, r *dns.Ms
 	// addressed: a constrained client (default.service.arpa.) and a direct client
 	// (h.upstreamZone) naming the same host correctly collide in FCFS instead of silently
 	// writing two different local nodes that both resolve to the same upstream name.
-	// zoneEnabled already confirmed the incoming zone is either h.upstreamZone or (when
-	// rewriteDefaultServiceARPA is set) default.service.arpa. -- checking the latter here
-	// is enough to decide whether a rewrite is needed; no need to re-check the config
-	// flag itself. Harmless no-op if h.upstreamZone happens to literally be
-	// default.service.arpa. too (an explicitly-configured real zone of that name).
-	if dnsname.Normalize(zone) == dnsname.Normalize(defaultServiceARPA) {
+	// The host decides, as it decided that the update is this handler's (takes); a name the
+	// rewrite leaves outside the zone is refused below (refuseNamesNotServed).
+	// Harmless no-op if h.upstreamZone happens to literally be default.service.arpa. too (an
+	// explicitly-configured real zone of that name).
+	if h.rewriteDefaultServiceARPA && dnsname.IsAtOrBelow(cu.Host.Name, defaultServiceARPA) {
 		rewriteDefaultServiceARPA(r, h.upstreamZone)
 		cu, err = srp.Validate(r)
 		if err != nil {
@@ -305,9 +265,16 @@ func (h *SRPHandler) Handle(ctx context.Context, w dns.ResponseWriter, r *dns.Ms
 			// error rather than a client one -- but fail closed rather than proceed
 			// with a stale cu.
 			h.logger.Errorf("SRP handler: re-validation after default.service.arpa. rewrite failed: %v", err)
-			msg := makeErrorResponse(r, dns.RcodeServerFailure, "internal error")
+			msg := makeErrorResponse(r, dns.RcodeServerFailure, dns.ExtendedErrorOther, fmt.Sprintf("internal error: %v", err))
 			return NewErrorResult(msg, err.Error(), err)
 		}
+	}
+
+	// Every name is now final: refuse one outside this zone, or in a zone another handler
+	// serves below it (SeparateZones).
+	if res := h.refuseNamesNotServed(r); res != nil {
+		h.logger.Debugf("SRP handler: %v", res.Error)
+		return res
 	}
 
 	// Steps 6-9 read the host's and instances' lease-store nodes, write upstream, then change
@@ -324,11 +291,33 @@ func (h *SRPHandler) Handle(ctx context.Context, w dns.ResponseWriter, r *dns.Ms
 	locks, err := h.nodeLocks.Acquire(ctx, func() []string { return h.lockNames(lockRoots...) })
 	if err != nil {
 		h.logger.Warnf("SRP handler: UPDATE for %s: %v", cu.Host.Name, err)
-		msg := makeErrorResponse(r, dns.RcodeServerFailure, "lease store busy, try again")
+		msg := makeErrorResponse(r, dns.RcodeServerFailure, dns.ExtendedErrorOther, "lease store busy, try again")
 		return NewErrorResult(msg, "lease-store node lock contention", err)
 	}
 	unlock := sync.OnceFunc(locks.Release)
 	defer unlock()
+
+	// The granted LEASE/KEY-LEASE, needed from here on: a host removal is one with a LEASE
+	// of 0, applyRecordTTL cuts TTLs to them, step 8 stores them, step 10 echoes them.
+	lease, keyLease, err := h.parseLease(r)
+	if err != nil {
+		// Validate() already confirmed the option is present and internally
+		// consistent (LEASE<=KEY-LEASE); a failure here would be a coding error, not
+		// a client one, but fail closed rather than forward TTLs or mutate the store
+		// with zero values.
+		h.logger.Errorf("SRP handler: lease option re-parse failed after validation: %v", err)
+		msg := makeErrorResponse(r, dns.RcodeServerFailure, dns.ExtendedErrorOther, fmt.Sprintf("internal error: %v", err))
+		return NewErrorResult(msg, err.Error(), err)
+	}
+	lease, keyLease = h.LeasePolicy.clamp(lease, keyLease)
+
+	// S3.2.5.5.1: a LEASE of 0 removes the host, with its service instances, listed or not.
+	// A KEY-LEASE of 0, which only a removal has (LEASE <= KEY-LEASE), frees the names too.
+	var unlistedDeletes []dns.RR
+	freeNames := keyLease == 0
+	if lease == 0 {
+		unlistedDeletes = h.removeHost(r, cu, freeNames)
+	}
 
 	// Step 6: FCFS (S3.3.3). Checked names are the host and each service instance name
 	// only (srp.Names) -- SRV/TXT/PTR owner names are never independently checked
@@ -345,40 +334,25 @@ func (h *SRPHandler) Handle(ctx context.Context, w dns.ResponseWriter, r *dns.Ms
 	prereqs := make([]dns.RR, 0, len(cu.Instances)+1)
 	for _, name := range srp.Names(cu) {
 		key := srp.KeyFor(cu, name)
-		result, prereq, err := srp.Evaluate(ctx, view, h.coordinator.QueryKeyAtName, h.upstreamZone, name, key, h.refuseOnForeignData)
+		result, prereq, err := srp.Evaluate(ctx, view, h.upstreamCoordinator.QueryKeyAtName, h.upstreamZone, name, key, h.refuseOnForeignData)
 		if err != nil {
 			h.logger.Errorf("SRP handler: FCFS evaluation failed for %s: %v", name, err)
-			msg := makeErrorResponse(r, dns.RcodeServerFailure, "FCFS evaluation failed")
+			msg := makeErrorResponse(r, dns.RcodeServerFailure, dns.ExtendedErrorNoReachableAuthority, fmt.Sprintf("FCFS evaluation failed: %v", err))
 			return NewErrorResult(msg, err.Error(), err)
 		}
 		switch result {
 		case srp.FCFSConflict:
 			h.logger.Infof("SRP handler: FCFS conflict for %s -- name held by a different key", name)
-			msg := makeErrorResponse(r, dns.RcodeYXDomain, "name held by a different key")
-			return NewErrorResult(msg, fmt.Sprintf("FCFS conflict for %s", name), fmt.Errorf("YXDOMAIN"))
+			return fcfsConflictResult(r, fmt.Sprintf("FCFS conflict for %s", name))
 		case srp.FCFSForeignData:
 			h.logger.Infof("SRP handler: FCFS refused for %s -- foreign data present, no KEY", name)
-			msg := makeErrorResponse(r, dns.RcodeRefused, "name occupied by non-SRP data")
+			msg := makeErrorResponse(r, dns.RcodeRefused, dns.ExtendedErrorProhibited, "name occupied by non-SRP data")
 			return NewErrorResult(msg, fmt.Sprintf("foreign data at %s", name), fmt.Errorf("REFUSED"))
 		}
 		if prereq != nil {
 			prereqs = append(prereqs, prereq)
 		}
 	}
-
-	// The granted LEASE/KEY-LEASE, needed from here on: applyRecordTTL cuts TTLs to them,
-	// step 8 stores them, step 10 echoes them.
-	lease, keyLease, err := h.parseLease(r)
-	if err != nil {
-		// Validate() already confirmed the option is present and internally
-		// consistent (LEASE<=KEY-LEASE); a failure here would be a coding error, not
-		// a client one, but fail closed rather than forward TTLs or mutate the store
-		// with zero values.
-		h.logger.Errorf("SRP handler: lease option re-parse failed after validation: %v", err)
-		msg := makeErrorResponse(r, dns.RcodeServerFailure, "internal error")
-		return NewErrorResult(msg, err.Error(), err)
-	}
-	lease, keyLease = h.LeasePolicy.clamp(lease, keyLease)
 
 	// After step 4, like step 5's rewrite: both change r.Ns in place, and the signature
 	// covers the requester's original TTLs.
@@ -398,12 +372,22 @@ func (h *SRPHandler) Handle(ctx context.Context, w dns.ResponseWriter, r *dns.Ms
 	// Service Description that's updated must end up with a KEY RR published, regardless
 	// of whether the requester's message included one -- see
 	// synthesizeOmittedInstanceKeys's own doc comment).
-	forwardRecords := make([]dns.RR, 0, len(r.Ns))
+	forwardRecords := make([]dns.RR, 0, len(r.Ns)+len(unlistedDeletes))
 	for _, rr := range r.Ns {
 		forwardRecords = append(forwardRecords, rr)
 	}
+	forwardRecords = append(forwardRecords, unlistedDeletes...)
 	forwardRecords = append(forwardRecords, h.ptrDeleteDiff(cu)...)
-	forwardRecords = append(forwardRecords, synthesizeOmittedInstanceKeys(cu)...)
+	forwardRecords = append(forwardRecords, synthesizeOmittedInstanceKeys(cu, keyLease)...)
+	// Freeing the names, the same UPDATE also deletes, record by record, every KEY and record
+	// the store holds at and below the host, as an RFC 9664 KEY delete does: the
+	// requester's Delete All RRsets miss an instance that is no longer advertised but still
+	// holds its name (removeHost adds only live ones). The answer then means the names are
+	// free, with nothing left for a timer to delete after it.
+	hostNodeKey := leasepkg.NodeKey(cu.Host.Key)
+	if freeNames {
+		forwardRecords = append(forwardRecords, subtreeDeletes(h.leaseManager, hostNodeKey)...)
+	}
 
 	if upstreamResp, err := h.upstream().send(ctx, prereqs, forwardRecords); err != nil {
 		h.logger.Errorf("SRP handler: UPDATE for zone %s: %v", h.upstreamZone, err)
@@ -416,10 +400,9 @@ func (h *SRPHandler) Handle(ctx context.Context, w dns.ResponseWriter, r *dns.Ms
 			// than by this handler's own pre-forward check -- report it exactly like the
 			// pre-forward conflict case above. Any other rejection is a failure, not a
 			// conflict.
-			msg := makeErrorResponse(r, dns.RcodeYXDomain, "name held by a different key")
-			return NewErrorResult(msg, fmt.Sprintf("FCFS conflict detected atomically by upstream prerequisite: %v", err), fmt.Errorf("YXDOMAIN"))
+			return fcfsConflictResult(r, fmt.Sprintf("FCFS conflict detected atomically by upstream prerequisite: %v", err))
 		}
-		msg := makeErrorResponse(r, dns.RcodeServerFailure, "upstream UPDATE failed")
+		msg := makeErrorResponse(r, dns.RcodeServerFailure, dns.ExtendedErrorNoReachableAuthority, err.Error())
 		return NewErrorResult(msg, err.Error(), err)
 	}
 
@@ -427,20 +410,17 @@ func (h *SRPHandler) Handle(ctx context.Context, w dns.ResponseWriter, r *dns.Ms
 	// touched by a Delete All RRsets in this update is wiped and reinserted
 	// uniformly (RemoveNonKEYRecords then UpsertNonKEYRecords, both pre-existing, no
 	// new store method needed). A node the update doesn't mention (an omitted
-	// service instance) is simply never touched here.
-	touchedNodeKeys, err := h.applyLocalMutations(ctx, cu, lease, keyLease, h.upstreamZone)
-	if err != nil {
-		// The upstream write already succeeded -- the two stores can only diverge
-		// from here, never silently fail the client's request. Log loudly; the 30s
-		// reconciliation pass (if wired the same way UpdateHandler's is) or the next
-		// refresh will correct it. Still respond success: from the requester's
-		// perspective, and the authoritative server's, the update happened.
-		h.logger.Errorf("SRP handler: local lease-store mutation failed after upstream success (store now diverged from authoritative): %v", err)
-	}
+	// service instance) is simply never touched here. Freeing the names, the host and every
+	// node below it are forgotten instead, as the UPDATE deleted them all.
+	if freeNames {
+		forgetSubtree(h.leaseManager, h.timers, hostNodeKey, h.Name()+": removal")
+	} else {
+		touchedNodeKeys := h.applyLocalMutations(cu, lease, keyLease, h.upstreamZone)
 
-	// Step 9: schedule expiry timers for every node this update touched.
-	for _, nodeKey := range touchedNodeKeys {
-		h.scheduleLeaseExpiry(nodeKey)
+		// Step 9: schedule expiry timers for every node this update touched.
+		for _, nodeKey := range touchedNodeKeys {
+			h.scheduleLeaseExpiry(nodeKey)
+		}
 	}
 	unlock()
 
@@ -453,31 +433,8 @@ func (h *SRPHandler) Handle(ctx context.Context, w dns.ResponseWriter, r *dns.Ms
 	h.reconcileServiceEnumeration(ctx)
 
 	// Step 10: NOERROR + echo the granted LEASE/KEY-LEASE.
-	resp := leaseResponse(r, lease, keyLease, h.logger)
+	resp := leaseResponse(r, leasepkg.Encode8Byte(lease, keyLease))
 	return NewProcessedResult(resp)
-}
-
-// prerequisiteFailed reports whether rcode is the authoritative server's answer to one of
-// prereqs no longer holding (RFC 2136 S3.2.2): YXDOMAIN to "Name is not in use" (TYPE ANY),
-// YXRRSET to "KEY RRset does not exist" (TYPE KEY). Only prerequisites produce these, so
-// either one without its prerequisite in prereqs is an impossible answer, not an FCFS
-// conflict.
-func prerequisiteFailed(rcode uint16, prereqs []dns.RR) bool {
-	var prereqType uint16
-	switch rcode {
-	case dns.RcodeYXDomain:
-		prereqType = dns.TypeANY
-	case dns.RcodeYXRrset:
-		prereqType = dns.TypeKEY
-	default:
-		return false
-	}
-	for _, rr := range prereqs {
-		if dns.RRToType(rr) == prereqType {
-			return true
-		}
-	}
-	return false
 }
 
 // collectLiveServiceTypes scans the lease store for every currently-registered, unexpired
@@ -523,9 +480,9 @@ func (h *SRPHandler) collectLiveServiceTypes() []string {
 // from a live upstream read.
 //
 // A type this process's own local knowledge no longer has an instance of is NOT deleted
-// outright: it's confirmed missing everywhere first, via a live QueryPTRExists at its
-// per-type browsing name (RFC 6763 S4.1 -- the exact name a real browse would query, so this
-// is asking the same question a real client would get a real answer to). This closes a gap a
+// outright: it's confirmed missing everywhere first, via a live PTR query at its per-type
+// browsing name (RFC 6763 S4.1 -- the exact name a real browse would query, so this is asking
+// the same question a real client would get a real answer to). This closes a gap a
 // local-store-only view can't see on its own: a shared real zone can have more than one
 // independent registrant (or registrar process, across a restart) providing the SAME type --
 // observed live against the real dev.zenr.io. shared environment, where a second proxy
@@ -534,21 +491,6 @@ func (h *SRPHandler) collectLiveServiceTypes() []string {
 // in the tracked state (so a later reconcile re-checks it, rather than forgetting it was ever
 // a candidate) and simply isn't included in this round's delete. A query that itself fails
 // fails safe the same way -- keep, don't delete, log, and let the next reconcile retry.
-//
-// Alongside the S9 type set, this also maintains all five S11 domain-enumeration PTRs
-// (dnssd.DiffSelfPointingDomainRecord): "b"/"db"/"lb" present whenever at least one service
-// type is known live in the zone (by this process's own local knowledge OR confirmed still
-// live elsewhere via the same survivors check the type diff already performs), absent
-// otherwise; "r"/"dr" present whenever h.advertiseRegistrationDomain is set, independent of
-// whether any service type is currently live (off by default -- advertising this zone as an
-// open target for direct RFC 2136 registration, not just SRP, is a deployment policy choice,
-// not a fact about current occupancy). A domain-enumeration browse tool queries one or
-// more of these FIRST, before ever asking for the S9 type list -- without them, a zone with
-// perfectly correct S9/S4.1 records is still invisible to such a tool, since it never gets
-// that far. Reusing the type diff's own survivors safety check here means the same
-// protection applies to all five: this process only ever removes one once it has
-// independently confirmed, via a live query, that no service type remains anywhere in the
-// zone -- not just gone from its own local view.
 //
 // A no-op diff (nothing left to add or delete after this) sends no upstream UPDATE at all.
 // Called both synchronously after a successful Handle()/expiry (prompt visibility for a
@@ -566,10 +508,6 @@ func (h *SRPHandler) reconcileServiceEnumeration(ctx context.Context) {
 	for t := range h.serviceTypes {
 		previous = append(previous, t)
 	}
-	wasDomainEnumPresent := make(map[string]bool, len(h.domainEnumPresent))
-	for prefix, present := range h.domainEnumPresent {
-		wasDomainEnumPresent[prefix] = present
-	}
 	h.serviceTypesMu.Unlock()
 
 	// previousForDiff feeds DiffEnumerationRecords: it must still include a type this
@@ -585,12 +523,12 @@ func (h *SRPHandler) reconcileServiceEnumeration(ctx context.Context) {
 			previousForDiff = append(previousForDiff, t) // still known locally too -- unaffected
 			continue
 		}
-		stillLive, err := h.coordinator.QueryPTRExists(ctx, h.upstreamZone, dnssd.BrowsingOwnerName(t, h.upstreamZone))
+		ptrs, err := h.upstreamCoordinator.QueryRRs(ctx, h.upstreamZone, dnssd.BrowsingOwnerName(t, h.upstreamZone), dns.TypePTR)
 		switch {
 		case err != nil:
 			h.logger.Errorf("SRP handler: service-type enumeration: failed to confirm %s has no other live instances, leaving it listed: %v", t, err)
 			survivors = append(survivors, t)
-		case stillLive:
+		case len(ptrs) > 0:
 			h.logger.Debugf("SRP handler: service-type enumeration: %s still has a live instance this process doesn't manage, leaving it listed", t)
 			survivors = append(survivors, t)
 		default:
@@ -598,48 +536,7 @@ func (h *SRPHandler) reconcileServiceEnumeration(ctx context.Context) {
 		}
 	}
 
-	// anyLive is true once at least one service type is known live in the zone, whether
-	// from this process's own local knowledge (currentSet) or confirmed still live
-	// elsewhere via the survivors check above -- exactly the same fact the type-enumeration
-	// record itself would end up expressing ("is the S9 record non-empty"), just as a
-	// boolean rather than a set. Reusing survivors here means a domain-enumeration record is
-	// never removed just because this process's own local view emptied out; it needs the
-	// same live confirmation a type's own removal does.
-	anyLive := len(currentSet) > 0 || len(survivors) > 0
-	// registrationOptedIn gates "r"/"dr" on h.advertiseRegistrationDomain alone, deliberately
-	// independent of anyLive: unlike "b"/"db"/"lb" (which advertise "there's something to
-	// browse," so they're meaningless while the zone is empty), "r"/"dr" advertise "you may
-	// register here," a deployment policy choice that holds regardless of whether anything
-	// happens to be registered right now. Tying it to anyLive would leave a freshly deployed,
-	// opted-in, still-empty zone unable to advertise itself as a registration target at
-	// all -- exactly the case a plain RFC 2136 client doing domain enumeration before its
-	// first registration needs it for -- and would flap the records offline whenever the
-	// zone's live services happen to hit zero, even though the operator's policy hasn't
-	// changed. If advertiseRegistrationDomain is (or becomes) false while one of them was
-	// previously published, this still naturally emits a delete for it below. A fixed-order
-	// slice, not a map, so the resulting upstream instructions have a deterministic order (map
-	// iteration order doesn't, and DiffEnumerationRecords's own output is already sorted for
-	// the same reason).
-	registrationOptedIn := h.advertiseRegistrationDomain
-	wantedDomainEnum := []struct {
-		prefix    string
-		isPresent bool
-	}{
-		{dnssd.BrowseDomainPrefix, anyLive},
-		{dnssd.DefaultBrowseDomainPrefix, anyLive},
-		{dnssd.LegacyBrowseDomainPrefix, anyLive},
-		{dnssd.RegistrationDomainPrefix, registrationOptedIn},
-		{dnssd.DefaultRegistrationDomainPrefix, registrationOptedIn},
-	}
-	var domainEnumRecords []dns.RR
-	newDomainEnumPresent := make(map[string]bool, len(wantedDomainEnum))
-	for _, w := range wantedDomainEnum {
-		domainEnumRecords = append(domainEnumRecords, dnssd.DiffSelfPointingDomainRecord(w.prefix, h.upstreamZone, wasDomainEnumPresent[w.prefix], w.isPresent, h.recordTTL)...)
-		newDomainEnumPresent[w.prefix] = w.isPresent
-	}
-
 	records := dnssd.DiffEnumerationRecords(h.upstreamZone, previousForDiff, current, h.recordTTL)
-	records = append(records, domainEnumRecords...)
 	newState := func() map[string]bool {
 		state := make(map[string]bool, len(currentSet)+len(survivors))
 		for t := range currentSet {
@@ -653,7 +550,6 @@ func (h *SRPHandler) reconcileServiceEnumeration(ctx context.Context) {
 	if len(records) == 0 {
 		h.serviceTypesMu.Lock()
 		h.serviceTypes = newState()
-		h.domainEnumPresent = newDomainEnumPresent
 		h.serviceTypesMu.Unlock()
 		return
 	}
@@ -665,10 +561,59 @@ func (h *SRPHandler) reconcileServiceEnumeration(ctx context.Context) {
 
 	h.serviceTypesMu.Lock()
 	h.serviceTypes = newState()
-	h.domainEnumPresent = newDomainEnumPresent
 	h.serviceTypesMu.Unlock()
 
 	h.logger.Debugf("SRP handler: service-type enumeration reconciled for zone %s (%d change(s))", h.upstreamZone, len(records))
+}
+
+// reconcileDomainEnumeration brings this zone's five RFC 6763 S11 domain-enumeration PTRs, at
+// "<prefix>._dns-sd._udp.<zone>" and each naming the zone itself, in line with the config:
+// "b"/"db"/"lb" (browse here) while advertiseBrowseDomain is set, "r"/"dr" (register here)
+// while advertiseRegistrationDomain is. A domain-enumeration client asks one of these before
+// it asks for the S9 type list, so without them a zone with correct S9/S4.1 records stays
+// invisible to it. Whether this zone is a domain to browse or to register in is the operator's
+// choice, not a fact about what is registered right now, so neither depends on the lease
+// store, and stopping the proxy leaves them, as it leaves the records registered through it
+// and the zone's _dnssd-srp._tcp SRV (docs/dns-sd-records.md).
+//
+// It compares the config with the zone, one PTR query per name, not with what this process
+// remembers writing: a setting turned off then also deletes what an earlier run published.
+// Only the self-pointing PTR is ever added or deleted; a PTR at the same name naming another
+// domain is left alone. A query that fails leaves its name for the next pass. Two proxies on
+// one zone with different settings would undo each other's records each pass, but several
+// proxies on one zone are not supported (docs/siglease_rfc9665.md S11). Called from the
+// reconciliation pass only, every leaseReconcileInterval from Start, since no request or
+// expiry changes what it wants.
+func (h *SRPHandler) reconcileDomainEnumeration(ctx context.Context) {
+	wanted := []struct {
+		prefix string
+		want   bool
+	}{
+		{dnssd.BrowseDomainPrefix, h.advertiseBrowseDomain},
+		{dnssd.DefaultBrowseDomainPrefix, h.advertiseBrowseDomain},
+		{dnssd.LegacyBrowseDomainPrefix, h.advertiseBrowseDomain},
+		{dnssd.RegistrationDomainPrefix, h.advertiseRegistrationDomain},
+		{dnssd.DefaultRegistrationDomainPrefix, h.advertiseRegistrationDomain},
+	}
+	var records []dns.RR
+	for _, w := range wanted {
+		owner := dnssd.DomainEnumerationOwnerName(w.prefix, h.upstreamZone)
+		ptrs, err := h.upstreamCoordinator.QueryRRs(ctx, h.upstreamZone, owner, dns.TypePTR)
+		if err != nil {
+			h.logger.Errorf("SRP handler: domain enumeration: %s is left for the next pass: %v", owner, err)
+			continue
+		}
+		present := dnssd.HasSelfPointingRecord(ptrs, h.upstreamZone)
+		records = append(records, dnssd.DiffSelfPointingDomainRecord(w.prefix, h.upstreamZone, present, w.want, h.recordTTL)...)
+	}
+	if len(records) == 0 {
+		return
+	}
+	if _, err := h.upstream().send(ctx, nil, records); err != nil {
+		h.logger.Errorf("SRP handler: domain enumeration: %v", err)
+		return
+	}
+	h.logger.Infof("SRP handler: domain enumeration for zone %s: %d change(s)", h.upstreamZone, len(records))
 }
 
 // applyRecordTTL sets the TTL of every add in cu to the one this handler writes upstream
@@ -703,7 +648,7 @@ func applyRecordTTL(cu *srp.ClassifiedUpdate, ttl, lease, keyLease uint32) {
 }
 
 // synthesizeOmittedInstanceKeys returns an explicit "Add To An RRSet" KEY instruction (RFC
-// 2136 S2.5.1) for every live (SRV-present) service instance in cu whose own Service
+// 2136 S2.5.1) for every service instance in cu whose own Service
 // Description Instruction omitted its KEY. RFC 9665 S3.2.5.1 lets a requester omit it "for
 // brevity" -- client/srp, this project's own requester, always takes that option -- but
 // S3.3.3 is unconditional on the other side of that trade: "After the SRP Update has been
@@ -720,20 +665,62 @@ func applyRecordTTL(cu *srp.ClassifiedUpdate, ttl, lease, keyLease uint32) {
 // srp.KeyFor already computes exactly the right value for this (same algorithm/protocol/
 // public-key/TTL as the Host Description's own KEY, owner name rewritten to the instance) --
 // it's reused here as-is for the local lease store's own bookkeeping; this function is the
-// one place that also forwards it upstream. A removal-shaped instance (SRV == nil) is
-// excluded: its Delete All RRsets already removes whatever KEY might exist there, and there
-// is no live Service Description left afterward for the MUST to apply to. An instance whose
-// Service Description DID include an explicit KEY is also excluded -- it's already part of
-// r.Ns, forwarded verbatim, and synthesizing a second copy would be redundant.
-func synthesizeOmittedInstanceKeys(cu *srp.ClassifiedUpdate) []dns.RR {
+// one place that also forwards it upstream. A removal-shaped instance (SRV == nil) gets one
+// only while the granted keyLease is not zero: its Delete All RRsets removes the KEY at its
+// name too, and S3.2.5.5.1 holds the name for the requester ("If the KEY lease time is
+// nonzero, the SRP registrar MUST NOT delete the KEY records for these service instances"),
+// as the lease store does (applyLocalMutations). With a KEY-LEASE of 0, a permanent removal,
+// the KEY goes with the rest. An instance whose Service Description DID include an explicit
+// KEY is excluded -- it's already part of r.Ns, forwarded verbatim, and synthesizing a
+// second copy would be redundant.
+func synthesizeOmittedInstanceKeys(cu *srp.ClassifiedUpdate, keyLease uint32) []dns.RR {
 	var records []dns.RR
 	for _, inst := range cu.Instances {
-		if inst.SRV == nil || inst.Key != nil {
+		if (inst.SRV == nil && keyLease == 0) || inst.Key != nil {
 			continue
 		}
 		records = append(records, srp.KeyFor(cu, inst.Name))
 	}
 	return records
+}
+
+// removeHost makes r and cu, an update with a LEASE of 0, the removal of its host
+// (S3.2.5.5.1): srp.RemoveHost drops any adds it carries, and every live service instance of
+// the host's that cu does not list gets a removal (srp.Removal), whose Delete All RRsets
+// removeHost returns for the upstream UPDATE: "an SRP registrar MUST remove all service
+// instances pointing to that hostname and all Service Discovery PTR records pointing to those
+// service instances, even if the SRP requester doesn't list them explicitly". From here on
+// every instance takes the path a listed removal does: FCFS, the PTR deletes (ptrDeleteDiff),
+// the KEY kept while KEY-LEASE is not 0 (synthesizeOmittedInstanceKeys), the lease store.
+// freeNames (a KEY-LEASE of 0) has srp.RemoveHost drop the KEY adds as well.
+// Called holding the host's node locks, which cover its instances (lockNames).
+func (h *SRPHandler) removeHost(r *dns.Msg, cu *srp.ClassifiedUpdate, freeNames bool) []dns.RR {
+	if dropped := srp.RemoveHost(r, cu, freeNames); len(dropped) > 0 {
+		h.logger.Infof("SRP handler: removal of %s (LEASE 0) carries %d adds; dropped, as a removal adds nothing (RFC 9665 S3.2.5.5.1)", cu.Host.Name, len(dropped))
+	}
+	listed := map[string]bool{}
+	for _, inst := range cu.Instances {
+		listed[dnsname.Normalize(inst.Name)] = true
+	}
+	var deletes []dns.RR
+	for _, child := range h.leaseManager.ListSubtreeKeys(leasepkg.NodeKey(cu.Host.Key)) {
+		if h.leaseManager.Get(child) == nil || listed[leasepkg.NodeKeyName(child)] {
+			continue // a non-KEY record, or an instance cu lists
+		}
+		set := h.leaseManager.GetNonKEYRecordSet(child)
+		if set == nil {
+			continue
+		}
+		for _, rec := range set.Records {
+			if srv, ok := rec.RR.(*dns.SRV); ok {
+				inst := srp.Removal(srv.Hdr.Name)
+				cu.Instances = append(cu.Instances, inst)
+				deletes = append(deletes, inst.Delete)
+				break
+			}
+		}
+	}
+	return deletes
 }
 
 // ptrDeleteDiff implements the one piece of genuinely new logic the lease-store mapping
@@ -775,7 +762,7 @@ func (h *SRPHandler) ptrDeleteDiff(cu *srp.ClassifiedUpdate) []dns.RR {
 				continue
 			}
 			if !named[rrKey] {
-				diff = append(diff, updatecore.AsDelete(rec.RR))
+				diff = append(diff, dnsmsg.AsDelete(rec.RR))
 			}
 		}
 	}
@@ -785,45 +772,34 @@ func (h *SRPHandler) ptrDeleteDiff(cu *srp.ClassifiedUpdate) []dns.RR {
 // applyLocalMutations performs step 8 and returns every node key it touched, for the
 // caller to schedule expiry timers against (step 9). Follows the deferred-mutation
 // pattern's other half: this is only ever called after the upstream write already
-// succeeded.
-func (h *SRPHandler) applyLocalMutations(ctx context.Context, cu *srp.ClassifiedUpdate, lease, keyLease uint32, upstreamZone string) ([]string, error) {
-	var touched []string
-	var firstErr error
-	note := func(err error) {
-		if err != nil && firstErr == nil {
-			firstErr = err
+// succeeded, so a store write it makes must not fail. Each one can fail only on a state
+// the checks before the forward rule out while the request holds its node locks: a node
+// renewed that is not in the store, or a record or name already held by another node,
+// which FCFS refuses (step 6). A failure is therefore a bug, and the store can no longer be
+// left as it was, since DNS has changed: the records would stay published with no lease to
+// end them. It panics, as a lease expiry does on a store write that fails after its
+// upstream delete.
+func (h *SRPHandler) applyLocalMutations(cu *srp.ClassifiedUpdate, lease, keyLease uint32, upstreamZone string) []string {
+	must := func(nodeKey string, err error) {
+		if err != nil {
+			panic(fmt.Sprintf("srp_handler: lease-store update of %s after the authoritative server applied it: %v", nodeKey, err))
 		}
 	}
+	var touched []string
 
 	hostNodeKey := leasepkg.NodeKey(cu.Host.Key)
-	hostErr := h.registerOrRenew(ctx, "", cu.Host.Key, keyLease, upstreamZone)
-	note(hostErr)
+	must(hostNodeKey, h.registerOrRenew("", cu.Host.Key, keyLease, upstreamZone))
 	touched = append(touched, hostNodeKey)
 
 	h.leaseManager.RemoveNonKEYRecords(hostNodeKey)
 	if len(cu.Host.Addresses) > 0 {
-		note(h.leaseManager.UpsertNonKEYRecords(hostNodeKey, cu.Host.Addresses, lease, upstreamZone))
-	}
-
-	// If the host's own node failed to register/renew locally (upstream already
-	// succeeded regardless -- see this function's own doc comment), parenting instances
-	// under hostNodeKey below would give them a ParentKeyName pointing at a node that
-	// doesn't actually exist in the store: unreachable via the host's subtree for
-	// cascade-expiry/deletion, and never itself corrected since nothing else revisits
-	// ParentKeyName after registration. Register them as their own roots instead --
-	// still tracked, still get their own expiry timer -- accepting the lesser cost of
-	// losing cascade-with-host semantics for this cycle, corrected on the next
-	// successful refresh (S3.2's "restate everything" already re-runs this whole
-	// function).
-	instanceParentKey := hostNodeKey
-	if hostErr != nil {
-		instanceParentKey = ""
+		must(hostNodeKey, h.leaseManager.UpsertNonKEYRecords(hostNodeKey, cu.Host.Addresses, lease, upstreamZone))
 	}
 
 	for _, inst := range cu.Instances {
 		key := srp.KeyFor(cu, inst.Name)
 		instNodeKey := leasepkg.NodeKey(key)
-		note(h.registerOrRenew(ctx, instanceParentKey, key, keyLease, upstreamZone))
+		must(instNodeKey, h.registerOrRenew(hostNodeKey, key, keyLease, upstreamZone))
 		touched = append(touched, instNodeKey)
 
 		if inst.SRV == nil {
@@ -849,22 +825,22 @@ func (h *SRPHandler) applyLocalMutations(ctx context.Context, cu *srp.Classified
 		// mirrors the Service Description's own Delete All RRsets, and gives S3.3.4
 		// subtype atomicity for free: only PTRs named in this update survive.
 		h.leaseManager.RemoveNonKEYRecords(instNodeKey)
-		note(h.leaseManager.UpsertNonKEYRecords(instNodeKey, records, lease, upstreamZone))
+		must(instNodeKey, h.leaseManager.UpsertNonKEYRecords(instNodeKey, records, lease, upstreamZone))
 	}
 
-	return touched, firstErr
+	return touched
 }
 
 // registerOrRenew creates keyRR's lease-store node (parented to parentNodeKey, "" for the
 // zone root) if it doesn't already exist as a live node, or renews its timers in place if
 // it does -- RenewLease deliberately never touches ParentKeyName or tree position, so a
 // refresh of an existing host/instance can't accidentally relocate it.
-func (h *SRPHandler) registerOrRenew(ctx context.Context, parentNodeKey string, keyRR *dns.KEY, keyLease uint32, upstreamZone string) error {
+func (h *SRPHandler) registerOrRenew(parentNodeKey string, keyRR *dns.KEY, keyLease uint32, upstreamZone string) error {
 	nodeKey := leasepkg.NodeKey(keyRR)
 	if existing := h.leaseManager.Get(nodeKey); existing != nil && !existing.IsExpired() {
-		return h.leaseManager.RenewLease(ctx, keyRR, keyLease, keyLease)
+		return h.leaseManager.RenewLease(keyRR, keyLease, keyLease)
 	}
-	return h.leaseManager.RegisterWithParent(ctx, parentNodeKey, keyRR, keyLease, keyLease, upstreamZone)
+	return h.leaseManager.RegisterWithParent(parentNodeKey, keyRR, keyLease, keyLease, upstreamZone)
 }
 
 // parseLease decodes the Update-Lease option. Unlike UpdateHandler.parseLease, this does
@@ -885,22 +861,6 @@ func (h *SRPHandler) parseLease(msg *dns.Msg) (uint32, uint32, error) {
 		return 0, 0, fmt.Errorf("SRP requires the 8-byte Update-Lease variant (LEASE + KEY-LEASE)")
 	}
 	return lo.Lease, *lo.KeyLease, nil
-}
-
-// scheduleLeaseExpiry arms (or re-arms) a timer for nodeKey's next lease event -- its
-// earliest non-KEY record's LEASE or its KEY's KEY-LEASE, whichever comes first -- that fires
-// processExpiredNode. Timers and retries use the same expiryTimers table as UpdateHandler.
-func (h *SRPHandler) scheduleLeaseExpiry(nodeKey string) {
-	h.timers.schedule(h.leaseManager, nodeKey, h.expireFunc(nodeKey))
-}
-
-// expireFunc is nodeKey's timer callback: one processExpiredNode run.
-func (h *SRPHandler) expireFunc(nodeKey string) func() {
-	return func() {
-		ctx, cancel := context.WithTimeout(context.Background(), expiryTimeout)
-		defer cancel()
-		h.processExpiredNode(ctx, nodeKey)
-	}
 }
 
 // lockNames returns this handler's lock ids for the KEY nodes nodeKeys and their subtrees:
@@ -939,42 +899,10 @@ func (h *SRPHandler) processExpiredNode(ctx context.Context, nodeKey string) {
 	}
 }
 
-// upstream is where this handler's UPDATEs go (upstreamTarget.send).
-func (h *SRPHandler) upstream() upstreamTarget {
-	return upstreamTarget{handler: h.Name(), coordinator: h.coordinator, signingKey: h.upstreamKeyRecord, zone: h.upstreamZone, logger: h.logger}
-}
-
 // expirer is how this handler ends leases (leaseExpirer): the same engine as the RFC 9664
 // handler's, with name lock ids (lockNames) and RFC 9665's data cascade.
 func (h *SRPHandler) expirer() leaseExpirer {
-	return leaseExpirer{
-		store:       h.leaseManager,
-		timers:      h.timers,
-		upstream:    h.upstream(),
-		fire:        h.expireFunc,
-		locks:       h.nodeLocks,
-		lockIDs:     func(nodeKey string) []string { return h.lockNames(nodeKey) },
-		dataCascade: true,
-	}
-}
-
-// startLeaseReconciliation is the SRP-handler equivalent of
-// UpdateHandler.startLeaseReconciliation: every interval, expiryTimers.reconcile arms a timer
-// for every lease owner that has none, and the service enumeration is recomputed.
-func (h *SRPHandler) startLeaseReconciliation(interval time.Duration) {
-	go func() {
-		ticker := time.NewTicker(interval)
-		defer ticker.Stop()
-		for range ticker.C {
-			h.timers.reconcile(h.leaseManager, h.logger, h.expireFunc)
-			// RFC 6763 S9 self-heal: recompute the enumeration record from current
-			// store state on every tick regardless of whether anything above changed,
-			// catching anything a missed/raced incremental call (Handle(),
-			// processExpiredNode) left stale -- see reconcileServiceEnumeration's own
-			// doc comment.
-			h.reconcileServiceEnumeration(context.Background())
-		}
-	}()
+	return h.newExpirer(h.upstream(), true)
 }
 
 // DumpLeasesLevel implements the same dump-endpoint interface UpdateHandler does (see

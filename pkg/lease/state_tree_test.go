@@ -2,7 +2,6 @@ package lease
 
 import (
 	"bytes"
-	"context"
 	"encoding/base64"
 	"encoding/json"
 	"net/netip"
@@ -30,15 +29,14 @@ func testKeyRR(name, label string) *dns.KEY {
 func TestRegisterWithParent_BuildsTree(t *testing.T) {
 	store := NewInMemoryManager()
 	defer store.Stop()
-	ctx := context.Background()
 
 	root := testKeyRR("root.dev.zenr.io.", "AAAAROOT=")
 	child := testKeyRR("child.dev.zenr.io.", "AAAACHILD=")
 
-	if err := store.Register(ctx, root, 300, 300, "dev.zenr.io."); err != nil {
+	if err := store.Register(root, 300, 300, "dev.zenr.io."); err != nil {
 		t.Fatalf("register root: %v", err)
 	}
-	if err := store.RegisterWithParent(ctx, NodeKey(root), child, 300, 300, "dev.zenr.io."); err != nil {
+	if err := store.RegisterWithParent(NodeKey(root), child, 300, 300, "dev.zenr.io."); err != nil {
 		t.Fatalf("register child with parent: %v", err)
 	}
 
@@ -66,15 +64,14 @@ func TestRegisterWithParent_BuildsTree(t *testing.T) {
 func TestRenewLease_PreservesIdentityAndRegisteredAt(t *testing.T) {
 	store := NewInMemoryManager()
 	defer store.Stop()
-	ctx := context.Background()
 
 	root := testKeyRR("root.dev.zenr.io.", "AAAAROOT2=")
 	child := testKeyRR("child.dev.zenr.io.", "AAAACHILD2=")
 
-	if err := store.Register(ctx, root, 300, 300, "dev.zenr.io."); err != nil {
+	if err := store.Register(root, 300, 300, "dev.zenr.io."); err != nil {
 		t.Fatalf("register root: %v", err)
 	}
-	if err := store.RegisterWithParent(ctx, NodeKey(root), child, 300, 300, "dev.zenr.io."); err != nil {
+	if err := store.RegisterWithParent(NodeKey(root), child, 300, 300, "dev.zenr.io."); err != nil {
 		t.Fatalf("register child with parent: %v", err)
 	}
 
@@ -88,7 +85,7 @@ func TestRenewLease_PreservesIdentityAndRegisteredAt(t *testing.T) {
 
 	time.Sleep(5 * time.Millisecond)
 
-	if err := store.RenewLease(ctx, child, 600, 600); err != nil {
+	if err := store.RenewLease(child, 600, 600); err != nil {
 		t.Fatalf("renew child: %v", err)
 	}
 
@@ -118,10 +115,9 @@ func TestRenewLease_PreservesIdentityAndRegisteredAt(t *testing.T) {
 func TestRenewLease_RejectsUnregisteredKey(t *testing.T) {
 	store := NewInMemoryManager()
 	defer store.Stop()
-	ctx := context.Background()
 
 	neverRegistered := testKeyRR("ghost.dev.zenr.io.", "AAAAGHOST=")
-	if err := store.RenewLease(ctx, neverRegistered, 60, 60); err == nil {
+	if err := store.RenewLease(neverRegistered, 60, 60); err == nil {
 		t.Fatalf("expected renewing a never-registered key to fail")
 	}
 }
@@ -129,19 +125,18 @@ func TestRenewLease_RejectsUnregisteredKey(t *testing.T) {
 func TestDeleteSubtree_RemovesDescendants(t *testing.T) {
 	store := NewInMemoryManager()
 	defer store.Stop()
-	ctx := context.Background()
 
 	root := testKeyRR("root.dev.zenr.io.", "AAAAROOT=")
 	child := testKeyRR("child.dev.zenr.io.", "AAAACHILD=")
 	grand := testKeyRR("grand.dev.zenr.io.", "AAAAGRAND=")
 
-	if err := store.Register(ctx, root, 300, 300, "dev.zenr.io."); err != nil {
+	if err := store.Register(root, 300, 300, "dev.zenr.io."); err != nil {
 		t.Fatalf("register root: %v", err)
 	}
-	if err := store.RegisterWithParent(ctx, NodeKey(root), child, 300, 300, "dev.zenr.io."); err != nil {
+	if err := store.RegisterWithParent(NodeKey(root), child, 300, 300, "dev.zenr.io."); err != nil {
 		t.Fatalf("register child: %v", err)
 	}
-	if err := store.RegisterWithParent(ctx, NodeKey(child), grand, 300, 300, "dev.zenr.io."); err != nil {
+	if err := store.RegisterWithParent(NodeKey(child), grand, 300, 300, "dev.zenr.io."); err != nil {
 		t.Fatalf("register grandchild: %v", err)
 	}
 
@@ -157,15 +152,14 @@ func TestDeleteSubtree_RemovesDescendants(t *testing.T) {
 func TestSnapshot_SaveLoad_RoundTrip(t *testing.T) {
 	store := NewInMemoryManager()
 	defer store.Stop()
-	ctx := context.Background()
 
 	root := testKeyRR("root.dev.zenr.io.", "AAAAROOT=")
 	child := testKeyRR("child.dev.zenr.io.", "AAAACHILD=")
 
-	if err := store.Register(ctx, root, 300, 300, "dev.zenr.io."); err != nil {
+	if err := store.Register(root, 300, 300, "dev.zenr.io."); err != nil {
 		t.Fatalf("register root: %v", err)
 	}
-	if err := store.RegisterWithParent(ctx, NodeKey(root), child, 300, 300, "dev.zenr.io."); err != nil {
+	if err := store.RegisterWithParent(NodeKey(root), child, 300, 300, "dev.zenr.io."); err != nil {
 		t.Fatalf("register child: %v", err)
 	}
 
@@ -195,10 +189,9 @@ func TestSnapshot_SaveLoad_RoundTrip(t *testing.T) {
 func TestNonKEYRecords_AreTreeNodesWithBaseRecordFields(t *testing.T) {
 	store := NewInMemoryManager()
 	defer store.Stop()
-	ctx := context.Background()
 
 	owner := testKeyRR("owner.dev.zenr.io.", "AAAAOWNER=")
-	if err := store.Register(ctx, owner, 300, 300, "dev.zenr.io."); err != nil {
+	if err := store.Register(owner, 300, 300, "dev.zenr.io."); err != nil {
 		t.Fatalf("register owner: %v", err)
 	}
 
@@ -229,10 +222,9 @@ func TestNonKEYRecords_AreTreeNodesWithBaseRecordFields(t *testing.T) {
 func TestSnapshot_SaveLoad_RoundTripWithNonKEYRecords(t *testing.T) {
 	store := NewInMemoryManager()
 	defer store.Stop()
-	ctx := context.Background()
 
 	owner := testKeyRR("owner.dev.zenr.io.", "AAAAOWNER=")
-	if err := store.Register(ctx, owner, 300, 300, "dev.zenr.io."); err != nil {
+	if err := store.Register(owner, 300, 300, "dev.zenr.io."); err != nil {
 		t.Fatalf("register owner: %v", err)
 	}
 	txt := &dns.TXT{Hdr: dns.Header{Name: "host.dev.zenr.io.", Class: dns.ClassINET, TTL: 60}}
@@ -270,14 +262,13 @@ func TestSnapshot_SaveLoad_RoundTripWithNonKEYRecords(t *testing.T) {
 func TestSnapshot_SaveLoad_RoundTripsDNSSDNames(t *testing.T) {
 	store := NewInMemoryManager()
 	defer store.Stop()
-	ctx := context.Background()
 
 	const (
 		instance = "Freifunk Café._http._tcp.dev.zenr.io."
 		subtype  = "\xff\xfe._sub._http._tcp.dev.zenr.io."
 	)
 	owner := testKeyRR(instance, "AAAAOWNER=")
-	if err := store.Register(ctx, owner, 300, 300, "dev.zenr.io."); err != nil {
+	if err := store.Register(owner, 300, 300, "dev.zenr.io."); err != nil {
 		t.Fatalf("register owner: %v", err)
 	}
 	hdr := func(name string) dns.Header {
@@ -337,7 +328,6 @@ func TestSnapshot_SaveLoad_RoundTripsDNSSDNames(t *testing.T) {
 func TestSnapshot_SaveLoad_RoundTripsArbitraryNameBytes(t *testing.T) {
 	store := NewInMemoryManager()
 	defer store.Stop()
-	ctx := context.Background()
 
 	const odd = "\xff\x00\"\\.dev.zenr.io."
 	parent := testKeyRR(odd, "PARENT")
@@ -345,11 +335,11 @@ func TestSnapshot_SaveLoad_RoundTripsArbitraryNameBytes(t *testing.T) {
 	lead := testKeyRR(" lead.dev.zenr.io.", "LEAD")
 	plain := testKeyRR("lead.dev.zenr.io.", "PLAIN")
 	for _, k := range []*dns.KEY{parent, lead, plain} {
-		if err := store.Register(ctx, k, 300, 300, "dev.zenr.io."); err != nil {
+		if err := store.Register(k, 300, 300, "dev.zenr.io."); err != nil {
 			t.Fatalf("register %q: %v", k.Hdr.Name, err)
 		}
 	}
-	if err := store.RegisterWithParent(ctx, NodeKey(parent), child, 300, 300, "dev.zenr.io."); err != nil {
+	if err := store.RegisterWithParent(NodeKey(parent), child, 300, 300, "dev.zenr.io."); err != nil {
 		t.Fatalf("register child: %v", err)
 	}
 	a := &dns.A{Hdr: dns.Header{Name: odd, Class: dns.ClassINET, TTL: 60}}
@@ -415,14 +405,13 @@ func TestSnapshot_SaveLoad_RoundTripsArbitraryNameBytes(t *testing.T) {
 func TestUpsertNonKEYRecords_RejectsDifferentOwnerForIdenticalRR(t *testing.T) {
 	store := NewInMemoryManager()
 	defer store.Stop()
-	ctx := context.Background()
 
 	ownerA := testKeyRR("ownera.dev.zenr.io.", "AAAAOWNERA=")
 	ownerB := testKeyRR("ownerb.dev.zenr.io.", "AAAAOWNERB=")
-	if err := store.Register(ctx, ownerA, 300, 300, "dev.zenr.io."); err != nil {
+	if err := store.Register(ownerA, 300, 300, "dev.zenr.io."); err != nil {
 		t.Fatalf("register ownerA: %v", err)
 	}
-	if err := store.Register(ctx, ownerB, 300, 300, "dev.zenr.io."); err != nil {
+	if err := store.Register(ownerB, 300, 300, "dev.zenr.io."); err != nil {
 		t.Fatalf("register ownerB: %v", err)
 	}
 
@@ -455,14 +444,13 @@ func TestUpsertNonKEYRecords_RejectsDifferentOwnerForIdenticalRR(t *testing.T) {
 func TestListSubtreeKeys_IncludesNonKEYDescendants(t *testing.T) {
 	store := NewInMemoryManager()
 	defer store.Stop()
-	ctx := context.Background()
 
 	root := testKeyRR("root2.dev.zenr.io.", "AAAAROOT3=")
 	child := testKeyRR("child2.dev.zenr.io.", "AAAACHILD3=")
-	if err := store.Register(ctx, root, 300, 300, "dev.zenr.io."); err != nil {
+	if err := store.Register(root, 300, 300, "dev.zenr.io."); err != nil {
 		t.Fatalf("register root: %v", err)
 	}
-	if err := store.RegisterWithParent(ctx, NodeKey(root), child, 300, 300, "dev.zenr.io."); err != nil {
+	if err := store.RegisterWithParent(NodeKey(root), child, 300, 300, "dev.zenr.io."); err != nil {
 		t.Fatalf("register child: %v", err)
 	}
 
@@ -513,10 +501,9 @@ func TestListSubtreeKeys_IncludesNonKEYDescendants(t *testing.T) {
 func TestRegisterWithParent_RejectsNonKEYNodeAsParent(t *testing.T) {
 	store := NewInMemoryManager()
 	defer store.Stop()
-	ctx := context.Background()
 
 	owner := testKeyRR("owner3.dev.zenr.io.", "AAAAOWNER3=")
-	if err := store.Register(ctx, owner, 300, 300, "dev.zenr.io."); err != nil {
+	if err := store.Register(owner, 300, 300, "dev.zenr.io."); err != nil {
 		t.Fatalf("register owner: %v", err)
 	}
 	txt := &dns.TXT{Hdr: dns.Header{Name: "data.dev.zenr.io.", Class: dns.ClassINET, TTL: 60}}
@@ -527,7 +514,7 @@ func TestRegisterWithParent_RejectsNonKEYNodeAsParent(t *testing.T) {
 
 	nonKeyID := RecordKey(txt)
 	child := testKeyRR("child3.dev.zenr.io.", "AAAACHILD4=")
-	if err := store.RegisterWithParent(ctx, nonKeyID, child, 300, 300, "dev.zenr.io."); err == nil {
+	if err := store.RegisterWithParent(nonKeyID, child, 300, 300, "dev.zenr.io."); err == nil {
 		t.Fatalf("expected registering a KEY under a non-KEY parent to be rejected")
 	}
 	if store.Get(NodeKey(child)) != nil {
@@ -542,10 +529,9 @@ func TestRegisterWithParent_RejectsNonKEYNodeAsParent(t *testing.T) {
 func TestLookupNonKEYRecord_GlobalRegardlessOfOwner(t *testing.T) {
 	store := NewInMemoryManager()
 	defer store.Stop()
-	ctx := context.Background()
 
 	owner := testKeyRR("owner4.dev.zenr.io.", "AAAAOWNER4=")
-	if err := store.Register(ctx, owner, 300, 300, "dev.zenr.io."); err != nil {
+	if err := store.Register(owner, 300, 300, "dev.zenr.io."); err != nil {
 		t.Fatalf("register owner: %v", err)
 	}
 
@@ -582,14 +568,13 @@ func TestLookupNonKEYRecord_GlobalRegardlessOfOwner(t *testing.T) {
 func TestRemoveSingleNonKEYRecord_IdempotentAndOwnershipChecked(t *testing.T) {
 	store := NewInMemoryManager()
 	defer store.Stop()
-	ctx := context.Background()
 
 	ownerA := testKeyRR("ownera5.dev.zenr.io.", "AAAAOWNERA5=")
 	ownerB := testKeyRR("ownerb5.dev.zenr.io.", "AAAAOWNERB5=")
-	if err := store.Register(ctx, ownerA, 300, 300, "dev.zenr.io."); err != nil {
+	if err := store.Register(ownerA, 300, 300, "dev.zenr.io."); err != nil {
 		t.Fatalf("register ownerA: %v", err)
 	}
-	if err := store.Register(ctx, ownerB, 300, 300, "dev.zenr.io."); err != nil {
+	if err := store.Register(ownerB, 300, 300, "dev.zenr.io."); err != nil {
 		t.Fatalf("register ownerB: %v", err)
 	}
 
@@ -652,7 +637,7 @@ func TestLoadSnapshot_RejectsHandEdits(t *testing.T) {
 	store := NewInMemoryManager()
 	defer store.Stop()
 	owner := testKeyRR("Freifunk Berlin._http._tcp.dev.zenr.io.", "OWNER")
-	if err := store.Register(context.Background(), owner, 300, 300, "dev.zenr.io."); err != nil {
+	if err := store.Register(owner, 300, 300, "dev.zenr.io."); err != nil {
 		t.Fatalf("register owner: %v", err)
 	}
 	path := filepath.Join(t.TempDir(), "lease_snapshot.json")
@@ -707,7 +692,7 @@ func TestLoadSnapshot_RejectsHandEdits(t *testing.T) {
 func TestSaveSnapshot_WritesAtomically(t *testing.T) {
 	store := NewInMemoryManager()
 	defer store.Stop()
-	if err := store.Register(context.Background(), testKeyRR("owner.dev.zenr.io.", "OWNER"), 300, 300, "dev.zenr.io."); err != nil {
+	if err := store.Register(testKeyRR("owner.dev.zenr.io.", "OWNER"), 300, 300, "dev.zenr.io."); err != nil {
 		t.Fatalf("register owner: %v", err)
 	}
 	dir := t.TempDir()
@@ -756,14 +741,13 @@ func TestSaveSnapshot_WritesAtomically(t *testing.T) {
 // owner with no KEY record of its own, which the snapshot keeps across a restart -- and drops
 // an owner once its last record is gone.
 func TestListOwners(t *testing.T) {
-	ctx := context.Background()
 	store := NewInMemoryManager()
 	parent := testKeyRR("a.example.", "PARENT")
 	child := testKeyRR("b.a.example.", "CHILD")
-	if err := store.Register(ctx, parent, 60, 60, "example."); err != nil {
+	if err := store.Register(parent, 60, 60, "example."); err != nil {
 		t.Fatal(err)
 	}
-	if err := store.RegisterWithParent(ctx, NodeKey(parent), child, 60, 60, "example."); err != nil {
+	if err := store.RegisterWithParent(NodeKey(parent), child, 60, 60, "example."); err != nil {
 		t.Fatal(err)
 	}
 	txt := func(name, text string) dns.RR {

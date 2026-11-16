@@ -27,12 +27,11 @@ README already documents that reasoning. Don't chase it.
 
 ## The catch: the native UPDATELEASE type does not support the 4-byte variant
 
-`pkg/lease.LeaseOption` supports both the 8-byte variant (LEASE + KEY-LEASE, always used for
-encoding) and, on decode only, the legacy 4-byte variant (LEASE only), gated by
-`prefer_4byte_variant` in config (`handlers/opcode5_lease_option.go`). `Encode4Byte` exists
-but is currently dead code (nothing calls it) — only `Encode8Byte` is used, by both
-`pkg/dnsmsg.NewLeaseUpdate` (client) and `handlers/opcode5_handle.go`'s response builder
-(server).
+`pkg/lease.LeaseOption` supports both the 8-byte variant (LEASE + KEY-LEASE) and the legacy
+4-byte variant (LEASE only). Requests carry the 8-byte variant (`pkg/dnsmsg.NewLeaseUpdate`).
+The RFC 9664 handler accepts a 4-byte request when `prefer_4byte_variant` is set
+(`handlers/opcode5_lease_option.go`) and answers it with `Encode4Byte`, as RFC 9664 S4
+requires; every other reply uses `Encode8Byte`.
 
 The upstream native type is 8-byte only by construction:
 
@@ -71,7 +70,8 @@ support working) rather than a required workaround for a still-broken library.
 **Option B — bigger change.** If 4-byte-variant support (`prefer_4byte_variant`) is
 confirmed genuinely unused/droppable (check with whoever owns that config flag — the code
 comments call it "legacy"/"backward compatibility" but that's not the same as "safe to
-delete"), then:
+delete"; note that macOS's mDNSResponder sends the 4-byte variant when it registers in a
+wide-area domain), then:
 1. Remove `pkg/dnscompat/updatelease.go` and its blank imports in `cmd/sig0lease/main.go`
    and `cmd/sig0lease-client/main.go` (it's the only file in that package).
 2. `pkg/lease.Encode`: replace the `hex.EncodeToString` + `ERFC3597{EDNS0Code: OPTION_CODE,

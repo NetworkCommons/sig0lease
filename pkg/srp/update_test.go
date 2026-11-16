@@ -61,9 +61,10 @@ func TestBuildUpdate_WithInstanceAndSubtype_RoundTrips(t *testing.T) {
 				TXT:         []string{"txtvers=1", "rp=ipp/print"},
 			},
 		},
-		Lease:    30,
-		KeyLease: 1209600,
-		TTL:      300,
+		Addresses: []netip.Addr{netip.MustParseAddr("192.0.2.1")},
+		Lease:     30,
+		KeyLease:  1209600,
+		TTL:       300,
 	}
 	msg, err := BuildUpdate(spec)
 	if err != nil {
@@ -122,9 +123,10 @@ func TestBuildUpdate_NoTXT_DefaultsToOneEmptyString(t *testing.T) {
 		Instances: []InstanceSpec{
 			{Name: "Printer._ipps._tcp.example.com.", ServiceType: "_ipps._tcp.example.com.", Port: 631},
 		},
-		Lease:    30,
-		KeyLease: 1209600,
-		TTL:      300,
+		Addresses: []netip.Addr{netip.MustParseAddr("192.0.2.1")},
+		Lease:     30,
+		KeyLease:  1209600,
+		TTL:       300,
 	}
 	msg, err := BuildUpdate(spec)
 	if err != nil {
@@ -151,9 +153,10 @@ func TestBuildUpdate_ExplicitInstanceKey_MustMatchHostMaterial(t *testing.T) {
 				Key: hostKey, // same material, explicit anyway -- S3.2.5.1 permits this
 			},
 		},
-		Lease:    30,
-		KeyLease: 1209600,
-		TTL:      300,
+		Addresses: []netip.Addr{netip.MustParseAddr("192.0.2.1")},
+		Lease:     30,
+		KeyLease:  1209600,
+		TTL:       300,
 	}
 	msg, err := BuildUpdate(spec)
 	if err != nil {
@@ -205,7 +208,7 @@ func TestBuildUpdate_HostRemoval_NoAddresses(t *testing.T) {
 		Zone:     "example.com.",
 		Host:     "myhost.example.com.",
 		Key:      testHostKey("myhost.example.com."),
-		Lease:    30,
+		Lease:    0,
 		KeyLease: 1209600,
 		TTL:      300,
 	}
@@ -251,8 +254,25 @@ func TestBuildUpdate_IPv6Address(t *testing.T) {
 func TestBuildUpdate_Rejections(t *testing.T) {
 	base := UpdateSpec{
 		Zone: "example.com.", Host: "myhost.example.com.", Key: testHostKey("myhost.example.com."),
-		Lease: 30, KeyLease: 1209600, TTL: 300,
+		Addresses: []netip.Addr{netip.MustParseAddr("192.0.2.1")},
+		Lease:     30, KeyLease: 1209600, TTL: 300,
 	}
+
+	// S3.3.1.3: addresses when registering, none in a removal (LEASE 0, S3.2.5.5.1).
+	t.Run("registration without an address", func(t *testing.T) {
+		s := base
+		s.Addresses = nil
+		if _, err := BuildUpdate(s); err == nil {
+			t.Fatal("expected an error for a LEASE without an address")
+		}
+	})
+	t.Run("removal with an address", func(t *testing.T) {
+		s := base
+		s.Lease = 0
+		if _, err := BuildUpdate(s); err == nil {
+			t.Fatal("expected an error for a LEASE of 0 with an address")
+		}
+	})
 
 	t.Run("missing zone", func(t *testing.T) {
 		s := base
