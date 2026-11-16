@@ -368,13 +368,27 @@ ipfs_on() {
 
 # connect_to_community <node> <name> -- connects kubo <node> to the community node at an address
 # the name's _dnsaddr records give, as /dnsaddr/<name> in its peer list would have it do; kubo
-# reads those through the system's resolver, which does not know the local BIND.
+# reads those through the system's resolver, which does not know the local BIND. It tries again
+# every second for up to CHANGE_TIMEOUT seconds, as a node does for its peering peer: a try fails
+# when the community node dials the member at the same moment (tests/README.md, a Mac in stealth
+# mode). What kubo answered at each failed try is printed: with the step that connected, or with
+# the failure if none did.
 connect_to_community() {
-    local ma
-    for ma in $(dig_srp "_dnsaddr.$2" TXT | tr -d '"' | sed 's/^dnsaddr=//'); do
-        if ipfs_on "$1" swarm connect "$ma" > /dev/null 2>&1; then return 0; fi
+    local ma out tried="" try=0 start
+    start=$(date +%s)
+    while :; do
+        try=$((try + 1))
+        for ma in $(dig_srp "_dnsaddr.$2" TXT | tr -d '"' | sed 's/^dnsaddr=//'); do
+            if out="$(ipfs_on "$1" swarm connect "$ma" 2>&1)"; then
+                [ -z "$tried" ] || log_step "$1 reached the community node at try ${try}, at $ma; before:$tried"
+                return 0
+            fi
+            tried+=$'\n'"  try ${try}, $ma: $out"
+        done
+        [ $(( $(date +%s) - start )) -lt "$CHANGE_TIMEOUT" ] || break
+        sleep 1
     done
-    log_error "$1 reached the community node at none of _dnsaddr.$2's addresses: $(dig_srp "_dnsaddr.$2" TXT)"
+    log_error "$1 reached the community node at none of _dnsaddr.$2's addresses in ${CHANGE_TIMEOUT}s: $(dig_srp "_dnsaddr.$2" TXT)$tried"
     return 1
 }
 
@@ -933,7 +947,8 @@ NAMES
 
     # The members' nodes reach the community's at an address its _dnsaddr records give, as
     # /dnsaddr/site.<zone> in their peer lists would have them do; kubo reads those through the
-    # system's resolver, which does not know the local BIND. The community's never reaches theirs.
+    # system's resolver, which does not know the local BIND. Once connected, the community's node
+    # also dials theirs by itself: on a Mac in stealth mode, see tests/README.md.
     local node
     for node in alice carol; do
         connect_to_community "$node" "site.${z}" || return 1

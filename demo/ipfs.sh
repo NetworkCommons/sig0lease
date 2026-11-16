@@ -163,9 +163,9 @@ in_site() {
 # kubo, from 0.36, asks a peer outside the local network for a block only once that peer has had
 # one for it, or if it is a peering peer: the registrar's community node announces no address in
 # the local network, so a member's node, merely connected, never asks it for the community's
-# folder.
+# folder. If kubo refuses the connection, what it answered is printed.
 connect_community() {
-    local addrs id args at i
+    local addrs id args at i out msg nl=$'\n'
     addrs="$(ask TXT "_dnsaddr.$site.$update_domain" | grep -o 'dnsaddr=[^" ]*' | sed 's/^dnsaddr=//')"
     id="$(sed -n 's/.*\/p2p\///p' <<< "$addrs" | sort -u)"
     args="$(sed 's/^/arg=/' <<< "$addrs" | paste -sd '&' -)"
@@ -177,7 +177,12 @@ connect_community() {
         echo "  could not connect to the community node: its node, at $api, did not take it as a peering peer"
         return
     fi
-    curl -sf --max-time 10 -X POST "$api/api/v0/swarm/connect?$args" > /dev/null
+    if ! out="$(curl -sS --fail-with-body --max-time 10 -X POST "$api/api/v0/swarm/connect?$args" 2>&1)"; then
+        # kubo's error answer is {"Message":"...","Code":...}; curl's own error, when there is none.
+        msg="$(sed -n 's/^{"Message":"\(.*\)","Code":.*/\1/p' <<< "$out")"
+        msg="${msg//\\n/$nl}"
+        echo "  its node, at $api, did not connect to the community node at once: ${msg:-$out}"
+    fi
     for i in $(seq 10); do
         at="$(curl -sf --max-time 5 -X POST "$api/api/v0/swarm/peers" | grep -o "\"Addr\":\"[^\"]*\",\"Peer\":\"$id\"" | cut -d '"' -f 4 | head -n 1)"
         if [ -n "$at" ]; then

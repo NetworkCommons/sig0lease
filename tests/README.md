@@ -16,6 +16,40 @@ probed service: run registers, a stopped service is withdrawn and comes back, te
 apply and an invalid one is ignored, a held name is renamed and the rename kept across a
 restart, and stopping deregisters. And so is `test_update.sh` with `AUTH_BACKEND=local` (below).
 
+On a Mac whose firewall is in stealth mode, the first try of alice's kubo node, started again in
+`test_agent.sh`'s AGENT-TEST 11, to connect to the community node (`connect_to_community` after
+`start_kubo alice`) can fail:
+
+```
+  * [/ip4/<the Mac's address>/tcp/24001] failed to negotiate security protocol: tls: received unexpected handshake message of type *tls.clientHelloMsg when waiting for *tls.serverHelloMsg
+```
+
+- The community node knows alice's addresses from their first connection, and dials alice
+  while alice's node is down, after the test pins alice's folder on it. Stealth mode
+  (`net.inet.tcp.blackhole=2`) leaves a connection to a closed port on the Mac's network
+  address unanswered instead of refused, so that dial is still pending when alice's node is
+  back.
+- kubo dials from its own listening port. When alice's node then dials the community node,
+  the two attempts use the same two ports and become one TCP connection (a simultaneous open),
+  on which both nodes start TLS as the client. Both dials fail at once, and none is left
+  pending.
+
+On Linux a closed port refuses at once, so the community node's dial is over before alice's
+node is back. There are two ways around it:
+
+1. Implemented: `connect_to_community` tries again every second, for up to `CHANGE_TIMEOUT`
+   seconds, as a member's node does in D3, where the community node is its peering peer. The
+   next try connects, as no dial is pending any more: on a Mac, the second try, a second after
+   the first. A failed try is not hidden: the suite prints it with the try that connected
+   (`alice reached the community node at try 2, ...; before: ...`), or, if none does, with the
+   failure.
+2. Not needed with 1, and kept as an alternative: run the suite with kubo dialing from a port
+   of its own for each connection, so that the two attempts cannot become one (the kubo nodes
+   inherit the environment):
+   ```bash
+   LIBP2P_TCP_REUSEPORT=false make test-agent
+   ```
+
 `test_update.sh` (by default) and `test_forward.sh` run against the **real DNS**, not a local
 BIND 9. Both start the proxy from a copy of `main/config.yaml` (only the listen address,
 `server.diagnostics` and the minimum leases are rewritten), so they also use its lease-store
