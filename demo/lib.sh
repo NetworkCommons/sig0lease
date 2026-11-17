@@ -203,15 +203,21 @@ wait_until() {
 # default demo), where demo/site/index.html, written like demo/demo.yaml for runs by hand, has
 # demo.srp.dev.zenr.io and demo.dev.zenr.io.
 start_site() {
+    local status=0
     mkdir -p "$log/site" || exit 1
+    # "\/", not "[/]": the Mac's awk ends a regex at its first "/", even one inside brackets.
     awk -v host="$name.$srp_domain" -v nm="$name.$update_domain" '
-        { h += gsub(/<code>demo[.]srp[.]dev[.]zenr[.]io<[/]code>/, "<code>" host "</code>")
-          n += gsub(/<code>demo[.]dev[.]zenr[.]io<[/]code>/, "<code>" nm "</code>")
+        { h += gsub(/<code>demo[.]srp[.]dev[.]zenr[.]io<\/code>/, "<code>" host "</code>")
+          n += gsub(/<code>demo[.]dev[.]zenr[.]io<\/code>/, "<code>" nm "</code>")
           print }
-        END { exit !(h == 1 && n == 1) }' demo/site/index.html > "$log/site/index.html" || {
-        echo "Could not give the site's page this run's names: demo/site/index.html no longer has <code>demo.srp.dev.zenr.io</code> and <code>demo.dev.zenr.io</code> once each" >&2
-        exit 1
-    }
+        END { if (h != 1 || n != 1) exit 3 }' demo/site/index.html > "$log/site/index.html" || status=$?
+    case $status in
+    0) ;;
+    3)  echo "Could not give the site's page this run's names: demo/site/index.html no longer has <code>demo.srp.dev.zenr.io</code> and <code>demo.dev.zenr.io</code> once each" >&2
+        exit 1 ;;
+    *)  echo "Could not give the site's page this run's names: awk failed (status $status) on demo/site/index.html" >&2
+        exit 1 ;;
+    esac
     start site site.log python3 -m http.server 8000 -d "$log/site"
 }
 
