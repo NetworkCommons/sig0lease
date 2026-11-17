@@ -547,9 +547,9 @@ The repositories stay too, with the swarm key and the folders: the next
 
 ### With the registrar
 
-The registrar runs the community node (deploy/README.md, "The community node"), always on, at a
-public address. It lists the members of `site` in `$SRP_DOMAIN`, keeps the community's folder
-at `site.$UPDATE_DOMAIN`, and serves it at `${DOH:-https://$REG}/ipns/site.$UPDATE_DOMAIN/`. A
+The registrar runs the community node (deploy/README.md, "The IPFS community node"), always on,
+at a public address. It lists the members of `site` in `$SRP_DOMAIN`, keeps the community's
+folder at `site.$UPDATE_DOMAIN`, and serves it at `${DOH:-https://$REG}/ipns/site.$UPDATE_DOMAIN/`. A
 member's node, behind the venue's NAT, connects to it; it never connects to a member's. An absent
 member's entry stays for 10 minutes. A member that stops keeps its label for an hour, its key's
 lease; one whose machine sleeps or leaves the network is no longer listed about 2 minutes later,

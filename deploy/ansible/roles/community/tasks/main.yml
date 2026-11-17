@@ -1,4 +1,4 @@
-# The instance's community node (deploy/README.md, "The community node"), for an instance that has
+# The instance's community node (deploy/README.md, "The IPFS community node"), for an instance that has
 # one: kubo, its user and repository, the private swarm's key, the node's config, and the node
 # started; the agent's user, keystore, swarm key, template and service, which the release's
 # activation starts (agent.yml), as the agent is part of the release. Runs before the sig0lease
@@ -11,7 +11,7 @@
       is match('/key/swarm/psk/1[.]0[.]0/\n/base16/\n[0-9a-f]{64}$')
     fail_msg: >-
       {{ community_swarm_key }} is not the private swarm key of {{ registrar_instance }}'s community
-      node: make it once, and give it to the members (deploy/README.md, "The community node").
+      node: make it once, and give it to the members (deploy/README.md, "The IPFS community node").
     quiet: true
 
 - name: Install curl, for the checks

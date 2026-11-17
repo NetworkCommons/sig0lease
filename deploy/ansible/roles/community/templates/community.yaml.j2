@@ -1,11 +1,8 @@
-# {{ ansible_managed }}: deploy/ansible, roles/community (deploy/README.md, "The community node").
-# The agent of the {{ registrar_instance }} instance's community node (docs/demo.md, D3): it lists
-# the community's members, the instances of _ipfs-member._tcp under the subtype
-# {{ community_settings.site }} in {{ community_srp_zone }} whose swarm-mac= the community's swarm
-# key makes, and keeps a folder with an entry for
-# each, the member's folder once the node pinned it all, which {{ community_site }} gives, with
-# the node's addresses, which the members' nodes connect to. An entry whose member is not listed
-# for {{ community_settings.revoke_after }} is removed. It keeps its names when it stops, for a
+# {{ ansible_managed }}: deploy/ansible, roles/community (deploy/README.md, "The IPFS community node").
+# The agent of the {{ registrar_instance }} instance's IPFS community node: {{ community_site }} gives
+# the node's addresses and a folder of the folders of the community's members, the instances of
+# _ipfs-member._tcp under the subtype {{ community_settings.site }} in {{ community_srp_zone }}
+# (docs/sig0lease-agent.md, "A name's IPFS node"). It keeps its names when it stops, for a
 # restart.
 keystore: {{ community_agent_keystore }}
 registrars:

@@ -1,9 +1,9 @@
 # {{ ansible_managed }}: deploy/ansible, roles/nginx (deploy/README.md).
 # The registrar's web servers: port 80, for Let's Encrypt's challenges; and for each instance
-# that has a release, at its HTTPS port, the page (docs/demo.md, D6), opened on the instance's
+# that has a release, at its HTTPS port, the page (cmd/sig0lease-web), opened on the instance's
 # zones, and DNS-over-HTTPS (RFC 8484), passed to the instance's plain-HTTP listener, which
 # answers every request with CORS headers, so a page served elsewhere can use it too; for an
-# instance with a community node (roles/community), its gateway.
+# instance with an IPFS community node (roles/community), the node's gateway, kubo's.
 {% set nginx_https_443 = nginx_served | map('extract', registrar_instances) | selectattr('https_port', 'equalto', 443) | list %}
 
 server {
@@ -68,8 +68,9 @@ server {
 {%     if instance.community is defined %}
 {%       set site = instance.community.site ~ '.' ~ instance.zones['update'] | regex_replace('\.$', '') %}
 
-    # The community node's gateway (deploy/README.md, "The community node"): the community's
-    # site, and what the node holds by CID, its links; it fetches nothing (Gateway.NoFetch).
+    # The IPFS community node's gateway (deploy/README.md, "The IPFS community node"): the
+    # community's site, and what the node holds by CID, its links; it fetches nothing
+    # (Gateway.NoFetch).
     location /ipns/{{ site }}/ {
         limit_req zone=sig0lease_gateway_{{ name }} burst={{ nginx_gateway_burst }} nodelay;
         limit_req_status 429;

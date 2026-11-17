@@ -19,7 +19,7 @@ community_kubo_repo: "/var/lib/kubo/{{ registrar_instance }}"
 community_kubo_service: "kubo@{{ registrar_instance }}"
 community_kubo_unit: /etc/systemd/system/kubo@.service
 
-# The instance's private swarm's key, on this machine (deploy/README.md, "The community node").
+# The instance's private swarm's key, on this machine (deploy/README.md, "The IPFS community node").
 community_swarm_key: "{{ playbook_dir | dirname | dirname }}/keystore/ipfs/{{ registrar_instance }}/swarm.key"
 
 # The agent: the release's sig0lease-agent, as a user of its own, with its template, made here,
@@ -33,10 +33,10 @@ community_agent_service: "sig0lease-agent@{{ registrar_instance }}"
 community_agent_unit: /etc/systemd/system/sig0lease-agent@.service
 
 # What the node's config, as ipfs init --profile server,autoconf-off makes it, changes, merged
-# into it (a map into a map; anything else replaced), as docs/demo.md, D3, sets a member's node:
-# no public peers, resolvers or routers (autoconf-off), nothing announced or dialled in private
-# address ranges (server: a hosting provider takes dialling them for a network scan), the
-# private swarm's settings, and the instance's listeners. Its gateway serves only what the node
+# into it (a map into a map; anything else replaced), as docs/demo.md, "How a node is set up",
+# sets a member's node: no public peers, resolvers or routers (autoconf-off), nothing announced
+# or dialled in private address ranges (server: a hosting provider takes dialling them for a
+# network scan), the private swarm's settings, and the instance's listeners. Its gateway serves only what the node
 # holds, the community's site, and resolves the instance's update zone through the instance's
 # proxy, which answers from the zone's authoritative server: nothing a resolver cached.
 community_kubo_overrides:

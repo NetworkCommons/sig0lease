@@ -38,9 +38,9 @@
 #   REGISTRAR, TRANSPORT  the registrar the agent uses instead of a proxy this script starts
 #              (demo/lib.sh).
 #   COMMUNITY_GATEWAY  member only: the registrar's community node, which is the community node
-#              (deploy/README.md, "The community node"), as the https URL of its gateway with no
-#              path, such as https://<registrar>:8444 for staging's. Once the community's folder
-#              has the member's, its address there is printed, with a QR code.
+#              (deploy/README.md, "The IPFS community node"), as the https URL of its gateway
+#              with no path, such as https://<registrar>:8444 for staging's. Once the community's
+#              folder has the member's, its address there is printed, with a QR code.
 # The community node starts first: members' nodes connect to it, at the addresses its name
 # gives, and it fetches their folders over those connections; it never connects to theirs.
 

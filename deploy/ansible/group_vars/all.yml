@@ -19,10 +19,10 @@ registrar_name: '{{ lookup("ansible.builtin.pipe", "ssh -G " ~ inventory_hostnam
 #   key          the name of the instance's key in keystore/server, K<key>+<algorithm>+<tag>,
 #                at its zones or above them, the only key it is given (deploy/README.md, "The
 #                zones' keys")
-#   community    the instance's community node (deploy/README.md, "The community node";
-#                docs/demo.md, D3), when it has one: a kubo node in a private swarm of its own,
-#                and an agent that keeps a folder of its members' folders, the community's
-#                site, served by nginx at https_port, under /ipns/<site>.<update zone>/:
+#   community    the instance's IPFS community node (deploy/README.md, "The IPFS community
+#                node"): a kubo node in a private swarm of its own, and an agent that keeps a
+#                folder of its members' folders, the community's site, served by nginx at
+#                https_port, under /ipns/<site>.<update zone>/:
 #     site             the label of the community's site, in the update zone, and the subtype
 #                      its members' _ipfs-member._tcp instances are listed under in the
 #                      srp_handler zone
@@ -41,6 +41,12 @@ registrar_instances:
     dot_port: 853
     https_port: 443
     doh_address: 127.0.0.1:8443
+    community:
+      site: site
+      revoke_after: 10m
+      swarm_port: 4001
+      api_address: 127.0.0.1:5101
+      gateway_address: 127.0.0.1:8101
   staging:
     zones:
       update: stg.zenr.io.
