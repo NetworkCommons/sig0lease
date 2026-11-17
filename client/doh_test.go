@@ -2,9 +2,12 @@ package client
 
 import (
 	"encoding/base64"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"strings"
+	"syscall"
 	"testing"
 	"time"
 
@@ -68,5 +71,21 @@ func TestQueryDoH_QueryGETUpdatePOST(t *testing.T) {
 			t.Errorf("opcode %d: sent as %s with Content-Type %q, answered with ID %d; want %s with %q, ID 4242",
 				tc.msg.Opcode, method, contentType, resp.ID, tc.method, tc.mediaType)
 		}
+	}
+}
+
+// TestQueryDoH_Unreachable: a DoH server that gives no answer at all, as one no longer
+// listening, fails the exchange with an *UnreachableError naming the server, with why, and
+// without the request's URL, whose dns parameter is the whole query.
+func TestQueryDoH_Unreachable(t *testing.T) {
+	srv := httptest.NewServer(http.NotFoundHandler())
+	srv.Close()
+	_, err := New(srv.URL, "doh", 2*time.Second).Query(dns.NewMsg("demo.example.", dns.TypeA))
+	var ue *UnreachableError
+	if !errors.As(err, &ue) || ue.Server != srv.URL || !errors.Is(err, syscall.ECONNREFUSED) {
+		t.Fatalf("Query = %v, want an *UnreachableError for %s, connection refused", err, srv.URL)
+	}
+	if want := "cannot reach " + srv.URL + ": "; !strings.HasPrefix(err.Error(), want) || strings.Contains(err.Error(), "dns=") {
+		t.Errorf("error %q: want it to start %q, without the request's URL", err, want)
 	}
 }

@@ -6,9 +6,11 @@ import (
 	"context"
 	"crypto/tls"
 	"encoding/base64"
+	"errors"
 	"fmt"
 	"net"
 	"net/http"
+	"net/url"
 	"strings"
 	"time"
 
@@ -177,6 +179,17 @@ func (c *Client) queryTCP(msg *dns.Msg) (*dns.Msg, error) {
 	return resp, err
 }
 
+// UnreachableError is queryDoH's failure to get any HTTP answer from Server: it could not
+// connect, or no answer came in time. In a browser it is also an answer whose CORS headers do
+// not let the page read it: fetch does not say which.
+type UnreachableError struct {
+	Server string // the DoH server's URL, as New had it
+	Err    error  // why, without the request's URL, which holds the whole message, encoded
+}
+
+func (e *UnreachableError) Error() string { return fmt.Sprintf("cannot reach %s: %v", e.Server, e.Err) }
+func (e *UnreachableError) Unwrap() error { return e.Err }
+
 // queryDoH sends a DNS message to the server URL's "/dns-query" (RFC 8484): a query as a GET,
 // with the message in its "dns" parameter, anything else, an UPDATE, as a POST. A GET has no
 // body and no Content-Type, so a browser sends it to a server of another origin without asking
@@ -184,20 +197,21 @@ func (c *Client) queryTCP(msg *dns.Msg) (*dns.Msg, error) {
 // answer; the proxy answers both. The message goes as packed, its ID included: a SIG(0)
 // signature covers the ID, so it cannot be set to 0 after signing, as RFC 8484 S4.1 suggests
 // for caching, and a query's random ID keeps any HTTP cache on the way from answering it.
-// Anything but a 200 answer with a DNS message is an error.
+// Anything but a 200 answer with a DNS message is an error: no answer at all an
+// *UnreachableError.
 func (c *Client) queryDoH(msg *dns.Msg) (*dns.Msg, error) {
 	if err := msg.Pack(); err != nil {
 		return nil, fmt.Errorf("pack error: %w", err)
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), c.timeout)
 	defer cancel()
-	url := strings.TrimSuffix(c.server, "/") + dnshttp.Path
+	endpoint := strings.TrimSuffix(c.server, "/") + dnshttp.Path
 	var req *http.Request
 	var err error
 	if msg.Opcode == dns.OpcodeQuery {
-		req, err = http.NewRequestWithContext(ctx, http.MethodGet, url+"?dns="+base64.RawURLEncoding.EncodeToString(msg.Data), nil)
+		req, err = http.NewRequestWithContext(ctx, http.MethodGet, endpoint+"?dns="+base64.RawURLEncoding.EncodeToString(msg.Data), nil)
 	} else {
-		req, err = http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(msg.Data))
+		req, err = http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(msg.Data))
 		if err == nil {
 			req.Header.Set("Content-Type", dnshttp.MimeType)
 		}
@@ -208,7 +222,11 @@ func (c *Client) queryDoH(msg *dns.Msg) (*dns.Msg, error) {
 	req.Header.Set("Accept", dnshttp.MimeType)
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
-		return nil, fmt.Errorf("connection error: %w", err)
+		var ue *url.Error // what Do returns
+		if errors.As(err, &ue) {
+			err = ue.Err
+		}
+		return nil, &UnreachableError{Server: c.server, Err: err}
 	}
 	if resp.StatusCode != http.StatusOK {
 		resp.Body.Close()

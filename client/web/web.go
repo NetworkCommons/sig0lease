@@ -119,13 +119,26 @@ func New(cfg Config) (*Page, error) {
 
 // Browse reads SRPDomain (browse.Browse).
 func (p *Page) Browse(ctx context.Context) (*browse.Domain, error) {
-	return browse.Browse(ctx, p.query, p.cfg.SRPDomain)
+	d, err := browse.Browse(ctx, p.query, p.cfg.SRPDomain)
+	return d, p.unreached(err)
 }
 
 // Names lists the names in UpdateDomain, outside SRPDomain (browse.Names): the zone must be
 // signed with NSEC.
 func (p *Page) Names(ctx context.Context) ([]browse.Name, error) {
-	return browse.Names(ctx, p.query, p.cfg.UpdateDomain, p.cfg.SRPDomain)
+	names, err := browse.Names(ctx, p.query, p.cfg.UpdateDomain, p.cfg.SRPDomain)
+	return names, p.unreached(err)
+}
+
+// unreached returns err, or, when it is that the proxy gave no answer at all
+// (client.UnreachableError), just that and why: every question fails alike then, so which
+// one it was says nothing.
+func (p *Page) unreached(err error) error {
+	var ue *client.UnreachableError
+	if errors.As(err, &ue) && ue.Server == p.cfg.DoH {
+		return fmt.Errorf("cannot reach the proxy at %s: %w", ue.Server, ue.Err)
+	}
+	return err
 }
 
 // Message returns the strings of the TXT records at label's name, as their octets: none when
@@ -137,7 +150,7 @@ func (p *Page) Message(ctx context.Context, label string) ([]string, error) {
 	}
 	rrs, err := p.query(ctx, name, dns.TypeTXT)
 	if err != nil {
-		return nil, err
+		return nil, p.unreached(err)
 	}
 	msg := []string{}
 	for _, rr := range rrs {
