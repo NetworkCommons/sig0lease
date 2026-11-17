@@ -1,6 +1,8 @@
 # What changed since the community node's agent started, of what it starts with: the release's
 # agent, its template and its service unit, as community_changes, for the sig0lease role's
-# compare.yml; or that the agent is not running. Changes nothing.
+# compare.yml; or that the agent is not running, or that the release has no agent (one built from
+# a branch without the community node), so the running agent is an earlier release's. Changes
+# nothing.
 
 - name: Find what changed since the community node's agent started, in {{ registrar_instance }}
   ansible.builtin.shell: |
@@ -9,8 +11,14 @@
         echo "{{ community_agent_service }} is not running"
         exit 0
     fi
-    find {{ registrar_root }}/{{ registrar_instance }}/current/sig0lease-agent {{ community_agent_template }} \
-        {{ community_agent_unit }} \
+    agent={{ registrar_root }}/{{ registrar_instance }}/current/sig0lease-agent
+    files=({{ community_agent_template }} {{ community_agent_unit }})
+    if [ -e "$agent" ]; then
+        files=("$agent" "${files[@]}")
+    else
+        echo "$agent does not exist: {{ community_agent_service }} runs an earlier release's agent"
+    fi
+    find "${files[@]}" \
         -newermt "$(systemctl show --timestamp=us+utc -p ExecMainStartTimestamp --value {{ community_agent_service }})" \
         -printf '%p changed since the agent started\n'
   args:
