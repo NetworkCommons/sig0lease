@@ -380,7 +380,7 @@ connect_to_community() {
         try=$((try + 1))
         for ma in $(dig_srp "_dnsaddr.$2" TXT | tr -d '"' | sed 's/^dnsaddr=//'); do
             if out="$(ipfs_on "$1" swarm connect "$ma" 2>&1)"; then
-                [ -z "$tried" ] || log_step "$1 reached the community node at try ${try}, at $ma; before:$tried"
+                [ -z "$tried" ] || log_step "$1 reached the IPFS community node at try ${try}, at $ma; before:$tried"
                 return 0
             fi
             tried+=$'\n'"  try ${try}, $ma: $out"
@@ -388,7 +388,7 @@ connect_to_community() {
         [ $(( $(date +%s) - start )) -lt "$CHANGE_TIMEOUT" ] || break
         sleep 1
     done
-    log_error "$1 reached the community node at none of _dnsaddr.$2's addresses in ${CHANGE_TIMEOUT}s: $(dig_srp "_dnsaddr.$2" TXT)$tried"
+    log_error "$1 reached the IPFS community node at none of _dnsaddr.$2's addresses in ${CHANGE_TIMEOUT}s: $(dig_srp "_dnsaddr.$2" TXT)$tried"
     return 1
 }
 
@@ -412,7 +412,7 @@ wait_entries() {
     start=$(date +%s)
     until got="$(ipfs_on community files ls -l "$1" | awk '{ sub(/\/$/, "", $1); print $1, $2 }' | sort | paste -sd ' ' -)" && [ "$got" = "$2" ]; do
         if [ $(( $(date +%s) - start )) -ge "$CHANGE_TIMEOUT" ]; then
-            log_error "the community node's $1 holds \"$got\", want \"$2\"; agent log:"; cat "$AGENT_LOG"; return 1
+            log_error "the IPFS community node's $1 holds \"$got\", want \"$2\"; agent log:"; cat "$AGENT_LOG"; return 1
         fi
         sleep 0.5
     done
@@ -959,11 +959,11 @@ NAMES
     wait_log "site.${z}: carol's entry gives ${carol1}" || return 1
     wait_entries "$folder" "alice ${alice1} carol ${carol1}" || return 1
     wait_log "site.${z}: mallory._ipfs-member._tcp.${SRP_ZONE}: not a member: its swarm-mac= is not the one the community's swarm key makes of its KEY and its folder ${carol1}" || return 1
-    [ "$(ipfs_on community --offline cat "/ipfs/${carol1}/hello.txt")" = "from carol" ] || { log_error "the community node does not hold carol's folder"; return 1; }
+    [ "$(ipfs_on community --offline cat "/ipfs/${carol1}/hello.txt")" = "from carol" ] || { log_error "the IPFS community node does not hold carol's folder"; return 1; }
     local pins
     pins="$(ipfs_on community pin ls --type=recursive --names | grep -F " sig0lease-agent " | sort)"
     [ "$pins" = "$(printf '%s recursive sig0lease-agent site.%s\n' "$alice1" "$z" "$carol1" "$z" | sort)" ] \
-        || { log_error "the community node's pins: $(ipfs_on community pin ls --type=recursive --names)"; return 1; }
+        || { log_error "the IPFS community node's pins: $(ipfs_on community pin ls --type=recursive --names)"; return 1; }
 
     # An entry removed from the folder by hand is put back at the next check.
     ipfs_on community files rm -r "$folder/carol"
@@ -976,7 +976,7 @@ NAMES
     wait_member alice alice "$alice2" || return 1
     wait_log "site.${z}: alice's entry gives ${alice2}" || return 1
     wait_entries "$folder" "alice ${alice2} carol ${carol1}" || return 1
-    [ "$(ipfs_on community --offline cat "/ipfs/${alice2}/second.txt")" = second ] || { log_error "the community node does not hold alice's new folder"; return 1; }
+    [ "$(ipfs_on community --offline cat "/ipfs/${alice2}/second.txt")" = second ] || { log_error "the IPFS community node does not hold alice's new folder"; return 1; }
     wait_log "site.${z}: unpinned ${alice1}, which no entry gives" || return 1
 
     # carol's node stops: its probe withdraws carol (and mallory, on the same node), and its entry
@@ -1020,7 +1020,7 @@ NAMES
     wait_log "site.${z}: alice's entry gives ${alice2}" 2 || return 1
     wait_entries "$folder" "alice ${alice2}" || return 1
     [ "$(ipfs_on community pin ls --type=recursive --names | grep -F "$alice2")" = "${alice2} recursive mine" ] \
-        || { log_error "the community node's pins: $(ipfs_on community pin ls --type=recursive --names)"; return 1; }
+        || { log_error "the IPFS community node's pins: $(ipfs_on community pin ls --type=recursive --names)"; return 1; }
     NAMES_REGISTRAR=""
     write_template <<< "$(sed '/^  - name: carol$/,$d' <<< "$hosts")"
     wait_state "site.${z}" KEY absent || return 1
@@ -1040,7 +1040,7 @@ NAMES
     stop_kubo community
     stop_kubo carol
 
-    log_success "alice and carol, members, gave their folders with the swarm-mac= their swarm key makes; the community node pinned each as it came, alice's new one too, unpinning the one before, and gave a folder of them, with no entry for mallory, whose swarm-mac= another key made; carol, gone and back within revoke_after, kept its entry; gone for good, it lost its entry and pin; an entry removed by hand came back, and a folder the community node's owner had pinned stayed their pin; the community name removed and added again took its folder's entries back; alice's name withdrew its addresses with its node and kept its folder"
+    log_success "alice and carol, members, gave their folders with the swarm-mac= their swarm key makes; the IPFS community node pinned each as it came, alice's new one too, unpinning the one before, and gave a folder of them, with no entry for mallory, whose swarm-mac= another key made; carol, gone and back within revoke_after, kept its entry; gone for good, it lost its entry and pin; an entry removed by hand came back, and a folder the IPFS community node's owner had pinned stayed their pin; the community name removed and added again took its folder's entries back; alice's name withdrew its addresses with its node and kept its folder"
     PERFORMED_TESTS="$PERFORMED_TESTS\n  [OK] $log_msg"
 }
 

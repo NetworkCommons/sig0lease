@@ -42,7 +42,8 @@
 #              with no path, such as https://<registrar>:8444 for staging's. Once the community's
 #              folder has the member's, its address there is printed, with a QR code.
 # The community node starts first: members' nodes connect to it, at the addresses its name
-# gives, and it fetches their folders over those connections; it never connects to theirs.
+# gives, and it fetches their folders over those connections: it needs no connection to theirs,
+# though it may dial them at addresses learned from an earlier connection (tests/README.md).
 
 cd "$(dirname "$0")/.." || exit 1
 . demo/lib.sh
@@ -67,7 +68,7 @@ community) tools=(go dig curl qrencode) labels=("$site" "$host") ;;
 esac
 if [ -n "$community_gateway" ]; then
     if [ "$role" != member ]; then
-        echo "COMMUNITY_GATEWAY names the registrar's community node, which is the community node: run only members (docs/demo.md, D3)" >&2
+        echo "COMMUNITY_GATEWAY names the registrar's IPFS community node, which is then the community's: run only members (docs/demo.md, D3)" >&2
         exit 1
     fi
     if ! [[ "$community_gateway" =~ ^https://[^/]+$ ]]; then
@@ -105,7 +106,7 @@ if [ "$role" = member ]; then
         exit 1
     fi
     if ! curl -sf -X POST "$api/api/v0/bootstrap/list" | grep -qF "\"/dnsaddr/$site.$update_domain/p2p/"; then
-        echo "The node's peer list has no /dnsaddr/$site.$update_domain/p2p/<ID>: the community node, which the member's node connects to; add it (docs/demo.md, D3; for the local test, demo/ipfs-local.sh start)" >&2
+        echo "The node's peer list has no /dnsaddr/$site.$update_domain/p2p/<ID>: the IPFS community node, which the member's node connects to; add it (docs/demo.md, D3; for the local test, demo/ipfs-local.sh start)" >&2
         exit 1
     fi
 fi
@@ -157,7 +158,8 @@ in_site() {
 # connect_community -- makes the community node a peering peer of the member's node (as
 # Peering.Peers does, until the node stops), at the addresses _dnsaddr.<SITE> gives on the zone's
 # server, connects to it there, which kubo does for a peering peer only after a delay of its own,
-# and waits up to 10 s for the connection. The community node never connects to a member's. The
+# and waits up to 10 s for the connection. The member's node makes the connection: the community
+# node needs none to a member's, which may be behind a NAT. The
 # node's own try, through its peer list, asks a resolver that may still hold "no such name" from
 # before the community node published them, for up to 6 minutes (the zone's negative TTL). And
 # kubo, from 0.36, asks a peer outside the local network for a block only once that peer has had
@@ -170,28 +172,28 @@ connect_community() {
     id="$(sed -n 's/.*\/p2p\///p' <<< "$addrs" | sort -u)"
     args="$(sed 's/^/arg=/' <<< "$addrs" | paste -sd '&' -)"
     if [ -z "$addrs" ] || [ "$(wc -l <<< "$id")" -ne 1 ]; then
-        echo "  could not connect to the community node: _dnsaddr.$site.$update_domain gives no addresses of one node"
+        echo "  could not connect to the IPFS community node: _dnsaddr.$site.$update_domain gives no addresses of one node"
         return
     fi
     if ! curl -sf --max-time 10 -X POST "$api/api/v0/swarm/peering/add?$args" > /dev/null; then
-        echo "  could not connect to the community node: its node, at $api, did not take it as a peering peer"
+        echo "  could not connect to the IPFS community node: its node, at $api, did not take it as a peering peer"
         return
     fi
     if ! out="$(curl -sS --fail-with-body --max-time 10 -X POST "$api/api/v0/swarm/connect?$args" 2>&1)"; then
         # kubo's error answer is {"Message":"...","Code":...}; curl's own error, when there is none.
         msg="$(sed -n 's/^{"Message":"\(.*\)","Code":.*/\1/p' <<< "$out")"
         msg="${msg//\\n/$nl}"
-        echo "  its node, at $api, did not connect to the community node at once: ${msg:-$out}"
+        echo "  its node, at $api, did not connect to the IPFS community node at once: ${msg:-$out}"
     fi
     for i in $(seq 10); do
         at="$(curl -sf --max-time 5 -X POST "$api/api/v0/swarm/peers" | grep -o "\"Addr\":\"[^\"]*\",\"Peer\":\"$id\"" | cut -d '"' -f 4 | head -n 1)"
         if [ -n "$at" ]; then
-            echo "  connected to the community node at $at, a peering peer of its node"
+            echo "  connected to the IPFS community node at $at, a peering peer of its node"
             return
         fi
         sleep 1
     done
-    echo "  could not connect to the community node within 10 s, at the addresses _dnsaddr.$site.$update_domain gives; its node keeps trying"
+    echo "  could not connect to the IPFS community node within 10 s, at the addresses _dnsaddr.$site.$update_domain gives; its node keeps trying"
 }
 
 # registrar <protocol> [<line>] -- a registrar through this machine's proxy, with <line> (an srp
@@ -255,7 +257,7 @@ EOF
 template "$log/ipfs.yaml" "$log/ipfs.yaml"
 proxy_config
 
-what="the community node"
+what="the IPFS community node"
 [ "$role" = community ] || what="the member $member"
 cat << EOF
 D3's $what, its node at $api, published in the live zone, in $update_domain, $via.
@@ -269,7 +271,7 @@ start agent agent.log "$B/sig0lease-agent" run -probe-interval 5s "$log/ipfs.yam
 if [ "$role" = member ]; then
     wait_until "$member is listed, a member of $site" listed
     connect_community
-    wait_until "the community's folder has $(label)'s, pinned by the community node" in_site
+    wait_until "the community's folder has $(label)'s, pinned by the IPFS community node" in_site
     cat << EOF
 
 What anyone can run:
@@ -277,8 +279,8 @@ What anyone can run:
   dig +short TXT $(label).$type.$srp_domain        # this member's folder, and its swarm-mac=
 The community's folder: /ipns/$site.$update_domain/, this member's in it: /ipns/$site.$update_domain/$(label)/
 A file put in $folder (IPFS Desktop's Files, or ipfs files cp) changes this member's folder within about 15 s,
-and the community's once its node pinned it. Stopped, the member's entry stays for the community
-node's REVOKE_AFTER, and its label for an hour: run again within it to come back as the member.
+and the community's once its node pinned it. Stopped, the member's entry stays for the IPFS
+community node's REVOKE_AFTER, and its label for an hour: run again within it to come back as the member.
 EOF
     if [ -n "$community_gateway" ]; then
         url="$community_gateway/ipns/$site.$update_domain/$(label)/"

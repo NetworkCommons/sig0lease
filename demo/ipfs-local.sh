@@ -167,7 +167,8 @@ The three nodes run. Each in a terminal of its own (docs/demo.md, D3, "Local tes
   REGISTRAR=127.0.0.1:8053 UPDATE_DOMAIN=$update_domain ${sites}MEMBER=alice IPFS_PATH=$(shown alice) IPFS_API=http://127.0.0.1:5003 demo/ipfs.sh member
   REGISTRAR=127.0.0.1:8053 UPDATE_DOMAIN=$update_domain ${sites}MEMBER=carol IPFS_PATH=$(shown carol) IPFS_API=http://127.0.0.1:5004 demo/ipfs.sh member
 A file into alice's folder:
-  export IPFS_PATH=$(shown alice)
-  ipfs files cp /ipfs/\$(ipfs add -Q photo.jpg) /community/photo.jpg
+  PHOTO=<path to a photo>
+  CID=\$(IPFS_PATH=$(shown alice) ipfs add -Q "\$PHOTO")
+  IPFS_PATH=$(shown alice) ipfs files cp /ipfs/\$CID /community/\$(basename "\$PHOTO")
 Afterwards: demo/ipfs-local.sh stop
 EOF
