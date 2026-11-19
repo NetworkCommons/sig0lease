@@ -244,6 +244,19 @@ func LiveTransport(timeout time.Duration) Transport
     LiveTransport sends msg to addr over network with this package's Client,
     the same transport every other client and test tool in this codebase uses.
 
+type UnreachableError struct {
+	Server string // the DoH server's URL, as New had it
+	Err    error  // why, without the request's URL, which holds the whole message, encoded
+}
+    UnreachableError is queryDoH's failure to get any HTTP answer from Server:
+    it could not connect, or no answer came in time. In a browser it is also an
+    answer whose CORS headers do not let the page read it: fetch does not say
+    which.
+
+func (e *UnreachableError) Error() string
+
+func (e *UnreachableError) Unwrap() error
+
 ```
 
 ## github.com/NetworkCommons/sig0lease/client/agent
@@ -427,7 +440,7 @@ type Options struct {
 	// name that follows a community asks the resolvers (watchIPFS); nil: the registrar's
 	// resolvers (clientsrp.LiveDNSQuery).
 	Send  baseclient.Transport
-	Query clientsrp.DNSQuery
+	Query dnszone.Query
 	Sleep func(context.Context, time.Duration) error
 	// MirrorSource is the daemon an mdns mirror asks, given its socket; default
 	// mdnsbridge.DaemonSource.
@@ -1165,10 +1178,10 @@ reached over TCP by default.
 
 FUNCTIONS
 
-func Discover(ctx context.Context, query DNSQuery, domain string, mode DiscoveryMode, network baseclient.Network) (string, error)
+func Discover(ctx context.Context, query dnszone.Query, domain string, mode DiscoveryMode, network baseclient.Network) (string, error)
     Discover finds the SRP registrar for domain that is reachable over network.
     As RFC 9665 S3.1.1 specifies, it first finds the apex of the closest DNS
-    zone enclosing domain with SOA queries (RFC 8765 S6.1, see zoneApex).
+    zone enclosing domain with SOA queries (RFC 8765 S6.1, dnszone.Apex).
     It then looks up the SRV record at "<service>.<name>.", where service
     is network's DiscoveryService -- "_dnssd-srp-tls._tcp" for NetworkTLS,
     "_dnssd-srp._tcp" otherwise, the service names RFC 9665 S10.4 registers
@@ -1193,6 +1206,10 @@ func DiscoveryService(n baseclient.Network) string
     DiscoveryService returns the service whose SRV record names a registrar
     reachable over n: "_dnssd-srp-tls._tcp" for NetworkTLS (RFC 9665 S10.4.2),
     "_dnssd-srp._tcp" otherwise (S10.4.1).
+
+func LiveDNSQuery(resolvers []string) dnszone.Query
+    LiveDNSQuery returns the dnszone.Query that asks resolvers in turn
+    (dnszone.Resolvers), or defaultBootstrapResolvers when resolvers is empty.
 
 func Publishable(a netip.Addr) bool
     Publishable reports whether a means something off the link: it is not
@@ -1295,7 +1312,7 @@ type Config struct {
 	RegistrarAddr string
 	Discovery     DiscoveryMode // where discovery looks for the SRV; DiscoveryClosest (the zero value) by default
 	Resolvers     []string      // bootstrap resolvers for discovery; LiveDNSQuery's default if empty
-	Query         DNSQuery      // discovery implementation; LiveDNSQuery(Resolvers) if nil
+	Query         dnszone.Query // discovery implementation; LiveDNSQuery(Resolvers) if nil
 
 	Network    baseclient.Network // default NetworkTCP (S3.5's MUST for non-constrained networks)
 	Timeout    time.Duration      // per-request transport timeout; default 20s
@@ -1331,20 +1348,6 @@ type Config struct {
 	OnRegistered func(resp *dns.Msg)
 }
     Config configures a Client. See NewClient's doc comment for defaults.
-
-type DNSQuery func(ctx context.Context, name string, qtype uint16) (*dns.Msg, error)
-    DNSQuery is the shape of a live DNS lookup, injected so Discover is testable
-    without real network I/O. It returns the whole response, since discovery
-    reads both the Answer section (SRV, or an SOA at a zone apex) and the
-    Authority section (the SOA a negative answer carries). A NOERROR or NXDOMAIN
-    response is an answer, not an error.
-
-func LiveDNSQuery(resolvers []string) DNSQuery
-    LiveDNSQuery returns a DNSQuery that performs a real lookup against
-    resolvers (falling back to defaultBootstrapResolvers if empty), trying
-    each in turn until one answers with NOERROR or NXDOMAIN. Any other RCODE
-    (SERVFAIL, REFUSED, ...) counts as that resolver failing, like a network
-    error.
 
 type DiscoveryMode int
     DiscoveryMode selects the names Discover looks under for the registrar's SRV
@@ -2654,6 +2657,49 @@ func ValidateServiceType(svcType string) error
     the second "_tcp" or "_udp". It is the requester's check -- stricter
     than ServiceTypeFromServiceName, since a requester should only ever send
     well-formed types.
+
+```
+
+## github.com/NetworkCommons/sig0lease/pkg/dnszone
+```
+package dnszone // import "github.com/NetworkCommons/sig0lease/pkg/dnszone"
+
+Package dnszone finds the zone that holds a name by asking resolvers: RFC 8765
+S6.1's discovery, which RFC 9665 S3.1.1 points SRP requesters to (client/srp),
+and which the proxy's handlers use to find the zone their UPDATEs name and its
+primary server (pkg/updatecore).
+
+FUNCTIONS
+
+func Apex(ctx context.Context, query Query, name string) (*dns.SOA, error)
+    Apex returns the SOA of the closest zone enclosing name: its owner is the
+    zone's apex, its MNAME the zone's primary server. It follows RFC 8765 S6.1
+    steps 1-4: query SOA for name; an SOA in the Answer section (name is itself
+    an apex) or in the Authority section (a NODATA or NXDOMAIN answer) is the
+    one. A response with no SOA in either section -- a resolver need not put
+    the SOA in a negative answer, and Google Public DNS at times leaves it out
+    -- means stripping the leading label and asking again, down to a two-label
+    name: reaching a single label (a TLD) is a configuration error and ends the
+    search. So is the root zone's SOA, which is what a resolver returns when
+    name's TLD does not exist, and an SOA of a zone that does not enclose name.
+    A failed query ends the search with its error.
+
+
+TYPES
+
+type Query func(ctx context.Context, name string, qtype uint16) (*dns.Msg, error)
+    Query is the shape of a DNS lookup, injected so its callers are testable
+    without real network I/O. It returns the whole response, since discovery
+    reads both the Answer section (an SOA at a zone apex) and the Authority
+    section (the SOA a negative answer carries). A NOERROR or NXDOMAIN response
+    is an answer, not an error.
+
+func Resolvers(resolvers []string) Query
+    Resolvers returns the Query that asks resolvers ("host:port", over UDP) in
+    turn until one answers with NOERROR or NXDOMAIN, and returns that answer.
+    Any other RCODE (SERVFAIL, REFUSED, ...) counts as that resolver failing,
+    like a network error; when every resolver fails, the error gives each one's
+    failure.
 
 ```
 

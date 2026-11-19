@@ -3,7 +3,6 @@ package srp
 import (
 	"context"
 	"errors"
-	"net"
 	"net/netip"
 	"slices"
 	"strings"
@@ -489,51 +488,6 @@ func TestDiscover_QueryError(t *testing.T) {
 	}
 	if len(f.queries) != 1 {
 		t.Fatalf("queries = %q, want the search to stop at the first failed query", f.queries)
-	}
-}
-
-// startTestResolver serves DNS over UDP on a local port, answering every query with an empty
-// response carrying rcode, and returns the "host:port" to reach it.
-func startTestResolver(t *testing.T, rcode uint16) string {
-	t.Helper()
-	pc, err := net.ListenPacket("udp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatalf("listen udp: %v", err)
-	}
-	handler := dns.HandlerFunc(func(ctx context.Context, w dns.ResponseWriter, r *dns.Msg) {
-		resp := &dns.Msg{MsgHeader: r.MsgHeader, Question: r.Question}
-		resp.Response = true
-		resp.Rcode = rcode
-		resp.WriteTo(w)
-	})
-	srv := &dns.Server{PacketConn: pc, Handler: handler}
-	// Wait for the server to start before returning: shutting down a dns.Server whose
-	// ListenAndServe hasn't initialized yet races with that initialization.
-	started := make(chan struct{})
-	srv.NotifyStartedFunc = func(context.Context) { close(started) }
-	go func() { _ = srv.ListenAndServe() }()
-	<-started
-	t.Cleanup(func() { srv.Shutdown(context.Background()) })
-	return pc.LocalAddr().String()
-}
-
-// TestLiveDNSQuery_SkipsFailingResolvers: SERVFAIL means that resolver failed, so the next
-// one is asked; NXDOMAIN is an answer, returned as is.
-func TestLiveDNSQuery_SkipsFailingResolvers(t *testing.T) {
-	query := LiveDNSQuery([]string{startTestResolver(t, dns.RcodeServerFailure), startTestResolver(t, dns.RcodeNameError)})
-	resp, err := query(context.Background(), "_dnssd-srp._tcp.example.com.", dns.TypeSRV)
-	if err != nil {
-		t.Fatalf("query: %v", err)
-	}
-	if resp.Rcode != dns.RcodeNameError {
-		t.Fatalf("rcode = %s, want the second resolver's NXDOMAIN", dns.RcodeToString[resp.Rcode])
-	}
-}
-
-func TestLiveDNSQuery_AllResolversFail(t *testing.T) {
-	query := LiveDNSQuery([]string{startTestResolver(t, dns.RcodeServerFailure), startTestResolver(t, dns.RcodeRefused)})
-	if _, err := query(context.Background(), "example.com.", dns.TypeSOA); err == nil {
-		t.Fatal("expected an error when every resolver fails")
 	}
 }
 

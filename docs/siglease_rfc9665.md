@@ -39,8 +39,11 @@ pkg/srp/            pure logic, no network, no DNS I/O
                      Names()/KeyFor() helpers over a ClassifiedUpdate
   update.go          SRP-update builder, used by the client
 
+pkg/dnszone/          RFC 8765 §6.1 zone discovery through resolvers, shared by the
+                      handlers (updatecore) and SRP clients (client/srp)
+
 pkg/updatecore/       shared forwarding plumbing (RFC 9664 handler and SRP handler alike)
-  coordinator.go      SOA-based discovery, static-upstream override,
+  coordinator.go      SOA-based discovery (dnszone, kept for the SOA's TTL), static-upstream override,
                       construct/forward/re-sign, the tri-state QueryKeyAtName
   ttl.go              RRset TTL consistency check (SRP)
 

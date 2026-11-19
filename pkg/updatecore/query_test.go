@@ -2,9 +2,14 @@ package updatecore
 
 import (
 	"context"
+	"fmt"
+	"maps"
 	"net"
+	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"codeberg.org/miekg/dns"
 )
@@ -107,10 +112,10 @@ func TestParentZone(t *testing.T) {
 	}
 }
 
-// soaAt builds the SOA of zone apex with primary server mname.
-func soaAt(t *testing.T, apex, mname string) dns.RR {
+// soaAt builds the SOA of zone apex with primary server mname and TTL ttl.
+func soaAt(t *testing.T, apex, mname string, ttl int) dns.RR {
 	t.Helper()
-	soa, err := dns.New(apex + " 0 IN SOA " + mname + " root.example. 1 10800 900 604800 86400")
+	soa, err := dns.New(fmt.Sprintf("%s %d IN SOA %s root.example. 1 10800 900 604800 86400", apex, ttl, mname))
 	if err != nil {
 		t.Fatalf("build SOA: %v", err)
 	}
@@ -122,7 +127,7 @@ func soaAt(t *testing.T, apex, mname string) dns.RR {
 // the apex itself. Discovery takes the zone and its primary server from that one answer, with
 // no further query per parent label.
 func TestDiscovery_OneSOAQuery(t *testing.T) {
-	zenr := soaAt(t, "zenr.io.", "ns1.free2air.org.")
+	zenr := soaAt(t, "zenr.io.", "ns1.free2air.org.", 0)
 	var queries atomic.Int32
 	addr := startTestAuthoritative(t, func(tcp bool, query *dns.Msg) *dns.Msg {
 		queries.Add(1)
@@ -163,9 +168,9 @@ func TestDiscovery_OneSOAQuery(t *testing.T) {
 
 // TestDiscovery_RejectsRootAndUnrelatedSOA: a name in no delegated zone gets the root's SOA
 // in the authority section, and a broken resolver may return the SOA of a zone that doesn't
-// hold the name at all; neither is a zone to send UPDATEs to.
+// hold the name at all, or one naming no primary server; none is a zone to send UPDATEs to.
 func TestDiscovery_RejectsRootAndUnrelatedSOA(t *testing.T) {
-	for _, soa := range []dns.RR{soaAt(t, ".", "a.root-servers.net."), soaAt(t, "other.example.", "ns.other.example.")} {
+	for _, soa := range []dns.RR{soaAt(t, ".", "a.root-servers.net.", 0), soaAt(t, "other.example.", "ns.other.example.", 0), soaAt(t, "nosuchtld.", ".", 0)} {
 		addr := startTestAuthoritative(t, func(tcp bool, query *dns.Msg) *dns.Msg {
 			resp := replyTo(query, dns.RcodeNameError)
 			resp.Ns = []dns.RR{soa}
@@ -174,6 +179,101 @@ func TestDiscovery_RejectsRootAndUnrelatedSOA(t *testing.T) {
 		c := NewCoordinator(testLogger(), []string{addr}, nil)
 		if server, zone, err := c.ResolveSOAMasterServer(context.Background(), "test.nosuchtld."); err == nil {
 			t.Errorf("SOA %s: expected an error, got %q, %q", soa.Header().Name, server, zone)
+		}
+	}
+}
+
+// minimalResolver serves zenr.io. as Google Public DNS answered the registrar at times: the
+// SOA in the answer for the apex, and a NOERROR answer with no SOA at all for a name below
+// it. It counts the queries for each name.
+func minimalResolver(t *testing.T, ttl int) (addr string, asked func() map[string]int) {
+	t.Helper()
+	zenr := soaAt(t, "zenr.io.", "ns1.free2air.org.", ttl)
+	var mu sync.Mutex
+	counts := map[string]int{}
+	addr = startTestAuthoritative(t, func(tcp bool, query *dns.Msg) *dns.Msg {
+		name := query.Question[0].Header().Name
+		mu.Lock()
+		counts[name]++
+		mu.Unlock()
+		if name == "zenr.io." {
+			return replyTo(query, dns.RcodeSuccess, zenr)
+		}
+		return replyTo(query, dns.RcodeSuccess)
+	})
+	return addr, func() map[string]int {
+		mu.Lock()
+		defer mu.Unlock()
+		return maps.Clone(counts)
+	}
+}
+
+// TestDiscovery_WalksUpWhenTheReplyHasNoSOA: an answer for srp.dev.zenr.io. without the
+// zone's SOA sends discovery up to dev.zenr.io. and zenr.io., whose SOA is the answer itself.
+func TestDiscovery_WalksUpWhenTheReplyHasNoSOA(t *testing.T) {
+	addr, asked := minimalResolver(t, 0)
+	c := NewCoordinator(testLogger(), []string{addr}, nil)
+
+	server, zone, err := c.ResolveSOAMasterServer(context.Background(), "srp.dev.zenr.io.")
+	if err != nil {
+		t.Fatalf("ResolveSOAMasterServer: %v", err)
+	}
+	if server != "ns1.free2air.org:53" || zone != "zenr.io." {
+		t.Errorf("ResolveSOAMasterServer = %q, %q; want ns1.free2air.org:53, zenr.io.", server, zone)
+	}
+	if want := map[string]int{"srp.dev.zenr.io.": 1, "dev.zenr.io.": 1, "zenr.io.": 1}; !maps.Equal(asked(), want) {
+		t.Errorf("asked %v, want %v", asked(), want)
+	}
+}
+
+// TestDiscovery_KeepsTheSOAForItsTTL: what discovery found answers every caller, with no
+// query, until the SOA's TTL runs out; then it asks again.
+func TestDiscovery_KeepsTheSOAForItsTTL(t *testing.T) {
+	addr, asked := minimalResolver(t, 360)
+	c := NewCoordinator(testLogger(), []string{addr}, nil)
+	start := time.Date(2026, 11, 19, 12, 0, 0, 0, time.UTC)
+	now := start
+	c.now = func() time.Time { return now }
+	ctx := context.Background()
+	lookups := func() int { return asked()["zenr.io."] }
+
+	for _, at := range []time.Duration{0, time.Second, 359 * time.Second} {
+		now = start.Add(at)
+		if _, zone, err := c.ResolveSOAMasterServer(ctx, "srp.dev.zenr.io."); err != nil || zone != "zenr.io." {
+			t.Fatalf("ResolveSOAMasterServer after %v: %q, %v", at, zone, err)
+		}
+		if zone, err := c.ResolveAuthoritativeZone(ctx, "srp.dev.zenr.io."); err != nil || zone != "zenr.io." {
+			t.Fatalf("ResolveAuthoritativeZone after %v: %q, %v", at, zone, err)
+		}
+	}
+	if n := lookups(); n != 1 {
+		t.Fatalf("%d lookups within the TTL, want 1", n)
+	}
+	now = start.Add(360 * time.Second)
+	if _, _, err := c.ResolveSOAMasterServer(ctx, "srp.dev.zenr.io."); err != nil {
+		t.Fatalf("ResolveSOAMasterServer after the TTL: %v", err)
+	}
+	if n := lookups(); n != 2 {
+		t.Fatalf("%d lookups after the TTL ran out, want 2", n)
+	}
+}
+
+// TestDiscovery_FailureIsNotKeptAndSaysWhy: a failed discovery says what each resolver
+// answered, and the next call asks again.
+func TestDiscovery_FailureIsNotKeptAndSaysWhy(t *testing.T) {
+	var queries atomic.Int32
+	addr := startTestAuthoritative(t, func(tcp bool, query *dns.Msg) *dns.Msg {
+		queries.Add(1)
+		return replyTo(query, dns.RcodeServerFailure)
+	})
+	c := NewCoordinator(testLogger(), []string{addr}, nil)
+	for i := 1; i <= 2; i++ {
+		_, _, err := c.ResolveSOAMasterServer(context.Background(), "srp.dev.zenr.io.")
+		if err == nil || !strings.Contains(err.Error(), addr+" answered SERVFAIL") {
+			t.Fatalf("call %d: error %v, want one saying %s answered SERVFAIL", i, err, addr)
+		}
+		if n := queries.Load(); n != int32(i) {
+			t.Fatalf("call %d: %d queries in all, want %d", i, n, i)
 		}
 	}
 }

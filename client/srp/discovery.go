@@ -12,48 +12,20 @@ import (
 	"codeberg.org/miekg/dns/dnsutil"
 	baseclient "github.com/NetworkCommons/sig0lease/client"
 	"github.com/NetworkCommons/sig0lease/pkg/dnsname"
+	"github.com/NetworkCommons/sig0lease/pkg/dnszone"
 )
 
-// DNSQuery is the shape of a live DNS lookup, injected so Discover is testable without real
-// network I/O. It returns the whole response, since discovery reads both the Answer section
-// (SRV, or an SOA at a zone apex) and the Authority section (the SOA a negative answer
-// carries). A NOERROR or NXDOMAIN response is an answer, not an error.
-type DNSQuery func(ctx context.Context, name string, qtype uint16) (*dns.Msg, error)
-
-// defaultBootstrapResolvers mirrors pkg/updatecore.Coordinator's own default -- the same
-// public resolver pair used elsewhere in this codebase to resolve records this project
-// doesn't itself serve.
+// defaultBootstrapResolvers are the resolvers LiveDNSQuery asks when none are configured: the
+// public pair config.yaml's upstreams also lists.
 var defaultBootstrapResolvers = []string{"8.8.8.8:53", "8.8.4.4:53"}
 
-// LiveDNSQuery returns a DNSQuery that performs a real lookup against resolvers (falling
-// back to defaultBootstrapResolvers if empty), trying each in turn until one answers with
-// NOERROR or NXDOMAIN. Any other RCODE (SERVFAIL, REFUSED, ...) counts as that resolver
-// failing, like a network error.
-func LiveDNSQuery(resolvers []string) DNSQuery {
+// LiveDNSQuery returns the dnszone.Query that asks resolvers in turn (dnszone.Resolvers),
+// or defaultBootstrapResolvers when resolvers is empty.
+func LiveDNSQuery(resolvers []string) dnszone.Query {
 	if len(resolvers) == 0 {
 		resolvers = defaultBootstrapResolvers
 	}
-	return func(ctx context.Context, name string, qtype uint16) (*dns.Msg, error) {
-		req := dns.NewMsg(name, qtype)
-		if req == nil {
-			return nil, fmt.Errorf("srp/client: failed to build %s query for %s", dns.TypeToString[qtype], name)
-		}
-
-		var lastErr error
-		for _, resolver := range resolvers {
-			resp, err := dns.Exchange(ctx, req, "udp", resolver)
-			if err != nil {
-				lastErr = err
-				continue
-			}
-			if resp.Rcode != dns.RcodeSuccess && resp.Rcode != dns.RcodeNameError {
-				lastErr = fmt.Errorf("resolver %s answered %s", resolver, dns.RcodeToString[resp.Rcode])
-				continue
-			}
-			return resp, nil
-		}
-		return nil, fmt.Errorf("srp/client: %s query for %s failed against all resolvers: %w", dns.TypeToString[qtype], name, lastErr)
-	}
+	return dnszone.Resolvers(resolvers)
 }
 
 // DiscoveryMode selects the names Discover looks under for the registrar's SRV record.
@@ -86,7 +58,7 @@ func (m DiscoveryMode) validate() error {
 
 // Discover finds the SRP registrar for domain that is reachable over network. As RFC 9665
 // S3.1.1 specifies, it first finds the apex of the closest DNS zone enclosing domain with SOA
-// queries (RFC 8765 S6.1, see zoneApex). It then looks up the SRV record at
+// queries (RFC 8765 S6.1, dnszone.Apex). It then looks up the SRV record at
 // "<service>.<name>.", where service is network's DiscoveryService -- "_dnssd-srp-tls._tcp"
 // for NetworkTLS, "_dnssd-srp._tcp" otherwise, the service names RFC 9665 S10.4 registers in
 // RFC 6763 S7's "_<service>._tcp" form -- for each name mode selects (see DiscoveryMode), in
@@ -102,9 +74,9 @@ func (m DiscoveryMode) validate() error {
 // Returns "address:port". A caller with an explicit registrar address configured should skip
 // this entirely (see Config.RegistrarAddr) -- discovery is the fallback, not the only path,
 // matching cmd/sig0lease-srp-client's own "dev/test tool" framing.
-func Discover(ctx context.Context, query DNSQuery, domain string, mode DiscoveryMode, network baseclient.Network) (string, error) {
+func Discover(ctx context.Context, query dnszone.Query, domain string, mode DiscoveryMode, network baseclient.Network) (string, error) {
 	if query == nil {
-		return "", fmt.Errorf("srp/client: Discover called with a nil DNSQuery")
+		return "", fmt.Errorf("srp/client: Discover called with a nil query")
 	}
 	if err := mode.validate(); err != nil {
 		return "", fmt.Errorf("srp/client: %w", err)
@@ -116,11 +88,11 @@ func Discover(ctx context.Context, query DNSQuery, domain string, mode Discovery
 		return "", fmt.Errorf("srp/client: no registrar is discovered over doh: RFC 9665 names no DoH service, so give the registrar's URL")
 	}
 	domain = dnsutil.Fqdn(domain)
-	zone, err := zoneApex(ctx, query, domain)
+	soa, err := dnszone.Apex(ctx, query, domain)
 	if err != nil {
 		return "", fmt.Errorf("srp/client: discovery failed for %s: %w", domain, err)
 	}
-	names, err := registrarSearchNames(domain, zone, mode)
+	names, err := registrarSearchNames(domain, dnsutil.Fqdn(soa.Hdr.Name), mode)
 	if err != nil {
 		return "", fmt.Errorf("srp/client: discovery failed for %s: %w", domain, err)
 	}
@@ -162,7 +134,7 @@ func Discover(ctx context.Context, query DNSQuery, domain string, mode Discovery
 
 // targetAddress returns an address for an SRV target: its first A record, or its first AAAA
 // record if it has no A record.
-func targetAddress(ctx context.Context, query DNSQuery, target string) (netip.Addr, error) {
+func targetAddress(ctx context.Context, query dnszone.Query, target string) (netip.Addr, error) {
 	resp, err := query(ctx, target, dns.TypeA)
 	if err != nil {
 		return netip.Addr{}, err
@@ -182,41 +154,6 @@ func targetAddress(ctx context.Context, query DNSQuery, target string) (netip.Ad
 		}
 	}
 	return netip.Addr{}, fmt.Errorf("SRV target %s has no A or AAAA record", target)
-}
-
-// zoneApex returns the apex of the closest DNS zone enclosing name, following RFC 8765
-// S6.1 steps 1-4, which RFC 9665 S3.1.1 points to: query SOA for name; an SOA in the Answer
-// section (name is itself an apex) or in the Authority section (a NODATA or NXDOMAIN
-// answer) gives the apex as that SOA's owner name. A response with no SOA in either
-// section means stripping the leading label and asking again, down to a two-label name --
-// reaching a single label (a TLD) is a configuration error and ends the search. So is the
-// root zone's SOA, which is what a resolver returns when name's TLD does not exist.
-//
-// RFC 9665 S3.1.1 starts from the names of the records being registered. Every one of them
-// is a subdomain of the registration domain, and an SRP Update covers exactly one zone
-// (S3.3), so starting from domain itself finds the same zone.
-func zoneApex(ctx context.Context, query DNSQuery, name string) (string, error) {
-	candidate := dnsutil.Fqdn(name)
-	// Labels counts the empty root label too: "example.com." has 3, "com." has 2.
-	for len(dnsname.Labels(candidate)) > 2 {
-		resp, err := query(ctx, candidate, dns.TypeSOA)
-		if err != nil {
-			return "", err
-		}
-		soa := firstSOA(resp.Answer)
-		if soa == nil {
-			soa = firstSOA(resp.Ns)
-		}
-		if soa != nil {
-			apex := dnsutil.Fqdn(soa.Hdr.Name)
-			if apex == "." {
-				return "", fmt.Errorf("no zone below the root encloses %s: the resolver answered with the root zone's SOA, so the top-level domain does not exist there", dnsutil.Fqdn(name))
-			}
-			return apex, nil
-		}
-		_, candidate, _ = dnsname.CutFirstLabel(candidate)
-	}
-	return "", fmt.Errorf("no SOA record found for %s or any parent name above the top-level domain (RFC 8765 S6.1 step 4)", dnsutil.Fqdn(name))
 }
 
 // registrarSearchNames returns the names Discover looks under for the registrar's SRV
@@ -239,13 +176,4 @@ func registrarSearchNames(domain, apex string, mode DiscoveryMode) ([]string, er
 		return names[len(names)-1:], nil
 	}
 	return names, nil
-}
-
-func firstSOA(rrs []dns.RR) *dns.SOA {
-	for _, rr := range rrs {
-		if soa, ok := rr.(*dns.SOA); ok {
-			return soa
-		}
-	}
-	return nil
 }

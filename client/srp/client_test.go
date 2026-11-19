@@ -12,6 +12,7 @@ import (
 	"codeberg.org/miekg/dns"
 	baseclient "github.com/NetworkCommons/sig0lease/client"
 	"github.com/NetworkCommons/sig0lease/client/clienttest"
+	"github.com/NetworkCommons/sig0lease/pkg/dnszone"
 	leasepkg "github.com/NetworkCommons/sig0lease/pkg/lease"
 	"github.com/NetworkCommons/sig0lease/pkg/sig0"
 	pkgsrp "github.com/NetworkCommons/sig0lease/pkg/srp"
@@ -332,9 +333,9 @@ func TestClient_Register_InterpretsConflict(t *testing.T) {
 	}
 }
 
-// heldBy is a DNSQuery answering a KEY query with another key's KEY at every name in held,
+// heldBy is a dnszone.Query answering a KEY query with another key's KEY at every name in held,
 // and NXDOMAIN everywhere else.
-func heldBy(held ...string) DNSQuery {
+func heldBy(held ...string) dnszone.Query {
 	return func(ctx context.Context, name string, qtype uint16) (*dns.Msg, error) {
 		resp := &dns.Msg{MsgHeader: dns.MsgHeader{Rcode: dns.RcodeNameError}}
 		for _, h := range held {

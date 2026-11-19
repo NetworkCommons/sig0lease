@@ -445,7 +445,7 @@ Two backends are selectable via `handlers.update.storage` in `config.yaml` (see 
   (default 1) instead of queueing them, so set this to the upstream server's quota — see
   `docs/siglease_rfc9665.md` §6, "Concurrent UPDATEs".
 
-The update handler uses the configured zone to discover the authoritative server for the effective zone, then sends the rewritten UPDATE there. A static `upstream: "host:port"` replaces that discovery for the configured zone and every name below it, including the zones the requests name (`make test-update-local` uses it to point the handler at a local BIND 9).
+The update handler uses the configured zone to discover the authoritative server for the effective zone, then sends the rewritten UPDATE there. Discovery is RFC 8765 §6.1's, through the upstream resolvers (`pkg/dnszone.Apex`, which SRP clients use too): an SOA query for the configured zone, whose answer carries the enclosing zone's SOA, or, when a resolver leaves it out (Google Public DNS does at times), SOA queries for each parent name up to the apex. The SOA found is kept for its TTL, so the resolvers are asked once per TTL, not once per request; a failed discovery is not kept, and its error gives each resolver's answer. A static `upstream: "host:port"` replaces that discovery for the configured zone and every name below it, including the zones the requests name (`make test-update-local` uses it to point the handler at a local BIND 9).
 
 ## DNS-over-TLS
 

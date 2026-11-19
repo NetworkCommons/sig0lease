@@ -13,6 +13,7 @@ import (
 	"codeberg.org/miekg/dns"
 	baseclient "github.com/NetworkCommons/sig0lease/client"
 	"github.com/NetworkCommons/sig0lease/client/clienttest"
+	"github.com/NetworkCommons/sig0lease/pkg/dnszone"
 	"github.com/NetworkCommons/sig0lease/pkg/keyrec"
 	leasepkg "github.com/NetworkCommons/sig0lease/pkg/lease"
 )
@@ -129,7 +130,7 @@ func (m *memStore) isHeld(host string) bool {
 	return ok
 }
 
-func startTestHost(t *testing.T, reg *hostRegistrar, store HostStore, query DNSQuery, logf func(string, ...any), keepNames bool) *Host {
+func startTestHost(t *testing.T, reg *hostRegistrar, store HostStore, query dnszone.Query, logf func(string, ...any), keepNames bool) *Host {
 	t.Helper()
 	key, err := keyrec.GenerateKey("box.srp.test.", dns.ECDSAP256SHA256, 0, 256)
 	if err != nil {

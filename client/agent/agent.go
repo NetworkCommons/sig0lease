@@ -21,6 +21,7 @@ import (
 	"github.com/NetworkCommons/sig0lease/logging"
 	"github.com/NetworkCommons/sig0lease/pkg/dnsmsg"
 	"github.com/NetworkCommons/sig0lease/pkg/dnsname"
+	"github.com/NetworkCommons/sig0lease/pkg/dnszone"
 	"github.com/NetworkCommons/sig0lease/pkg/keyrec"
 )
 
@@ -51,7 +52,7 @@ type Options struct {
 	// name that follows a community asks the resolvers (watchIPFS); nil: the registrar's
 	// resolvers (clientsrp.LiveDNSQuery).
 	Send  baseclient.Transport
-	Query clientsrp.DNSQuery
+	Query dnszone.Query
 	Sleep func(context.Context, time.Duration) error
 	// MirrorSource is the daemon an mdns mirror asks, given its socket; default
 	// mdnsbridge.DaemonSource.
@@ -418,7 +419,7 @@ func (a *agent) srpConfig(r savedRegistrar) clientsrp.Config {
 // resolverQuery is how the agent asks a registrar's resolvers, given in its template (nil:
 // client/srp's default ones): an SRP client, for discovery and KEY lookups, and a name that
 // follows a community, for the names of members its registrar does not serve.
-func (a *agent) resolverQuery(resolvers []string) clientsrp.DNSQuery {
+func (a *agent) resolverQuery(resolvers []string) dnszone.Query {
 	if a.opts.Query != nil {
 		return a.opts.Query
 	}

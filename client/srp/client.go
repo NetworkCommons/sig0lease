@@ -23,6 +23,7 @@ import (
 	_ "github.com/NetworkCommons/sig0lease/pkg/dnscompat" // registers EDNS0 code 2 (UPDATE-LEASE); required to unpack a registrar's response
 	"github.com/NetworkCommons/sig0lease/pkg/dnsname"
 	"github.com/NetworkCommons/sig0lease/pkg/dnssd"
+	"github.com/NetworkCommons/sig0lease/pkg/dnszone"
 	"github.com/NetworkCommons/sig0lease/pkg/keyrec"
 	"github.com/NetworkCommons/sig0lease/pkg/sig0"
 	pkgsrp "github.com/NetworkCommons/sig0lease/pkg/srp"
@@ -141,7 +142,7 @@ type Config struct {
 	RegistrarAddr string
 	Discovery     DiscoveryMode // where discovery looks for the SRV; DiscoveryClosest (the zero value) by default
 	Resolvers     []string      // bootstrap resolvers for discovery; LiveDNSQuery's default if empty
-	Query         DNSQuery      // discovery implementation; LiveDNSQuery(Resolvers) if nil
+	Query         dnszone.Query // discovery implementation; LiveDNSQuery(Resolvers) if nil
 
 	Network    baseclient.Network // default NetworkTCP (S3.5's MUST for non-constrained networks)
 	Timeout    time.Duration      // per-request transport timeout; default 20s

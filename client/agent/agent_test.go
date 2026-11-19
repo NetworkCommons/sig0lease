@@ -23,9 +23,9 @@ import (
 	"github.com/NetworkCommons/sig0lease/client/mdnsbridge"
 	"github.com/NetworkCommons/sig0lease/client/mdnsresponder"
 	"github.com/NetworkCommons/sig0lease/client/rfc9664"
-	clientsrp "github.com/NetworkCommons/sig0lease/client/srp"
 	"github.com/NetworkCommons/sig0lease/pkg/dnsmsg"
 	"github.com/NetworkCommons/sig0lease/pkg/dnsname"
+	"github.com/NetworkCommons/sig0lease/pkg/dnszone"
 	leasepkg "github.com/NetworkCommons/sig0lease/pkg/lease"
 )
 
@@ -166,7 +166,7 @@ func summarize(m *dns.Msg) update {
 }
 
 // heldBy answers KEY lookups: each name in held has a KEY that is not the agent's.
-func heldBy(held ...string) clientsrp.DNSQuery {
+func heldBy(held ...string) dnszone.Query {
 	return func(ctx context.Context, name string, qtype uint16) (*dns.Msg, error) {
 		resp := &dns.Msg{MsgHeader: dns.MsgHeader{Rcode: dns.RcodeNameError}}
 		if slices.Contains(held, name) && qtype == dns.TypeKEY {
