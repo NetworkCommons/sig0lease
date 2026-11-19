@@ -1,0 +1,10 @@
+#export KEYLEASE=500
+#export LEASE=250 
+./client-wg-req-mon.sh blackbox
+./client-wg-req-mon.sh whitebox
+./client-wg-req-mon.sh greenbox
+./client-wg-req-mon.sh redbox
+./client-wg-req-mon.sh bluebox
+./client-wg-req-mon.sh cuddly
+./client-wg-req-mon.sh sweetly
+./client-wg-req-mon.sh deadly
