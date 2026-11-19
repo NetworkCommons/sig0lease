@@ -92,60 +92,39 @@ function get_WGCFG_attribute() {
     # get specified attribute value from TXT of a WGPEER DNS-SD service instance
     #
     # PARAMS
-    #   1 WGPEER instance name
-    #   2 WG service instance name (used as subtype)
+    #   1 WG instance name
+    #   2 WGPEER instance name (used as subtype)
     #   3 DOMAIN
     #   4 TXT Attribute key value to enumerate
     # 
-    # Example test uses:
-    #
-    # $ TEST_GET_WGCFG_ATTRIBUTE="True" ./get_WG_attribute.sh blackbox wgservice dev.zenr.io  pk
-    # Service Instance 'blackbox' of type '_wgpeer._udp' in domain dev.zenr.io has TXT RR attribute 'txtvers' value of '1'
-    #
-    # $ TEST_GET_WGCFG_ATTRIBUTE="True" ./get_WGCFG_attribute.sh blackbox wgservice dev.zenr.io  pk
-    # Service Instance 'blackbox' of type '_wgpeer._udp' in domain dev.zenr.io has TXT RR attribute 'pk' value of 'mul5zgBo+f14SCYvsj6F1CJgZlO/LFm3dWJrRnCHZzQ='
-    #
-    #   WG service instance name (S subtype)
-    local wgpeer_instance="${1}" # WGPEER instance name
-    local wg_instance="${2}"     # WG service instance name (used as wgpeer subtype)
+    local wgpeer_instance="${1}" # WGPEER client instance name
+    local wg_instance="${2}"     # WG server instance name
+    local wgcfg_instance="${wg_instance}-${wgpeer_instance}" # WGCFG cfg instance name
+
     local domain="${3}"          # FQDN common to _wg and _wgpeer instances
     local attribute="${4}"       # TXT key attribute to evaluate & return value
 
+
+
     SD_TYPE="_wgcfg._udp"
-    SD_SUBTYPE="${wg_instance}._sub"
+    SD_SUBTYPE="${wgpeer_instance}._sub" # WGCFG subtype is CLIENT Ci
 
     PTR_RR="`dig +short @${MNAME} ${SD_SUBTYPE}.${SD_TYPE}.${domain}. ptr`"
+    PTR_RR_STR="dig +short @${MNAME} ${SD_SUBTYPE}.${SD_TYPE}.${domain}. ptr"
 
-    WGPEER_RR_ARRAY=(${PTR_RR})
-
-    i=0
-    WGPEER_RR=""
-    while (( i < ${#WGPEER_RR_ARRAY[@]} ))
-    do
-        # echo "$i. ${WGPEER_RR_ARRAY[i]} : `dig +short @${MNAME} ${WGPEER_RR_ARRAY[i]} TXT` : ${wgpeer_instance}.${SD_TYPE}.${domain}."
-        if [[ "${WGPEER_RR_ARRAY[i]}" == "${wgpeer_instance}.${SD_TYPE}.${domain}." ]]; then
-            WGPEER_RR="${WGPEER_RR_ARRAY[i]}"
-            break;
-        fi
-        ((i++))
-    done
-    # echo "===== ${WGPEER_RR}"
-
-    TXT_RR="`dig +short @${MNAME} ${WGPEER_RR} TXT`"
-    # echo "***** ${TXT_RR}"
+    TXT_RR="`dig +short @${MNAME} ${PTR_RR} TXT`"
 
     temp="${TXT_RR##*\"${attribute}=}" # strip up to and including '"'+attribute+'='
     res="${temp%%\"*}"   # strip everything after endquote matching beginning '"' from above
     echo "${res}"
 }
 
-
-
 if [[ -n ${TEST_GET_WG_ATTRIBUTE} ]]; then
     instance=${1:-"wgservice"}
     service_type="_wg._udp"
-    domain=${3:-"dev.zenr.io"}
+    domain=${3:-"srp.dev.zenr.io"}
     attr=${4:-"net"}
+    echo " get_WG_attribute <wg instance name> <domain> <TXT RR attribute>"
     echo " Service Instance '${instance}' of type '${service_type}' in domain ${domain} has TXT RR attribute '${attr}' value of '$(get_WG_attribute ${instance} ${domain} ${attr})'"
 fi
 
@@ -153,19 +132,21 @@ if [[ -n ${TEST_GET_WGPEER_ATTRIBUTE} ]]; then
     instance=${1:-"redbox"}
     service_type="_wgpeer._udp"
     wg_instance="wgservice"
-    domain=${3:-"dev.zenr.io"}
-    attr=${4:-"addr"}
+    domain=${3:-"srp.dev.zenr.io"}
+    attr=${4:-"pk"}
+    echo " get_WG_attribute <wgpeer instance name> <wg instance name> <domain> <TXT RR attribute>"
     echo " Service Instance '${instance}' of type '${service_type}' in domain ${domain} has TXT RR attribute '${attr}' value of '$(get_WGPEER_attribute ${instance} ${wg_instance} ${domain} ${attr})'"
     echo
 fi
 
 if [[ -n ${TEST_GET_WGCFG_ATTRIBUTE} ]]; then
-    instance=${1:-"redbox"}
     service_type="_wgcfg._udp"
-    wg_instance="wgservice"
-    domain=${3:-"dev.zenr.io"}
+    wg_instance=${1:-"wgservice"}
+    wgpeer_instance=${2:-"bluebox"}
+    wgcfg_instance="${wg_instance}-${wgpeer_instance}"
+    domain=${3:-"srp.dev.zenr.io"}
     attr=${4:-"addr"}
-    echo " Service Instance '${instance}' of type '${service_type}' in domain ${domain} has TXT RR attribute '${attr}' value of '$(get_WGCFG_attribute ${instance} ${wg_instance} ${domain} ${attr})'"
-    echo
+    echo " get_WGCFG_attribute <wgpeer instance name> <wg instance name> <domain> <TXT RR attribute>"
+    echo " Service Instance '${wgcfg_instance}' of type '${service_type}' in domain '${domain}' has TXT RR attribute '${attr}' value of '$(get_WGCFG_attribute ${wgpeer_instance} ${wg_instance} ${domain} ${attr})'"
 fi
 

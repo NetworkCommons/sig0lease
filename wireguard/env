@@ -8,7 +8,7 @@ DIR=${DIR:-"$(uname | tr '[:upper:]' '[:lower:]')"}
 
 
 # SRP defaults
-DOMAIN=${DOMAIN:-"dev.zenr.io"}
+DOMAIN=${DOMAIN:-"srp.dev.zenr.io"}
 MNAME=$(get_mname ${DOMAIN})
 DIG_OPTIONS=${DIG_OPTIONS:-"+noall +answer @${MNAME}"}
 
@@ -43,7 +43,6 @@ REQ_SERVICE_NAME=${SERVER_SERVICE_NAME:-"myservice"}
 
 
 # # DEBUG TEST
-# WG_CLIENT_CIDR="${SERVER_NETWORK}"
-# WG_CLIENT_IP_POOL=$(cidrl ${WG_CLIENT_CIDR})
-# #echo "WG_CLIENT_IP_POOL:"
+WG_CLIENT_CIDR="${SERVER_NETWORK}"
+WG_CLIENT_IP_POOL=$(cidrl ${WG_CLIENT_CIDR})
 # echo "${WG_CLIENT_IP_POOL}"

@@ -48,13 +48,10 @@ CLIENT_SD_TYPE="_wgpeer._udp"
 CLIENT_SERVICE_NAME=${CLIENT_SERVICE_NAME:-"wgclientservice"}
 CLIENT_SUBTYPE=${SERVER_SERVICE_NAME}
 CLIENT_PUBKEY="mul5zgBo+f14SCYvsj6F1CJgZlO/LFm3dWJrRnCHZzQ="
+
 #
 # Request to use VPN service instance ${SERVER_SERVICE_NAME}
 #
-echo "****"
-echo "**** Step 2: REQUEST: CLIENT Browses & Requests to be a VPN client: ${CLIENT_HOSTNAME} for SD VPN service: ${SERVER_SERVICE_NAME} with service type: ${CLIENT_SD_TYPE} and subtype: ${CLIENT_SUBTYPE}"
-echo "****"
-
 CLIENT_KEYSTORE_DIR="${GITDIR}/keystore/client" ${GITDIR}/bin/${DIR}/sig0lease-srp-client \
   -domain="${DOMAIN}" \
   -host="${CLIENT_HOSTNAME}" \
@@ -67,18 +64,15 @@ CLIENT_KEYSTORE_DIR="${GITDIR}/keystore/client" ${GITDIR}/bin/${DIR}/sig0lease-s
   -keystore="${GITDIR}/keystore/client" -k=15 \
   -once
 
-echo
-echo "*** 2.Requested (WG Client)"
-echo
-echo "== Browse ${SERVER_SD_TYPE} Service Instances Results"
-SERVICE_INSTANCES=`dig ${DIG_OPTIONS} ${SERVER_SD_TYPE}.${DOMAIN} PTR | grep -v RRSIG | grep -v NSEC`
-echo "${SERVICE_INSTANCES}"
-echo
-echo "== Published Request with ${SERVER_SERVICE_NAME}._sub.${CLIENT_SERVICE_NAME}.${CLIENT_SD_TYPE}.${DOMAIN}"
-CLIENT_REQUEST=`dig ${DIG_OPTIONS} ${SERVER_SERVICE_NAME}._sub.${CLIENT_SD_TYPE}.${DOMAIN} PTR | grep -v RRSIG | grep -v NSEC`
-echo "${CLIENT_REQUEST}"
-echo
+# SERVICE_INSTANCES=`dig ${DIG_OPTIONS} ${SERVER_SD_TYPE}.${DOMAIN} PTR | grep -v RRSIG | grep -v NSEC`
+# echo "${SERVICE_INSTANCES}"
+# echo
 
+# echo "== Published Request with ${SERVER_SERVICE_NAME}._sub.${CLIENT_SERVICE_NAME}.${CLIENT_SD_TYPE}.${DOMAIN}"
+# CLIENT_REQUEST=`dig ${DIG_OPTIONS} ${SERVER_SERVICE_NAME}._sub.${CLIENT_SD_TYPE}.${DOMAIN} PTR | grep -v RRSIG | grep -v NSEC`
+# echo "${CLIENT_REQUEST}"
+# echo
+#
 
 exit
 
