@@ -560,6 +560,126 @@ plain queries (`client/browse`), and claims a name with a message through `clien
 proxy too, which answers them for its zones from their authoritative server ("Queries for the
 Zones Served"), so the page sees a change as soon as that server has it.
 
+## macOS's Own Updates (Wide-Area Bonjour)
+
+An application can ask mDNSResponder to register in a domain other than `local.`; the daemon
+then updates that domain's zone itself, with RFC 2136 (Wide-Area Bonjour), and a Mac would need
+nothing of this project's to publish. The proxy refuses those updates. What the daemon sends,
+what the proxy answers, and what accepting them would take, as tried on macOS 26.7
+(mDNSResponder 2881.160.4) on 2026-10-15 and read in the mDNSResponder source
+(`mDNSCore/uDNS.c`). A Mac's services reach the zone instead through `sig0lease-agent`'s `mdns`
+mirror ([demo.md](demo.md), D2).
+
+```mermaid
+flowchart LR
+  app["dns-sd -P<br/>Demo in update.test,<br/>host demo.update.test"]:::theirs
+  daemon["mDNSResponder<br/>zone by SOA, server<br/>by _dns-update._udp"]:::theirs
+  proxy["sig0lease<br/>update_handler<br/>update.test."]:::ours
+  bind["BIND 9<br/>update.test.<br/>127.0.0.1:5300"]:::infra
+  app -- "/var/run/mDNSResponder" --> daemon
+  daemon -- "UPDATE, UDP, unsigned" --> proxy
+  proxy -. "not reached" .-> bind
+  classDef ours fill:#e9edfc,stroke:#3454d1,color:#1b2028
+  classDef theirs fill:#f9ecdc,stroke:#a5571a,color:#1b2028
+  classDef infra fill:#eaecf1,stroke:#566072,color:#1b2028
+```
+
+The set-up, on one Mac:
+
+- The tests' local BIND 9 (`tests/lib/bind9.sh`) serves `update.test.`, with two records added
+  by hand: `_dns-update._udp SRV 0 0 <proxy port> proxy.update.test.` and `proxy A 127.0.0.1`,
+  where the daemon sends its updates.
+- `/etc/resolver/update.test` makes the daemon, which is also macOS's DNS resolver, ask that
+  BIND 9 about the domain.
+- The proxy runs a copy of `config.yaml` localized as for `make test-update-local`.
+
+```bash
+sudo sh -c 'mkdir -p /etc/resolver && printf "nameserver 127.0.0.1\nport 5300\n" > /etc/resolver/update.test'
+dns-sd -P "Demo" _http._tcp update.test 8080 demo.update.test 192.0.2.33 path=/demo
+sudo rm /etc/resolver/update.test   # afterwards
+```
+
+What the daemon sends, from UDP port 5353, with no KEY, no SIG(0) and no TSIG (none
+configured); A, SRV and TXT each follow a delete of their whole RRset (class ANY):
+
+```
+ZONE    update.test. SOA
+UPDATE  demo.update.test.             A    192.0.2.33
+        Demo._http._tcp.update.test.  SRV  0 0 8080 demo.update.test.
+        Demo._http._tcp.update.test.  TXT  "path=/demo"
+        _http._tcp.update.test.       PTR  Demo._http._tcp.update.test.
+        _services._dns-sd._udp.update.test.  PTR  _http._tcp.update.test.
+OPT     Update Lease, 4-byte variant: 7200 s
+```
+
+When `dns-sd` stops, the daemon withdraws the records in one update of class NONE deletes (all
+but the `_services` PTR), carrying the same 4-byte lease. From the source: it refreshes on the
+lease the reply grants; a record withdrawn on its own carries no lease; after an error it cannot
+classify (not REFUSED) from a server on port 53, it sends the registration again without a lease.
+
+What the proxy answers:
+
+- With `prefer_4byte_variant: false`, as in `config.yaml`: REFUSED, for the 4-byte lease
+  (Extended DNS Error 21, Not Supported; "Adds and Deletes").
+- With `prefer_4byte_variant: true`: the lease is accepted, then the registration is REFUSED at
+  its first delete of a whole RRset (class ANY), with Extended DNS Error 21, before any signature
+  check. The withdrawal, class NONE deletes only, is REFUSED for having no SIG(0) (Extended DNS
+  Error 18, Prohibited). Both from the code since 3f4b30b, not run on a Mac since; before it, the
+  registration was refused for having no SIG(0).
+- Nothing reaches BIND 9. The daemon logs `RCODE: Refused` and keeps retrying; `dns-sd` prints
+  nothing. `srp_handler` declines these updates before `update_handler` sees them: a
+  delete-then-add is not SRP's shape.
+
+`dns-sd -R`, which registers a service of the Mac itself with no host given, as applications do,
+sent the PTR and TXT but no SRV, and withdrew them about 9 s later. For such a service, on a Mac
+with a private IPv4 address and an update server whose address is not private (127.0.0.1 here),
+the daemon first asks the router to forward the service's port (NAT-PMP, PCP or UPnP), and sends
+the SRV only with the forwarded port. That router answered none of the three, so the SRV never
+went. With the update server on the Mac's LAN address, the SRVs went at once, with the internal
+port.
+
+What a Mac can be given, tried with a listener in place of the proxy that checked each signature
+and answered REFUSED:
+
+- **A TSIG key**: a System keychain password item, service `dns:<domain>`, label the domain (a
+  `:` in it is read as host:port and the key is skipped), account the key's name, password the
+  base64 secret. The daemon took it at once and signed every update and withdrawal with it, with
+  HMAC-MD5 only, which RFC 8945 says must not be used.
+- **`Setup:/Network/DynamicDNS`**, in the system's network preferences, set with a small Swift
+  tool (`SCPreferences`, as root; `scutil` cannot write these entries). `HostNames` gives the Mac
+  a name and address in the zone; `RegistrationDomains` sends every registration that names no
+  domain to the zone. The Mac at once sent one signed update with its host name's AAAA, its
+  global IPv6 address, and every service it advertises (`_ssh`, `_sftp-ssh`, `_smb`, `_nfs`),
+  named after the computer. No A record: for a private IPv4 address the daemon waits for the
+  router's public address over NAT-PMP, and none came. The SRV target was the router's name for
+  the Mac; the source switches it to the zone's host name once that name is registered.
+- UDP only: the daemon never uses its TLS update path, and finds the server only by
+  `_dns-update._udp` at the zone apex.
+
+What accepting them would take:
+
+- **The proxy**: the deletes of a whole RRset (class ANY) that start each registration, which it
+  refuses; a TSIG key as the owner of names, in place of a KEY; TSIG with HMAC-MD5 for chosen
+  keys; and `prefer_4byte_variant: true`. The class NONE deletes of the withdrawals it takes
+  already. The TSIG key stays between the Mac and the proxy: upstream, the proxy keeps signing
+  with SIG(0).
+- **The zone**: `_dns-update._udp` at its apex, pointing at the proxy (`docs/dns-sd-records.md`).
+  Under `dev.zenr.io.` the apex is the shared `zenr.io.`, unless a child zone is delegated; not
+  `srp.dev.zenr.io.`, which `srp_handler` serves.
+- **Where the proxy sits**: on a public address, a Mac with a private IPv4 address asks its
+  router to forward a port to each service it registers without a host, and publishes only the
+  services the router forwards, so SSH or SMB would be open to the internet. Tried with UPnP:
+  the Mac's A record was the router's public address; the router forwarded port 50999 and the
+  SRV carried it; it refused port 9, and that service was not published at all. A UPnP forward
+  has no expiry: it lasts until the daemon deletes it when the service stops. On a LAN address,
+  the Mac asks nothing and publishes the internal ports, usable over IPv4 only on the same
+  network.
+- **For a demo**: `RegistrationDomains` publishes everything the Mac advertises, with an address
+  reachable over IPv6. Switch off what should stay private first.
+- **Without a signature**, it would be safe only from loopback, with the proxy on the same Mac,
+  since UDP sources can be forged, and it would still need the class ANY deletes. Not
+  recommended.
+
 ## Project Layout
 
 - `cmd/sig0lease/` - proxy entrypoint

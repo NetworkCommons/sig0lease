@@ -607,14 +607,17 @@ no concept of a "service description" to key this off of.
 ## 12. Testing and interop
 
 - `make test-srp` runs a full register → refresh → conflict → remove-one → host removal keeping its name → expiry → discovery
-  → concurrent claims → foreign-data takeover → domain enumeration suite against a disposable local BIND 9, with no
+  → concurrent claims → foreign-data takeover → release → DNS-over-HTTPS → domain enumeration suite against a
+  disposable local BIND 9, with no
   external dependency — this is the CI gate. Every update in it is sent by
   `cmd/sig0lease-srp-client`, the same requester users run. The discovery tests find the
   registrar through `_dnssd-srp._tcp` and `_dnssd-srp-tls._tcp`, the latter registering over
   DNS-over-TLS against the proxy's DoT listener with a throwaway certificate generated for the
   run. Two identities then claim one new name at once (one `NOERROR`, one `YXDOMAIN`), and
   the proxy, restarted with `refuse_on_foreign_data: false`, takes over a name holding non-SRP
-  data with the KEY prerequisite, which BIND must accept. Last, the §11 domain-enumeration
+  data with the KEY prerequisite, which BIND must accept. A host released with a KEY-LEASE of 0
+  has its KEYs gone once the proxy answers, and a host registers and is released over the
+  proxy's DNS-over-HTTPS listener. Last, the §11 domain-enumeration
   records follow the config, and a proxy restarted with `advertise_browse_domain: false` deletes
   the `b`/`db`/`lb` the earlier run published (§10).
 - The unit tests for the window in §5 hold one operation inside its upstream send while a
@@ -629,17 +632,32 @@ no concept of a "service description" to key this off of.
   deregistration on stop (`tests/test_agent.sh`).
 - `make test-mdnsresponder-interop` runs the same registrar, plus `client/srp`, against the
   real, unmodified Apple `mDNSResponder/ServiceRegistration` binaries (a sibling checkout, not
-  vendored — see `tests/README.md` for setup and the exact pinned commit). It covers plain
-  registration, host-only registration, and all three subtype variants in the direction of a real
-  `srp-client` against this project's registrar; and Register plus Deregister in the direction of
-  `client/srp` against the real `srp-mdns-proxy` registrar; and, from the mDNS daemon,
-  `sig0lease-agent`'s `mdns` mirror into this project's registrar. (`srp-client`'s own
+  vendored — see `tests/README.md` for setup and the exact pinned commit), in three directions,
+  drawn in `tests/README.md` ("mDNSResponder"), which also shows how to run Directions 1 and 2
+  by hand. (`srp-client`'s own
   `--remove-added-service`/`--delete-registrations` flags were found to hang indefinitely — a
   confirmed bug in that binary's own reconnect logic, unrelated to this project, and not
   exercised by the test as a result.)
 - The real, shared `srp.dev.zenr.io.` zone (under `zenr.io.` at `ns1.free2air.org`) is a
   developer-visible environment other people can `dig`/browse against directly; see
   `docs/srp-live-demo.md` for a walkthrough. Local BIND 9 (above) is what CI actually gates on.
+
+### Pointing mDNSResponder at the proxy
+
+Checked against the mDNSResponder 2881.120.11 source in `../mDNSResponder` and RFCs 6763, 9664
+and 9665. Release 2881 publishes no macOS platform layer (`mDNSMacOSX/`); the last release that
+does is 2600. The rows about the running daemon were checked on macOS 26.7 (mDNSResponder
+2881.160.4).
+
+| Route | Here | Why |
+|---|---|---|
+| Proxy chain: requester → our proxy (validates SRP) → authoritative DNS | yes | The design; Direction 1 by hand (`tests/README.md`) and demo D2 run it on the real zone. |
+| TSIG from the proxy to the authoritative server | not needed | The proxy signs every UPDATE it sends upstream with its own SIG(0) key (`keystore/server`), and BIND accepts it. Apple's SRP-to-DNS gateway, `ServiceRegistration/srp-dns-proxy.c` (not in the default build, §11), signs this hop with one TSIG HMAC-SHA256 key, if given one. TSIG would matter only for an authoritative server that accepts updates with TSIG alone. |
+| An SRV record so that requesters find the proxy | our client only | RFC 9665 names `_dnssd-srp._tcp.<zone>`, or `_dnssd-srp-tls._tcp` for DNS-over-TLS, at the zone apex, with the proxy's DNS port. `sig0lease-srp-client` and the agent look them up (§13), closest first unless `-discovery=apex`. Nothing in mDNSResponder does: `srp-client` uses `--server` or `[::1]:53`, and no other file in the source names `_dnssd-srp`. |
+| The daemon registers in our zone itself (Wide-Area Bonjour) | not today | It sends RFC 2136 UPDATEs, unsigned or signed with TSIG HMAC-MD5, which the proxy refuses: `docs/siglease_rfc9664.md`, "macOS's Own Updates (Wide-Area Bonjour)". |
+| Our software takes the services from the running daemon | yes | `sig0lease-agent`'s `mdns` mirror browses, resolves and looks up addresses over the daemon's client socket, the API every Bonjour application uses, then registers through SRP (interop Direction 3 in `tests/README.md`, demo D2). |
+| A search domain makes Macs browse our zone | yes, on a Mac | The proxy publishes `b`, `db` and `lb._dns-sd._udp` at its zone (§10), and the daemon looks for them in each search domain: demo D4 (`docs/demo.md`) and `docs/dns-sd-records.md`, "Browsing". Not tried: iPhone, and applications other than `dns-sd`. |
+| "Our `srp-client` tests prove the daemon's packets work" | partly | True for software built on `srp-client.c`, which implements `DNSServiceRegister` over SRP (with a Thread accessory build). The daemon's own unicast registration is other code (the Wide-Area Bonjour row). |
 
 ## 13. SRP requester (`client/srp` and `cmd/sig0lease-srp-client`)
 
