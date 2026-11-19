@@ -15,6 +15,7 @@ class Dashboard {
     this.zone = null;
     this.dns = null;
     this.timer = null;
+    this.service_info = new SdServiceInfo();
     // incremented on every zone change, so stale refreshes can be dropped
     this.generation = 0;
     // instance names seen per service type, to highlight new entries
@@ -165,8 +166,15 @@ class Dashboard {
       box.classList.add('new');
     }
 
-    const service_name = type.service.service.replace(/^_/, '');
-    box.querySelector('.service').textContent = service_name;
+    // title row: per service name, accent color and icon
+    const appearance = this.service_info.appearance(type.service.service);
+    box.style.setProperty('--accent', appearance.color);
+    box.style.setProperty('--on-accent', appearance.on_color);
+    box.querySelector('.service-icon')
+        .appendChild(this.service_info.create_icon(type.service.service));
+    box.querySelector('.name').textContent = appearance.name;
+    box.querySelector('.service').textContent =
+        type.service.service.replace(/^_/, '');
     box.querySelector('.protocol').textContent =
         type.service.protocol.replace(/^_/, '');
     box.querySelector('.count').textContent = type.instances.length;
@@ -201,7 +209,7 @@ class Dashboard {
 
     // service link, constructed by SdServiceInfo for known services
     const srv = instance.srv[0];
-    const service_info = new SdServiceInfo();
+    const service_info = this.service_info;
     const link = srv ? service_info.create_link(
                            service.service, normalize_name(srv.target),
                            srv.port, instance.txt) :
@@ -210,8 +218,8 @@ class Dashboard {
     if (link) {
       link_node.href = link;
       link_node.querySelector('.url').textContent = link;
-      link_node.querySelector('.icon').classList.add(
-          'fa-' + service_info.service_list[service.service].icon);
+      link_node.querySelector('.icon').appendChild(
+          service_info.create_icon(service.service));
       link_node.hidden = false;
     }
 
