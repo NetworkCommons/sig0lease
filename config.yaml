@@ -96,7 +96,7 @@ handlers:
   #                                 direct RFC 2136 registration (not just SRP) is a deployment
   #                                 choice.
   srp_handler:
-    upstream_zone: "srp.dev.zenr.io."
+    upstream_zone: "dev.zenr.io."
     # Optional static "host:port" of the authoritative server, as for handlers.update below.
     # upstream: "127.0.0.1:53"
     keystore_dir: "./keystore/server"
