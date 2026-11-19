@@ -7,10 +7,12 @@
     <link rel="stylesheet" href="dashboard.css"/>
     <link href="fontawesome/css/fontawesome.min.css" rel="stylesheet" />
     <link href="fontawesome/css/solid.min.css" rel="stylesheet" />
+    <link href="fontawesome/css/brands.min.css" rel="stylesheet" />
     <script src="https://cdn.jsdelivr.net/npm/dohjs@0.3.3/dist/doh.min.js"></script>
     <script src="sig0_wasm.js"></script>
     <script src="sig0.js"></script>
     <script src="dns.js"></script>
+    <script src="icons.js"></script>
     <script src="services.js"></script>
     <script src="dashboard.js"></script>
     <script>
@@ -89,11 +91,17 @@
     <!-- Templates -->
     <template id="box-template">
         <section class="box">
-            <h2 class="title">
-                <span class="service"></span>
-                <span class="protocol"></span>
-                <span class="count"></span>
-            </h2>
+            <div class="title">
+                <span class="service-icon"></span>
+                <div class="heading">
+                    <h2 class="name"></h2>
+                    <div class="type">
+                        <span class="service"></span>
+                        <span class="protocol"></span>
+                    </div>
+                </div>
+                <span class="count" title="registered instances"></span>
+            </div>
             <div class="fqdn"></div>
             <ul class="entries"></ul>
         </section>
@@ -102,7 +110,7 @@
         <li class="entry">
             <div class="label"></div>
             <a class="link" href="" target="_blank" rel="noopener noreferrer" hidden>
-                <span class="icon fa-solid"></span>
+                <span class="icon"></span>
                 <span class="url"></span>
             </a>
             <div class="targets"></div>
