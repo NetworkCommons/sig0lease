@@ -134,7 +134,10 @@ Hard requirements the handler enforces:
 - **All KEY RRs identical** and equal to the SIG(0) signing key (§3.2.5.1). KEY `flags` are
   never checked by the registrar — RFC 9665 §3.3.3 is explicit that flags must be stored
   exactly as received, without checking or modifying them; this is one-directional (a
-  requester MUST send flags 0, the registrar MUST NOT enforce that).
+  requester MUST send flags 0, the registrar MUST NOT enforce that). mDNSResponder's and
+  OpenThread's clients both send 513 (0x0201). In RFC 2535's flags layout (§3.1.2) that is
+  name type 10, the key of a non-zone entity such as a host, and signatory field 1, a key that
+  may sign dynamic updates (RFC 2137): the flags a host's update key carried before RFC 9665.
 - **TTL consistency** within every RRset in the update (§4) — rejected with `REFUSED` if
   violated (`pkg/updatecore/ttl.go`). The registrar then replaces these TTLs before writing
   anything (§6, "TTLs"), but §4 requires the check on the requester's own TTLs regardless.
@@ -188,6 +191,11 @@ Compressed SRV target names (§3.2.5.4) are accepted, matching real client behav
    leaves two KEYs at a name, so such a name was written by something else. The RFC 9664
    handler's `fcfs_naming` applies the same check to its new KEYs
    (`docs/siglease_rfc9664.md`, "First-Come First-Served Naming").
+
+   With `refuse_on_foreign_data: false` the requester takes the name whole: its Delete All
+   RRsets removes every RRset at the name, and what it adds there is the registration's from
+   then on. A record identical to one another writer had put there is no exception: it is
+   deleted when the registration's lease ends.
 
    This is the same query used for the pre-forward cost described in `docs/siglease_rfc9664.md`
    — reading its RCODE is free. A write can land between this check and the forwarded UPDATE;
@@ -309,7 +317,10 @@ instances' discoverability. A PTR only ever moves via an individual add/delete i
   expires, the node's whole subtree is removed.
 - A Service Discovery PTR is removed whenever its target service instance's data is removed.
 - The baseline refresh clock is 80% of the lease plus a 0–5% random offset (RFC 9664 §5.2, a
-  MUST — shared with the base handler, see `docs/siglease_rfc9664.md`).
+  MUST — shared with the base handler, see `docs/siglease_rfc9664.md`). RFC 9664 §5.2.1's
+  coalescing, a MAY, is not implemented: a requester holding several registrations at one
+  server may refresh them all in one request once one of them has run 75% of its lease. Each
+  registration here refreshes on its own clock.
 
 **TTLs (§4, §5.1).** The registrar does not forward the requester's TTLs. They are advisory
 (§4), and requesters may send their lease as the TTL (OpenThread's client does by default),
@@ -432,6 +443,13 @@ store, so the names stayed held.
 
 - On non-constrained networks, TCP is required (anti off-path spoofing); a UDP SRP update is
   rejected with `REFUSED` unless the zone is flagged `allow_udp` for constrained (CNN) devices.
+  The TCP handshake is the check, so a registrar relying on it "MUST NOT accept TCP Fast Open
+  payloads" (§6.1). A kernel takes data from a SYN only on a listener that asks for it with
+  the `TCP_FASTOPEN` socket option, which neither the proxy, Go's `net` package nor
+  `codeberg.org/miekg/dns` sets. Linux also takes it on every listener when
+  `net.ipv4.tcp_fastopen` has bits 0x2 and 0x400 set; the default is 0x1. nginx, which ends
+  DNS-over-TLS and DNS-over-HTTPS in front of the deployed proxy, takes it only with
+  `fastopen=` on a `listen` line, which `deploy/` does not set.
 - The registrar implements ECDSAP256SHA256 (algorithm 13), required by RFC 9665 for
   interoperability with real requesters. `client/srp` generates P-256 keys by default and
   always emits a flags-0 KEY, per §3.2.5.1. ED25519 (algorithm 15) also stays fully supported,
@@ -733,6 +751,14 @@ Capabilities:
   0–5% jitter) and repeats, unattended, until canceled. A transient send/network error retries
   with exponential backoff (5s up to 5m, reset on success) rather than terminating the client
   permanently, reported via an injectable error hook.
+- **One update at a time.** RFC 9665 §3.2.3.3: "If a configuration change occurs while an
+  outstanding SRP Update is in flight, the SRP registrar MUST defer sending a new SRP Update
+  for that change until the previous SRP Update has completed." The section is about what a
+  requester sends, so "registrar" reads as a slip for "requester". Taken literally it does not
+  concern this proxy, which forwards plain RFC 2136 UPDATEs, never SRP Updates to another
+  registrar. `client/srp` defers: `Run` sends one update after another, and on a change
+  `Host`'s Keeper (`client/keeper.go`) waits for the update in flight to end, answered or
+  timed out, before sending the next.
 - **Renames** — a `YXDOMAIN` does not say which name conflicted, so the client looks up the KEY
   at the host name and at each instance name (`Config.Query`, through `Config.Resolvers`) and
   renames only the names another key holds, by the rule the registrar applies (§5,

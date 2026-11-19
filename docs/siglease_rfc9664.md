@@ -316,6 +316,8 @@ This means the local lease store's view of the world and the authoritative DNS s
 
 Two operations on the same lease-store nodes never interleave across that upstream round trip: see "Node Locks" below.
 
+The authoritative server never sees a requester's key. It accepts an UPDATE because the proxy's key signed it: the proxy rewrites the request (its Zone Section, its TTLs), so the requester's signature would not verify there, and the server need not know any requester. Every check the proxy makes therefore ends at that key: whoever holds it writes whatever the server's update-policy allows it. Grant each proxy key the zones its handlers serve and nothing above them (BIND: `grant <key name> subdomain <zone> ANY;` per zone in `update-policy`); `allow-update` would give it the whole zone.
+
 ### Node Locks
 
 *(Shared mechanism: the SRP handler uses the same lock table, locking names instead — see
