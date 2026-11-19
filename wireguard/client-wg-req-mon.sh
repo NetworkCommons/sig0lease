@@ -5,14 +5,17 @@
 DIR=$(uname | tr '[:upper:]' '[:lower:]')
 ##
 GITDIR="$(git rev-parse --show-toplevel)"
-DIG_OPTIONS=${DIG_OPTIONS:-"+noall +answer @ns1.free2air.org"}
 
-# set DNS RFC9664 lease test defaults
-KEYLEASE=${KEYLEASE:-"250"}
-LEASE=${LEASE:-"130"}
+# includes ...
+source get_mname.sh
+
+source ./env
 
 # set srp registration domain
 DOMAIN=${DOMAIN:-"dev.zenr.io"}
+MNAME="$(get_mname ${DOMAIN})"
+
+DIG_OPTIONS=${DIG_OPTIONS:-"+noall +answer @${MNAME}"}
 
 # set wg Service Host description defaults
 SERVER_HOSTNAME=${SERVER_HOSTNAME:-"vpn"}

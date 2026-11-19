@@ -1,19 +1,23 @@
 #!/bin/bash
 
+source ./get_mname.sh
 
 ##
 GITDIR=${GITDIR:-"$(git rev-parse --show-toplevel)"}
 DIR=${DIR:-"$(uname | tr '[:upper:]' '[:lower:]')"}
-DIG_OPTIONS=${DIG_OPTIONS:-"+noall +answer @ns1.free2air.org"}
-BROWSE_DIG_OPTIONS=${BROWSE_DIG_OPTIONS:-"${DIG_OPTIONS}"}
-SHORT_DIG_OPTIONS=${SHORT_DIG_OPTIONS:-"+short ${DIG_OPTIONS}"}
+
 
 # SRP defaults
 DOMAIN=${DOMAIN:-"dev.zenr.io"}
+MNAME=$(get_mname ${DOMAIN})
+DIG_OPTIONS=${DIG_OPTIONS:-"+noall +answer @${MNAME}"}
+
+BROWSE_DIG_OPTIONS=${BROWSE_DIG_OPTIONS:-"${DIG_OPTIONS}"}
+SHORT_DIG_OPTIONS=${SHORT_DIG_OPTIONS:-"+short ${DIG_OPTIONS}"}
 
 # set DNS RFC9664 lease test defaults
-KEYLEASE=${KEYLEASE:-"500"}
-LEASE=${LEASE:-"260"}
+KEYLEASE=${KEYLEASE:-"2400"}
+LEASE=${LEASE:-"1200"}
 
 # set wg Service Host description defaults
 SERVER_HOSTNAME=${SERVER_HOSTNAME:-"vpn"}
@@ -25,15 +29,21 @@ SERVER_SD_TYPE="_wg._udp"
 
 # Set WG Service Instructions Details
 SERVER_LISTENPORT=${SERVER_LISTENPORT:-"51820"} # SRV port
-SERVER_NETWORK=${SERVER_NETWORK:-"172.16.31.0/24"}
+SERVER_NETWORK=${SERVER_NETWORK:-"172.16.30.0/29"}
 SERVER_PUBKEY=${SERVER_PUBKEY:-"dLAovvPP0LQ8ZBgbAw4tkVb3wuqZyS9HFFutsAz+ezA="}
 
 # set WG client request service type
 REQ_SERVICE_TYPE=${REQ_SERVICE_TYPE:-"_wgpeer._udp"}
 
-# service name to monitor requests for
-REQ_SERVICE_NAME=${SERVER_SERVICE_NAME:-"myservice"}
-
 # service name to provide config to ...
 ANS_SERVICE_TYPE=${ANS_SERVICE_TYPE:-"_wgcfg._udp"}
 
+# service name to monitor requests for
+REQ_SERVICE_NAME=${SERVER_SERVICE_NAME:-"myservice"}
+
+
+# # DEBUG TEST
+# WG_CLIENT_CIDR="${SERVER_NETWORK}"
+# WG_CLIENT_IP_POOL=$(cidrl ${WG_CLIENT_CIDR})
+# #echo "WG_CLIENT_IP_POOL:"
+# echo "${WG_CLIENT_IP_POOL}"
