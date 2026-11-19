@@ -32,6 +32,11 @@ ssl = { certificate = dir .. "/cert.pem", key = dir .. "/key.pem" }
 -- the signatures.
 s2s_secure_auth = true
 use_dane = true
+-- Servers connect to each other over IPv4 only. Prosody 13.0 merges a name's A and AAAA
+-- addresses wrongly (merge_targets in net/resolvers/basic.lua): with more AAAA records than A, as
+-- for a Mac with a ULA and a global IPv6 address, the IPv4 one is overwritten. A container
+-- without IPv6, as on Docker Desktop, then fails on every address left ("Network is unreachable").
+use_ipv6 = false
 unbound = { resolvconf = false, hoststxt = false, trustfile = "/usr/share/dns/root.ds" }
 
 http_default_host = domain -- a phone may open the page by address

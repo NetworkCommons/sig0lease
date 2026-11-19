@@ -20,7 +20,7 @@ each. D4 adds to D1 or D6 and has no such parts: it is the same both ways.
 | D2: the Mac's own services | turning on Remote Login or Screen Sharing puts it in the public zone | a Mac |
 | D3: a community folder over IPFS | phones open the members' folders by name from the IPFS community node, which finds each member by browsing as it comes up, pins its folder before publishing it, keeps serving it while the member is away, and drops it once the member stays away; the nodes find each other by DNS alone, in a private swarm | the laptop with kubo, or, with the registrar, the members' machines with IPFS Desktop or kubo; phones |
 | D4: native discovery | an audience Mac lists the laptop's services beside its `local.` ones | a Mac in the audience |
-| D5: two communities meet in one chat room | phones log in as guests of two laptops' XMPP servers and talk in one room; the servers find each other by SRV records and trust each other's self-signed certificates by TLSA records (DANE) | two machines, each with Docker (a Mac) or Prosody 13 (Linux); phones |
+| D5: two communities meet in one chat room | phones log in as guests of two XMPP servers and talk in one room; the servers find each other by SRV records and trust each other's self-signed certificates by TLSA records (DANE) | one or two machines, each with Docker (a Mac) or Prosody 13 (Linux); phones |
 | D6: the zone in a browser | phones watch the services come and go, and the zone's names with their records; they claim a name with a message, held by a key their browser makes, and every phone lists it; `dig` shows it within seconds | the laptop; phones |
 
 The demos use this repository's programs and tools that come with the system, except IPFS
@@ -707,39 +707,54 @@ network: `docs/dns-sd-records.md`, "Browsing".
 
 ## D5: two communities meet in one chat room
 
-Two machines, A and B, each run an XMPP server (Prosody) for a community: A's guests get
-addresses at `chat-a.$UPDATE_DOMAIN` and its rooms are at `rooms.chat-a.$UPDATE_DOMAIN`; B's, at
-`chat-b`. The agent on each publishes its server's addresses, the SRV records that tell other
-servers where it listens (`_xmpp-server._tcp`, for the name and for `rooms`) and clients where to
-log in (`_xmpp-client._tcp`), and a TLSA record with the hash of the server's key. The
-certificates are self-signed: a server accepts another only when its key matches its TLSA
-record, which DNSSEC vouches for (DANE). Nothing is configured between the two servers, and
-nobody makes an account.
+Two XMPP servers (Prosody), A and B, each serve a community: A's guests get addresses at
+`chat-a.$UPDATE_DOMAIN` and its rooms are at `rooms.chat-a.$UPDATE_DOMAIN`; B's, at `chat-b`.
+The agent publishes each server's addresses, the SRV records that tell other servers where it
+listens (`_xmpp-server._tcp`, for the name and for `rooms`) and clients where to log in
+(`_xmpp-client._tcp`), and a TLSA record with the hash of the server's key. The certificates are
+self-signed: a server accepts another only when its key matches its TLSA record, which DNSSEC
+vouches for (DANE). Nothing is configured between the two servers, and nobody makes an account.
+It runs on one machine or on two, each with its own section below, with all its steps:
+
+- **On one machine**: one `chat.sh` starts both servers and one agent; B gets the ports 10 above
+  XMPP's: 5232, 5279 and 5290. The servers still find and authenticate each other only by their
+  records.
+- **On two machines**: A on one, B on the other, each started by its own `chat.sh`, with its own
+  agent, on XMPP's ports: 5222, 5269 and 5280.
 
 ### Common to both
 
-**Needs**:
+Each machine that runs `chat.sh` needs: on a Mac, Docker Desktop, then
+`docker pull prosodyim/prosody:13.0`; on Linux, Prosody 13 (`apt install prosody` on Debian 13,
+which brings luaunbound, then `sudo systemctl disable --now prosody`: the package's own server
+would hold the ports), or Docker with `PROSODY=docker`. Also `qrencode`, as for D3. `chat.sh`
+runs its servers in Docker on a Mac, and with the installed Prosody on Linux; `PROSODY=docker` or
+`native` chooses.
 
-- Two machines, A and B, each with: on a Mac, Docker Desktop, then
-  `docker pull prosodyim/prosody:13.0`; on Linux, Prosody 13 (`apt install prosody` on Debian
-  13, which brings luaunbound, then `sudo systemctl disable --now prosody`: the package's own
-  server would hold the ports), or Docker with `PROSODY=docker`. Also `qrencode`, as for D3.
-- Ports 5222, 5269 and 5280 open to the network on each.
-- Phones on the network, which also reach the internet, for Converse.js.
+Phones talk to their server over plain HTTP on the venue's network, so the guests' messages are
+not encrypted there; the servers talk to each other over TLS. Each server keeps its certificate
+and key in `demo/chat/servers/<name>/`, so its TLSA record is the same at every run; delete the
+directory for a new key. A server whose key its TLSA record does not match is refused
+("certificate does not match any DANE TLSA records" in the other server's log), as a test run
+showed.
+
+#### On one machine
+
+**Needs**: the machine, with ports 5222, 5269, 5280, 5232, 5279 and 5290 open to the network;
+phones on its network, which also reach the internet, for Converse.js.
 
 **Run**:
 
-1. On A and B:
+1. Start both servers:
 
    ```bash
-   <REGISTRAR=$REGISTRAR UPDATE_DOMAIN=$UPDATE_DOMAIN> demo/chat.sh chat-a
-   <REGISTRAR=$REGISTRAR UPDATE_DOMAIN=$UPDATE_DOMAIN> ROOM=meet@rooms.chat-a.$UPDATE_DOMAIN demo/chat.sh chat-b
+   <REGISTRAR=$REGISTRAR UPDATE_DOMAIN=$UPDATE_DOMAIN> demo/chat.sh chat-a chat-b
    ```
 
-   Each starts its server (in Docker on a Mac, Prosody installed on Linux; `PROSODY=docker` or
-   `native` chooses) and its agent, waits until `ns1.free2air.org` has the records, and prints
-   the address of the page its server serves, and its QR code. On a Mac, allow Docker's incoming
-   connections when asked; on Linux, the firewall has to let in ports 5222, 5269 and 5280.
+   It starts the servers and the agent, waits until `ns1.free2air.org` has the records, and
+   prints the address of the page each server serves, and its QR code. Both pages join A's room,
+   `meet@rooms.chat-a.$UPDATE_DOMAIN`. On a Mac, allow Docker's incoming connections when asked;
+   on Linux, the firewall has to let in the six ports.
 2. Show what the other server reads:
 
    ```bash
@@ -751,27 +766,53 @@ nobody makes an account.
    guest of that server and joins `meet@rooms.chat-a.$UPDATE_DOMAIN`; the first one in creates the
    room. B's guests' messages reach A's room over a connection between the servers that each end
    authenticated by the other's TLSA record.
-4. `n`, or Ctrl-C, in `chat.sh` stops the agent first, which frees the names, then the server.
+4. `n`, or Ctrl-C, in `chat.sh` stops the agent first, which frees the names, then the servers.
 
-**On one machine**: `<REGISTRAR=$REGISTRAR UPDATE_DOMAIN=$UPDATE_DOMAIN> demo/chat.sh chat-a
-chat-b`, which runs both servers, giving the second ports 10 above: 5232, 5279, 5290.
+#### On two machines
 
-Phones talk to their server over plain HTTP on the venue's network, so the guests' messages are
-not encrypted there; the servers talk to each other over TLS. Each server keeps its certificate
-and key in `demo/chat/servers/<name>/`, so its TLSA record is the same at every run; delete the
-directory for a new key. A server whose key its TLSA record does not match is refused
-("certificate does not match any DANE TLSA records" in the other server's log), as a test run
-showed.
+**Needs**: two machines, A and B, each with ports 5222, 5269 and 5280 open to the network; phones
+on their network, which also reach the internet, for Converse.js.
+
+**Run**:
+
+1. On A, start A's server:
+
+   ```bash
+   <REGISTRAR=$REGISTRAR UPDATE_DOMAIN=$UPDATE_DOMAIN> demo/chat.sh chat-a
+   ```
+
+   It starts the server and the agent, waits until `ns1.free2air.org` has the records, and prints
+   the address of the page the server serves, and its QR code. On a Mac, allow Docker's incoming
+   connections when asked; on Linux, the firewall has to let in the three ports.
+2. On B, start B's server, whose page joins A's room:
+
+   ```bash
+   <REGISTRAR=$REGISTRAR UPDATE_DOMAIN=$UPDATE_DOMAIN> ROOM=meet@rooms.chat-a.$UPDATE_DOMAIN demo/chat.sh chat-b
+   ```
+
+   It does on B what step 1 does on A.
+3. Show what the other server reads:
+
+   ```bash
+   dig +short SRV _xmpp-server._tcp.rooms.chat-a.$UPDATE_DOMAIN   # 0 0 5269 chat-a.<UPDATE_DOMAIN>.
+   dig +dnssec TLSA _5269._tcp.chat-a.$UPDATE_DOMAIN @8.8.8.8    # the ad flag: validated
+   ```
+
+4. Half the room scans A's QR code, half B's. The page (Converse.js) logs each phone in as a
+   guest of that server and joins `meet@rooms.chat-a.$UPDATE_DOMAIN`; the first one in creates the
+   room. B's guests' messages reach A's room over a connection between the servers that each end
+   authenticated by the other's TLSA record.
+5. `n`, or Ctrl-C, in `chat.sh` on A and on B stops its agent first, which frees its name, then
+   its server.
 
 ### Local test
 
-Each `chat.sh` also starts a proxy on its machine, before the agent, and stops it last; on one
-machine, the one `chat.sh` starts one.
+Each `chat.sh` also starts a proxy on its machine, before its agent, and stops it last.
 
 ### With the registrar
 
-Both agents register through the registrar, which gives `chat-a` and `chat-b` to the first key
-that claims them: check that they are free ("Before a demo", step 3).
+The registrar gives `chat-a` and `chat-b` to the first key that claims them: check that they are
+free ("Before a demo", step 3).
 
 ## D6: the zone in a browser
 
