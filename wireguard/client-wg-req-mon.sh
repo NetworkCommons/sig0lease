@@ -11,10 +11,6 @@ source get_mname.sh
 
 source ./env
 
-# set srp registration domain
-DOMAIN=${DOMAIN:-"dev.zenr.io"}
-MNAME="$(get_mname ${DOMAIN})"
-
 DIG_OPTIONS=${DIG_OPTIONS:-"+noall +answer @${MNAME}"}
 
 # set wg Service Host description defaults
@@ -34,6 +30,7 @@ SERVER_PUBKEY=${SERVER_PUBKEY:-"dLAovvPP0LQ8ZBgbAw4tkVb3wuqZyS9HFFutsAz+ezA="}
 if [ "$#" -eq 1 ]; then
   CLIENT_SERVICE_NAME=${1:-"myclientservice"}
 fi
+
 # debug: set CLIENT_SERVICE_NAME on command line
 # debug: set service instance name on command line
 if [ "$#" -eq 2 ]; then

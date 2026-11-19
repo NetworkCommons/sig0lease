@@ -19,27 +19,6 @@ source ./env
 
 clear
 
-# # Step 1: ADVERTISE: SERVER advertises a VPN Server with instance name ${SERVER_SERVICE_NAME}.${SERVER_SD_TYPE} over SD"
-# #
-# CLIENT_KEYSTORE_DIR="${GITDIR}/keystore/client" ${GITDIR}/bin/${DIR}/sig0lease-srp-client \
-#   -domain="${DOMAIN}" \
-#   -host="${SERVER_HOSTNAME}" \
-#   -addr="${SERVER_HOST_IP}" \
-#   -instance=${SERVER_SERVICE_NAME}:${SERVER_SD_TYPE}:${SERVER_LISTENPORT} \
-#   -txt="${SERVER_SERVICE_NAME}:txtvers=1" \
-#   -txt="${SERVER_SERVICE_NAME}:peer=${SERVER_PUBKEY}" \
-#   -txt="${SERVER_SERVICE_NAME}:net=${SERVER_NETWORK}" \
-#   -lease=${LEASE} -keylease=${KEYLEASE} \
-#   -keystore="${GITDIR}/keystore/client" -k=15 -once
-#
-# # Step 3: ANSWER: The server watches S._sub._wgpeer._udp. For each new request it decides whether to admit the client (policy to be defined).
-# # If it admits the client, it allocates an address and adds the peer to its interface. It then registers S-Ci._wgcfg._udp with subtype Ci. 
-# # (not yet implemented) A refused client gets the same record with status=refused and no addr or allowed.
-#
-#SETTLE_TIME=2
-#echo "Settle time ${SETTLE_TIME} seconds ..."
-#sleep ${SETTLE_TIME}
-#
 while true
 do
     # Step 1: ADVERTISE: SERVER advertises a VPN Server with instance name ${SERVER_SERVICE_NAME}.${SERVER_SD_TYPE} over SD"
