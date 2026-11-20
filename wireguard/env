@@ -22,6 +22,7 @@ LEASE=${LEASE:-"1200"}
 # set wg Service Host description defaults
 SERVER_HOSTNAME=${SERVER_HOSTNAME:-"vpn"}
 SERVER_HOST_IP=${SERVER_HOST_IP:-"128.140.34.230"}
+VPN_INTERFACE=${VPN_INTERFACE:-"wg0"}
 
 # WG server Service Description defaults
 SERVER_SERVICE_NAME="wgservice"
@@ -41,8 +42,37 @@ ANS_SERVICE_TYPE=${ANS_SERVICE_TYPE:-"_wgcfg._udp"}
 # service name to monitor requests for
 REQ_SERVICE_NAME=${SERVER_SERVICE_NAME:-"myservice"}
 
+#
+# MANUEL RESET FOR NON-VPN SERVER TESTING RUNS
+#
+#
+VPN_SERVER_IP="172.16.30.1"
 
-# # DEBUG TEST
-WG_CLIENT_CIDR="${SERVER_NETWORK}"
-WG_CLIENT_IP_POOL=$(cidrl ${WG_CLIENT_CIDR})
-# echo "${WG_CLIENT_IP_POOL}"
+# (moved to WG server script)
+# # set IP Allocation array for clients
+# VPN_IP_LIST="$(cidrl ${SERVER_NETWORK} | head -n-1 | tail -n+2)"
+# # take IP address VPN_INTERFACE out of list for VPN_CLIENT_POOL
+# IP_FREE_ARRAY=(${VPN_IP_LIST})
+#
+# IP_FREE_ARRAY=("${IP_FREE_ARRAY[@]/$VPN_SERVER_IP}")
+#
+# i=0
+# while (( i < ${#IP_FREE_ARRAY[@]} ))
+# 	do
+# 		# echo "${i} len: ${#IP_FREE_ARRAY[i]}"
+# 		if ! [[ -n ${IP_FREE_ARRAY[i]} ]]; then
+# 			unset IP_FREE_ARRAY[i]
+# 		fi
+# 		((i++))
+# 	done
+# for i in "${!IP_FREE_ARRAY[@]}"; do
+# 	NEW_FREE_ARRAY+=( "${IP_FREE_ARRAY[i]}" )
+# done
+# IP_FREE_ARRAY=("${NEW_FREE_ARRAY[@]}")
+# unset NEW_FREE_ARRAY
+#
+# if [[ -n ${TEST_IP_FREE_ARRAY} ]]; then
+# 	echo ${IP_FREE_ARRAY[@]}
+# 	echo ${#IP_FREE_ARRAY[@]}
+# fi
+#
