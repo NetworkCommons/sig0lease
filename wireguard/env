@@ -30,7 +30,7 @@ SERVER_SD_TYPE="_wg._udp"
 
 # Set WG Service Instructions Details
 SERVER_LISTENPORT=${SERVER_LISTENPORT:-"51820"} # SRV port
-SERVER_NETWORK=${SERVER_NETWORK:-"172.16.30.0/29"}
+SERVER_NETWORK=${SERVER_NETWORK:-"10.0.0.0/24"}
 SERVER_PUBKEY=${SERVER_PUBKEY:-"dLAovvPP0LQ8ZBgbAw4tkVb3wuqZyS9HFFutsAz+ezA="}
 
 # set WG client request service type
