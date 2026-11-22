@@ -13,8 +13,6 @@ class Dns {
     this.doh_url_dohjs = 'https://1.1.1.1/dns-query';
     // domain name
     this.domain = domain_name;
-    this.doh_domain = '1.1.1.1';
-    this.doh_url = 'https://1.1.1.1/dns-query';
     this.doh_method = 'POST';
     this.zone = null;
 
@@ -26,18 +24,16 @@ class Dns {
     this.resolver = new doh.DohResolver(this.doh_url_dohjs);
 
     // initialize longer tasks
-    this.init_wasm(on_initialized);
+    this.init(on_initialized);
   }
 
   /// start asynchronous, longer running tasks at initialization
-  async init_wasm(callback) {
+  async init(callback) {
     try {
       // get zone
       this.zone = await this.get_zone(this.domain);
       // check if RRSIG record is available
       this.dnssec_enabled = await this.check_rrsig(this.domain);
-      // find DoH server via WASM
-      await this.find_doh();
     } catch (error) {
       console.log('Dns initialization of ' + this.domain + ' incomplete');
       console.error(error);
@@ -103,20 +99,6 @@ class Dns {
       }
     }
     throw new Error('no Zone found for ' + query_domain);
-  }
-
-  /// find DoH endpoint for the zone of this domain
-  async find_doh() {
-    try {
-      const dohEndpoint = await window.goFuncs.findDOHEndpoint(this.zone);
-      this.doh_url = dohEndpoint;
-      const doh_array = this.doh_url.split('/');
-      if (doh_array.length > 2) {
-        this.doh_domain = doh_array[2];
-      }
-    } catch (error) {
-      console.log('no DoH endpoint found for zone ' + this.zone);
-    }
   }
 
   /// check if an RRSIG record is present for a specific domain

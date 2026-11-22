@@ -9,7 +9,7 @@
     <link href="fontawesome/css/solid.min.css" rel="stylesheet" />
     <link href="fontawesome/css/brands.min.css" rel="stylesheet" />
     <script src="https://cdn.jsdelivr.net/npm/dohjs@0.3.3/dist/doh.min.js"></script>
-    <script src="sig0_wasm.js"></script>
+    <script src="wasm_exec.js"></script>
     <script src="sig0.js"></script>
     <script src="dns.js"></script>
     <script src="icons.js"></script>
@@ -30,6 +30,12 @@
             console.log('WASM is ready')
             dashboard = new Dashboard()
             dashboard.set_zone(document.getElementById('zone').value)
+        })
+
+        window.addEventListener('wasm_failed', function(event){
+            document.getElementById('status').dataset.state = 'error'
+            document.getElementById('status-text').textContent =
+                'WASM did not load: ' + event.detail.message
         })
 
         window.addEventListener('DOMContentLoaded', function(){

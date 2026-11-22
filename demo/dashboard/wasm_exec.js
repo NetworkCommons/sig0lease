@@ -1,0 +1,1 @@
+../../bin/web/wasm_exec.js
