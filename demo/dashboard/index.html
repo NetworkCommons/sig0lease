@@ -8,7 +8,6 @@
     <link href="fontawesome/css/fontawesome.min.css" rel="stylesheet" />
     <link href="fontawesome/css/solid.min.css" rel="stylesheet" />
     <link href="fontawesome/css/brands.min.css" rel="stylesheet" />
-    <script src="https://cdn.jsdelivr.net/npm/dohjs@0.3.3/dist/doh.min.js"></script>
     <script src="wasm_exec.js"></script>
     <script src="sig0.js"></script>
     <script src="dns.js"></script>
@@ -17,6 +16,11 @@
     <script src="dashboard.js"></script>
     <script>
         const DEFAULT_ZONE = 'srp.dev.zenr.io'
+        // DNS-over-HTTPS server of the sig0lease proxy, which answers its
+        // zones from their authoritative server: `?doh=<url>`, by default
+        // the origin the dashboard is served from (as on the registrar)
+        const DOH = new URLSearchParams(location.search).get('doh') ||
+            location.origin
         let dashboard = null
 
         /// zone from the URL hash, or the default zone
@@ -28,7 +32,7 @@
         // start the dashboard when WASM is ready
         window.addEventListener('wasm_ready', function(){
             console.log('WASM is ready')
-            dashboard = new Dashboard()
+            dashboard = new Dashboard(DOH)
             dashboard.set_zone(document.getElementById('zone').value)
         })
 

@@ -1,43 +1,34 @@
 /// Central DNS object
 ///
-/// Read-only adaptation of `dns-sd-inspector/dns.js` for the dashboard:
-/// the key management and update functions were removed, and `query()`
-/// can report failures so that a transient network error does not wipe
-/// the dashboard.
+/// Every question goes through the sig0lease WASM (`sig0lease.lookup`) to
+/// the DNS-over-HTTPS endpoint of a sig0lease proxy. For the zones it serves,
+/// the proxy asks the zone's authoritative server and answers with
+/// `Cache-Control: no-store`, so the dashboard sees a change as soon as the
+/// server has it, not when a resolver's cache expires. A name the proxy does
+/// not serve (e.g. an instance in another zone) is answered by a public
+/// resolver instead; such answers are counted in `cached_answers`.
 class Dns {
-  /// construct the DNS object with the domain to query
-  constructor(domain_name, on_initialized) {
-    // FIXME: there is an error to investigate within the dohjs library when
-    // resolving queries via 'https://doh.zembla.io/dns-query'.
-    // In the meantime, we resolve everything via 'https://1.1.1.1/dns-query'
-    this.doh_url_dohjs = 'https://1.1.1.1/dns-query';
-    // domain name
+  /// construct the DNS object for `domain_name`, asking the DoH server `doh`
+  /// (a URL without path, e.g. `https://registrar.example`)
+  constructor(domain_name, doh, on_initialized) {
     this.domain = domain_name;
-    this.doh_method = 'POST';
-    this.zone = null;
+    this.doh = doh;
 
     // set initialization flags
     this.dnssec_enabled = false;
     this.initialized = false;
+    // answers of the last refresh that did not come from the proxy
+    this.cached_answers = 0;
 
-    // create the resolver
-    this.resolver = new doh.DohResolver(this.doh_url_dohjs);
-
-    // initialize longer tasks
     this.init(on_initialized);
   }
 
   /// start asynchronous, longer running tasks at initialization
   async init(callback) {
-    try {
-      // get zone
-      this.zone = await this.get_zone(this.domain);
-      // check if RRSIG record is available
-      this.dnssec_enabled = await this.check_rrsig(this.domain);
-    } catch (error) {
-      console.log('Dns initialization of ' + this.domain + ' incomplete');
-      console.error(error);
-    }
+    // check if the domain, or its DNS-SD service list (the domain itself is
+    // often an empty non-terminal without records), is signed
+    this.dnssec_enabled = await this.check_rrsig(this.domain) ||
+        await this.check_rrsig('_services._dns-sd._udp.' + this.domain);
 
     // set initialized flag
     this.initialized = true;
@@ -46,33 +37,21 @@ class Dns {
     }
   }
 
-  /// read the record types from dns of a domain
-  /// and returns an array of answers of the requested type.
+  /// query `record_type` records of `query_domain` and return an array of
+  /// answers `{name, type, ttl, data}`. `data` is a string for PTR, an
+  /// object `{priority, weight, port, target}` for SRV and an array of
+  /// strings for TXT.
   ///
   /// If `strict` is false (default) this function never errors and returns
   /// an empty array on failure. If `strict` is true, failures are thrown.
   async query(query_domain, record_type, strict) {
-    const query = doh.makeQuery(query_domain, record_type);
-    // we always want to query with DNSSEC enabled
-    query.additionals = [{
-      type: 'OPT',
-      name: '.',
-      udpPayloadSize: 4096,
-      flags: doh.dnsPacket.DNSSEC_OK,
-      options: []
-    }];
-
     try {
-      const query_result =
-          await doh.sendDohMsg(query, this.doh_url_dohjs, this.doh_method);
-
-      let results = [];
-      for (const answer of query_result.answers) {
-        if (answer.type == record_type) {
-          results.push(answer);
-        }
+      const answer =
+          await sig0lease.lookup(this.doh, query_domain, record_type);
+      if (!answer.authoritative) {
+        this.cached_answers++;
       }
-      return results;
+      return answer.records;
     } catch (error) {
       if (strict) {
         throw error;
@@ -82,32 +61,13 @@ class Dns {
     }
   }
 
-  /// read the query response & look for SOA record from:
-  ///   1. answers section, which means zone cut is at query_domain, or
-  ///   2. authorities section, which means zone cut is above query domain
-  async get_zone(query_domain) {
-    const query_result = await this.resolver.query(query_domain, 'SOA');
-
-    for (const ans of query_result.answers) {
-      if (ans.type == 'SOA') {
-        return ans.name;
-      }
-    }
-    for (const auth of query_result.authorities) {
-      if (auth.type == 'SOA') {
-        return auth.name;
-      }
-    }
-    throw new Error('no Zone found for ' + query_domain);
-  }
-
   /// check if an RRSIG record is present for a specific domain
   async check_rrsig(query_domain) {
     try {
-      const query_result = await this.resolver.query(query_domain, 'RRSIG');
-      return query_result.answers.length > 0;
+      const records = await this.query(query_domain, 'RRSIG', true);
+      return records.length > 0;
     } catch (error) {
-      console.error('check_rrsig query failed for ' + query_domain);
+      console.error('check_rrsig query failed for ' + query_domain, error);
       return false;
     }
   }

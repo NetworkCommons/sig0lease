@@ -11,7 +11,10 @@
 const REFRESH_INTERVAL = 5000;
 
 class Dashboard {
-  constructor() {
+  /// `doh` is the DNS-over-HTTPS server of the sig0lease proxy all queries go
+  /// to, as a URL without path
+  constructor(doh) {
+    this.doh = doh;
     this.zone = null;
     this.dns = null;
     this.timer = null;
@@ -50,7 +53,7 @@ class Dashboard {
     document.title = zone + ' · DNS-SD Dashboard';
 
     const generation = this.generation;
-    this.dns = new Dns(zone, (dns) => {
+    this.dns = new Dns(zone, this.doh, (dns) => {
       if (generation === this.generation) {
         this.dnssec.hidden = !dns.dnssec_enabled;
       }
@@ -63,6 +66,7 @@ class Dashboard {
   async refresh() {
     const generation = this.generation;
     try {
+      this.dns.cached_answers = 0;
       const types = await this.collect(this.dns, this.zone);
       if (generation !== this.generation) {
         return;
@@ -73,7 +77,12 @@ class Dashboard {
           'ok',
           plural(types.length, 'service type') + ' · ' +
               plural(count, 'instance') + ' · updated ' +
-              new Date().toLocaleTimeString());
+              new Date().toLocaleTimeString() + ' from ' +
+              new URL(this.doh).host +
+              (this.dns.cached_answers ?
+                   ' · ' + plural(this.dns.cached_answers, 'answer') +
+                       ' via public resolver (may be cached)' :
+                   ''));
     } catch (error) {
       if (generation !== this.generation) {
         return;
