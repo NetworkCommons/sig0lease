@@ -42,9 +42,10 @@ done
 IP_FREE_ARRAY=("${NEW_FREE_ARRAY[@]}")
 unset NEW_FREE_ARRAY
 
+echo "VPN Server IP: ${VPN_SERVER_IP}"
+echo "VPN Free Array: ${IP_FREE_ARRAY[@]} (${#IP_FREE_ARRAY[@]} free addresses)"
+sleep 5
 if [[ -n ${TEST_IP_FREE_ARRAY} ]]; then
-        echo "VPN Server IP: ${VPN_SERVER_IP}"
-	echo "VPN Free Array: ${IP_FREE_ARRAY[@]} (${#IP_FREE_ARRAY[@]} free addresses)"
 	exit
 fi
 
@@ -82,54 +83,45 @@ do
     echo
 
 
-    echo "=== Advertised SD Wireguard Service Instances in ${DOMAIN}"
-    WG_SERVICE_INSTANCES=`dig ${BROWSE_DIG_OPTIONS} _wg._udp.${DOMAIN}. PTR | grep -v RRSIG | grep -v NSEC`
-    echo ${WG_SERVICE_INSTANCES}
-    echo
+    echo "=== Advertised SD Wireguard Service Instances (_wg._udp) in ${DOMAIN}"
+    #WG_SERVICE_INSTANCES=`dig ${BROWSE_DIG_OPTIONS} _wg._udp.${DOMAIN}. PTR | grep -v RRSIG | grep -v NSEC`
+    WG_SERVICE_INSTANCES=`dig ${SHORT_DIG_OPTIONS} _wg._udp.${DOMAIN}. PTR | grep -v RRSIG | grep -v NSEC`
+    for wgs in "${WG_SERVICE_INSTANCES}"
+    do
+        #echo "${wgs}"
+        dig ${BROWSE_DIG_OPTIONS} $wgs SRV
+        dig ${BROWSE_DIG_OPTIONS} $wgs TXT
+        echo
+    done
 
-    # echo "== *ALL* WIREGUARD SERVICE CLIENT_REQUESTS for all instances in ${DOMAIN}"
-    # CLIENT_REQUESTS=`dig ${SHORT_DIG_OPTIONS} ${REQ_SERVICE_TYPE}.${DOMAIN} PTR | grep -v RRSIG | grep -v NSEC`
-    # echo "${CLIENT_REQUESTS}"
-    # echo
-    # #
- 
-    echo "== WIREGUARD SERVICE CLIENT_REQUESTS for my Service Instance (subtype) '${SERVER_SERVICE_NAME}' in ${DOMAIN}"
-    #CLIENT_REQUESTS=`dig ${SHORT_DIG_OPTIONS} ${SERVER_SERVICE_NAME}._sub.${REQ_SERVICE_TYPE}.${DOMAIN} PTR | grep -v RRSIG | grep -v NSEC`
-    CLIENT_REQUESTS=`dig ${BROWSE_DIG_OPTIONS} ${SERVER_SERVICE_NAME}._sub.${REQ_SERVICE_TYPE}.${DOMAIN} PTR | grep -v RRSIG | grep -v NSEC`
-    echo "${CLIENT_REQUESTS}"
-    echo
-    #
-    
-    echo "** SERVICE '${REQ_SERVICE_NAME}' CLIENT_ANSWERS with subtype CLIENT in ${DOMAIN}"
+ #    echo "== *ALL* WIREGUARD SERVICE CLIENT_REQUESTS for all instances in ${DOMAIN}"
+ #    CLIENT_REQUESTS=`dig ${SHORT_DIG_OPTIONS} ${REQ_SERVICE_TYPE}.${DOMAIN} PTR | grep -v RRSIG | grep -v NSEC`
+ #    echo "${CLIENT_REQUESTS}"
+ #    echo
 
+    echo "== WIREGUARD SERVICE CLIENT_REQUESTS (_wgpeer._udp) for my Service Instance (subtype) '${SERVER_SERVICE_NAME}' in ${DOMAIN}"
     CLIENT_REQUESTS_SUB=`dig ${SHORT_DIG_OPTIONS} ${REQ_SERVICE_NAME}._sub.${REQ_SERVICE_TYPE}.${DOMAIN} PTR | grep -v RRSIG | grep -v NSEC`
     CLIENT_LOOP="${CLIENT_REQUESTS_SUB//$'\n'/ }" # substitute new line for space in list for looping ...
+    #echo "CLIENT_LOOP=${CLIENT_LOOP}"
+    for client in $(echo ${CLIENT_LOOP})
+      do
+          # echo "get_WGPEER_attribute ${client%%.*} ${SERVER_SERVICE_NAME} ${DOMAIN} pk"
+          CLIENT_PUBLIC_KEY="$(get_WGPEER_attribute ${client%%.*} ${SERVER_SERVICE_NAME} ${DOMAIN} pk)"
+          echo -e " ${client%%.*}:\tCi_REQ: client pk = ${CLIENT_PUBLIC_KEY}"
+      done
+    #
 
-    # ** FIRST RUN to collect existing allocated client IP addresses
-#     if (( ${#CLIENT_LOOP} > 0 )); then
-#       echo "**** DEBUG: client loop > 0"
-#       for Ci in $(echo ${CLIENT_LOOP})
-#       do
-#         # echo "**** DEBUG: processing $Ci ..."
-#         Ci_CFG="$(dig ${BROWSE_DIG_OPTIONS} ${REQ_SERVICE_NAME}-${Ci%%.*}.${ANS_SERVICE_TYPE}.${DOMAIN} TXT | grep -v RRSIG | grep -v NSEC)"
-#         # echo "TEST=get_WGCFG_attribute ${SERVER_SERVICE_NAME} ${Ci%%.*} ${DOMAIN} addr"
-#         TEST="$(get_WGCFG_attribute ${Ci%%.*} ${SERVER_SERVICE_NAME} ${DOMAIN} addr)"
-#         echo "**** DEBUG: ${Ci%%.*} addr=$TEST"
-#         # remove from IP_FREE_ARRAY
-#       done
-#     fi
-#
+    echo
+    echo
+    echo "** WIREGUARD SERVICE INSTANCE '${REQ_SERVICE_NAME}' CLIENT_ANSWERS (_wgcfg._udp) with subtype CLIENT in ${DOMAIN}"
+
     # loop over client requests and collect those without corresponding _wgcfg entries for ${REQ_SERVICE_NAME}
     if (( ${#CLIENT_LOOP} > 0 )); then
       for Ci in $(echo ${CLIENT_LOOP})
       do
         Ci_TXT="$(dig ${DIG_OPTIONS} ${Ci} TXT)"
         Ci_SRV="$(dig ${DIG_OPTIONS} ${Ci} SRV)"
-        # first line with sub - its a pointer
-        # not used: Ci_SUB="$(dig ${SHORT_DIG_OPTIONS} ${REQ_SERVICE_NAME}-${Ci%%.*}.${Ci%%.*}._sub.${ANS_SERVICE_TYPE}.${DOMAIN} TXT | grep -v RRSIG | grep -v NSEC)"
-        #           Ci_PTR="$(dig ${SHORT_DIG_OPTIONS} ${REQ_SERVICE_NAME}-${Ci%%.*}.${Ci%%.*}._sub.${ANS_SERVICE_TYPE}.${DOMAIN} PTR | grep -v RRSIG | grep -v NSEC)"
-        #Ci_CFG="$(dig ${SHORT_DIG_OPTIONS} ${REQ_SERVICE_NAME}-${Ci%%.*}.${ANS_SERVICE_TYPE}.${DOMAIN} TXT | grep -v RRSIG | grep -v NSEC)"
-        Ci_CFG="$(dig ${BROWSE_DIG_OPTIONS} ${REQ_SERVICE_NAME}-${Ci%%.*}.${ANS_SERVICE_TYPE}.${DOMAIN} TXT | grep -v RRSIG | grep -v NSEC)"
+        Ci_CFG="$(dig ${SHORT_DIG_OPTIONS} ${REQ_SERVICE_NAME}-${Ci%%.*}.${ANS_SERVICE_TYPE}.${DOMAIN} TXT | grep -v RRSIG | grep -v NSEC)"
 
         if (( ${#Ci_CFG} == 0 )); then
           echo "${Ci%%.*} needs a config"
@@ -148,9 +140,18 @@ do
 
 	    echo "Allocated: ${WG_CLIENT_IP}"
 	    echo "Next free: ${IP_FREE_ARRAY[0]}"
+	    echo
+
+	    # DEBUG bad IP Alloc
+	    if ((${#WG_CLIENT_IP} < 8)); then
+              echo "IP alloc ${WG_CLIENT_IP} incorrectly formed"
+	      echo "Attempting again on next run ..."
+	      echo "IP_FREE_ARRAY[@]"
+	      echo "${IP_FREE_ARRAY[@]}"
+	      break
+	    fi
 
 	    # TEST DATA (DEBUG)
-            # WG_CLIENT_IP="172.16.0.2"
             WG_CLIENT_NET="172.16.0.0/24"
             CLIENT_KEYSTORE_DIR="${GITDIR}/keystore/client" ${GITDIR}/bin/${DIR}/sig0lease-srp-client \
               -domain="${DOMAIN}" \
@@ -166,8 +167,7 @@ do
               -keystore="${GITDIR}/keystore/client" -k=15 -once
           fi
         fi
-        echo "${Ci%%.*}: Ci_CFG: ${Ci_CFG} (len:${#Ci_CFG})"
-        # echo "** SERVICE subtype '${REQ_SERVICE_NAME}' CLIENT_CONFIG for ${Ci%%.*}"
+        echo -e " ${Ci%%.*}:\tCi_CFG: ${Ci_CFG}"
       done
     fi
 

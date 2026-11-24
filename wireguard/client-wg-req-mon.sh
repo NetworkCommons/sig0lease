@@ -26,6 +26,10 @@ SERVER_LISTENPORT=${SERVER_LISTENPORT:-"51820"} # SRV port
 SERVER_NETWORK=${SERVER_NETWORK:-"192.168.179.0/24"}
 SERVER_PUBKEY=${SERVER_PUBKEY:-"dLAovvPP0LQ8ZBgbAw4tkVb3wuqZyS9HFFutsAz+ezA="}
 
+
+CLIENT_HOSTNAME="$(hostname -s)"
+CLIENT_SERVICE_NAME="${CLIENT_HOSTNAME}-wgcs"
+
 # debug: set CLIENT_SERVICE_NAME on command line
 if [ "$#" -eq 1 ]; then
   CLIENT_SERVICE_NAME=${1:-"myclientservice"}
@@ -33,16 +37,16 @@ fi
 
 # debug: set CLIENT_SERVICE_NAME on command line
 # debug: set service instance name on command line
+
 if [ "$#" -eq 2 ]; then
-  CLIENT_SERVICE_NAME=${1:-"myclientservice"}
+  CLIENT_SERVICE_NAME=${1:-"${CLIENT_HOSTNAME}-wgcs"}
   SERVER_SERVICE_NAME=${2:-"wgservice"}
 fi
 
 
-CLIENT_HOSTNAME="myclient"
 CLIENT_HOST_IP="10.10.10.10"
 CLIENT_SD_TYPE="_wgpeer._udp"
-CLIENT_SERVICE_NAME=${CLIENT_SERVICE_NAME:-"wgclientservice"}
+CLIENT_SERVICE_NAME=${CLIENT_SERVICE_NAME:-"${CLIENT_HOSTNAME}-wgclientservice"}
 CLIENT_SUBTYPE=${SERVER_SERVICE_NAME}
 CLIENT_PUBKEY="mul5zgBo+f14SCYvsj6F1CJgZlO/LFm3dWJrRnCHZzQ="
 

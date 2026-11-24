@@ -16,8 +16,8 @@ BROWSE_DIG_OPTIONS=${BROWSE_DIG_OPTIONS:-"${DIG_OPTIONS}"}
 SHORT_DIG_OPTIONS=${SHORT_DIG_OPTIONS:-"+short ${DIG_OPTIONS}"}
 
 # set DNS RFC9664 lease test defaults
-KEYLEASE=${KEYLEASE:-"2400"}
-LEASE=${LEASE:-"1200"}
+KEYLEASE=${KEYLEASE:-"300"}
+LEASE=${LEASE:-"150"}
 
 # set wg Service Host description defaults
 SERVER_HOSTNAME=${SERVER_HOSTNAME:-"vpn"}
@@ -30,7 +30,7 @@ SERVER_SD_TYPE="_wg._udp"
 
 # Set WG Service Instructions Details
 SERVER_LISTENPORT=${SERVER_LISTENPORT:-"51820"} # SRV port
-SERVER_NETWORK=${SERVER_NETWORK:-"10.0.0.0/24"}
+SERVER_NETWORK=${SERVER_NETWORK:-"10.0.0.0/27"}
 SERVER_PUBKEY=${SERVER_PUBKEY:-"dLAovvPP0LQ8ZBgbAw4tkVb3wuqZyS9HFFutsAz+ezA="}
 
 # set WG client request service type
@@ -46,7 +46,8 @@ REQ_SERVICE_NAME=${SERVER_SERVICE_NAME:-"myservice"}
 # MANUEL RESET FOR NON-VPN SERVER TESTING RUNS
 #
 #
-VPN_SERVER_IP="172.16.30.1"
+#VPN_SERVER_IP="172.16.30.1"
+VPN_SERVER_IP="10.0.0.1"
 
 # (moved to WG server script)
 # # set IP Allocation array for clients
