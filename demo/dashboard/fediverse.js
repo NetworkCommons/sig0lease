@@ -43,10 +43,11 @@
 /// instances it shows after every refresh, so the worker skips those. The
 /// browser's localStorage keeps each entry and its key (`entry_key`).
 
-const REFRESH_INTERVAL = 5000;
-const FULL_SCAN_EVERY = 12;
+/// time between two refreshes of the dashboard, in ms
+const REFRESH_INTERVAL = 15000;
+const FULL_SCAN_EVERY = 4;
 /// SRV and TXT records of known instances asked again per refresh
-const DETAILS_PER_REFRESH = 5;
+const DETAILS_PER_REFRESH = 15;
 /// queries per second of a refresh: at first, at least and at most; after a
 /// refusal of the rate limit, the rate halves and queries pause QUERY_PAUSE ms
 const QUERY_RATE = 10;
@@ -59,11 +60,11 @@ const SOURCES_CSV = ICON_DIR + 'sources.csv';
 const INSTANCES_MD = ICON_DIR + 'instances.md';
 /// lease of the entries the worker registers, and of their keys, so the
 /// names are free again when the entries are not renewed
-const LEASE = 300;
+const LEASE = 900;
 /// the script of the registration worker
 const SEED_WORKER = 'fediverse-seed-worker.js';
 /// time between two registrations, in ms
-const SEED_INTERVAL = 1000;
+const SEED_INTERVAL = 3000;
 /// wait after the rate limit refused a request, in ms, doubled up to the max
 const SEED_RETRY_MIN = 5000;
 const SEED_RETRY_MAX = 60000;
