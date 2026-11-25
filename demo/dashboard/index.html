@@ -16,11 +16,11 @@
     <script src="dashboard.js"></script>
     <script>
         const DEFAULT_ZONE = 'srp.dev.zenr.io'
-        // DNS-over-HTTPS server of the sig0lease proxy, which answers its
-        // zones from their authoritative server: `?doh=<url>`, by default
-        // the origin the dashboard is served from (as on the registrar)
+        // DNS-over-HTTPS server all queries go to: `?doh=<url>`, by default
+        // Cloudflare's public resolver 1.1.1.1 (no other server is searched)
+        const DEFAULT_DOH = 'https://1.1.1.1'
         const DOH = new URLSearchParams(location.search).get('doh') ||
-            location.origin
+            DEFAULT_DOH
         let dashboard = null
 
         /// zone from the URL hash, or the default zone
