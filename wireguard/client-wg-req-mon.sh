@@ -28,7 +28,7 @@ SERVER_PUBKEY=${SERVER_PUBKEY:-"dLAovvPP0LQ8ZBgbAw4tkVb3wuqZyS9HFFutsAz+ezA="}
 
 
 CLIENT_HOSTNAME="$(hostname -s)"
-CLIENT_SERVICE_NAME="${CLIENT_HOSTNAME}-wgcs"
+CLIENT_SERVICE_NAME="${CLIENT_HOSTNAME}"
 
 # debug: set CLIENT_SERVICE_NAME on command line
 if [ "$#" -eq 1 ]; then
@@ -48,7 +48,19 @@ CLIENT_HOST_IP="10.10.10.10"
 CLIENT_SD_TYPE="_wgpeer._udp"
 CLIENT_SERVICE_NAME=${CLIENT_SERVICE_NAME:-"${CLIENT_HOSTNAME}-wgclientservice"}
 CLIENT_SUBTYPE=${SERVER_SERVICE_NAME}
-CLIENT_PUBKEY="mul5zgBo+f14SCYvsj6F1CJgZlO/LFm3dWJrRnCHZzQ="
+
+# Does keypair for [client instance]-[server instance] exist?
+#
+# if not, create it
+#
+KEYPAIR_PATH=${KEYPAIR_PATH:-"/etc/wireguard"}
+PUBKEY_FILENAME="${KEYPAIR_PATH}/publickey-${CLIENT_SERVICE_NAME}.${SERVER_SERVICE_NAME}"
+PRIVATEKEY_FILENAME="${KEYPAIR_PATH}/privatekey-${CLIENT_SERVICE_NAME}.${SERVER_SERVICE_NAME}"
+
+echo "wg genkey | tee \"${PRIVATEKEY_FILENAME}\" | wg pubkey > \"${PUBKEY_FILENAME}\""
+wg genkey | tee "${PRIVATEKEY_FILENAME}" | wg pubkey > "${PUBKEY_FILENAME}"
+CLIENT_PUBKEY="$(cat ${PUBKEY_FILENAME})"
+echo "Generated keypair public key: ${CLIENT_PUBKEY} in ${KEYPAIR_PATH}"
 
 #
 # Request to use VPN service instance ${SERVER_SERVICE_NAME}
@@ -65,14 +77,16 @@ CLIENT_KEYSTORE_DIR="${GITDIR}/keystore/client" ${GITDIR}/bin/${DIR}/sig0lease-s
   -keystore="${GITDIR}/keystore/client" -k=15 \
   -once
 
+
+
 # SERVICE_INSTANCES=`dig ${DIG_OPTIONS} ${SERVER_SD_TYPE}.${DOMAIN} PTR | grep -v RRSIG | grep -v NSEC`
 # echo "${SERVICE_INSTANCES}"
 # echo
 
-# echo "== Published Request with ${SERVER_SERVICE_NAME}._sub.${CLIENT_SERVICE_NAME}.${CLIENT_SD_TYPE}.${DOMAIN}"
-# CLIENT_REQUEST=`dig ${DIG_OPTIONS} ${SERVER_SERVICE_NAME}._sub.${CLIENT_SD_TYPE}.${DOMAIN} PTR | grep -v RRSIG | grep -v NSEC`
-# echo "${CLIENT_REQUEST}"
-# echo
+echo "== Published Request with ${SERVER_SERVICE_NAME}._sub.${CLIENT_SERVICE_NAME}.${CLIENT_SD_TYPE}.${DOMAIN}"
+CLIENT_REQUEST=`dig ${DIG_OPTIONS} ${SERVER_SERVICE_NAME}._sub.${CLIENT_SD_TYPE}.${DOMAIN} PTR | grep -v RRSIG | grep -v NSEC`
+echo "${CLIENT_REQUEST}"
+echo
 #
 
 exit
