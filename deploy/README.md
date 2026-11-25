@@ -1,13 +1,13 @@
 # Deploying the community registrar
 
-The community registrar is a public machine that runs the proxy, for anyone to register through,
-with the demo's page (docs/demo.md, D6) in front. It runs two instances of it:
+The community registrar is a public machine that runs the proxy, the web page
+(`cmd/sig0lease-web`) and an IPFS community node. It runs two instances of them:
 
-- **stable**, the one the zones' discovery records name, which the community uses;
-- **staging**, where a release runs first, before it is promoted to stable.
+- **stable**, the one the discovery records name;
+- **staging**, where `make deploy` installs a release, which `make promote` then moves to stable.
 
-[`ansible/`](ansible) deploys them from the operator's machine, over ssh: nothing is installed on
-the registrar to deploy it, and its name is in no file of this repository.
+[`ansible/`](ansible) deploys them from the operator's machine, over ssh. The registrar's name is
+in no file of this repository.
 
 | | stable | staging |
 |---|---|---|
@@ -15,34 +15,38 @@ the registrar to deploy it, and its name is in no file of this repository.
 | Plain DNS, UDP and TCP | 8053 | 8054 |
 | DNS-over-TLS | 853 | 8853 |
 | The page, and DNS-over-HTTPS at `/dns-query` | `https://<registrar>/` | `https://<registrar>:8444/` |
+| IPFS community node: swarm port, TCP and QUIC | 4001 | 4002 |
+| Its site, at its gateway | `https://<registrar>/ipns/site.dev.zenr.io/` | `https://<registrar>:8444/ipns/site.stg.zenr.io/` |
 
-These, the proxy's DNS-over-HTTPS listener behind nginx and the name of its key are each
-instance's settings in `registrar_instances` ([group_vars/all.yml](ansible/group_vars/all.yml)).
-Every zone the registrar serves is set there; none comes from `config.yaml`. Each instance's
-zones lie outside the other's: with one inside the other, a name could be registered through
-both, and each instance would delete records the other still renews.
+Each instance's settings are in `registrar_instances`
+([group_vars/all.yml](ansible/group_vars/all.yml)). An instance's proxy config is the repository's
+`config.yaml` with the changes in `sig0lease_config_overrides`
+([roles/sig0lease/defaults/main.yml](ansible/roles/sig0lease/defaults/main.yml)): its zones,
+listeners, key and lease stores. Neither instance's zones may lie inside the other's: a name
+registered through both would have a lease in each, and the first to end would delete records
+the other still renews.
 
-| On the registrar | What it is |
+## On the registrar
+
+| | What it is |
 |---|---|
-| `sig0lease@stable.service`, `sig0lease@staging.service` | each instance's proxy, as a user of its own, `sig0lease-<instance>`: plain DNS at the instance's port, for everyone; DNS-over-HTTPS in plain HTTP on 127.0.0.1, for nginx only |
-| `/opt/sig0lease/<instance>/releases/<time>-<commit>/` | a release: the proxy (`sig0lease`), the page (`web/`), `config.base.yaml` (the repository's `config.yaml` at the commit) and `config.yaml` (the instance's config, made from it); `/opt/sig0lease/<instance>/current` links to the one the instance runs |
-| `/etc/sig0lease/<instance>/keystore/` | the instance's key, from `keystore/server` on the operator's machine, and nothing else, readable by the instance's user only ("The zones' keys") |
-| `/var/lib/sig0lease/<instance>/` | the instance's lease stores, readable by the instance's user only |
-| nginx | port 80: Let's Encrypt's challenges, and a redirect to stable's HTTPS. For each instance that has a release, at its ports: HTTPS, with the page, opened on the instance's zones, and `/dns-query`, passed to the instance's DNS-over-HTTPS, with a request rate per source address; DNS-over-TLS, its TLS ended here and the DNS-over-TCP inside passed to the instance's plain DNS port, with a number of connections per source address |
-| certbot | the registrar's certificate, renewed by `certbot.timer`; nginx reloads it. Its Let's Encrypt account has the address in `nginx_acme_email` ([roles/nginx/defaults/main.yml](ansible/roles/nginx/defaults/main.yml)) |
+| `sig0lease@<instance>.service` | The instance's proxy, run as user `sig0lease-<instance>`. Its systemd unit file is `/etc/systemd/system/sig0lease@.service`, one for both instances. |
+| `kubo@<instance>.service` | The instance's IPFS node: kubo, run as user `kubo-<instance>`, from `/opt/kubo/<version>/`, with its repository in `/var/lib/kubo/<instance>/`. kubo's own HTTP gateway serves the community's site. Unit file `/etc/systemd/system/kubo@.service`. |
+| `sig0lease-agent@<instance>.service` | The node's agent: the release's `sig0lease-agent`, run as user `sig0lease-agent-<instance>`, with its template `/etc/sig0lease/<instance>/community.yaml` and its keystore `/var/lib/sig0lease-agent/<instance>/`. Through the instance's proxy, it registers the community's site name and keeps its folder up to date with the members' folders ([docs/sig0lease-agent.md](../docs/sig0lease-agent.md), "A name's IPFS node"). Unit file `/etc/systemd/system/sig0lease-agent@.service`. |
+| `/opt/sig0lease/<instance>/releases/<time>-<commit>/` | A release: `sig0lease`, `sig0lease-agent`, the page (`web/`), `config.base.yaml` (the repository's `config.yaml`) and `config.yaml` (the instance's). `/opt/sig0lease/<instance>/current` links to the one the instance runs. |
+| `/etc/sig0lease/<instance>/keystore/` | The instance's zone key, and nothing else. |
+| `/var/lib/sig0lease/<instance>/` | The instance's two lease stores, one per handler. |
+| nginx | Port 80: Let's Encrypt's challenges, and a redirect to HTTPS. At each instance's HTTPS port: the page, `/dns-query` passed to the proxy's DNS-over-HTTPS on 127.0.0.1, and `/ipns/<site>/` and `/ipfs/` passed to kubo's gateway on 127.0.0.1, each limited per source address. At each instance's DNS-over-TLS port: TLS ended, DNS passed to the proxy's plain DNS port. |
+| certbot | The registrar's certificate, renewed by `certbot.timer`. The account's address is `nginx_acme_email` ([roles/nginx/defaults/main.yml](ansible/roles/nginx/defaults/main.yml)). |
 
-An instance's config is `config.base.yaml` with the changes in `sig0lease_config_overrides`
-([roles/sig0lease/defaults/main.yml](ansible/roles/sig0lease/defaults/main.yml)): the instance's
-zones and listeners, and where its key and lease stores are. Everything else is `config.yaml`'s:
-the lease policy, `server.diagnostics` and `server.forward` off. Change `config.yaml`, the
-overrides or `registrar_instances`, and deploy.
+Each user reads only its own instance's files: no proxy reads the other's key or lease stores, and
+neither kubo nor the agent reads a proxy's key.
 
 ## The operator's machine, once
 
-- Ansible (`brew install ansible` on a Mac; the playbooks were checked with ansible-core 2.18),
-  Go, git and dig.
-- An ssh alias `registrar` in `~/.ssh/config`, whose `HostName` is the registrar's DNS name,
-  for which its certificate is issued:
+- Ansible (`brew install ansible` on a Mac; checked with ansible-core 2.18), Go, git and dig.
+- An ssh alias `registrar` in `~/.ssh/config`, whose `HostName` is the registrar's DNS name, the
+  name its certificate is issued for. `ssh registrar true` must work without a password prompt.
 
   ```
   Host registrar
@@ -50,20 +54,31 @@ overrides or `registrar_instances`, and deploy.
       User root
   ```
 
-  `ssh registrar true` must work without a password prompt.
-- In `keystore/server`, each instance's key ("The zones' keys").
+- Each instance's zone key in `keystore/server`, and its swarm key in
+  `keystore/ipfs/<instance>/swarm.key` (below).
 
-## The zones' keys
+## Keys
 
-Each instance has one key, the one in `keystore/server` at the name its `key` in
-`registrar_instances` gives: `dev.zenr.io.` for stable, `stg.zenr.io.` for staging. Its zones are
-at that name or below it.
+**Zone keys.** Each instance's `key` in `registrar_instances` names its key in `keystore/server`:
+`dev.zenr.io.` for stable, `stg.zenr.io.` for staging. Its zones must be at that name or below it.
+Every deploy and promote copies that key, and no other, into the instance's keystore, and removes
+anything else there. The play stops before building anything if `keystore/server` has no key at
+that name, or more than one, or if a zone is outside it.
 
-Every deploy and promote copies that key, and no other, into the instance's keystore on the
-registrar, and removes whatever else is there, a key it replaces included. Before it builds or
-switches anything, the play stops if `keystore/server` has no key at that name, or more than one,
-or if one of the instance's zones is not at that name or below it. An instance loads its key when
-it starts: a deploy restarts staging, a promote restarts stable.
+**Swarm keys.** Each instance's IPFS node is in a private swarm, whose key is the community's
+secret. Make it once per instance and give it to the members by hand, never in DNS or the
+repository:
+
+```bash
+mkdir -p keystore/ipfs/<instance>
+printf '/key/swarm/psk/1.0.0/\n/base16/\n%s\n' "$(openssl rand -hex 32)" > keystore/ipfs/<instance>/swarm.key
+```
+
+A member proves it has the key with a `swarm-mac=` in its instance's TXT record. The agent checks
+it before pinning anything ([docs/sig0lease-agent.md](../docs/sig0lease-agent.md), "Who is a
+member"). The play stops if the key is missing. Every deploy and promote copies it into kubo's
+repository and next to the agent's template, each readable only by its own user. A changed key
+restarts kubo. The agent reads it at each check, so it needs no restart.
 
 ## Releasing
 
@@ -74,127 +89,126 @@ make promote     # the release staging runs, moved to stable
 
 `make deploy`:
 
-1. On this machine: makes staging's config and finds its key, then builds the proxy for the registrar's Linux from
-   the checkout, refusing uncommitted changes (`make deploy ARGS="-e
-   sig0lease_allow_dirty=true"` deploys them, as a release whose name ends in `-dirty`), and the
-   page (`make web`).
-2. On the registrar: installs nginx and gets the certificate the first time, and gives staging its
-   user, directories, key and service. Unless staging runs the same release already (below), it
-   installs the release in staging beside the ones before it, points staging's `current` at it, and
-   restarts staging.
-3. Checks, on the registrar: staging runs the release; each of its zones is answered from its
-   authoritative server over UDP, TCP, DNS-over-TLS and DNS-over-HTTPS; any other name is
-   refused. When a check fails, staging goes back to the release before (on its first release,
-   it stops), and the play fails with the failed release's journal.
-4. Checks from this machine that staging's plain DNS port answers and its page is served. A
-   failure here leaves the release running: something between the two machines blocks them.
+1. On this machine, it makes staging's config and finds its keys. It then builds the proxy, the
+   agent and the page (`make web`) for the registrar's Linux. It refuses uncommitted changes:
+   `make deploy ARGS="-e sig0lease_allow_dirty=true"` deploys them, as a release whose name ends
+   in `-dirty`.
+2. On the registrar, it sets up nginx and the certificate, staging's IPFS node, and staging's
+   users, directories and keys. Unless staging already runs the same release (below), it installs
+   the release beside the ones before it, points `current` at it, and restarts the proxy and the
+   agent.
+3. It checks staging on the registrar:
+   - staging runs the release;
+   - each zone is answered from its authoritative server over UDP, TCP, DNS-over-TLS and
+     DNS-over-HTTPS;
+   - any other name is refused;
+   - kubo runs and the agent is the release's;
+   - the site name gives the node's addresses and folder;
+   - nginx serves the gateway.
 
-Staging runs the same release already when the release it runs holds the same files, byte for
-byte (the proxy, the page, `config.base.yaml`, and staging's config made from it), and its proxy
-started after the last change to anything it starts with: that release's program and config,
-`current`, staging's key and the service unit. `make deploy` then says so, and installs, restarts
-and checks nothing (`make deploy-check` runs step 3's checks). Otherwise it says what differs.
-The same code and Go build the same proxy and page, byte for byte, so a commit that changes
-neither, nor `config.yaml`, deploys nothing. Neither records the commit: the release's name does.
+   If any check fails, staging goes back to the release before (on its first release, it stops)
+   and the play fails, printing the journal.
+4. From this machine, it checks that staging's plain DNS port answers and its page is served. A
+   failure here leaves the release running: something between the two machines blocks it.
 
-`make deploy` installs on staging only. Try the release there: the demos take staging's zones
-(docs/demo.md, "Against a shared registrar"), and its page is at `https://<registrar>:8444/`.
+`make promote`:
 
-```bash
-REGISTRAR=<registrar>:8054 ZONE=stg.zenr.io DOMAIN=srp.stg.zenr.io demo/run.sh
-REGISTRAR=<registrar>:8054 ZONE=stg.zenr.io DOMAIN=srp.stg.zenr.io DOH=https://<registrar>:8444 demo/web.sh
-REGISTRAR=<registrar>:8054 ZONE=stg.zenr.io demo/ipfs.sh member     # community on B
-```
-
-`demo/web.sh` takes staging's DNS-over-HTTPS with `DOH`: without it, the page asks
-`https://<registrar>/`, which is stable's.
-
-Then `make promote`:
-
-1. Checks staging's release again, as in step 3.
-2. Copies its files into stable's releases, makes stable's config from the release's own
-   `config.base.yaml`, points stable's `current` at it, and restarts stable. Nothing is built:
+1. It checks staging's release again, as in step 3.
+2. It copies the release's files into stable's releases, makes stable's config from the release's
+   `config.base.yaml`, points `current` at the release, and restarts stable. Nothing is built:
    stable runs the very files staging was checked with.
-3. Checks stable as in steps 3 and 4, going back to stable's release before when a check fails.
+3. It checks stable as in steps 3 and 4, going back to stable's release before if a check fails.
 
-When stable runs the same release already, as `make deploy` tells for staging, `make promote`
-says so after step 1, and installs, restarts and checks nothing.
+An instance already runs the same release when its current release holds the same files, byte for
+byte, and nothing either service starts with has changed since it started. For the proxy, that
+means `current`, the release's `sig0lease` and `config.yaml`, the keystore and
+`sig0lease@.service`. For the agent, it means the release's `sig0lease-agent`, `community.yaml`
+and `sig0lease-agent@.service`. Then `make deploy` or `make promote` says so and installs,
+restarts and checks nothing. Otherwise it says what differs. The same commit and Go build the same
+files, byte for byte, so a commit that changes no code they are built from, nor `config.yaml`,
+deploys nothing.
 
 Each instance keeps the 5 releases before the one it runs.
 
-- `make deploy-check INSTANCE=stable`: the checks of step 3, on the release stable runs; changes
-  nothing. `INSTANCE` is `staging` or `stable`, default `staging`.
-- `make deploy-rollback INSTANCE=stable`: stable back to the release before the one it runs,
-  then its checks.
+- `make deploy-check INSTANCE=stable`: step 3's checks on the release stable runs. It changes
+  nothing. `INSTANCE` is `staging` or `stable`; the default is `staging`.
+- `make deploy-rollback INSTANCE=stable`: stable goes back to the release before the one it runs,
+  then is checked.
 - `make deploy ARGS="--tags nginx"`: nginx and the certificate only.
+
+## The IPFS community node
+
+An instance with `community` in its `registrar_instances` entry runs one. Both instances do.
+
+- **kubo** runs in the instance's private swarm. Its swarm port must be reachable from the
+  internet, since the members' nodes connect to it. Its config is what
+  `ipfs init --profile server,autoconf-off` makes, plus `community_kubo_overrides`
+  ([roles/community/defaults/main.yml](ansible/roles/community/defaults/main.yml)). kubo is
+  installed from its GitHub release, checked against the SHA-512 sum set there.
+- **Its gateway** is kubo's own, on 127.0.0.1, behind nginx. nginx passes on only the site and
+  `/ipfs/`. The gateway serves only what the node holds (`Gateway.NoFetch`).
+- **The agent** registers `<site>.<update zone>` (`site.dev.zenr.io` on stable) and follows the
+  members registered under the subtype `<site>` in the SRP zone. A member unlisted for
+  `revoke_after` loses its entry. How it works is in
+  [docs/sig0lease-agent.md](../docs/sig0lease-agent.md), "A name's IPFS node".
+
+Every deploy and promote installs kubo, its config and unit, and the agent's template and unit.
+kubo restarts when its config, unit or swarm key changed. The agent comes with the release and
+restarts with it, or when its template or unit changed.
 
 ## Lease stores across releases
 
-Each instance keeps its lease stores, in `/var/lib/sig0lease/<instance>/`; only releases move
-between instances. A name registered through staging therefore stays on staging, and promoting
-leaves stable's names as they were.
+Each instance's two lease stores stay with the instance; only releases move between instances. A
+name registered through staging stays on staging, and a promote leaves stable's names as they
+were.
 
-A proxy stopped for a new release saves its stores, and the new release loads them. A release
-that cannot read them, because their format changed (the project keeps no compatibility with
-older lease-store files), stops before writing to them: its checks fail, and the instance goes
-back to the release before, on the untouched stores. Staging meets such a release first, with
-its own stores. Such a release cannot be promoted as it is: stable's names are removed from the
-zones first, and stable starts with empty stores, as at the first promote.
+A proxy stopped for a new release saves its stores, and the new release loads them. If a release
+cannot read them because their format changed (the project keeps no compatibility with older
+lease-store files), it stops before writing to them. Its checks fail, and the instance goes back
+to the release before, with the stores untouched. Such a release therefore fails at
+`make deploy`, on staging, before it can reach stable. It can run on an instance only after that
+instance's names are removed from the zones and its stores are deleted.
 
 ## Discovery records
 
-An SRP client given no registrar finds one in DNS (RFC 9665; docs/siglease_rfc9665.md,
-"Discovery"): it asks for `_dnssd-srp._tcp` (over DNS-over-TLS, `_dnssd-srp-tls._tcp`) at its
-domain and at each name above it, the closest record winning. One record per transport at
-stable's RFC 9664 zone names stable for both its zones:
+An SRP client given no registrar finds stable through these records, written by hand with the
+`dev.zenr.io.` key. The deploy does not write them, so change them when stable's ports or the
+registrar's name change:
 
 ```
-_dnssd-srp._tcp.dev.zenr.io.         SRV 0 0 8053 <registrar>.
-_dnssd-srp-tls._tcp.dev.zenr.io.     SRV 0 0 853  <registrar>.
+_dnssd-srp._tcp.dev.zenr.io.      SRV 0 0 8053 <registrar>.
+_dnssd-srp-tls._tcp.dev.zenr.io.  SRV 0 0 853  <registrar>.
 ```
 
-The deploy does not write them: they are written once, with the zones' key, and change only with
-stable's zones or ports. `dig +short _dnssd-srp._tcp.dev.zenr.io SRV` shows one.
+```bash
+dig +short _dnssd-srp._tcp.dev.zenr.io SRV _dnssd-srp-tls._tcp.dev.zenr.io SRV
+```
 
-Staging has none: it is reached by its address only. A client of its zones is given that
-address, as the demos are with `REGISTRAR`; given none, it finds a registrar only if a record at
-`zenr.io.` names one.
-
-## The first promote
-
-Until the first promote, the registrar's stable is a proxy started by hand on port 8053, serving
-`dev.zenr.io.` with both handlers, and staging runs beside it.
-
-The first promote stops before switching anything while another process holds port 8053, and
-names it. With that proxy's operators:
-
-1. Remove from the zones what it registered: stop its clients so that they deregister, or delete
-   their records with the zones' key. `demo/leftovers.sh` lists what is in the zones that no
-   lease store holds.
-2. Stop it.
-3. `make promote`. Stable's lease stores start empty; the old proxy's files are left where they
-   are. Its SRP clients registered in `dev.zenr.io.`; stable's SRP domain is `srp.dev.zenr.io.`.
+Staging has none: its clients are given its address.
 
 ## Looking at it
 
 ```bash
-ssh registrar journalctl -u sig0lease@stable -f      # stable's log
+ssh registrar journalctl -u sig0lease@stable -f          # the proxy's log
+ssh registrar journalctl -u kubo@stable -u sig0lease-agent@stable -f   # the IPFS node's
 ssh registrar runuser -u sig0lease-stable -- /opt/sig0lease/stable/current/sig0lease --dump /opt/sig0lease/stable/current/config.yaml
 ```
 
 `--dump` (`--dump-debug` for every record) reads the lease stores and changes nothing. The dump
-query over DNS is refused, as `server.diagnostics` is off.
+query over DNS is refused, since `server.diagnostics` is off.
 
 ## What protects it
 
 - Each proxy answers only for its zones (`server.forward` off): neither is an open resolver.
 - Error replies carry the Extended DNS Error's code and no reason (`server.diagnostics` off).
-- nginx limits each source address's DNS-over-HTTPS requests and DNS-over-TLS connections, per
-  instance ([roles/nginx/defaults/main.yml](ansible/roles/nginx/defaults/main.yml)). Behind
-  nginx, a proxy sees every such client as 127.0.0.1.
-- Each proxy runs as a user of its own, with no capabilities, in systemd's sandbox: neither can
-  read the other's key or lease stores, and each writes only its own stores.
-- The plain DNS ports themselves have no limit, and the machine no firewall from these roles: its
-  other services belong to their own operators, and a firewall of its own (an nftables table
-  beside theirs) is still to come. It would open, besides theirs and ssh: 80, 443, 853, 8053,
-  8054, 8444 and 8853.
+- nginx limits each source address's DNS-over-HTTPS and gateway requests and its DNS-over-TLS
+  connections, per instance ([roles/nginx/defaults/main.yml](ansible/roles/nginx/defaults/main.yml)).
+  Behind nginx, a proxy sees every such client as 127.0.0.1.
+- Each service runs as its own user, with no capabilities, in systemd's sandbox, and writes only
+  its own directories.
+- kubo's RPC API listens on 127.0.0.1 without authentication: any user on the registrar can use
+  it.
+- The plain DNS ports have no limit, and these roles set up no firewall, since the machine's other
+  services belong to their own operators. A firewall of its own (an nftables table beside theirs)
+  is still to come. Besides theirs and ssh, it would open 80, 443, 853, 8053, 8054, 8444, 8853,
+  4001 and 4002.

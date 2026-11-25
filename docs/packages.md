@@ -244,6 +244,19 @@ func LiveTransport(timeout time.Duration) Transport
     LiveTransport sends msg to addr over network with this package's Client,
     the same transport every other client and test tool in this codebase uses.
 
+type UnreachableError struct {
+	Server string // the DoH server's URL, as New had it
+	Err    error  // why, without the request's URL, which holds the whole message, encoded
+}
+    UnreachableError is queryDoH's failure to get any HTTP answer from Server:
+    it could not connect, or no answer came in time. In a browser it is also an
+    answer whose CORS headers do not let the page read it: fetch does not say
+    which.
+
+func (e *UnreachableError) Error() string
+
+func (e *UnreachableError) Unwrap() error
+
 ```
 
 ## github.com/NetworkCommons/sig0lease/client/agent
@@ -255,18 +268,19 @@ what a template (YAML) describes registered: hosts and their services through
 SRP registrars (RFC 9665), and names and their records through this project's
 proxy (RFC 9664).
 
-A template lists its registrars, each with a protocol. An srp one holds
-hosts -- each one SRP identity with its own key -- and each host's services.
-A service is an instance of a service type: a built-in preset ("ssh", "http",
-...), or a type the template defines with the same fields. A service whose
-probe fails is withdrawn and registered again once it passes. Complex types
-are code, not data: a template uses them but cannot define them; "mdns",
-under an srp registrar's mirrors:, mirrors what a running mDNSResponder sees
-(client/mdnsbridge). An rfc9664 one holds names, each given in full, with its
-own key, its addresses, its records and its services, which SRV records find at
-the name (RFC 2782), with a TLSA record for a TLS one (DANE) (client/rfc9664);
-"ipfs", a name's ipfs:, publishes an IPFS node at the name: its addresses,
-and a folder of its files or the one another name publishes (client/kubo).
+A template lists its registrars, each with a protocol. An srp one holds hosts --
+each one SRP identity with its own key -- and each host's services. A service
+is an instance of a service type: a built-in preset ("ssh", "http", ...), or a
+type the template defines with the same fields. A service whose probe fails is
+withdrawn and registered again once it passes. Complex types are code, not data:
+a template uses them but cannot define them; "mdns", under an srp registrar's
+mirrors:, mirrors what a running mDNSResponder sees (client/mdnsbridge).
+An rfc9664 one holds names, each given in full, with its own key, its addresses,
+its records and its services, which SRV records find at the name (RFC 2782),
+with a TLSA record for a TLS one (DANE) (client/rfc9664); "ipfs", a name's
+ipfs:, publishes an IPFS node at the name: its addresses, and a folder of
+its files or one holding the folders of a community's members (client/kubo);
+a host's service's ipfs: gives a folder of its node's files in its TXT record.
 See docs/sig0lease-agent.md.
 
 CONSTANTS
@@ -320,6 +334,26 @@ func TLSARecord(owner, file string) (*dns.TLSA, error)
 
 TYPES
 
+type Follow struct {
+	ServiceType string        // such as _ipfs-member._tcp
+	Subtype     string        // a label: the name's first one unless the template gives it
+	Domain      string        // the SRP domain, fully qualified
+	RevokeAfter time.Duration // more than 0
+}
+    Follow is the community whose members' folders a name's node keeps:
+    the instances of a service type in an SRP domain listed under a subtype of
+    it (RFC 6763 S7.1), each a member's node giving its folder in its TXT record
+    (Service.IPFS). Each member is its Instance label, held by the member's
+    key (RFC 9665's First-Come First-Served naming): the node pins each folder
+    a member gives, and the name's site is a folder with an entry per member,
+    by its label, giving the member's folder last pinned. A member gone from
+    the listing for RevokeAfter, or whose label another key holds, has its entry
+    removed and its folder unpinned.
+
+func (f Follow) Members() string
+    Members returns the name whose PTR records list the members' instances:
+    "<subtype>._sub.<service type>.<domain>".
+
 type Host struct {
 	Name      string
 	Auto      bool         // this machine's addresses too, as they change
@@ -330,16 +364,24 @@ type Host struct {
     Host is one SRP identity: a name, its addresses and its services.
 
 type IPFS struct {
-	API     string // the node's RPC API, "http://host:port"
-	Publish string // a path in the node's files (MFS), such as /community
-	Follow  string // a name, fully qualified, whose site the node pins and the name publishes
+	API      string  // the node's RPC API, "http://host:port"
+	Publish  string  // a path in the node's files (MFS), such as /community
+	Follow   *Follow // nil: none
+	SwarmKey string  // the swarm key file, absolute: a community's and a member's; "" a name's site
 }
-    IPFS is the kubo node a name publishes (client/kubo): its addresses,
-    as the name's _dnsaddr TXT records, which a node given /dnsaddr/<name>
-    connects to, and a site, as its _dnslink TXT record (DNSLink), which IPFS
-    gateways and nodes open by the name: a path in the node's files (Publish),
-    or the site another name publishes, once the node holds all of it (Follow).
-    With neither, the name publishes the node's addresses alone.
+    IPFS is the kubo node a name publishes (client/kubo): its addresses, as the
+    name's _dnsaddr TXT records, which a node given /dnsaddr/<name> connects to,
+    and a site, as its _dnslink TXT record (DNSLink), which IPFS gateways and
+    nodes open by the name: a path in the node's files (Publish), or a folder
+    with the folders of a community's members, each once the node holds all of
+    it (Follow). With neither, the name publishes the node's addresses alone.
+    A host's service publishes a path in the node's files alone, in its TXT
+    record (Service.IPFS).
+
+    A community and its members share a swarm key (SwarmKey): a member's TXT
+    record gives, with its folder, the swarm-mac= that key makes of its KEY
+    and its folder (swarmKey.mac), and the community counts as members only the
+    instances whose swarm-mac= it makes too.
 
 type Lifetime struct {
 	Lease     uint32 // seconds
@@ -395,10 +437,10 @@ type Options struct {
 	Interfaces func() ([]netip.Addr, error)
 	// Send, Query and Sleep are every SRP client's (clientsrp.Config), Send and Sleep every
 	// RFC 9664 client's too (rfc9664.Config); nil: the clients' own. Query also asks what a
-	// name that follows a site asks the resolvers (watchIPFS); nil: the registrar's resolvers
-	// (clientsrp.LiveDNSQuery).
+	// name that follows a community asks the resolvers (watchIPFS); nil: the registrar's
+	// resolvers (clientsrp.LiveDNSQuery).
 	Send  baseclient.Transport
-	Query clientsrp.DNSQuery
+	Query dnszone.Query
 	Sleep func(context.Context, time.Duration) error
 	// MirrorSource is the daemon an mdns mirror asks, given its socket; default
 	// mdnsbridge.DaemonSource.
@@ -475,6 +517,10 @@ type Service struct {
 	Type     string                   // the type's name: a preset or one the template defines
 	Instance clientsrp.InstanceConfig // a name's: its ServiceType and Port alone
 	Probe    Probe
+	// A host's only: the node whose folder (IPFS.Publish) its TXT record gives, as
+	// "dnslink=/ipfs/<CID>", which a community's node follows (IPFS.Follow); nil: none. The
+	// instance is registered once the folder is read.
+	IPFS *IPFS
 	// A name's only. Subdomains are names below the name, relative to it, that the service is
 	// also offered for; TLSA is the certificate file, absolute, whose key a TLSA record at
 	// "_<port>._<proto>.<name>" gives (TLSARecord), or "".
@@ -531,6 +577,17 @@ the service types the domain lists (S9), each type's instances (S4), and each
 instance's SRV and TXT records (S6) and its target's addresses. Names reads,
 the same way, the names in a zone signed with NSEC, which are typed rather than
 browsed: those RFC 9664 registers and any other.
+
+FUNCTIONS
+
+func InstanceLabels(ctx context.Context, q Query, owner, t, domain string) ([]string, error)
+    InstanceLabels returns the Instance labels of the instances of the
+    service type t in domain that the PTR records at owner point at:
+    owner is t's browsing name, "<t>.<domain>", or one of its subtypes',
+    "<subtype>._sub.<t>.<domain>" (RFC 6763 S7.1). A PTR record that points
+    at anything but an instance of t in domain is left out: it lists nothing a
+    client can resolve as one.
+
 
 TYPES
 
@@ -610,7 +667,7 @@ func Fallback(q, other Query) Query
     when it forwards no queries (server.forward off). q would be the proxy,
     for its zones' answers from their authoritative server, and other resolvers,
     for every other name, such as the target of an SRV record outside the zones:
-    the browser page's, and a sig0lease-agent name's that follows a site.
+    the browser page's, and a sig0lease-agent name's that follows a community.
     Any other answer, or failure, is q's.
 
 func Querier(send client.Transport, server string, network client.Network) Query
@@ -662,9 +719,9 @@ func Granted(lease, keyLease uint32) *dns.Msg
 package kubo // import "github.com/NetworkCommons/sig0lease/client/kubo"
 
 Package kubo asks a kubo node -- the IPFS daemon, which IPFS Desktop runs
--- through its RPC API (docs.ipfs.tech/reference/kubo/rpc/): its peer ID and
-addresses, the CID of a path in its files (MFS, IPFS Desktop's Files), and its
-pins.
+-- through its RPC API (docs.ipfs.tech/reference/kubo/rpc/): its peer ID
+and addresses, the CID of a path in its files (MFS, IPFS Desktop's Files),
+the entries of a folder there, which it adds and removes, and its pins.
 
 CONSTANTS
 
@@ -691,6 +748,13 @@ func New(api string, timeout time.Duration) *Client
     New returns the Client of the RPC API at api (CheckAPI). Every request but
     Pin's lasts at most timeout.
 
+func (c *Client) Add(ctx context.Context, cid, path string) error
+    Add puts cid at path in the node's files, linking to it: nothing is fetched.
+
+func (c *Client) Entries(ctx context.Context, path string) (map[string]string, error)
+    Entries returns the entries of the folder path in the node's files: each
+    one's CID, by name.
+
 func (c *Client) ID(ctx context.Context) (id string, addrs []string, err error)
     ID returns the node's peer ID and the addresses it can be reached at,
     each a multiaddr ending in /p2p/<ID>.
@@ -698,14 +762,22 @@ func (c *Client) ID(ctx context.Context) (id string, addrs []string, err error)
 func (c *Client) MFSCID(ctx context.Context, path string) (string, error)
     MFSCID returns the CID of path in the node's files (MFS).
 
+func (c *Client) MakeFolder(ctx context.Context, path string) error
+    MakeFolder makes the folder path in the node's files, with the folders above
+    it, unless it is there.
+
 func (c *Client) Pin(ctx context.Context, cid, name string) (string, error)
     Pin pins cid and everything it links to under name, fetching from other
     nodes what the node does not hold, which lasts until the node holds it all
     or ctx ends. It returns the CID as the node writes it.
 
-func (c *Client) PinsNamed(ctx context.Context, name string) ([]string, error)
-    PinsNamed returns the CIDs pinned with everything they link to under name,
-    sorted.
+func (c *Client) Pins(ctx context.Context) (map[string]string, error)
+    Pins returns the CIDs the node has pinned with everything they link to,
+    each with its pin's name, "" none: a CID has one such pin, and pinning it
+    again under another name renames it.
+
+func (c *Client) Remove(ctx context.Context, path string) error
+    Remove removes path, and what is below it, from the node's files.
 
 func (c *Client) Unpin(ctx context.Context, cid string) error
     Unpin removes cid's pin. What it pinned stays in the node until kubo's
@@ -1106,10 +1178,10 @@ reached over TCP by default.
 
 FUNCTIONS
 
-func Discover(ctx context.Context, query DNSQuery, domain string, mode DiscoveryMode, network baseclient.Network) (string, error)
+func Discover(ctx context.Context, query dnszone.Query, domain string, mode DiscoveryMode, network baseclient.Network) (string, error)
     Discover finds the SRP registrar for domain that is reachable over network.
     As RFC 9665 S3.1.1 specifies, it first finds the apex of the closest DNS
-    zone enclosing domain with SOA queries (RFC 8765 S6.1, see zoneApex).
+    zone enclosing domain with SOA queries (RFC 8765 S6.1, dnszone.Apex).
     It then looks up the SRV record at "<service>.<name>.", where service
     is network's DiscoveryService -- "_dnssd-srp-tls._tcp" for NetworkTLS,
     "_dnssd-srp._tcp" otherwise, the service names RFC 9665 S10.4 registers
@@ -1134,6 +1206,10 @@ func DiscoveryService(n baseclient.Network) string
     DiscoveryService returns the service whose SRV record names a registrar
     reachable over n: "_dnssd-srp-tls._tcp" for NetworkTLS (RFC 9665 S10.4.2),
     "_dnssd-srp._tcp" otherwise (S10.4.1).
+
+func LiveDNSQuery(resolvers []string) dnszone.Query
+    LiveDNSQuery returns the dnszone.Query that asks resolvers in turn
+    (dnszone.Resolvers), or defaultBootstrapResolvers when resolvers is empty.
 
 func Publishable(a netip.Addr) bool
     Publishable reports whether a means something off the link: it is not
@@ -1236,7 +1312,7 @@ type Config struct {
 	RegistrarAddr string
 	Discovery     DiscoveryMode // where discovery looks for the SRV; DiscoveryClosest (the zero value) by default
 	Resolvers     []string      // bootstrap resolvers for discovery; LiveDNSQuery's default if empty
-	Query         DNSQuery      // discovery implementation; LiveDNSQuery(Resolvers) if nil
+	Query         dnszone.Query // discovery implementation; LiveDNSQuery(Resolvers) if nil
 
 	Network    baseclient.Network // default NetworkTCP (S3.5's MUST for non-constrained networks)
 	Timeout    time.Duration      // per-request transport timeout; default 20s
@@ -1272,20 +1348,6 @@ type Config struct {
 	OnRegistered func(resp *dns.Msg)
 }
     Config configures a Client. See NewClient's doc comment for defaults.
-
-type DNSQuery func(ctx context.Context, name string, qtype uint16) (*dns.Msg, error)
-    DNSQuery is the shape of a live DNS lookup, injected so Discover is testable
-    without real network I/O. It returns the whole response, since discovery
-    reads both the Answer section (SRV, or an SOA at a zone apex) and the
-    Authority section (the SOA a negative answer carries). A NOERROR or NXDOMAIN
-    response is an answer, not an error.
-
-func LiveDNSQuery(resolvers []string) DNSQuery
-    LiveDNSQuery returns a DNSQuery that performs a real lookup against
-    resolvers (falling back to defaultBootstrapResolvers if empty), trying
-    each in turn until one answers with NOERROR or NXDOMAIN. Any other RCODE
-    (SERVFAIL, REFUSED, ...) counts as that resolver failing, like a network
-    error.
 
 type DiscoveryMode int
     DiscoveryMode selects the names Discover looks under for the registrar's SRV
@@ -1428,10 +1490,10 @@ type Claim struct {
     there.
 
 type Config struct {
-	DoH     string  // the proxy's DNS-over-HTTPS server, "http://host:port"
-	Zone    string  // the zone names are claimed in, and Names lists: the proxy's RFC 9664 handler's
-	Domain  string  // the DNS-SD domain Browse reads, which Names leaves out
-	Storage Storage // required
+	DoH          string  // the proxy's DNS-over-HTTPS server, "http://host:port"
+	UpdateDomain string  // where names are claimed, and Names lists: the proxy's RFC 9664 handler's subtree
+	SRPDomain    string  // the DNS-SD domain Browse reads, which Names leaves out: its SRP handler's subtree
+	Storage      Storage // required
 	// Fallback is the DNS-over-HTTPS server asked the questions DoH refuses as names it does
 	// not serve (browse.Fallback), as a URL with no path, which a page may ask from any
 	// origin: a public resolver, such as https://dns.google. Default: none, and those
@@ -1453,7 +1515,7 @@ func New(cfg Config) (*Page, error)
     New validates cfg and applies its defaults.
 
 func (p *Page) Browse(ctx context.Context) (*browse.Domain, error)
-    Browse reads the domain (browse.Browse).
+    Browse reads SRPDomain (browse.Browse).
 
 func (p *Page) Claim(label, message string) error
     Claim claims label's name with message: the name, held by a key kept in the
@@ -1471,7 +1533,7 @@ func (p *Page) Message(ctx context.Context, label string) ([]string, error)
     octets: none when it has none.
 
 func (p *Page) Names(ctx context.Context) ([]browse.Name, error)
-    Names lists the names in the zone, outside the domain (browse.Names):
+    Names lists the names in UpdateDomain, outside SRPDomain (browse.Names):
     the zone must be signed with NSEC.
 
 func (p *Page) Release() error
@@ -2595,6 +2657,49 @@ func ValidateServiceType(svcType string) error
     the second "_tcp" or "_udp". It is the requester's check -- stricter
     than ServiceTypeFromServiceName, since a requester should only ever send
     well-formed types.
+
+```
+
+## github.com/NetworkCommons/sig0lease/pkg/dnszone
+```
+package dnszone // import "github.com/NetworkCommons/sig0lease/pkg/dnszone"
+
+Package dnszone finds the zone that holds a name by asking resolvers: RFC 8765
+S6.1's discovery, which RFC 9665 S3.1.1 points SRP requesters to (client/srp),
+and which the proxy's handlers use to find the zone their UPDATEs name and its
+primary server (pkg/updatecore).
+
+FUNCTIONS
+
+func Apex(ctx context.Context, query Query, name string) (*dns.SOA, error)
+    Apex returns the SOA of the closest zone enclosing name: its owner is the
+    zone's apex, its MNAME the zone's primary server. It follows RFC 8765 S6.1
+    steps 1-4: query SOA for name; an SOA in the Answer section (name is itself
+    an apex) or in the Authority section (a NODATA or NXDOMAIN answer) is the
+    one. A response with no SOA in either section -- a resolver need not put
+    the SOA in a negative answer, and Google Public DNS at times leaves it out
+    -- means stripping the leading label and asking again, down to a two-label
+    name: reaching a single label (a TLD) is a configuration error and ends the
+    search. So is the root zone's SOA, which is what a resolver returns when
+    name's TLD does not exist, and an SOA of a zone that does not enclose name.
+    A failed query ends the search with its error.
+
+
+TYPES
+
+type Query func(ctx context.Context, name string, qtype uint16) (*dns.Msg, error)
+    Query is the shape of a DNS lookup, injected so its callers are testable
+    without real network I/O. It returns the whole response, since discovery
+    reads both the Answer section (an SOA at a zone apex) and the Authority
+    section (the SOA a negative answer carries). A NOERROR or NXDOMAIN response
+    is an answer, not an error.
+
+func Resolvers(resolvers []string) Query
+    Resolvers returns the Query that asks resolvers ("host:port", over UDP) in
+    turn until one answers with NOERROR or NXDOMAIN, and returns that answer.
+    Any other RCODE (SERVFAIL, REFUSED, ...) counts as that resolver failing,
+    like a network error; when every resolver fails, the error gives each one's
+    failure.
 
 ```
 

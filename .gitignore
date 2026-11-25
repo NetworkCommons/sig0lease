@@ -1,6 +1,7 @@
 bin
 keystore/client
 keystore/server
+keystore/ipfs
 *.tar.gz
 .pi
 coverage.out

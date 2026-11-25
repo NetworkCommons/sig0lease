@@ -2,6 +2,7 @@ package web
 
 import (
 	"context"
+	"errors"
 	"reflect"
 	"slices"
 	"strings"
@@ -126,7 +127,7 @@ func (p *proxy) none(t *testing.T) {
 
 func newPage(t *testing.T, p *proxy, s Storage) *Page {
 	t.Helper()
-	page, err := New(Config{DoH: "http://proxy:8443", Zone: "dev.zenr.io", Domain: "srp.dev.zenr.io", Storage: s, Send: p.send, Logf: t.Logf})
+	page, err := New(Config{DoH: "http://proxy:8443", UpdateDomain: "dev.zenr.io", SRPDomain: "srp.dev.zenr.io", Storage: s, Send: p.send, Logf: t.Logf})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -301,12 +302,12 @@ func TestNew_Refused(t *testing.T) {
 		cfg     Config
 		wantErr string
 	}{
-		{Config{DoH: "proxy:8443", Zone: "z.", Domain: "d.", Storage: s}, "DoH"},
-		{Config{DoH: "http://proxy:8443/dns-query", Zone: "z.", Domain: "d.", Storage: s}, "DoH"},
-		{Config{DoH: "http://proxy:8443", Domain: "d.", Storage: s}, "Zone and Domain"},
-		{Config{DoH: "http://proxy:8443", Zone: "z.", Storage: s}, "Zone and Domain"},
-		{Config{DoH: "http://proxy:8443", Zone: "z.", Domain: "d."}, "Storage"},
-		{Config{DoH: "http://proxy:8443", Zone: "z.", Domain: "d.", Storage: s, Fallback: "dns.google"}, "Fallback"},
+		{Config{DoH: "proxy:8443", UpdateDomain: "u.", SRPDomain: "s.", Storage: s}, "DoH"},
+		{Config{DoH: "http://proxy:8443/dns-query", UpdateDomain: "u.", SRPDomain: "s.", Storage: s}, "DoH"},
+		{Config{DoH: "http://proxy:8443", SRPDomain: "s.", Storage: s}, "UpdateDomain and SRPDomain"},
+		{Config{DoH: "http://proxy:8443", UpdateDomain: "u.", Storage: s}, "UpdateDomain and SRPDomain"},
+		{Config{DoH: "http://proxy:8443", UpdateDomain: "u.", SRPDomain: "s."}, "Storage"},
+		{Config{DoH: "http://proxy:8443", UpdateDomain: "u.", SRPDomain: "s.", Storage: s, Fallback: "dns.google"}, "Fallback"},
 	} {
 		if _, err := New(c.cfg); err == nil || !strings.Contains(err.Error(), c.wantErr) {
 			t.Errorf("New(%+v) = %v, want an error containing %q", c.cfg, err, c.wantErr)
@@ -354,8 +355,8 @@ func (s *servers) send(ctx context.Context, addr string, network client.Network,
 
 func (s *servers) page(t *testing.T) *Page {
 	t.Helper()
-	page, err := New(Config{DoH: "http://proxy:8443", Fallback: "https://dns.google", Zone: "dev.zenr.io",
-		Domain: "srp.dev.zenr.io", Storage: newMemStorage(), Send: s.send})
+	page, err := New(Config{DoH: "http://proxy:8443", Fallback: "https://dns.google", UpdateDomain: "dev.zenr.io",
+		SRPDomain: "srp.dev.zenr.io", Storage: newMemStorage(), Send: s.send})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -417,5 +418,47 @@ func TestNames(t *testing.T) {
 	}
 	if len(s.asked["https://dns.google"]) != 0 {
 		t.Errorf("asked of the fallback: %q, want nothing", s.asked["https://dns.google"])
+	}
+}
+
+// TestUnreachable: when the proxy gives no answer at all, Browse, Names and Message say just
+// that, and why; when the fallback gives none, they say which question it was asked, and
+// that it was the fallback.
+func TestUnreachable(t *testing.T) {
+	refused := errors.New("TypeError: Failed to fetch")
+	unreachable := func(server string) client.Transport {
+		return func(_ context.Context, addr string, _ client.Network, msg *dns.Msg) (*dns.Msg, error) {
+			if addr == server {
+				return nil, &client.UnreachableError{Server: addr, Err: refused}
+			}
+			resp := &dns.Msg{MsgHeader: dns.MsgHeader{ID: msg.ID, Response: true, Rcode: dns.RcodeRefused}, Question: msg.Question}
+			dnsmsg.AddEDE(resp, msg, dns.ExtendedErrorNotAuthoritative, "")
+			return resp, nil
+		}
+	}
+	page := func(send client.Transport) *Page {
+		page, err := New(Config{DoH: "http://proxy:8443", Fallback: "https://dns.google", UpdateDomain: "dev.zenr.io",
+			SRPDomain: "srp.dev.zenr.io", Storage: newMemStorage(), Send: send})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return page
+	}
+	ctx := context.Background()
+	reads := func(p *Page) map[string]error {
+		_, browseErr := p.Browse(ctx)
+		_, namesErr := p.Names(ctx)
+		_, messageErr := p.Message(ctx, "alice")
+		return map[string]error{"Browse": browseErr, "Names": namesErr, "Message": messageErr}
+	}
+	for read, err := range reads(page(unreachable("http://proxy:8443"))) {
+		if want := "cannot reach the proxy at http://proxy:8443: TypeError: Failed to fetch"; err == nil || err.Error() != want || !errors.Is(err, refused) {
+			t.Errorf("%s with the proxy unreachable: %v, want %q", read, err, want)
+		}
+	}
+	for read, err := range reads(page(unreachable("https://dns.google"))) {
+		if err == nil || strings.Contains(err.Error(), "the proxy") || !strings.Contains(err.Error(), "cannot reach https://dns.google: TypeError: Failed to fetch") {
+			t.Errorf("%s with the fallback unreachable: %v, want the question and the fallback's failure", read, err)
+		}
 	}
 }

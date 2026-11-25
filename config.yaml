@@ -63,7 +63,8 @@ server:
 upstreams:
   # Required: at least one, each with its address, protocol (udp or tcp) and timeout.
   # The handlers ask them for a zone's SOA, to find the authoritative server of
-  # handlers.<handler>.upstream_zone; with server.forward on, they also get what no handler takes.
+  # handlers.<handler>.upstream_zone, and keep it for the SOA's TTL; with server.forward on,
+  # they also get what no handler takes.
   - address: "8.8.8.8:53"
     protocol: "udp"
     timeout: "5s"

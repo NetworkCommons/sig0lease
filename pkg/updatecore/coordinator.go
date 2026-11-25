@@ -8,11 +8,14 @@ import (
 	"fmt"
 	"net"
 	"strings"
+	"sync"
+	"time"
 
 	"codeberg.org/miekg/dns"
 	"codeberg.org/miekg/dns/dnsutil"
 	"github.com/NetworkCommons/sig0lease/logging"
 	"github.com/NetworkCommons/sig0lease/pkg/dnsname"
+	"github.com/NetworkCommons/sig0lease/pkg/dnszone"
 	"github.com/NetworkCommons/sig0lease/pkg/keyrec"
 )
 
@@ -26,8 +29,13 @@ import (
 type Coordinator struct {
 	logger *logging.Logger
 	// bootstrapResolvers are the resolvers asked for a name's SOA to find the zone holding
-	// it and that zone's primary server (discoverZone), for names static does not cover.
+	// it and that zone's primary server (discoverZone), for names static does not cover;
+	// query asks them.
 	bootstrapResolvers []string
+	query              dnszone.Query
+	// zones keeps what discoverZone found, each SOA for its TTL; now is its clock.
+	zones zoneCache
+	now   func() time.Time
 	// static, when set, replaces discovery for its zone and every name below it.
 	static *StaticUpstream
 }
@@ -50,6 +58,8 @@ func NewCoordinator(logger *logging.Logger, bootstrapResolvers []string, static 
 	return &Coordinator{
 		logger:             logger,
 		bootstrapResolvers: bootstrapResolvers,
+		query:              dnszone.Resolvers(bootstrapResolvers),
+		now:                time.Now,
 		static:             static,
 	}
 }
@@ -60,44 +70,80 @@ func (c *Coordinator) covers(name string) bool {
 	return c.static != nil && dnsname.IsAtOrBelow(name, c.static.Zone)
 }
 
-// discoverZone returns the SOA of the zone holding name, from a single SOA query for name
-// to the bootstrap resolvers: the SOA is in the answer when name is that zone's apex, and in
-// the authority section otherwise, of a NOERROR (no data) or NXDOMAIN response alike. Its
-// owner is the zone's apex, its MNAME the zone's primary server. A root SOA (name is in no
-// delegated zone, e.g. under a TLD that doesn't exist) or an SOA whose owner is not at or
-// above name is not taken as an answer.
+// discoverZone returns the SOA of the zone holding name: its owner is the zone's apex, its
+// MNAME the zone's primary server. It asks the bootstrap resolvers (dnszone.Apex, RFC 8765
+// S6.1): one SOA query for name, whose answer carries the SOA in the Answer section when name
+// is the apex and in the Authority section otherwise, unless the resolver leaves it out
+// (Google Public DNS does at times for srp.dev.zenr.io., a name inside zenr.io.); then the
+// parent names are asked in turn, up to the apex. A root SOA (name is in no delegated zone),
+// an SOA of a zone not holding name, or one naming no primary server is no answer.
+//
+// Every query the handlers relay and every UPDATE they send starts here, so the SOA found is
+// kept for its TTL -- the zone's negative-caching TTL when it came in the Authority section
+// -- and discoverZone answers from it, with no query, until that runs out. A failure is
+// never kept: the next call asks again.
 func (c *Coordinator) discoverZone(ctx context.Context, name string) (*dns.SOA, error) {
-	fqdn := name
-	if !strings.HasSuffix(fqdn, ".") {
-		fqdn += "."
-	}
-	if dnsname.Normalize(fqdn) == "" {
+	fqdn := dnsutil.Fqdn(name)
+	key := dnsname.Normalize(fqdn)
+	if key == "" {
 		return nil, fmt.Errorf("upstream zone is empty")
 	}
-	req := dns.NewMsg(fqdn, dns.TypeSOA)
-	if req == nil {
-		return nil, fmt.Errorf("failed to build SOA query for %q", fqdn)
+	if soa := c.zones.get(key, c.now()); soa != nil {
+		return soa, nil
 	}
+	soa, err := dnszone.Apex(ctx, c.query, fqdn)
+	if err != nil {
+		return nil, fmt.Errorf("no zone SOA found for %q via bootstrap resolvers %v: %w", fqdn, c.bootstrapResolvers, err)
+	}
+	if dnsname.Normalize(soa.Ns) == "" {
+		return nil, fmt.Errorf("no zone SOA found for %q via bootstrap resolvers %v: the SOA of %s names no primary server (MNAME %q)", fqdn, c.bootstrapResolvers, soa.Hdr.Name, soa.Ns)
+	}
+	c.logger.Debugf("Zone of %s is %s, primary server %s, kept for %d s (via bootstrap resolvers %v)", fqdn, soa.Hdr.Name, soa.Ns, soa.Hdr.TTL, c.bootstrapResolvers)
+	c.zones.put(key, soa, c.now())
+	return soa, nil
+}
 
-	for _, resolver := range c.bootstrapResolvers {
-		resp, err := dns.Exchange(ctx, req, "udp", resolver)
-		if err != nil || resp == nil || (resp.Rcode != dns.RcodeSuccess && resp.Rcode != dns.RcodeNameError) {
-			continue
-		}
-		for _, rr := range append(resp.Answer, resp.Ns...) {
-			soa, ok := rr.(*dns.SOA)
-			if !ok {
-				continue
-			}
-			apex := soa.Hdr.Name
-			if dnsname.Normalize(apex) == "" || !dnsname.IsAtOrBelow(fqdn, apex) || dnsname.Normalize(soa.Ns) == "" {
-				break
-			}
-			c.logger.Debugf("Zone of %s is %s, primary server %s (via bootstrap resolver %s)", fqdn, apex, soa.Ns, resolver)
-			return soa, nil
+// zoneCache keeps discoverZone's answers, by the name asked (normalized), each until its
+// SOA's TTL runs out. The handlers ask only for their upstream_zone, so it holds one entry
+// per handler; put drops whatever has run out all the same.
+type zoneCache struct {
+	mu      sync.Mutex
+	entries map[string]cachedZone
+}
+
+type cachedZone struct {
+	soa     *dns.SOA
+	expires time.Time
+}
+
+// get returns the SOA kept for name, or nil when there is none or its TTL has run out by now.
+func (z *zoneCache) get(name string, now time.Time) *dns.SOA {
+	z.mu.Lock()
+	defer z.mu.Unlock()
+	e, ok := z.entries[name]
+	if !ok || !now.Before(e.expires) {
+		return nil
+	}
+	return e.soa
+}
+
+// put keeps soa for name for its TTL from now (not at all for a TTL of 0), and drops every
+// entry that has run out.
+func (z *zoneCache) put(name string, soa *dns.SOA, now time.Time) {
+	z.mu.Lock()
+	defer z.mu.Unlock()
+	for k, e := range z.entries {
+		if !now.Before(e.expires) {
+			delete(z.entries, k)
 		}
 	}
-	return nil, fmt.Errorf("no zone SOA found for %q via bootstrap resolvers %v", fqdn, c.bootstrapResolvers)
+	if soa.Hdr.TTL == 0 {
+		return
+	}
+	if z.entries == nil {
+		z.entries = make(map[string]cachedZone)
+	}
+	z.entries[name] = cachedZone{soa: soa, expires: now.Add(time.Duration(soa.Hdr.TTL) * time.Second)}
 }
 
 // ResolveSOAMasterServer returns the "host:port" of the primary server (SOA MNAME, port 53)

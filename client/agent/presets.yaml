@@ -23,6 +23,10 @@ ipfs-gateway:
   txt: {path: /ipfs/}
   subtypes: [_ipfs]
   probe: {tcp: true}
+ipfs-member:
+  service: _ipfs-member._tcp
+  port: 4001
+  probe: {tcp: true}
 activitypub:
   service: _activitypub._tcp
   port: 443

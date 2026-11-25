@@ -10,10 +10,13 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Chat</title>
 <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/converse.js@14.0.1/dist/converse.min.css">
-<script src="https://cdn.jsdelivr.net/npm/converse.js@14.0.1/dist/converse.min.js"></script>
+<!-- Converse.js 14 is built only as an ES module: as a classic script it does not parse, and
+     converse stays undefined. Module scripts run in document order, so the one below finds
+     window.converse, which this one sets. -->
+<script type="module" src="https://cdn.jsdelivr.net/npm/converse.js@14.0.1/dist/converse.min.js"></script>
 </head>
 <body>
-<script>
+<script type="module">
 const params = new URLSearchParams(location.search);
 const domain = params.get('domain') || location.hostname;
 converse.initialize({
@@ -24,6 +27,14 @@ converse.initialize({
     discover_connection_methods: false,
     auto_join_rooms: [params.get('room') || `meet@rooms.${domain}`],
     view_mode: 'fullscreen',
+    // The room's last 20 messages on joining, from the history Prosody keeps for it in memory
+    // (20 by default). Converse asks for none unless told how many (<history maxstanzas="0"/>):
+    // it expects the room's archive (MAM), which the rooms here do not keep.
+    muc_history_max_stanzas: 20,
+    // Opened over plain HTTP at a LAN address, the page is not a secure context, so the browser
+    // gives it no Web Crypto (crypto.subtle). converse-caps hashes every presence with it, and
+    // without it the room's join presence is never sent; converse-omemo cannot start without it.
+    blacklisted_plugins: ['converse-caps', 'converse-omemo'],
 });
 </script>
 </body>

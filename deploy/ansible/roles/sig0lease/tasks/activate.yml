@@ -1,7 +1,8 @@
 # The release sig0lease_release, in the instance's releases/ with its files, made the one the
 # instance runs: its config written (sig0lease_config, config.yml), then current pointed at it,
-# the proxy restarted, nginx serving the instance, and the release checked, once nothing else
-# holds the instance's port. A release that fails its checks is replaced by the one before it,
+# the proxy restarted, nginx serving the instance, the community node's agent restarted, for an
+# instance that has one (roles/community), and the release checked, once nothing else holds the
+# instance's port. A release that fails its checks is replaced by the one before it,
 # or, on the instance's first release, stopped; either way the play fails. deploy (main.yml) and
 # promote (promote.yml) end here.
 
@@ -22,8 +23,7 @@
       {{ sig0lease_current.stat.lnk_source | basename
          if sig0lease_current.stat.islnk | default(false) else '' }}
 
-# The old proxy, started by hand, holds port 8053 until its operators stop it, with its names
-# removed from the zone first (deploy/README.md, "The first promote").
+# A proxy started by hand on the instance's port would keep it from the release.
 - name: List what else holds the instance's port
   ansible.builtin.shell: |
     set -uo pipefail
@@ -43,8 +43,7 @@
       Port {{ sig0lease_port }} is held by another process, which {{ sig0lease_service }} would
       not replace (pid, program):
       {{ sig0lease_port_holders.stdout }}
-      The proxy started by hand? Remove its names from the zone and stop it first
-      (deploy/README.md, "The first promote").
+      Stop it first.
     quiet: true
 
 - name: Switch to the release and check it, in {{ registrar_instance }}
@@ -67,6 +66,14 @@
       ansible.builtin.include_role:
         name: nginx
         tasks_from: sites.yml
+
+    - name: Restart the community node's agent with the release
+      ansible.builtin.include_role:
+        name: community
+        tasks_from: agent.yml
+      vars:
+        community_agent_state: restarted
+      when: registrar_settings.community is defined
 
     - name: Check the release
       ansible.builtin.include_tasks: check.yml
@@ -101,6 +108,14 @@
         name: "{{ sig0lease_service }}"
         state: stopped
       when: sig0lease_previous == ''
+
+    - name: Restart the community node's agent with the release before, or stop it
+      ansible.builtin.include_role:
+        name: community
+        tasks_from: agent.yml
+      vars:
+        community_agent_state: "{{ 'restarted' if sig0lease_previous else 'stopped' }}"
+      when: registrar_settings.community is defined
 
     - name: Fail the play
       ansible.builtin.fail:

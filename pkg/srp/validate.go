@@ -214,10 +214,10 @@ func validateTTLConsistency(cu *ClassifiedUpdate) error {
 // WITHOUT CHECKING OR MODIFYING its value" -- rejecting on a non-zero flags value would be
 // exactly the registrar-side check the RFC forbids. (This was caught by
 // TestValidate_RealMDNSResponderCapture: the real captured mDNSResponder srp-client
-// message carries flags=513, not 0 -- that client doesn't fully honor the requester-side
-// MUST, and per the text above that's not this registrar's problem to enforce.) The
-// flags-0 requirement belongs entirely to client/srp (a later phase), which constructs
-// the KEY adds a requester sends.
+// message carries flags=513, not 0, as OpenThread's does -- RFC 2535's flags for a host's
+// update key, see docs/siglease_rfc9665.md §4 -- and per the text above that's not this
+// registrar's problem to enforce.) The flags-0 requirement belongs to the requester:
+// BuildUpdate zeroes them in the KEY adds it builds (update.go).
 func validateKeys(cu *ClassifiedUpdate) error {
 	keys := []*dns.KEY{cu.Host.Key}
 	for _, inst := range cu.Instances {

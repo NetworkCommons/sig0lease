@@ -1,8 +1,9 @@
-# The release, built on this machine from the checkout into sig0lease_build_dir: the proxy for the
-# registrar's Linux, the page (make web) in web/, and config.base.yaml, the checkout's config.yaml,
-# which each instance's config is made from (config.yml), before anything is built. The same code
-# and Go build the same proxy, byte for byte: it records neither the commit, which the release's
-# name gives, nor where it was built.
+# The release, built on this machine from the checkout into sig0lease_build_dir: the proxy and the
+# agent, which a community node runs (roles/community), for the registrar's Linux, the page (make
+# web) in web/, and config.base.yaml, the checkout's config.yaml, which each instance's config is
+# made from (config.yml), before anything is built. The same code and Go build the same programs,
+# byte for byte: they record neither the commit, which the release's name gives, nor where they
+# were built.
 
 - name: Build the release
   delegate_to: localhost
@@ -52,14 +53,15 @@
         state: directory
         mode: "0755"
 
-    - name: Build the proxy for linux/{{ sig0lease_goarch }}
+    - name: Build the proxy and the agent for linux/{{ sig0lease_goarch }}
       ansible.builtin.command:
-        cmd: go build -trimpath -buildvcs=false -o {{ sig0lease_build_dir }}/sig0lease ./cmd/sig0lease
+        cmd: go build -trimpath -buildvcs=false -o {{ sig0lease_build_dir }}/{{ item }} ./cmd/{{ item }}
         chdir: "{{ sig0lease_repo }}"
       environment:
         GOOS: linux
         GOARCH: "{{ sig0lease_goarch }}"
         CGO_ENABLED: "0"
+      loop: [sig0lease, sig0lease-agent]
       changed_when: true
 
     - name: Build the page

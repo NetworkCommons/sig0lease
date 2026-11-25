@@ -39,8 +39,11 @@ pkg/srp/            pure logic, no network, no DNS I/O
                      Names()/KeyFor() helpers over a ClassifiedUpdate
   update.go          SRP-update builder, used by the client
 
+pkg/dnszone/          RFC 8765 §6.1 zone discovery through resolvers, shared by the
+                      handlers (updatecore) and SRP clients (client/srp)
+
 pkg/updatecore/       shared forwarding plumbing (RFC 9664 handler and SRP handler alike)
-  coordinator.go      SOA-based discovery, static-upstream override,
+  coordinator.go      SOA-based discovery (dnszone, kept for the SOA's TTL), static-upstream override,
                       construct/forward/re-sign, the tri-state QueryKeyAtName
   ttl.go              RRset TTL consistency check (SRP)
 
@@ -134,7 +137,10 @@ Hard requirements the handler enforces:
 - **All KEY RRs identical** and equal to the SIG(0) signing key (§3.2.5.1). KEY `flags` are
   never checked by the registrar — RFC 9665 §3.3.3 is explicit that flags must be stored
   exactly as received, without checking or modifying them; this is one-directional (a
-  requester MUST send flags 0, the registrar MUST NOT enforce that).
+  requester MUST send flags 0, the registrar MUST NOT enforce that). mDNSResponder's and
+  OpenThread's clients both send 513 (0x0201). In RFC 2535's flags layout (§3.1.2) that is
+  name type 10, the key of a non-zone entity such as a host, and signatory field 1, a key that
+  may sign dynamic updates (RFC 2137): the flags a host's update key carried before RFC 9665.
 - **TTL consistency** within every RRset in the update (§4) — rejected with `REFUSED` if
   violated (`pkg/updatecore/ttl.go`). The registrar then replaces these TTLs before writing
   anything (§6, "TTLs"), but §4 requires the check on the requester's own TTLs regardless.
@@ -188,6 +194,11 @@ Compressed SRV target names (§3.2.5.4) are accepted, matching real client behav
    leaves two KEYs at a name, so such a name was written by something else. The RFC 9664
    handler's `fcfs_naming` applies the same check to its new KEYs
    (`docs/siglease_rfc9664.md`, "First-Come First-Served Naming").
+
+   With `refuse_on_foreign_data: false` the requester takes the name whole: its Delete All
+   RRsets removes every RRset at the name, and what it adds there is the registration's from
+   then on. A record identical to one another writer had put there is no exception: it is
+   deleted when the registration's lease ends.
 
    This is the same query used for the pre-forward cost described in `docs/siglease_rfc9664.md`
    — reading its RCODE is free. A write can land between this check and the forwarded UPDATE;
@@ -309,7 +320,10 @@ instances' discoverability. A PTR only ever moves via an individual add/delete i
   expires, the node's whole subtree is removed.
 - A Service Discovery PTR is removed whenever its target service instance's data is removed.
 - The baseline refresh clock is 80% of the lease plus a 0–5% random offset (RFC 9664 §5.2, a
-  MUST — shared with the base handler, see `docs/siglease_rfc9664.md`).
+  MUST — shared with the base handler, see `docs/siglease_rfc9664.md`). RFC 9664 §5.2.1's
+  coalescing, a MAY, is not implemented: a requester holding several registrations at one
+  server may refresh them all in one request once one of them has run 75% of its lease. Each
+  registration here refreshes on its own clock.
 
 **TTLs (§4, §5.1).** The registrar does not forward the requester's TTLs. They are advisory
 (§4), and requesters may send their lease as the TTL (OpenThread's client does by default),
@@ -432,6 +446,13 @@ store, so the names stayed held.
 
 - On non-constrained networks, TCP is required (anti off-path spoofing); a UDP SRP update is
   rejected with `REFUSED` unless the zone is flagged `allow_udp` for constrained (CNN) devices.
+  The TCP handshake is the check, so a registrar relying on it "MUST NOT accept TCP Fast Open
+  payloads" (§6.1). A kernel takes data from a SYN only on a listener that asks for it with
+  the `TCP_FASTOPEN` socket option, which neither the proxy, Go's `net` package nor
+  `codeberg.org/miekg/dns` sets. Linux also takes it on every listener when
+  `net.ipv4.tcp_fastopen` has bits 0x2 and 0x400 set; the default is 0x1. nginx, which ends
+  DNS-over-TLS and DNS-over-HTTPS in front of the deployed proxy, takes it only with
+  `fastopen=` on a `listen` line, which `deploy/` does not set.
 - The registrar implements ECDSAP256SHA256 (algorithm 13), required by RFC 9665 for
   interoperability with real requesters. `client/srp` generates P-256 keys by default and
   always emits a flags-0 KEY, per §3.2.5.1. ED25519 (algorithm 15) also stays fully supported,
@@ -607,14 +628,17 @@ no concept of a "service description" to key this off of.
 ## 12. Testing and interop
 
 - `make test-srp` runs a full register → refresh → conflict → remove-one → host removal keeping its name → expiry → discovery
-  → concurrent claims → foreign-data takeover → domain enumeration suite against a disposable local BIND 9, with no
+  → concurrent claims → foreign-data takeover → release → DNS-over-HTTPS → domain enumeration suite against a
+  disposable local BIND 9, with no
   external dependency — this is the CI gate. Every update in it is sent by
   `cmd/sig0lease-srp-client`, the same requester users run. The discovery tests find the
   registrar through `_dnssd-srp._tcp` and `_dnssd-srp-tls._tcp`, the latter registering over
   DNS-over-TLS against the proxy's DoT listener with a throwaway certificate generated for the
   run. Two identities then claim one new name at once (one `NOERROR`, one `YXDOMAIN`), and
   the proxy, restarted with `refuse_on_foreign_data: false`, takes over a name holding non-SRP
-  data with the KEY prerequisite, which BIND must accept. Last, the §11 domain-enumeration
+  data with the KEY prerequisite, which BIND must accept. A host released with a KEY-LEASE of 0
+  has its KEYs gone once the proxy answers, and a host registers and is released over the
+  proxy's DNS-over-HTTPS listener. Last, the §11 domain-enumeration
   records follow the config, and a proxy restarted with `advertise_browse_domain: false` deletes
   the `b`/`db`/`lb` the earlier run published (§10).
 - The unit tests for the window in §5 hold one operation inside its upstream send while a
@@ -629,17 +653,32 @@ no concept of a "service description" to key this off of.
   deregistration on stop (`tests/test_agent.sh`).
 - `make test-mdnsresponder-interop` runs the same registrar, plus `client/srp`, against the
   real, unmodified Apple `mDNSResponder/ServiceRegistration` binaries (a sibling checkout, not
-  vendored — see `tests/README.md` for setup and the exact pinned commit). It covers plain
-  registration, host-only registration, and all three subtype variants in the direction of a real
-  `srp-client` against this project's registrar; and Register plus Deregister in the direction of
-  `client/srp` against the real `srp-mdns-proxy` registrar; and, from the mDNS daemon,
-  `sig0lease-agent`'s `mdns` mirror into this project's registrar. (`srp-client`'s own
+  vendored — see `tests/README.md` for setup and the exact pinned commit), in three directions,
+  drawn in `tests/README.md` ("mDNSResponder"), which also shows how to run Directions 1 and 2
+  by hand. (`srp-client`'s own
   `--remove-added-service`/`--delete-registrations` flags were found to hang indefinitely — a
   confirmed bug in that binary's own reconnect logic, unrelated to this project, and not
   exercised by the test as a result.)
 - The real, shared `srp.dev.zenr.io.` zone (under `zenr.io.` at `ns1.free2air.org`) is a
   developer-visible environment other people can `dig`/browse against directly; see
   `docs/srp-live-demo.md` for a walkthrough. Local BIND 9 (above) is what CI actually gates on.
+
+### Pointing mDNSResponder at the proxy
+
+Checked against the mDNSResponder 2881.120.11 source in `../mDNSResponder` and RFCs 6763, 9664
+and 9665. Release 2881 publishes no macOS platform layer (`mDNSMacOSX/`); the last release that
+does is 2600. The rows about the running daemon were checked on macOS 26.7 (mDNSResponder
+2881.160.4).
+
+| Route | Here | Why |
+|---|---|---|
+| Proxy chain: requester → our proxy (validates SRP) → authoritative DNS | yes | The design; Direction 1 by hand (`tests/README.md`) and demo D2 run it on the real zone. |
+| TSIG from the proxy to the authoritative server | not needed | The proxy signs every UPDATE it sends upstream with its own SIG(0) key (`keystore/server`), and BIND accepts it. Apple's SRP-to-DNS gateway, `ServiceRegistration/srp-dns-proxy.c` (not in the default build, §11), signs this hop with one TSIG HMAC-SHA256 key, if given one. TSIG would matter only for an authoritative server that accepts updates with TSIG alone. |
+| An SRV record so that requesters find the proxy | our client only | RFC 9665 names `_dnssd-srp._tcp.<zone>`, or `_dnssd-srp-tls._tcp` for DNS-over-TLS, at the zone apex, with the proxy's DNS port. `sig0lease-srp-client` and the agent look them up (§13), closest first unless `-discovery=apex`. Nothing in mDNSResponder does: `srp-client` uses `--server` or `[::1]:53`, and no other file in the source names `_dnssd-srp`. |
+| The daemon registers in our zone itself (Wide-Area Bonjour) | not today | It sends RFC 2136 UPDATEs, unsigned or signed with TSIG HMAC-MD5, which the proxy refuses: `docs/siglease_rfc9664.md`, "macOS's Own Updates (Wide-Area Bonjour)". |
+| Our software takes the services from the running daemon | yes | `sig0lease-agent`'s `mdns` mirror browses, resolves and looks up addresses over the daemon's client socket, the API every Bonjour application uses, then registers through SRP (interop Direction 3 in `tests/README.md`, demo D2). |
+| A search domain makes Macs browse our zone | yes, on a Mac | The proxy publishes `b`, `db` and `lb._dns-sd._udp` at its zone (§10), and the daemon looks for them in each search domain: demo D4 (`docs/demo.md`) and `docs/dns-sd-records.md`, "Browsing". Not tried: iPhone, and applications other than `dns-sd`. |
+| "Our `srp-client` tests prove the daemon's packets work" | partly | True for software built on `srp-client.c`, which implements `DNSServiceRegister` over SRP (with a Thread accessory build). The daemon's own unicast registration is other code (the Wide-Area Bonjour row). |
 
 ## 13. SRP requester (`client/srp` and `cmd/sig0lease-srp-client`)
 
@@ -715,6 +754,14 @@ Capabilities:
   0–5% jitter) and repeats, unattended, until canceled. A transient send/network error retries
   with exponential backoff (5s up to 5m, reset on success) rather than terminating the client
   permanently, reported via an injectable error hook.
+- **One update at a time.** RFC 9665 §3.2.3.3: "If a configuration change occurs while an
+  outstanding SRP Update is in flight, the SRP registrar MUST defer sending a new SRP Update
+  for that change until the previous SRP Update has completed." The section is about what a
+  requester sends, so "registrar" reads as a slip for "requester". Taken literally it does not
+  concern this proxy, which forwards plain RFC 2136 UPDATEs, never SRP Updates to another
+  registrar. `client/srp` defers: `Run` sends one update after another, and on a change
+  `Host`'s Keeper (`client/keeper.go`) waits for the update in flight to end, answered or
+  timed out, before sending the next.
 - **Renames** — a `YXDOMAIN` does not say which name conflicted, so the client looks up the KEY
   at the host name and at each instance name (`Config.Query`, through `Config.Resolvers`) and
   renames only the names another key holds, by the rule the registrar applies (§5,

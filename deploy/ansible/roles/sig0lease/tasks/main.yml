@@ -26,13 +26,14 @@
         state: directory
         mode: "0755"
 
-    - name: Copy the proxy and config.base.yaml
+    - name: Copy the proxy, the agent and config.base.yaml
       ansible.builtin.copy:
         src: "{{ sig0lease_build_dir }}/{{ item.name }}"
         dest: "{{ sig0lease_root }}/releases/{{ sig0lease_release }}/{{ item.name }}"
         mode: "{{ item.mode }}"
       loop:
         - {name: sig0lease, mode: "0755"}
+        - {name: sig0lease-agent, mode: "0755"}
         - {name: config.base.yaml, mode: "0644"}
       loop_control:
         label: "{{ item.name }}"
