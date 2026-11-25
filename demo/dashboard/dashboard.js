@@ -12,9 +12,16 @@ const REFRESH_INTERVAL = 5000;
 
 class Dashboard {
   /// `doh` is the DNS-over-HTTPS server of the sig0lease proxy all queries go
-  /// to, as a URL without path
-  constructor(doh) {
+  /// to, as a URL without path. If it is empty, a zone's queries go to the
+  /// first of these that answers DoH: the page's origin, the proxies of
+  /// `zone_doh` (`[{domain, doh}]`) whose `domain` is the zone or above it,
+  /// and else to the public resolver `public_doh`.
+  constructor(doh, zone_doh, public_doh) {
     this.doh = doh;
+    this.zone_doh = zone_doh || [];
+    this.public_doh = public_doh;
+    // DoH server -> promise of whether it answers DoH, each asked once
+    this.probes = new Map();
     this.zone = null;
     this.dns = null;
     this.timer = null;
@@ -53,13 +60,51 @@ class Dashboard {
     document.title = zone + ' · DNS-SD Dashboard';
 
     const generation = this.generation;
-    this.dns = new Dns(zone, this.doh, (dns) => {
+    this.dns = new Dns(zone, this.choose_server(zone), (dns) => {
       if (generation === this.generation) {
         this.dnssec.hidden = !dns.dnssec_enabled;
       }
     });
 
     this.refresh();
+  }
+
+  /// choose the DoH server for `zone`, as the constructor describes, and
+  /// return `{doh, is_public}`
+  async choose_server(zone) {
+    if (this.doh) {
+      return {doh: this.doh, is_public: false};
+    }
+    const candidates = [];
+    if (location.protocol === 'https:' || location.protocol === 'http:') {
+      candidates.push(location.origin);
+    }
+    for (const {domain, doh} of this.zone_doh) {
+      if (zone === domain || zone.endsWith('.' + domain)) {
+        candidates.push(doh);
+      }
+    }
+    for (const doh of candidates) {
+      if (await this.answers_doh(doh)) {
+        return {doh, is_public: false};
+      }
+    }
+    return {doh: this.public_doh, is_public: true};
+  }
+
+  /// whether `doh` answers a DoH question; asked once per server
+  answers_doh(doh) {
+    if (!this.probes.has(doh)) {
+      // a proxy hands a name it does not serve, as the root, to a public
+      // resolver, so only a server that speaks no DoH fails
+      this.probes.set(
+          doh,
+          sig0lease.lookup(doh, '.', 'SOA').then(() => true, (error) => {
+            console.warn(doh + ' is no DoH server', error);
+            return false;
+          }));
+    }
+    return this.probes.get(doh);
   }
 
   /// query the zone and re-render, then schedule the next refresh
@@ -78,7 +123,7 @@ class Dashboard {
           plural(types.length, 'service type') + ' · ' +
               plural(count, 'instance') + ' · updated ' +
               new Date().toLocaleTimeString() + ' from ' +
-              new URL(this.doh).host +
+              new URL(this.dns.doh).host +
               (this.dns.cached_answers ?
                    ' · ' + plural(this.dns.cached_answers, 'answer') +
                        ' via public resolver (may be cached)' :

@@ -16,11 +16,18 @@
     <script src="dashboard.js"></script>
     <script>
         const DEFAULT_ZONE = 'srp.dev.zenr.io'
-        // DNS-over-HTTPS server all queries go to: `?doh=<url>`, by default
-        // Cloudflare's public resolver 1.1.1.1 (no other server is searched)
-        const DEFAULT_DOH = 'https://1.1.1.1'
-        const DOH = new URLSearchParams(location.search).get('doh') ||
-            DEFAULT_DOH
+        // DNS-over-HTTPS server of the sig0lease proxy, which answers its
+        // zones from their authoritative server: `?doh=<url>`, by default
+        // the origin the dashboard is served from (as on the registrar)
+        const DOH = new URLSearchParams(location.search).get('doh')
+        // when no `?doh=` is given and the origin is no DoH server (a static
+        // web server, a file:// page): the sig0lease proxies asked for a zone
+        // that is, or is under, `domain`, if they answer DoH ...
+        const ZONE_DOH = [
+            {domain: 'dev.zenr.io', doh: 'https://sig0lease.dev.zenr.io'},
+        ]
+        // ... and else a public resolver, whose answers may be cached
+        const PUBLIC_DOH = 'https://1.1.1.1'
         let dashboard = null
 
         /// zone from the URL hash, or the default zone
@@ -32,7 +39,7 @@
         // start the dashboard when WASM is ready
         window.addEventListener('wasm_ready', function(){
             console.log('WASM is ready')
-            dashboard = new Dashboard(DOH)
+            dashboard = new Dashboard(DOH, ZONE_DOH, PUBLIC_DOH)
             dashboard.set_zone(document.getElementById('zone').value)
         })
 

@@ -6,13 +6,19 @@
 /// `Cache-Control: no-store`, so the dashboard sees a change as soon as the
 /// server has it, not when a resolver's cache expires. A name the proxy does
 /// not serve (e.g. an instance in another zone) is answered by a public
-/// resolver instead; such answers are counted in `cached_answers`.
+/// resolver instead; such answers are counted in `cached_answers`, as are all
+/// answers when no proxy is found and a public resolver is asked directly.
 class Dns {
-  /// construct the DNS object for `domain_name`, asking the DoH server `doh`
-  /// (a URL without path, e.g. `https://registrar.example`)
-  constructor(domain_name, doh, on_initialized) {
+  /// construct the DNS object for `domain_name`, asking the DoH server that
+  /// `server` resolves to: `{doh, is_public}`, `doh` a URL without path
+  /// (e.g. `https://registrar.example`), `is_public` whether it is a public
+  /// resolver rather than a sig0lease proxy, so that every answer may be
+  /// cached
+  constructor(domain_name, server, on_initialized) {
     this.domain = domain_name;
-    this.doh = doh;
+    this.server = server;
+    // the DoH server, once `server` resolved
+    this.doh = null;
 
     // set initialization flags
     this.dnssec_enabled = false;
@@ -25,6 +31,8 @@ class Dns {
 
   /// start asynchronous, longer running tasks at initialization
   async init(callback) {
+    this.doh = (await this.server).doh;
+
     // check if the domain, or its DNS-SD service list (the domain itself is
     // often an empty non-terminal without records), is signed
     this.dnssec_enabled = await this.check_rrsig(this.domain) ||
@@ -46,9 +54,9 @@ class Dns {
   /// an empty array on failure. If `strict` is true, failures are thrown.
   async query(query_domain, record_type, strict) {
     try {
-      const answer =
-          await sig0lease.lookup(this.doh, query_domain, record_type);
-      if (!answer.authoritative) {
+      const {doh, is_public} = await this.server;
+      const answer = await sig0lease.lookup(doh, query_domain, record_type);
+      if (is_public || !answer.authoritative) {
         this.cached_answers++;
       }
       return answer.records;
