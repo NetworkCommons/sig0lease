@@ -76,3 +76,16 @@ registrar_root: /opt/sig0lease
 # Whether nginx offers DNS-over-TLS (RFC 7858), at each instance's dot_port, with the registrar's
 # certificate.
 registrar_dot: true
+
+# nginx's limits per source address (roles/nginx/defaults/main.yml), raised for a room of phones
+# behind one NAT address. The page (demo/web/index.html) asks, through /dns-query, four questions
+# per SRP instance every 3 s and every name's records every 10 s, up to 8 at once: tens of
+# requests per second per phone once the zones hold a few dozen names. Each request becomes one
+# query from the proxy to the zone's authoritative server, so 1000r/s is what one address may
+# send there.
+nginx_doh_rate: 1000r/s
+nginx_doh_burst: 2000
+# The burst covers about 25 phones opening a community folder of 15 pictures at once.
+nginx_gateway_rate: 40r/s
+nginx_gateway_burst: 400
+nginx_dot_connections: 100
