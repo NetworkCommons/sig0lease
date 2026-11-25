@@ -240,26 +240,16 @@ class SdServiceInfo {
     return link
   }
 
-  /// Parse binary TXT entries, to get an object of key: value pairs
+  /// Parse TXT answers (see `txt_strings`) to an object of key: value
+  /// pairs; a key without `=` is true
   txt_2_object(txt_array) {
     let txt_result = {};
-    for (let i = 0; i < txt_array.length; i++) {
-      for (let j = 0; j < txt_array[i].data.length; j++) {
-        // convert the binary array to string
-        let entry = String.fromCharCode.apply(String, txt_array[i].data[j])
-
-        // split string
-        const key_value = entry.split('=')
-        if (key_value.length == 1) {
-          txt_result[key_value[0]] = true
-        }
-        else if (key_value.length == 2) {
-          txt_result[key_value[0]] = key_value[1]
-        }
-        else {
-          console.log('unexpected output: ' + key_value);
-          txt_result[key_value[0]] = key_value[1]
-        }
+    for (const entry of txt_strings(txt_array)) {
+      const i = entry.indexOf('=')
+      if (i < 0) {
+        txt_result[entry] = true
+      } else {
+        txt_result[entry.slice(0, i)] = entry.slice(i + 1)
       }
     }
     return txt_result
