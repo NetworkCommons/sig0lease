@@ -167,6 +167,24 @@ button:hover {
     animation: pulse 1s infinite alternate;
 }
 
+#seed {
+    padding-left: 0.5rem;
+    border-left: 1px solid var(--line);
+}
+
+#seed[data-state="loading"] {
+    animation: pulse 1s infinite alternate;
+}
+
+#seed[data-state="waiting"] {
+    color: var(--muted);
+    font-style: italic;
+}
+
+#seed[data-state="error"] {
+    color: var(--error);
+}
+
 #dnssec {
     margin-left: auto;
     color: var(--ok);

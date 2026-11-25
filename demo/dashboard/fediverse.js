@@ -19,17 +19,53 @@
 ///   _fedi._tcp.<zone> PTR                    -> all fediverse instances
 ///   _services._dns-sd._udp.<zone> PTR        -> subtypes the zone lists
 ///   <subtype>._sub._fedi._tcp.<zone> PTR     -> instances of a project
+///                                               (the label as UTF-8 octets)
 ///   <service instance> SRV + TXT             -> instance details
 ///
-/// To keep the number of queries low, all known projects are only asked
-/// every FULL_SCAN_EVERY refreshes, or when an unseen instance appears;
-/// in between only the subtypes that had instances are asked again.
+/// To keep the number of queries low (the proxy sits behind a rate limit),
+/// a refresh asks the base type, and the subtypes only when it changed:
+/// all known projects every FULL_SCAN_EVERY refreshes, or when an instance
+/// appears that the registration worker did not announce; the subtypes of
+/// the instances the worker announced; an instance that is gone is dropped
+/// from its subtypes without asking. The SRV and TXT records of an instance
+/// are asked when it appears, and DETAILS_PER_REFRESH of the others each
+/// refresh, the longest unchecked first. All queries go through a Pacer:
+/// at most `rate` per second, slowing down and trying again when the rate
+/// limit refuses one. Until a refresh is done the page shows the last one.
+///
+/// When the page has loaded and shown the instances the zone has, a Web
+/// Worker (SEED_WORKER) registers the instances listed in
+/// `icons/instances.md` that the zone does not have yet over SRP, one each
+/// SEED_INTERVAL, for SEED_LEASE seconds and without refresh. The dashboard
+/// hands the worker the instances it shows after every refresh, so the
+/// worker skips those.
 
 const REFRESH_INTERVAL = 5000;
-const FULL_SCAN_EVERY = 6;
+const FULL_SCAN_EVERY = 12;
+/// SRV and TXT records of known instances asked again per refresh
+const DETAILS_PER_REFRESH = 5;
+/// queries per second of a refresh: at first, at least and at most; after a
+/// refusal of the rate limit, the rate halves and queries pause QUERY_PAUSE ms
+const QUERY_RATE = 10;
+const QUERY_RATE_MIN = 1;
+const QUERY_RATE_MAX = 25;
+const QUERY_PAUSE = 3000;
 const FEDI_TYPE = '_fedi._tcp';
 const ICON_DIR = 'icons/';
 const SOURCES_CSV = ICON_DIR + 'sources.csv';
+const INSTANCES_MD = ICON_DIR + 'instances.md';
+/// lease of the instances registered from INSTANCES_MD, and of their keys,
+/// so the names are free again when the entries expire
+const SEED_LEASE = 300;
+/// the script of the registration worker
+const SEED_WORKER = 'fediverse-seed-worker.js';
+/// time between two registrations, in ms
+const SEED_INTERVAL = 1000;
+/// wait after the rate limit refused a request, in ms, doubled up to the max
+const SEED_RETRY_MIN = 5000;
+const SEED_RETRY_MAX = 60000;
+/// localStorage prefix of the keys of the registered hosts
+const SEED_KEY_PREFIX = 'fediverse-seed-key:';
 /// box key of the instances that are in no subtype
 const OTHER = '';
 
@@ -161,8 +197,26 @@ class FediverseDashboard {
   /// first of these that answers DoH: the page's origin, the proxies of
   /// `zone_doh` (`[{domain, doh}]`) whose `domain` is the zone or above it,
   /// and else to the public resolver `public_doh`.
-  constructor(doh, zone_doh, public_doh) {
+  ///
+  /// `seed`: register the instances of INSTANCES_MD missing in the first
+  /// zone shown, at the SRP registrar `registrar` (a DoH URL), by default
+  /// the DoH server of the zone, in a SEED_WORKER.
+  constructor(doh, zone_doh, public_doh, seed, registrar) {
     this.doh = doh;
+    this.seed_pending = Boolean(seed);
+    this.registrar = registrar;
+    // the registration worker, while it runs for the current zone
+    this.worker = null;
+    // folded subtype label -> label: subtypes of instances the worker
+    // registered, asked on the next refresh
+    this.hinted = new Map();
+    // folded names of the instances the worker registered, which need no
+    // full subtype scan when they appear
+    this.expected = new Set();
+    // instance name -> its SRV and TXT records and when they were asked
+    this.details = new Map();
+    this.pacer = new Pacer(QUERY_RATE, QUERY_RATE_MIN, QUERY_RATE_MAX,
+                           QUERY_PAUSE);
     this.zone_doh = zone_doh || [];
     this.public_doh = public_doh;
     // DoH server -> promise of whether it answers DoH, each asked once
@@ -193,6 +247,7 @@ class FediverseDashboard {
     this.status_text = document.getElementById('status-text');
     this.dnssec = document.getElementById('dnssec');
     this.empty = document.getElementById('empty');
+    this.seed_status = document.getElementById('seed');
   }
 
   /// start watching a zone
@@ -205,7 +260,15 @@ class FediverseDashboard {
     this.generation++;
     clearTimeout(this.timer);
 
-    // reset UI and state
+    // reset UI and state; registering is for the first zone only
+    if (this.worker) {
+      this.worker.terminate();
+      this.worker = null;
+    }
+    this.seed_status.hidden = true;
+    this.hinted.clear();
+    this.expected.clear();
+    this.details.clear();
     this.refreshes = 0;
     this.members.clear();
     this.seen.clear();
@@ -225,6 +288,74 @@ class FediverseDashboard {
     });
 
     this.refresh();
+  }
+
+  /// start the registration worker for `zone` (see SEED_WORKER), after the
+  /// first refresh showed what the zone has
+  async start_seeding(zone) {
+    const {doh, is_public} = await this.choose_server(zone);
+    const registrar = this.registrar || (is_public ? null : doh);
+    if (!registrar) {
+      console.info('no sig0lease proxy for ' + zone +
+                   ', the listed instances are not registered');
+      return;
+    }
+    if (zone !== this.zone) {
+      return;
+    }
+    // the worker has no localStorage: it gets the kept keys, and sends the
+    // keys it uses to keep
+    const keys = {};
+    for (let i = 0; i < localStorage.length; i++) {
+      const name = localStorage.key(i);
+      if (name.startsWith(SEED_KEY_PREFIX)) {
+        try {
+          keys[name] = JSON.parse(localStorage.getItem(name));
+        } catch (error) {
+          // a broken key is replaced by a new one
+        }
+      }
+    }
+    this.worker = new Worker(SEED_WORKER);
+    this.worker.onmessage = (event) => this.on_seed_message(event.data);
+    this.worker.onerror = (event) => {
+      event.preventDefault();
+      this.set_seed_status('error', 'Registering instances failed: ' +
+                                        (event.message || 'worker error'));
+    };
+    this.worker.postMessage({type: 'registered', names: [...this.seen]});
+    this.worker.postMessage({
+      type: 'start',
+      zone: zone,
+      doh: doh,
+      registrar: registrar,
+      keys: keys,
+    });
+  }
+
+  /// a message of the registration worker
+  on_seed_message(message) {
+    switch (message.type) {
+      case 'status':
+        this.set_seed_status(message.state, message.text, message.title);
+        break;
+      case 'key':
+        localStorage.setItem(message.storage_key, JSON.stringify(message.key));
+        break;
+      case 'registered':
+        this.expected.add(fold(message.name));
+        for (const subtype of message.subtypes) {
+          this.hinted.set(fold(subtype), subtype);
+        }
+        break;
+    }
+  }
+
+  set_seed_status(state, text, title) {
+    this.seed_status.dataset.state = state;
+    this.seed_status.textContent = text;
+    this.seed_status.title = title || '';
+    this.seed_status.hidden = false;
   }
 
   /// choose the DoH server for `zone`, as the constructor describes, and
@@ -271,11 +402,25 @@ class FediverseDashboard {
     await this.projects_loaded;
     try {
       this.dns.cached_answers = 0;
+      const refusals = this.pacer.refusals;
       const groups = await this.collect(this.dns, this.zone, generation);
       if (generation !== this.generation) {
         return;
       }
       this.render(groups);
+      // the worker starts once the instances the zone has are shown, and
+      // skips those
+      if (this.seed_pending && this.complete) {
+        this.seed_pending = false;
+        this.start_seeding(this.zone).catch((error) => {
+          console.error('registering the listed instances failed', error);
+          this.set_seed_status('error', 'Registering instances failed: ' +
+                                            error.message);
+        });
+      }
+      if (this.worker) {
+        this.worker.postMessage({type: 'registered', names: [...this.seen]});
+      }
       const projects = groups.filter(g => g.key !== OTHER).length;
       this.set_status(
           'ok',
@@ -286,6 +431,10 @@ class FediverseDashboard {
               (this.dns.cached_answers ?
                    ' · ' + plural(this.dns.cached_answers, 'answer') +
                        ' via public resolver (may be cached)' :
+                   '') +
+              (this.pacer.refusals > refusals ?
+                   ' · rate limited, slowed to ' +
+                       this.pacer.rate.toFixed(1) + ' queries/s' :
                    ''));
     } catch (error) {
       if (generation !== this.generation) {
@@ -303,51 +452,60 @@ class FediverseDashboard {
   /// collect the fediverse instances of a zone, their SRV and TXT records,
   /// grouped by project: an array of `{key, label, owner, instances}`
   async collect(dns, zone, generation) {
+    const query = (name, type) =>
+        this.pacer.run(() => dns.query(name, type, true));
     const base = FEDI_TYPE + '.' + zone;
-    const [base_answers, service_answers] = await Promise.all([
-      dns.query(base, 'PTR', true),
-      // a zone may not list its service types; that's no failure
-      dns.query('_services._dns-sd._udp.' + zone, 'PTR'),
-    ]);
-    const base_names = unique(base_answers.map(a => normalize_name(a.data)));
+    const base_names = unique((await query(base, 'PTR'))
+                                  .map(a => normalize_name(a.data)));
+    const current = new Set(base_names);
 
-    // subtypes to ask: on a full scan, or when an unseen instance shows up,
-    // all known projects, else those that had instances
+    // subtypes to ask: all known projects on a full scan, or when an
+    // instance appears that the worker did not announce; else those of the
+    // instances the worker announced
+    const added = base_names.filter(name => !this.seen.has(name));
     const full_scan = this.refreshes++ % FULL_SCAN_EVERY === 0 ||
-        base_names.some(name => !this.seen.has(name));
+        added.some(name => !this.expected.has(fold(name)));
     const subtypes = new Map();
     const add = (label) => {
-      if (label && !subtypes.has(fold(label))) {
+      if (usable_label(label) && !subtypes.has(fold(label))) {
         subtypes.set(fold(label), label);
       }
     };
     if (full_scan) {
       this.projects.list.forEach(p => add(p.name));
-    }
-    for (const member of this.members.values()) {
-      if (member.instances.size > 0) {
+      for (const member of this.members.values()) {
         add(member.label);
       }
-    }
-    for (const answer of service_answers) {
-      const labels = split_labels(normalize_name(answer.data));
-      if (labels.length > 4 && labels[1] === '_sub' &&
-          (labels[2] + '.' + labels[3]).toLowerCase() === FEDI_TYPE) {
-        add(decode_label(labels[0]));
+      // a zone may list the subtypes in its service types
+      try {
+        for (const answer of await query(
+                 '_services._dns-sd._udp.' + zone, 'PTR')) {
+          const labels = split_labels(normalize_name(answer.data));
+          if (labels.length > 4 && labels[1] === '_sub' &&
+              (labels[2] + '.' + labels[3]).toLowerCase() === FEDI_TYPE) {
+            add(decode_label(labels[0]));
+          }
+        }
+      } catch (error) {
+        console.warn('service types of ' + zone + ' failed', error);
       }
+    }
+    for (const label of this.hinted.values()) {
+      add(label);
     }
 
     // ask the subtypes; a failed one keeps its last known instances
     await Promise.all([...subtypes].map(async ([key, label]) => {
       const owner = encode_label(label) + '._sub.' + base;
       try {
-        const answers = await dns.query(owner, 'PTR', true);
+        const answers = await query(owner, 'PTR');
         const previous = this.members.get(key);
         this.members.set(key, {
           // keep the spelling the project list or the zone gave first
           label: previous ? previous.label : label,
           instances: new Set(answers.map(a => normalize_name(a.data))),
         });
+        this.hinted.delete(key);
       } catch (error) {
         console.warn('subtype ' + owner + ' failed', error);
       }
@@ -355,40 +513,68 @@ class FediverseDashboard {
     if (generation !== this.generation) {
       return [];
     }
-
-    // every instance: listed under the base type or under a subtype
-    const names = new Set(base_names);
+    // an instance gone from the base type is gone from its subtypes
     for (const member of this.members.values()) {
-      member.instances.forEach(name => names.add(name));
+      for (const name of member.instances) {
+        if (!current.has(name)) {
+          member.instances.delete(name);
+        }
+      }
     }
-    const details = new Map(
-        await Promise.all([...names].map(async (name) => {
-          const [srv, txt] = await Promise.all(
-              [dns.query(name, 'SRV', true), dns.query(name, 'TXT', true)]);
-          return [name, {
-            name: name,
-            label: decode_label(split_labels(name)[0]),
-            srv: srv.map(a => a.data)
-                     .sort((a, b) => a.priority - b.priority ||
-                               b.weight - a.weight),
-            txt: txt,
-          }];
-        })));
+
+    // SRV and TXT records: of new instances, and of the longest unchecked
+    // others; an instance whose records were never answered is left out
+    // until they are
+    for (const name of this.details.keys()) {
+      if (!current.has(name)) {
+        this.details.delete(name);
+      }
+    }
+    const unknown = base_names.filter(name => !this.details.has(name));
+    const recheck = base_names.filter(name => this.details.has(name))
+                        .sort((a, b) => this.details.get(a).checked -
+                                  this.details.get(b).checked)
+                        .slice(0, DETAILS_PER_REFRESH);
+    await Promise.all([...unknown, ...recheck].map(async (name) => {
+      try {
+        const [srv, txt] =
+            await Promise.all([query(name, 'SRV'), query(name, 'TXT')]);
+        this.details.set(name, {
+          name: name,
+          label: decode_label(split_labels(name)[0]),
+          srv: srv.map(a => a.data)
+                   .sort((a, b) => a.priority - b.priority ||
+                             b.weight - a.weight),
+          txt: txt,
+          checked: Date.now(),
+        });
+      } catch (error) {
+        console.warn('records of ' + name + ' failed', error);
+      }
+    }));
+    if (generation !== this.generation) {
+      return [];
+    }
+    const details = this.details;
+    const names = new Set(base_names.filter(name => details.has(name)));
     this.seen = names;
+    // the refresh is complete when every instance has its records
+    this.complete = names.size === base_names.length;
 
     // group the instances per project; instances of no subtype go to OTHER
     const groups = [];
     const grouped = new Set();
     for (const [key, member] of this.members) {
-      if (member.instances.size === 0) {
+      const instances = [...member.instances].filter(name => names.has(name));
+      instances.forEach(name => grouped.add(name));
+      if (instances.length === 0) {
         continue;
       }
-      member.instances.forEach(name => grouped.add(name));
       groups.push({
         key: key,
         label: member.label,
         owner: encode_label(member.label) + '._sub.' + base,
-        instances: [...member.instances].map(name => details.get(name)),
+        instances: instances.map(name => details.get(name)),
       });
     }
     const others = [...names].filter(name => !grouped.has(name));
@@ -497,12 +683,15 @@ class FediverseDashboard {
     li.querySelector('.label').textContent = instance.label;
     li.querySelector('.label').title = instance.name;
 
-    // `_fedi` follows `_http`: SdServiceInfo constructs the link
+    // the TXT key `url`, else as `_fedi` follows `_http`, the link
+    // SdServiceInfo constructs
     const srv = instance.srv[0];
-    const link = srv ? this.service_info.create_link(
-                           '_http', normalize_name(srv.target), srv.port,
-                           instance.txt) :
-                       null;
+    const url = this.service_info.txt_2_object(instance.txt).url;
+    const link = typeof url === 'string' && /^https?:\/\//i.test(url) ? url :
+        srv ? this.service_info.create_link(
+                  '_http', normalize_name(srv.target), srv.port,
+                  instance.txt) :
+              null;
     const link_node = li.querySelector('.link');
     if (link) {
       link_node.href = link;
@@ -560,6 +749,102 @@ function create_logo(appearance) {
   img.alt = '';
   img.loading = 'lazy';
   return img;
+}
+
+/// the instances of INSTANCES_MD: `## <project>` headings, each followed by
+/// a list of `- [name](url)` links. A heading starting with `_fedi` lists
+/// general fediverse services, which get no subtype. An instance listed
+/// twice is registered once, in the subtypes of both headings.
+/// Returns `[{host, url, subtypes}]`, `host` the host label of the url's
+/// domain.
+function parse_instances(markdown) {
+  const by_host = new Map();
+  let project = null;
+  for (const line of markdown.split(/\r?\n/)) {
+    const heading = /^##\s+(.+?)\s*$/.exec(line);
+    if (heading) {
+      project = heading[1].startsWith('_fedi') ? null : heading[1];
+      continue;
+    }
+    const link = /^\s*[-*]\s+\[[^\]]*\]\((https?:\/\/[^)\s]+)\)/.exec(line);
+    if (!link) {
+      continue;
+    }
+    let url;
+    try {
+      url = new URL(link[1]);
+    } catch (error) {
+      continue;
+    }
+    const host = url.hostname.toLowerCase().replace(/\./g, '-');
+    if (!/^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$/.test(host)) {
+      console.warn(INSTANCES_MD + ': ' + url.hostname + ' makes no host label');
+      continue;
+    }
+    if (!by_host.has(host)) {
+      by_host.set(host, {host: host, url: url, subtypes: []});
+    }
+    const subtypes = by_host.get(host).subtypes;
+    if (project && !usable_label(project)) {
+      console.warn(INSTANCES_MD + ': ' + project + ' makes no subtype label');
+    } else if (project && !subtypes.some(s => fold(s) === fold(project))) {
+      subtypes.push(project);
+    }
+  }
+  return [...by_host.values()];
+}
+
+/// whether `error` is the refusal of the rate limit in front of the proxy:
+/// an error answer without CORS header, which the browser reports as a
+/// failed fetch, or an HTTP status of a limit or an overloaded upstream
+function rate_limited(error) {
+  const message = String(error && error.message || error);
+  return /Failed to fetch|cannot reach|answered (429|502|503|504)\b/i.test(
+      message);
+}
+
+function sleep(ms) {
+  return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+/// Paces requests: at most `rate` per second; when the rate limit refuses
+/// one (`rate_limited`), the rate halves down to `min`, all requests pause
+/// `pause` ms, and the refused one is sent again. Each answered request
+/// raises the rate a little, up to `max`.
+class Pacer {
+  constructor(rate, min, max, pause) {
+    this.rate = rate;
+    this.min = min;
+    this.max = max;
+    this.pause = pause;
+    // when the next request may go, in ms since the epoch
+    this.next = 0;
+    // requests the rate limit refused
+    this.refusals = 0;
+  }
+
+  async run(f) {
+    for (;;) {
+      const now = Date.now();
+      const at = Math.max(now, this.next);
+      this.next = at + 1000 / this.rate;
+      if (at > now) {
+        await sleep(at - now);
+      }
+      try {
+        const result = await f();
+        this.rate = Math.min(this.max, this.rate + 0.1);
+        return result;
+      } catch (error) {
+        if (!rate_limited(error)) {
+          throw error;
+        }
+        this.refusals++;
+        this.rate = Math.max(this.min, this.rate / 2);
+        this.next = Math.max(this.next, Date.now() + this.pause);
+      }
+    }
+  }
 }
 
 /// clone the first element of a template
@@ -621,16 +906,19 @@ function decode_label(label) {
   return new TextDecoder().decode(new Uint8Array(bytes));
 }
 
-/// UTF-8 text to a label in presentation format, every octet but letters,
-/// digits, `-` and `_` escaped as `\DDD`
+/// a subtype label or project name as the name of a query: the DNS library
+/// of the WASM packs a name's labels as their octets, without escapes, so
+/// the text goes as it is (`Takahē`, `GNU social`), and a label containing
+/// `.` cannot be asked for (nor registered, see `usable_label`)
 function encode_label(text) {
-  let label = '';
-  for (const octet of new TextEncoder().encode(text.normalize('NFC'))) {
-    const c = String.fromCharCode(octet);
-    label += /[A-Za-z0-9_-]/.test(c) ? c :
-                                       '\\' + String(octet).padStart(3, '0');
-  }
-  return label;
+  return text.normalize('NFC');
+}
+
+/// whether a subtype label can be queried and registered: not empty, no
+/// `.`, at most 63 octets
+function usable_label(text) {
+  const octets = new TextEncoder().encode(text.normalize('NFC')).length;
+  return octets > 0 && octets <= 63 && !text.includes('.');
 }
 
 /// parse CSV text (RFC 4180, with quoted fields) into an array of rows

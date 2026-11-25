@@ -28,6 +28,12 @@
         ]
         // ... and else a public resolver, whose answers may be cached
         const PUBLIC_DOH = 'https://1.1.1.1'
+        // the instances of icons/instances.md that the zone does not have
+        // yet are registered for 5 minutes when the page loads, unless
+        // `?seed=0`; at the SRP registrar `?registrar=<url>`, by default
+        // the zone's DoH server
+        const SEED = new URLSearchParams(location.search).get('seed') !== '0'
+        const REGISTRAR = new URLSearchParams(location.search).get('registrar')
         let dashboard = null
 
         /// zone from the URL hash, or the default zone
@@ -39,7 +45,7 @@
         // start the dashboard when WASM is ready
         window.addEventListener('wasm_ready', function(){
             console.log('WASM is ready')
-            dashboard = new FediverseDashboard(DOH, ZONE_DOH, PUBLIC_DOH)
+            dashboard = new FediverseDashboard(DOH, ZONE_DOH, PUBLIC_DOH, SEED, REGISTRAR)
             dashboard.set_zone(document.getElementById('zone').value)
         })
 
@@ -96,6 +102,7 @@
         <div id="status" data-state="loading">
             <span class="dot"></span>
             <span id="status-text">Loading WASM …</span>
+            <span id="seed" hidden></span>
             <span id="dnssec" title="zone is DNSSEC signed" hidden><span class="fa-solid fa-shield-halved"></span> DNSSEC</span>
         </div>
     </header>
