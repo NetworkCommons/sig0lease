@@ -26,7 +26,8 @@
 //	sig0lease.register({doh, domain, host, addresses, instances, lease, keyLease, key})
 //	                                           registers an SRP host once at the SRP
 //	                                           registrar doh, without start or refresh
-//	                                           (RegisterRequest): {registered, conflict, key}
+//	                                           (RegisterRequest; with remove, withdraws it):
+//	                                           {registered, conflict, key}
 //	sig0lease.newKey(name)                      a fresh key for register: {public, private}
 //
 // The browser's localStorage keeps the name's key and the claim. A question the proxy refuses

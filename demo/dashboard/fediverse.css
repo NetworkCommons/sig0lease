@@ -354,6 +354,79 @@ main {
     overflow-wrap: anywhere;
 }
 
+.entry .label-row {
+    display: flex;
+    align-items: baseline;
+    justify-content: space-between;
+    gap: 0.5rem;
+}
+
+/* add and edit: small buttons in the project color */
+.box .add-button,
+.entry .edit-button,
+.instance-form button {
+    font-size: 0.8rem;
+    padding: 0.15em 0.7em;
+    border-color: var(--accent);
+}
+
+.entry .edit-button {
+    flex: none;
+}
+
+.box .add-button:hover,
+.entry .edit-button:hover,
+.instance-form button:hover {
+    background-color: color-mix(in srgb, var(--accent) var(--tint-strong), var(--surface));
+}
+
+.box-actions {
+    padding: 0.5rem 0.75rem;
+    border-top: 1px solid color-mix(in srgb, var(--accent) 25%, var(--surface));
+}
+
+.instance-form {
+    display: flex;
+    flex-direction: column;
+    gap: 0.4rem;
+    margin-top: 0.5rem;
+}
+
+.instance-form input,
+.instance-form select {
+    font: inherit;
+    font-size: 0.9rem;
+    padding: 0.25em 0.5em;
+    border: 1px solid var(--accent);
+    border-radius: 0.4em;
+    background-color: var(--surface);
+    color: var(--fg);
+    min-width: 0;
+}
+
+.instance-form .form-buttons {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.4rem;
+}
+
+.instance-form .remove {
+    color: var(--error);
+}
+
+.instance-form .form-message {
+    font-size: 0.8rem;
+    color: var(--muted);
+}
+
+.instance-form .form-message:empty {
+    display: none;
+}
+
+.instance-form .form-message.error {
+    color: var(--error);
+}
+
 .entry .link {
     display: flex;
     align-items: baseline;

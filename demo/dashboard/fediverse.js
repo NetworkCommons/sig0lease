@@ -34,11 +34,14 @@
 /// limit refuses one. Until a refresh is done the page shows the last one.
 ///
 /// When the page has loaded and shown the instances the zone has, a Web
-/// Worker (SEED_WORKER) registers the instances listed in
-/// `icons/instances.md` that the zone does not have yet over SRP, one each
-/// SEED_INTERVAL, for SEED_LEASE seconds and without refresh. The dashboard
-/// hands the worker the instances it shows after every refresh, so the
-/// worker skips those.
+/// Worker (SEED_WORKER) starts, which does all registering over SRP, one
+/// registration each SEED_INTERVAL, each for LEASE seconds: what the
+/// visitor adds, edits or removes in the boxes; the renewal of every entry
+/// this browser has the key for, at 80 to 85% of its lease; and, for the
+/// zone the page opened with, the instances listed in `icons/instances.md`
+/// that the zone does not have yet. The dashboard hands the worker the
+/// instances it shows after every refresh, so the worker skips those. The
+/// browser's localStorage keeps each entry and its key (`entry_key`).
 
 const REFRESH_INTERVAL = 5000;
 const FULL_SCAN_EVERY = 12;
@@ -54,9 +57,9 @@ const FEDI_TYPE = '_fedi._tcp';
 const ICON_DIR = 'icons/';
 const SOURCES_CSV = ICON_DIR + 'sources.csv';
 const INSTANCES_MD = ICON_DIR + 'instances.md';
-/// lease of the instances registered from INSTANCES_MD, and of their keys,
-/// so the names are free again when the entries expire
-const SEED_LEASE = 300;
+/// lease of the entries the worker registers, and of their keys, so the
+/// names are free again when the entries are not renewed
+const LEASE = 300;
 /// the script of the registration worker
 const SEED_WORKER = 'fediverse-seed-worker.js';
 /// time between two registrations, in ms
@@ -64,8 +67,10 @@ const SEED_INTERVAL = 1000;
 /// wait after the rate limit refused a request, in ms, doubled up to the max
 const SEED_RETRY_MIN = 5000;
 const SEED_RETRY_MAX = 60000;
-/// localStorage prefix of the keys of the registered hosts
-const SEED_KEY_PREFIX = 'fediverse-seed-key:';
+/// localStorage prefix of the entries this browser registered, see
+/// `entry_key`; OLD_KEY_PREFIX kept their keys alone, before
+const ENTRY_PREFIX = 'fediverse-entry:';
+const OLD_KEY_PREFIX = 'fediverse-seed-key:';
 /// box key of the instances that are in no subtype
 const OTHER = '';
 
@@ -198,15 +203,22 @@ class FediverseDashboard {
   /// `zone_doh` (`[{domain, doh}]`) whose `domain` is the zone or above it,
   /// and else to the public resolver `public_doh`.
   ///
-  /// `seed`: register the instances of INSTANCES_MD missing in the first
-  /// zone shown, at the SRP registrar `registrar` (a DoH URL), by default
-  /// the DoH server of the zone, in a SEED_WORKER.
+  /// Registering (adding, editing, renewing, see SEED_WORKER) goes to the
+  /// SRP registrar `registrar` (a DoH URL), by default the DoH server of the
+  /// zone. `seed`: also register the instances of INSTANCES_MD missing in
+  /// the first zone shown.
   constructor(doh, zone_doh, public_doh, seed, registrar) {
     this.doh = doh;
     this.seed_pending = Boolean(seed);
     this.registrar = registrar;
-    // the registration worker, while it runs for the current zone
+    // the registration worker of the current zone, once it started
     this.worker = null;
+    this.worker_pending = false;
+    // storage key -> entry this browser registered (see `entry_key`)
+    this.entries = new Map();
+    // id -> resolve of a visitor's request to the worker
+    this.requests = new Map();
+    this.request_id = 0;
     // folded subtype label -> label: subtypes of instances the worker
     // registered, asked on the next refresh
     this.hinted = new Map();
@@ -260,11 +272,17 @@ class FediverseDashboard {
     this.generation++;
     clearTimeout(this.timer);
 
-    // reset UI and state; registering is for the first zone only
+    // reset UI and state; each zone has its own worker, started after its
+    // first complete refresh
     if (this.worker) {
       this.worker.terminate();
       this.worker = null;
     }
+    this.worker_pending = true;
+    for (const [id, resolve] of this.requests) {
+      resolve('the zone changed');
+    }
+    this.requests.clear();
     this.seed_status.hidden = true;
     this.hinted.clear();
     this.expected.clear();
@@ -292,35 +310,41 @@ class FediverseDashboard {
 
   /// start the registration worker for `zone` (see SEED_WORKER), after the
   /// first refresh showed what the zone has
-  async start_seeding(zone) {
+  async start_worker(zone) {
     const {doh, is_public} = await this.choose_server(zone);
     const registrar = this.registrar || (is_public ? null : doh);
     if (!registrar) {
-      console.info('no sig0lease proxy for ' + zone +
-                   ', the listed instances are not registered');
+      console.info('no sig0lease proxy for ' + zone + ', nothing is registered');
       return;
     }
-    if (zone !== this.zone) {
+    if (zone !== this.zone || this.worker) {
       return;
     }
-    // the worker has no localStorage: it gets the kept keys, and sends the
-    // keys it uses to keep
-    const keys = {};
-    for (let i = 0; i < localStorage.length; i++) {
-      const name = localStorage.key(i);
-      if (name.startsWith(SEED_KEY_PREFIX)) {
-        try {
-          keys[name] = JSON.parse(localStorage.getItem(name));
-        } catch (error) {
-          // a broken key is replaced by a new one
+    // the worker has no localStorage: it gets the entries of the zone, and
+    // sends the entries to keep
+    this.entries = load_entries(zone);
+    for (const entry of this.entries.values()) {
+      if (!entry.url) {
+        // only a key, kept before entries were: take the rest from the zone
+        const instance = this.details.get(entry.host + '.' + FEDI_TYPE + '.' + zone);
+        if (instance) {
+          const url = this.service_info.txt_2_object(instance.txt).url;
+          if (typeof url === 'string' && /^https?:\/\//i.test(url)) {
+            entry.url = url;
+            entry.subtypes = [...this.members.values()]
+                                 .filter(m => m.instances.has(instance.name))
+                                 .map(m => m.label);
+          }
         }
       }
     }
+    const seed = this.seed_pending;
+    this.seed_pending = false;
     this.worker = new Worker(SEED_WORKER);
     this.worker.onmessage = (event) => this.on_seed_message(event.data);
     this.worker.onerror = (event) => {
       event.preventDefault();
-      this.set_seed_status('error', 'Registering instances failed: ' +
+      this.set_seed_status('error', 'Registering failed: ' +
                                         (event.message || 'worker error'));
     };
     this.worker.postMessage({type: 'registered', names: [...this.seen]});
@@ -329,8 +353,11 @@ class FediverseDashboard {
       zone: zone,
       doh: doh,
       registrar: registrar,
-      keys: keys,
+      entries: Object.fromEntries(this.entries),
+      seed: seed,
     });
+    // the boxes get their add and edit buttons
+    this.redraw();
   }
 
   /// a message of the registration worker
@@ -339,15 +366,56 @@ class FediverseDashboard {
       case 'status':
         this.set_seed_status(message.state, message.text, message.title);
         break;
-      case 'key':
-        localStorage.setItem(message.storage_key, JSON.stringify(message.key));
+      case 'entry':
+        this.entries.set(message.storage_key, message.entry);
+        localStorage.setItem(message.storage_key, JSON.stringify(message.entry));
+        break;
+      case 'forget':
+        this.entries.delete(message.storage_key);
+        localStorage.removeItem(message.storage_key);
+        this.redraw();
         break;
       case 'registered':
         this.expected.add(fold(message.name));
         for (const subtype of message.subtypes) {
           this.hinted.set(fold(subtype), subtype);
         }
+        this.redraw();
         break;
+      case 'done': {
+        const resolve = this.requests.get(message.id);
+        this.requests.delete(message.id);
+        if (resolve) {
+          resolve(message.error);
+        }
+        break;
+      }
+    }
+  }
+
+  /// ask the worker to add, edit or remove an entry; resolves to null when
+  /// done, or to an error message
+  request(message) {
+    if (!this.worker) {
+      return Promise.resolve('registering is not available for this zone');
+    }
+    const id = ++this.request_id;
+    return new Promise((resolve) => {
+      this.requests.set(id, resolve);
+      this.worker.postMessage({...message, id: id});
+    });
+  }
+
+  /// whether this browser has the key of `instance`, so it can edit it
+  owns(instance) {
+    return this.worker !== null &&
+        this.entries.has(entry_key(fold(instance.label), this.zone));
+  }
+
+  /// render the last groups again, e.g. when buttons change
+  redraw() {
+    if (this.groups) {
+      this.render(this.groups);
     }
   }
 
@@ -407,15 +475,15 @@ class FediverseDashboard {
       if (generation !== this.generation) {
         return;
       }
+      this.groups = groups;
       this.render(groups);
       // the worker starts once the instances the zone has are shown, and
       // skips those
-      if (this.seed_pending && this.complete) {
-        this.seed_pending = false;
-        this.start_seeding(this.zone).catch((error) => {
-          console.error('registering the listed instances failed', error);
-          this.set_seed_status('error', 'Registering instances failed: ' +
-                                            error.message);
+      if (this.worker_pending && this.complete) {
+        this.worker_pending = false;
+        this.start_worker(this.zone).catch((error) => {
+          console.error('the registration worker did not start', error);
+          this.set_seed_status('error', 'Registering failed: ' + error.message);
         });
       }
       if (this.worker) {
@@ -609,11 +677,16 @@ class FediverseDashboard {
     this.first_render = false;
     const ordered = [];
     for (const group of groups) {
-      const signature = JSON.stringify(
-          group.instances.map(i => [i.name, i.srv, txt_strings(i.txt)]));
+      const signature = JSON.stringify([
+        this.worker !== null,
+        group.instances.map(
+            i => [i.name, i.srv, txt_strings(i.txt), this.owns(i)]),
+      ]);
       let box = existing.get(group.key);
       existing.delete(group.key);
-      if (!box || box.dataset.signature !== signature) {
+      // a box with an open form stays until the form closes
+      const editing = box && box.querySelector('.instance-form');
+      if (!editing && (!box || box.dataset.signature !== signature)) {
         const fresh = this.create_box(group, !box && !initial);
         fresh.dataset.signature = signature;
         if (box) {
@@ -624,8 +697,12 @@ class FediverseDashboard {
       ordered.push(box);
     }
 
-    // remove vanished projects
+    // remove vanished projects, unless a form is open in one
     for (const [key, box] of existing) {
+      if (box.querySelector('.instance-form')) {
+        ordered.push(box);
+        continue;
+      }
       box.remove();
       this.known.delete(key);
     }
@@ -674,7 +751,114 @@ class FediverseDashboard {
     }
     this.known.set(group.key, new Set(group.instances.map(i => i.name)));
 
+    // a new entry in this box's project
+    if (this.worker) {
+      const actions = box.querySelector('.box-actions');
+      actions.hidden = false;
+      const button = actions.querySelector('.add-button');
+      button.addEventListener('click', () => {
+        if (actions.querySelector('.instance-form')) {
+          return;
+        }
+        const subtypes = group.key === OTHER ? [] : [group.label];
+        actions.appendChild(this.create_form({
+          mode: 'add',
+          url: '',
+          subtypes: subtypes,
+          done: () => this.redraw(),
+        }));
+      });
+    }
+
     return box;
+  }
+
+  /// a form to add (`mode` 'add') or edit (`mode` 'edit', of the entry at
+  /// host label `host`) an entry: its URL, and when editing its project.
+  /// `done` is called when the form closes.
+  create_form({mode, host, url, subtypes, done}) {
+    const form = clone_template('form-template');
+    const input = form.querySelector('input[name="url"]');
+    const select = form.querySelector('select[name="project"]');
+    const message = form.querySelector('.form-message');
+    const remove = form.querySelector('.remove');
+    input.value = url;
+    form.querySelector('.save-text').textContent =
+        mode === 'add' ? 'Add' : 'Save';
+
+    if (mode === 'edit') {
+      // the projects, with this entry's first; '' is no project
+      const options = [['', 'No project (Other)']];
+      for (const project of [...this.projects.list].sort(
+               (a, b) => a.name.localeCompare(b.name))) {
+        options.push([project.name, project.name]);
+      }
+      for (const subtype of subtypes) {
+        if (!options.some(([value]) => fold(value) === fold(subtype))) {
+          options.push([subtype, subtype]);
+        }
+      }
+      for (const [value, text] of options) {
+        const option = document.createElement('option');
+        option.value = value;
+        option.textContent = text;
+        select.appendChild(option);
+      }
+      const current = subtypes.length ?
+          options.find(([value]) => fold(value) === fold(subtypes[0])) :
+          options[0];
+      select.value = current ? current[0] : '';
+      select.hidden = false;
+      remove.hidden = false;
+    }
+
+    const close = () => {
+      form.remove();
+      done();
+    };
+    const busy = (text) => {
+      for (const element of form.elements) {
+        element.disabled = Boolean(text);
+      }
+      message.textContent = text || '';
+      message.classList.remove('error');
+    };
+    const send = async (request, text) => {
+      busy(text);
+      const error = await this.request(request);
+      if (error) {
+        busy('');
+        message.textContent = error;
+        message.classList.add('error');
+        return;
+      }
+      close();
+    };
+
+    form.addEventListener('submit', (event) => {
+      event.preventDefault();
+      let instance;
+      try {
+        const chosen = mode === 'add' ? subtypes :
+            select.value ? [select.value] : [];
+        instance = instance_of(input.value.trim(), chosen);
+      } catch (error) {
+        message.textContent = error.message;
+        message.classList.add('error');
+        return;
+      }
+      send(mode === 'add' ?
+               {type: 'add', url: instance.url.href, subtypes: instance.subtypes} :
+               {type: 'edit', host: host, url: instance.url.href,
+                subtypes: instance.subtypes},
+           mode === 'add' ? 'Registering …' : 'Saving …');
+    });
+    remove.addEventListener('click', () => {
+      send({type: 'remove', host: host}, 'Removing …');
+    });
+    form.querySelector('.cancel').addEventListener('click', close);
+    setTimeout(() => input.focus());
+    return form;
   }
 
   /// create a service instance entry
@@ -716,6 +900,30 @@ class FediverseDashboard {
       targets.appendChild(div);
     }
 
+    // this browser has the key: the entry can be edited
+    if (this.owns(instance)) {
+      const host = fold(instance.label);
+      const entry = this.entries.get(entry_key(host, this.zone));
+      const button = li.querySelector('.edit-button');
+      button.hidden = false;
+      button.addEventListener('click', () => {
+        if (li.querySelector('.instance-form')) {
+          return;
+        }
+        const subtypes = entry && entry.url ? entry.subtypes :
+            [...this.members.values()]
+                .filter(m => m.instances.has(instance.name))
+                .map(m => m.label);
+        li.appendChild(this.create_form({
+          mode: 'edit',
+          host: host,
+          url: entry && entry.url ? entry.url : (link || ''),
+          subtypes: subtypes || [],
+          done: () => this.redraw(),
+        }));
+      });
+    }
+
     // TXT records as key/value chips
     const txt_node = li.querySelector('.txt');
     for (const entry of txt_strings(instance.txt)) {
@@ -751,6 +959,71 @@ function create_logo(appearance) {
   return img;
 }
 
+/// the localStorage name of the entry at host label `host` in `zone`
+function entry_key(host, zone) {
+  return ENTRY_PREFIX + host + '.' + zone;
+}
+
+/// the entries of `zone` this browser keeps: storage key -> `{host, key,
+/// url, subtypes, registered}`; a key kept alone under OLD_KEY_PREFIX
+/// becomes an entry without url
+function load_entries(zone) {
+  const entries = new Map();
+  const suffix = '.' + zone;
+  for (let i = 0; i < localStorage.length; i++) {
+    const name = localStorage.key(i);
+    let value;
+    try {
+      value = JSON.parse(localStorage.getItem(name));
+    } catch (error) {
+      continue;
+    }
+    if (!value || !name.endsWith(suffix)) {
+      continue;
+    }
+    if (name.startsWith(ENTRY_PREFIX)) {
+      entries.set(name, value);
+    } else if (name.startsWith(OLD_KEY_PREFIX) && value.public) {
+      const host = name.slice(OLD_KEY_PREFIX.length, -suffix.length);
+      const key = entry_key(host, zone);
+      if (!entries.has(key)) {
+        entries.set(key, {host: host, key: value, url: null, subtypes: [],
+                          registered: 0});
+      }
+    }
+  }
+  return entries;
+}
+
+/// an entry to register for the URL `text` in the projects `subtypes`:
+/// `{host, url, subtypes}`, `host` the host label of the URL's domain;
+/// throws for what cannot be registered
+function instance_of(text, subtypes) {
+  let url;
+  try {
+    url = new URL(text);
+  } catch (error) {
+    throw new Error('not a URL: ' + text);
+  }
+  if (url.protocol !== 'https:' && url.protocol !== 'http:') {
+    throw new Error('not an http(s) URL: ' + text);
+  }
+  const host = url.hostname.toLowerCase().replace(/\./g, '-');
+  if (!/^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$/.test(host)) {
+    throw new Error(url.hostname + ' makes no host label');
+  }
+  const labels = [];
+  for (const subtype of subtypes) {
+    if (!usable_label(subtype)) {
+      throw new Error(subtype + ' makes no subtype label');
+    }
+    if (!labels.some(label => fold(label) === fold(subtype))) {
+      labels.push(subtype);
+    }
+  }
+  return {host: host, url: url, subtypes: labels};
+}
+
 /// the instances of INSTANCES_MD: `## <project>` headings, each followed by
 /// a list of `- [name](url)` links. A heading starting with `_fedi` lists
 /// general fediverse services, which get no subtype. An instance listed
@@ -770,25 +1043,19 @@ function parse_instances(markdown) {
     if (!link) {
       continue;
     }
-    let url;
+    let instance;
     try {
-      url = new URL(link[1]);
+      instance = instance_of(link[1], project ? [project] : []);
     } catch (error) {
+      console.warn(INSTANCES_MD + ': ' + error.message);
       continue;
     }
-    const host = url.hostname.toLowerCase().replace(/\./g, '-');
-    if (!/^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$/.test(host)) {
-      console.warn(INSTANCES_MD + ': ' + url.hostname + ' makes no host label');
-      continue;
-    }
-    if (!by_host.has(host)) {
-      by_host.set(host, {host: host, url: url, subtypes: []});
-    }
-    const subtypes = by_host.get(host).subtypes;
-    if (project && !usable_label(project)) {
-      console.warn(INSTANCES_MD + ': ' + project + ' makes no subtype label');
-    } else if (project && !subtypes.some(s => fold(s) === fold(project))) {
-      subtypes.push(project);
+    const known = by_host.get(instance.host);
+    if (!known) {
+      by_host.set(instance.host, instance);
+    } else if (instance.subtypes.length &&
+               !known.subtypes.some(s => fold(s) === fold(instance.subtypes[0]))) {
+      known.subtypes.push(instance.subtypes[0]);
     }
   }
   return [...by_host.values()];

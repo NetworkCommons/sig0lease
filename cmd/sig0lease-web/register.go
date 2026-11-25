@@ -26,7 +26,9 @@ const registerTimeout = 20 * time.Second
 // RegisterRequest is register's argument: one SRP host, with its addresses and instances,
 // registered at the SRP registrar doh (a DoH URL, RFC 9665 names no DoH discovery) for Lease
 // seconds, its KEY for KeyLease. Key, if set, is the host's key as Key returns it; else a
-// fresh key signs.
+// fresh key signs. Remove withdraws the host and its instances instead, KEYs included, so
+// the names are free (Client.Deregister): Addresses, Lease and KeyLease are ignored, and Key
+// must be the key that registered them.
 type RegisterRequest struct {
 	DoH       string             `json:"doh"`
 	Domain    string             `json:"domain"`
@@ -36,6 +38,7 @@ type RegisterRequest struct {
 	Lease     uint32             `json:"lease"`
 	KeyLease  uint32             `json:"keyLease"`
 	Key       *Key               `json:"key"`
+	Remove    bool               `json:"remove"`
 }
 
 // RegisterInstance is one service instance of a RegisterRequest: Service is the service type
@@ -114,13 +117,16 @@ func register(ctx context.Context, req RegisterRequest) (*RegisterResult, error)
 		addrs = append(addrs, a)
 	}
 	addrs = srp.PublishableAddresses(addrs)
-	if len(addrs) == 0 {
+	if len(addrs) == 0 && !req.Remove {
 		return nil, fmt.Errorf("register: %s has no publishable address", req.Host)
 	}
 
 	owner := dnsutil.Fqdn(req.Host + "." + req.Domain)
 	var key *keyrec.LoadedKey
 	var err error
+	if req.Remove && req.Key == nil {
+		return nil, fmt.Errorf("register: removing %s needs the key that registered it", owner)
+	}
 	if req.Key != nil {
 		key, err = keyrec.ParseKey(owner, req.Key.Public, req.Key.Private)
 	} else {
@@ -159,7 +165,13 @@ func register(ctx context.Context, req RegisterRequest) (*RegisterResult, error)
 	if err != nil {
 		return nil, fmt.Errorf("register: %w", err)
 	}
-	resp, outcome, err := c.Register(ctx)
+	register := c.Register
+	if req.Remove {
+		register = func(ctx context.Context) (*dns.Msg, client.Outcome, error) {
+			return c.Deregister(ctx, false)
+		}
+	}
+	resp, outcome, err := register(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("register: %w", err)
 	}
