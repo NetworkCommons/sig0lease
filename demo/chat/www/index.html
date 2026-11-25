@@ -19,7 +19,37 @@
 <script type="module">
 const params = new URLSearchParams(location.search);
 const domain = params.get('domain') || location.hostname;
+
+// Each guest login is a new address, so a page opened again (a reload, or a phone that dropped
+// the tab) is a new guest, which cannot resume the old one's session. The page makes it the same
+// person in the room:
+// - The page keeps the nickname the guest chose, in this browser, and joins with it next time.
+// - When the page goes, the page closes its session (unavailable presence, then the stream's close),
+//   so the server frees the nickname at once. Converse leaves a resumable session open instead,
+//   which would hold the nickname until the server gives up on it (smacks_hibernation_time in
+//   prosody.cfg.lua). A page the browser restores from its cache has no session any more, and
+//   loads again.
+// The room's conversation comes from its archive (muc_mam in prosody.cfg.lua).
+const nickname = 'd5-nickname';
+const keepNickname = (muc) => localStorage.setItem(nickname, muc.get('nick'));
+converse.plugins.add('d5-guest', {
+    initialize() {
+        const { api } = this._converse;
+        api.listen.on('getNicknameForMUC', (muc, nick) => nick || localStorage.getItem(nickname));
+        // After a reconnection, Converse enters the same room model again: the page adds its
+        // listener once.
+        api.listen.on('enteredNewRoom', (muc) => {
+            keepNickname(muc);
+            muc.off('change:nick', keepNickname);
+            muc.on('change:nick', keepNickname);
+        });
+        window.addEventListener('pagehide', () => api.connection.get()?.disconnect('the page closed'));
+        window.addEventListener('pageshow', (event) => { if (event.persisted) location.reload(); });
+    },
+});
+
 converse.initialize({
+    whitelisted_plugins: ['d5-guest'],
     authentication: 'anonymous',
     jid: domain,
     auto_login: true,
@@ -27,10 +57,10 @@ converse.initialize({
     discover_connection_methods: false,
     auto_join_rooms: [params.get('room') || `meet@rooms.${domain}`],
     view_mode: 'fullscreen',
-    // The room's last 20 messages on joining, from the history Prosody keeps for it in memory
-    // (20 by default). Converse asks for none unless told how many (<history maxstanzas="0"/>):
-    // it expects the room's archive (MAM), which the rooms here do not keep.
-    muc_history_max_stanzas: 20,
+    // The room's conversation, from its archive, also while the page asks a new guest for a
+    // nickname. Converse reads the archive of a room that has one on joining, and then asks for
+    // none of the history the room keeps in memory (muc_history_max_stanzas).
+    muc_show_logs_before_join: true,
     // Opened over plain HTTP at a LAN address, the page is not a secure context, so the browser
     // gives it no Web Crypto (crypto.subtle). converse-caps hashes every presence with it, and
     // without it the room's join presence is never sent; converse-omemo cannot start without it.

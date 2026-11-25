@@ -23,6 +23,12 @@ modules_enabled = {
     "http_files", -- the page
 }
 
+-- A page whose connection drops without closing (a phone that slept, or dropped the tab) can
+-- resume its session for this long (XEP-0198): the session, and its nickname in the room, stay
+-- until then. Prosody's default is 10 minutes, so a guest who opened the page again could not
+-- take the same nickname for 10 minutes. A page that goes closes its session itself (www/).
+smacks_hibernation_time = "2 minutes"
+
 certificates = dir
 ssl = { certificate = dir .. "/cert.pem", key = dir .. "/key.pem" }
 
@@ -50,3 +56,6 @@ VirtualHost(domain)
 
 Component("rooms." .. domain) "muc"
     muc_room_default_persistent = true -- the room stays while nobody is in it
+    -- The rooms' archive (XEP-0313), kept for a week in data_path: a page that joins a room,
+    -- a guest's page opened again included, shows the room's conversation from it.
+    modules_enabled = { "muc_mam" }

@@ -71,7 +71,7 @@ REGISTRAR=$REG:8054 DOH=https://$REG:8444 UPDATE_DOMAIN=stg.zenr.io SRP_DOMAIN=s
   document's commands build addresses and URLs. No script reads it.
 - `REGISTRAR` is what the scripts read: where the agents send their updates, written
   `<host>:<port>`, the host `$REG` and the instance's plain DNS port, 8053 or 8054, used over
-  TCP. With it, a script starts no proxy, and checks no ports for one.
+  TCP. With `REGISTRAR` set, a script starts no proxy, and checks no ports for one.
 - `DOH` is for D6 only. The page in the browser can use only DNS-over-HTTPS, and `DOH` is the
   instance's DNS-over-HTTPS server. Stable's is `https://$REG`, on port 443, which `web.sh` takes
   when `DOH` is empty; staging's is on port 8444.
@@ -96,9 +96,14 @@ such as `TRANSPORT=tls REGISTRAR=$REG:853 UPDATE_DOMAIN=$UPDATE_DOMAIN demo/run.
 
 Two things differ from a local test:
 
-- Other people can use the same registrar, and the registrar gives each name in a demo to the first key that claims it,
-  for as long as that key's lease lasts. One of the demo's names may already be taken by someone:
-  you can check this (see "Before a demo"). The registrar's own lease limits apply to lease time.
+- Anyone can claim names through the registrar. Every proxy, the registrar and a local test's
+  alike, gives a name to the first key that claims it, for as long as that key's lease lasts.
+  Through the registrar, that first key can be anybody's, so one of the demo's names may already
+  be taken: check the names before each run ("Before a demo", step 3). In a local test, nobody
+  can claim names in `local.dev.zenr.io` through the registrar ("Where the names go"): only a
+  proxy with the key of `dev.zenr.io`, such as another laptop's local test, or an earlier run's
+  leftovers can hold the demo's names there. The registrar's own lease limits apply to lease
+  time.
 - For security reasons, a shared registrar does not report its error reasons and its lease-store dump
   (`server.diagnostics` off): a refusal shows only its Extended DNS Error's code, and
   `demo/leftovers.sh -r` cannot read its stores.
@@ -108,10 +113,12 @@ Two things differ from a local test:
 A part of a command in `<…>` is optional: write it without `<` and `>`, or leave it out.
 
 - `<REGISTRAR=$REGISTRAR UPDATE_DOMAIN=$UPDATE_DOMAIN>` hands the script the block you pasted.
-  Write it with the registrar's block, or with a local block whose subtrees are not
-  `local.dev.zenr.io` and `srp.local.dev.zenr.io`; add `SRP_DOMAIN=$SRP_DOMAIN` to it when
-  `SRP_DOMAIN` is not `srp.$UPDATE_DOMAIN`. Left out, the script runs the local test, in
-  `local.dev.zenr.io` and `srp.local.dev.zenr.io`.
+  Write this part when you pasted the registrar's block, or a local block whose subtrees are not
+  `local.dev.zenr.io` and `srp.local.dev.zenr.io`; add `SRP_DOMAIN=$SRP_DOMAIN` to this part
+  when `SRP_DOMAIN` is not `srp.$UPDATE_DOMAIN`. A command without this part runs the local
+  test, in the scripts' default subtrees, `local.dev.zenr.io` and `srp.local.dev.zenr.io`. The
+  registrar has no default: a script uses the registrar only when its command gives `REGISTRAR`,
+  and stops when its command gives `REGISTRAR` without `UPDATE_DOMAIN`.
 - Any other optional part, such as `<MEMBER=…>`, has nothing to do with the block: the demo's
   section says when to write it.
 
@@ -243,7 +250,7 @@ While a demo runs:
 <REGISTRAR=$REGISTRAR UPDATE_DOMAIN=$UPDATE_DOMAIN> demo/run.sh
 ```
 
-It starts the site and the agent, and after each step prints how long `ns1.free2air.org` took to
+`demo/run.sh` starts the site and the agent, and after each step prints how long `ns1.free2air.org` took to
 show it.
 
 1. The agent registers the host `demo`, with its service `demo http`, and the name `demo`:
@@ -361,6 +368,18 @@ What the agents publish, which `<UPDATE_DOMAIN=$UPDATE_DOMAIN> NAME=site demo/wa
 | `_dnsaddr.site.$UPDATE_DOMAIN` TXT `dnsaddr=/ip4/<address>/tcp/<port>/p2p/<ID>`, one for each of its node's addresses | the IPFS community node | its node's addresses change |
 | `community ipfs-gateway._http._tcp.$SRP_DOMAIN` SRV `0 0 8081 community.$SRP_DOMAIN.`: the gateway phones open, as a service | the local test's IPFS community node; the registrar's gateway is at the registrar's own address | its gateway starts or stops answering |
 
+The subtype `site` is the community's label. Several communities can list their members in the
+same `$SRP_DOMAIN`, all with the type `_ipfs-member._tcp`, each under its own subtype; each IPFS
+community node lists only its own community's subtype. Through the registrar, where anyone can
+register, another community can appear beside yours at any time.
+
+The local test's IPFS community node registers its gateway as the service
+`community ipfs-gateway`. The agent registers that service only once its probe reaches the
+gateway's port, and `demo/ipfs.sh community` waits for the service before printing the gateway's
+address, `http://community.$SRP_DOMAIN:8081/…`, whose host name the same registration gives. DNS-SD
+browsers list the gateway too: `dns-sd -B _http._tcp,_ipfs $SRP_DOMAIN` on a Mac. Phones do not
+read the service: they open the printed address, or its QR code.
+
 `/ipns/site.$UPDATE_DOMAIN/alice/` is alice's folder. A member is its label, `MEMBER`, by default
 the machine's name, which its key holds: a member that stops comes back to its label as the same
 member. The IPFS community node keeps an absent member's entry for `REVOKE_AFTER`, then removes it and
@@ -408,7 +427,7 @@ Every node, the IPFS community node's and each member's, gets these settings:
 - `ipfs config --json Swarm.Transports.Network.Websocket false`: no WebSocket listener, the
   transport that certificate is for.
 - `ipfs config --json Discovery.MDNS.Enabled false`: otherwise nodes on the same local network
-  find each other by multicast DNS. Off, they find each other by DNS alone, as across the
+  find each other by multicast DNS. With multicast DNS off, they find each other by DNS alone, as across the
   internet: through the IPFS community node's name.
 - A swarm key, the file `swarm.key` in the repository, made once for the community and given to
   each member. It has three lines, two fixed ones and 32 random bytes in hex:
@@ -421,8 +440,8 @@ Every node, the IPFS community node's and each member's, gets these settings:
 
   `demo/ipfs-local.sh start` makes it with
   `printf '/key/swarm/psk/1.0.0/\n/base16/\n%s\n' "$(openssl rand -hex 32)" > swarm.key`.
-  With it, the node connects only to nodes with the same key, a private
-  swarm: every connection is encrypted with it, and a node without it cannot connect at all. At
+  With a swarm key, the node connects only to nodes with the same key, a private
+  swarm: every connection is encrypted with that key, and a node without the key cannot connect at all. At
   start the node says "Swarm is limited to private network of peers with the swarm key", then
   the key's fingerprint, the same on every node of the community. The key never goes into DNS or
   this repository.
@@ -439,8 +458,9 @@ its value: `/ip4/127.0.0.1/tcp/5001` is TCP port 5001 on the address 127.0.0.1, 
   `/ipfs/<CID>` and `/ipns/<name>` to browsers. The local test's IPFS community node has it on
   0.0.0.0, all of the machine's addresses, so that phones reach it, and registers it as the
   instance `community ipfs-gateway` in `$SRP_DOMAIN`.
-- `Addresses.Swarm`, port 4001 by default, over TCP and QUIC (UDP), on all of the machine's
-  addresses: where the node takes connections from other nodes. The IPFS community node's agent
+- `Addresses.Swarm`, port 4001 by default, on all of the machine's addresses: where the node
+  takes connections from other nodes. With a swarm key, the node takes them over TCP only: kubo
+  turns QUIC off in a private swarm, since QUIC cannot use a swarm key. The IPFS community node's agent
   publishes its node's swarm addresses at `_dnsaddr.site.$UPDATE_DOMAIN`; a member's agent gives
   its node's TCP swarm port in the member's SRV record, and probes it.
 
@@ -460,9 +480,11 @@ ipfs bootstrap add /dnsaddr/site.$UPDATE_DOMAIN/p2p/<ID>
 
 `demo/ipfs.sh member` also makes the IPFS community node a peering peer of the member's node, for as
 long as the node runs (`ipfs swarm peering add`, at the addresses `_dnsaddr.site` gives). kubo
-keeps a peering peer connected, and asks a peer outside the local network for blocks only if it
-is a peering peer or has sent it some: without it, a member's node would never ask the
-registrar's IPFS community node for the community's folder.
+keeps a peering peer connected. kubo also asks a peer outside the local network for blocks only
+if that peer is a peering peer or has already sent the node blocks. If the registrar's IPFS
+community node were not a peering peer, a member's node would never ask the registrar's IPFS
+community node for the community's folder, which `demo/ipfs.sh member` reads through the
+member's node to check that the folder has the member's entry.
 
 A member's folder is a directory in its node's files (MFS, the files IPFS Desktop's Files shows),
 `/community` by default (`FOLDER`):
@@ -512,7 +534,7 @@ For each node that does not run, `demo/ipfs-local.sh start`:
 
 Then it gives alice and carol each a folder, `/community`, with a first file, `alice.txt` and
 `carol.txt`, if they have none, and prints the commands of "Run". A node that runs is left as it
-is: run again, `demo/ipfs-local.sh start` starts only the nodes that stopped. The members' nodes
+is: a later run of `demo/ipfs-local.sh start` starts only the nodes that stopped. The members' nodes
 log "failed to bootstrap (no peers found)" until the IPFS community node publishes its addresses:
 `demo/ipfs.sh member` connects them, in "Run", step 3.
 
@@ -571,7 +593,7 @@ log "failed to bootstrap (no peers found)" until the IPFS community node publish
    alice's instance goes within about 15 s, when her agent's probe of the node's swarm port
    fails, and within about 10 s more the IPFS community node says "alice is not listed; its entry goes
    in 2m0s unless it is again"; phones still load alice's folder. Start her node again within
-   those 2 minutes, which starts only the nodes that stopped:
+   those 2 minutes; `demo/ipfs-local.sh start` starts only the nodes that stopped:
 
    ```bash
    UPDATE_DOMAIN=$UPDATE_DOMAIN demo/ipfs-local.sh start
@@ -589,10 +611,21 @@ log "failed to bootstrap (no peers found)" until the IPFS community node publish
     demo/ipfs-local.sh stop
     ```
 
-A member that stops keeps its label for an hour, its key's lease, as long as the proxy runs. The
-IPFS community node keeps the community's folder for the next run, in its files at
-`/sig0lease-agent/site.$UPDATE_DOMAIN`, with the members' folders pinned under
-`sig0lease-agent site.$UPDATE_DOMAIN.`; a member's key is in `demo/keys-ipfs-member-<MEMBER>`.
+A member that stops keeps its label for an hour, its key's lease, as long as the proxy runs. A
+member's key is in `demo/keys-ipfs-member-<MEMBER>`. For the next run, the IPFS community node
+keeps the community's folder and a pin of each member's folder, both inside its node, neither in
+the file system nor in DNS:
+
+- The community's folder is `/sig0lease-agent/site.$UPDATE_DOMAIN` in the node's files (MFS,
+  the files IPFS Desktop's Files shows); `_dnslink.site.$UPDATE_DOMAIN` gives the folder's CID.
+- Each member's folder is pinned with the name `sig0lease-agent site.$UPDATE_DOMAIN.`, a label
+  kubo keeps with the pin, by which the agent finds its own pins.
+
+```bash
+IPFS_PATH=~/.ipfs-community ipfs files ls -l /sig0lease-agent/site.$UPDATE_DOMAIN   # one entry per member
+IPFS_PATH=~/.ipfs-community ipfs pin ls --type=recursive --names                   # the pins
+```
+
 The repositories stay too, with the swarm key and the folders: the next
 `demo/ipfs-local.sh start` starts the same nodes.
 
@@ -607,7 +640,9 @@ connects to it, and it fetches the member's folder over that connection, so a me
 behind the venue's NAT takes part as well. It may also dial a member's node, at addresses it
 learned from an earlier connection. An absent member's entry stays for 10 minutes. A member that stops keeps its label for an hour, its key's
 lease; one whose machine sleeps or leaves the network is no longer listed about 2 minutes later,
-when its instance's lease ends.
+when its instance's lease ends. The registrar's IPFS community node keeps the community's folder
+and the pins of the members' folders as the local test's does, in its own node: deploy/README.md,
+"The IPFS community node", gives the commands that list them on the registrar.
 
 **Needs**: on each member's machine, IPFS Desktop or kubo, and `qrencode`; a network that lets
 the members' nodes reach the IPFS community node's swarm port, the port in the addresses
@@ -653,8 +688,10 @@ first: `ipfs init`.
 **Run**:
 
 1. A screen shows `UPDATE_DOMAIN=$UPDATE_DOMAIN NAME=site demo/watch.sh`, and the peers of the
-   node on alice's machine, which list the IPFS community node: IPFS Desktop's Peers, or
-   `ipfs swarm peers`.
+   node on alice's machine: IPFS Desktop's Peers, or `ipfs swarm peers`. Each line of
+   `ipfs swarm peers` is one connection to a node with the community's swarm key: the IPFS
+   community node, whose peer ID is the one `_dnsaddr.site` gives, and any other node of the
+   community that alice's node is connected to.
 2. On alice's machine, then on each other member's (`n` in each):
 
    ```bash
@@ -671,8 +708,8 @@ first: `ipfs init`.
    `ipfs files cp` command of "Once", step 4): a phone's reload shows it within about a minute.
 5. alice leaves: `n` in alice's `demo/ipfs.sh member`, or stop the node (quit IPFS Desktop, or
    `ipfs shutdown`). alice's instance
-   goes; its entry stays for 10 minutes, and phones still load its folder; back within them, it
-   carries on as the same member.
+   goes; its entry stays for 10 minutes, and phones still load its folder. If alice comes back
+   within those 10 minutes, alice carries on as the same member.
 
 ### Why DNSLink, not IPNS
 
@@ -714,7 +751,7 @@ listens (`_xmpp-server._tcp`, for the name and for `rooms`) and clients where to
 (`_xmpp-client._tcp`), and a TLSA record with the hash of the server's key. The certificates are
 self-signed: a server accepts another only when its key matches its TLSA record, which DNSSEC
 vouches for (DANE). Nothing is configured between the two servers, and nobody makes an account.
-It runs on one machine or on two, each with its own section below, with all its steps:
+D5 runs on one machine or on two, each with its own section below, with all its steps:
 
 - **On one machine**: one `chat.sh` starts both servers and one agent; B gets the ports 10 above
   XMPP's: 5232, 5279 and 5290. The servers still find and authenticate each other only by their
@@ -738,6 +775,19 @@ directory for a new key. A server whose key its TLSA record does not match is re
 ("certificate does not match any DANE TLSA records" in the other server's log), as a test run
 showed.
 
+A guest gets a new address at each login, so a page opened again, after a reload or after the
+phone dropped the tab, is a new guest. The page makes it the same person in the room:
+
+- The page keeps the nickname the guest chose, in the browser, and joins with it again.
+- The page shows the room's conversation from the room's archive. A server run natively keeps
+  the archive for a week, in `demo/chat/servers/<name>/data`; a server in Docker keeps it only
+  while its container runs.
+- A page that goes closes its session, and the server frees the nickname at once. A phone that
+  drops the page without closing it holds the nickname for up to 2 minutes, while the server
+  waits for the page to resume its session (`smacks_hibernation_time` in
+  `demo/chat/prosody.cfg.lua`). A page still open that reconnects within those 2 minutes, as a
+  phone woken from sleep does, carries on its session.
+
 #### On one machine
 
 **Needs**: the machine, with ports 5222, 5269, 5280, 5232, 5279 and 5290 open to the network;
@@ -751,7 +801,7 @@ phones on its network, which also reach the internet, for Converse.js.
    <REGISTRAR=$REGISTRAR UPDATE_DOMAIN=$UPDATE_DOMAIN> demo/chat.sh chat-a chat-b
    ```
 
-   It starts the servers and the agent, waits until `ns1.free2air.org` has the records, and
+   `demo/chat.sh` starts the servers and the agent, waits until `ns1.free2air.org` has the records, and
    prints the address of the page each server serves, and its QR code. Both pages join A's room,
    `meet@rooms.chat-a.$UPDATE_DOMAIN`. On a Mac, allow Docker's incoming connections when asked;
    on Linux, the firewall has to let in the six ports.
@@ -781,7 +831,7 @@ on their network, which also reach the internet, for Converse.js.
    <REGISTRAR=$REGISTRAR UPDATE_DOMAIN=$UPDATE_DOMAIN> demo/chat.sh chat-a
    ```
 
-   It starts the server and the agent, waits until `ns1.free2air.org` has the records, and prints
+   `demo/chat.sh` starts the server and the agent, waits until `ns1.free2air.org` has the records, and prints
    the address of the page the server serves, and its QR code. On a Mac, allow Docker's incoming
    connections when asked; on Linux, the firewall has to let in the three ports.
 2. On B, start B's server, whose page joins A's room:
@@ -790,7 +840,7 @@ on their network, which also reach the internet, for Converse.js.
    <REGISTRAR=$REGISTRAR UPDATE_DOMAIN=$UPDATE_DOMAIN> ROOM=meet@rooms.chat-a.$UPDATE_DOMAIN demo/chat.sh chat-b
    ```
 
-   It does on B what step 1 does on A.
+   `demo/chat.sh` does on B what step 1 does on A.
 3. Show what the other server reads:
 
    ```bash
@@ -840,7 +890,7 @@ or later. What they must reach is in "Local test" and "With the registrar".
    <REGISTRAR=$REGISTRAR UPDATE_DOMAIN=$UPDATE_DOMAIN DOH=$DOH> demo/web.sh
    ```
 
-   It builds the agent and the page, and starts a site and an agent that registers it as the
+   `demo/web.sh` builds the agent and the page, and starts a site and an agent that registers the site as the
    service `demo http`, as in D1 (`demo/demo.yaml`), and the page, on port 8090. It prints the
    page's address and its QR code.
 2. Phones scan the code. The page lists the services in `$SRP_DOMAIN`, read every 3
@@ -942,6 +992,9 @@ internet, not the laptop's port 8443. `DOH` gives the registrar's DNS-over-HTTPS
   `forward = { "9.9.9.9" }` to `unbound` in `demo/chat/prosody.cfg.lua`, a resolver that passes
   the signatures on, which Prosody still checks. Without DANE, `s2s_secure_auth = false` there
   lets the servers fall back to dialback.
+- D5: a guest who opened the page again is asked for a nickname, as the one kept is "already in
+  use": the page before did not close its session, as when the phone dropped the tab. The server
+  frees the nickname within 2 minutes; the guest can wait, or choose another nickname.
 - D5: a phone cannot open the page by name: the venue's resolver hides answers with private
   addresses. The address line `chat.sh` prints, and its QR code, need no name.
 - D5: the records list a Docker or VPN address that other machines cannot reach: give the

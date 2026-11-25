@@ -68,7 +68,7 @@ Every field name is checked: one the format does not have is an error, not ignor
 
 | Field | Default | Meaning |
 |---|---|---|
-| `keystore` | `CLIENT_KEYSTORE_DIR` | The directory holding one key per host and name, and the agent's state. A relative path is relative to the template's directory. Left out, the agent uses `CLIENT_KEYSTORE_DIR`, as `sig0lease-client` and `sig0lease-srp-client` do without `-keystore`; with neither, the template is invalid. |
+| `keystore` | `CLIENT_KEYSTORE_DIR` | The directory holding one key per host and name, and the agent's state. A relative path is relative to the template's directory. A template without `keystore` uses `CLIENT_KEYSTORE_DIR`, as `sig0lease-client` and `sig0lease-srp-client` do without `-keystore`; with neither, the template is invalid. |
 | `types` | none | The template's own service types (see "types" below), for every srp registrar's hosts. |
 
 ### registrars
@@ -114,7 +114,7 @@ services, sent in one registration.
 | `name` | The host label: letters, digits and hyphens, not starting or ending with a hyphen (RFC 952, RFC 1123; BIND refuses other host names by default). Unique in its registrar, ignoring case. |
 | `addresses` | At least one: `auto`, IP addresses, or both. `auto` is this machine's addresses, read again at every poll: a change is registered. It leaves out loopback and link-local addresses, and, on Linux and macOS, IPv6 addresses that are temporary (privacy addresses, RFC 8981), not usable yet or at all (tentative, duplicate, detached) or anycast, as mDNSResponder's SRP client does on macOS; elsewhere temporary addresses are published too. A literal address may be any but unspecified, multicast or zoned (loopback is allowed, for tests). |
 | `services` | The host's services. None: the host is registered alone, with its addresses. |
-| `lease`, `key_lease`, `on_stop` | As in the registrar, for this host only. Left out: the registrar's. |
+| `lease`, `key_lease`, `on_stop` | As in the registrar, for this host only. One that the host does not set is the registrar's. |
 
 A host's key is created on its first run, as ECDSA P-256 (`K<name>.<domain>.+013+<tag>` in
 the keystore), and used from then on: the registrar gives a name to the key that first
@@ -219,7 +219,7 @@ KEY and the records added, on the registrar's leases.
 | `records` | `"<owner> <type> <data>"`, the owner `@` for the name itself or relative to it (`_dnslink`, `www`), the data in zone-file format. At or below the name, class IN, no KEY or SIG, no A or AAAA at the name (`addresses:` has those). Each once. |
 | `services` | Services found at the name by SRV records (below). They need `addresses:`, which the SRV records point at. |
 | `ipfs` | An IPFS node whose addresses, and a folder it keeps, its own or a community's, the name publishes (see "A name's IPFS node"). |
-| `lease`, `key_lease`, `on_stop` | As in the registrar, for this name only. Left out: the registrar's. |
+| `lease`, `key_lease`, `on_stop` | As in the registrar, for this name only. One that the name does not set is the registrar's. |
 
 A name needs an address, a record or `ipfs:`. With only `auto` and no address to publish, the
 agent registers nothing for it until the machine has one. A name's records the template or the
@@ -334,7 +334,9 @@ the path and the swarm key file have been read, and withdrawn while the file can
 
 A community's members are the instances of one service type listed under one subtype, the
 community's (RFC 6763 §7.1): the preset `ipfs-member` (`_ipfs-member._tcp`, port 4001, the swarm
-port) with the subtype `site`, for `site.dev.zenr.io`, as above. A member is its instance label,
+port) with the subtype `site`, for `site.dev.zenr.io`, as above. With one subtype per community,
+several communities can use the same service type in the same SRP domain, and each community's
+node lists only its own members. A member is its instance label,
 its entry's name: letters, digits and hyphens, so give `instance:` (the default
 `myhost ipfs-member` is not one). The host's key holds it: stopping with `on_stop: keep`, the
 default, the label stays the host's for `key_lease`, and the host comes back to it, as the same

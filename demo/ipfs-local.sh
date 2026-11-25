@@ -81,7 +81,7 @@ set_up() {
         on "$n" config --json Discovery.MDNS.Enabled false &&
         on "$n" config Addresses.API "/ip4/127.0.0.1/tcp/$api" &&
         on "$n" config Addresses.Gateway "/ip4/$at/tcp/$gateway" &&
-        on "$n" config --json Addresses.Swarm "[\"/ip4/0.0.0.0/tcp/$swarm\", \"/ip4/0.0.0.0/udp/$swarm/quic-v1\"]" ||
+        on "$n" config --json Addresses.Swarm "[\"/ip4/0.0.0.0/tcp/$swarm\"]" ||
         exit 1
 }
 

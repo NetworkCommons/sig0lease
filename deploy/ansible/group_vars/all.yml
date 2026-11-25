@@ -27,7 +27,8 @@ registrar_name: '{{ lookup("ansible.builtin.pipe", "ssh -G " ~ inventory_hostnam
 #                      its members' _ipfs-member._tcp instances are listed under in the
 #                      srp_handler zone
 #     revoke_after     how long a member may be unlisted before its entry is removed
-#     swarm_port       the node's swarm, TCP and QUIC, which the members' nodes connect to
+#     swarm_port       the node's swarm, TCP only (kubo has no QUIC with a swarm key), which the
+#                      members' nodes connect to
 #     api_address      its RPC API, which the agent uses, on 127.0.0.1
 #     gateway_address  its gateway, which only nginx reaches, on 127.0.0.1
 # Each instance's zones lie outside the other's (deploy/README.md).

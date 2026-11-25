@@ -15,7 +15,7 @@ in no file of this repository.
 | Plain DNS, UDP and TCP | 8053 | 8054 |
 | DNS-over-TLS | 853 | 8853 |
 | The page, and DNS-over-HTTPS at `/dns-query` | `https://<registrar>/` | `https://<registrar>:8444/` |
-| IPFS community node: swarm port, TCP and QUIC | 4001 | 4002 |
+| IPFS community node: swarm port, TCP | 4001 | 4002 |
 | Its site, at its gateway | `https://<registrar>/ipns/site.dev.zenr.io/` | `https://<registrar>:8444/ipns/site.stg.zenr.io/` |
 
 Each instance's settings are in `registrar_instances`
@@ -140,11 +140,22 @@ Each instance keeps the 5 releases before the one it runs.
 
 An instance with `community` in its `registrar_instances` entry runs one. Both instances do.
 
-- **kubo** runs in the instance's private swarm. Its swarm port must be reachable from the
-  internet, since the members' nodes connect to it. Its config is what
+- **kubo** runs in the instance's private swarm. Its swarm port, TCP only (kubo turns QUIC off
+  with a swarm key), must be reachable from the internet, since the members' nodes connect to it. Its config is what
   `ipfs init --profile server,autoconf-off` makes, plus `community_kubo_overrides`
   ([roles/community/defaults/main.yml](ansible/roles/community/defaults/main.yml)). kubo is
   installed from its GitHub release, checked against the SHA-512 sum set there.
+- **Its repository** is `/var/lib/kubo/<instance>`, and its RPC API listens on 127.0.0.1, port
+  5101 on stable and 5102 on staging (`api_address`). The agent keeps the community's folder in
+  the node's files, at `/sig0lease-agent/<site>.<update zone>`, and pins each member's folder
+  with the name `sig0lease-agent <site>.<update zone>.`. As root on the registrar, with
+  `<version>` the installed kubo's (`community_kubo_version`), for stable:
+
+  ```bash
+  /opt/kubo/<version>/kubo/ipfs --api /ip4/127.0.0.1/tcp/5101 files ls -l /sig0lease-agent/site.dev.zenr.io
+  /opt/kubo/<version>/kubo/ipfs --api /ip4/127.0.0.1/tcp/5101 pin ls --type=recursive --names
+  ```
+
 - **Its gateway** is kubo's own, on 127.0.0.1, behind nginx. nginx passes on only the site and
   `/ipfs/`. The gateway serves only what the node holds (`Gateway.NoFetch`).
 - **The agent** registers `<site>.<update zone>` (`site.dev.zenr.io` on stable) and follows the
@@ -211,4 +222,4 @@ query over DNS is refused, since `server.diagnostics` is off.
 - The plain DNS ports have no limit, and these roles set up no firewall, since the machine's other
   services belong to their own operators. A firewall of its own (an nftables table beside theirs)
   is still to come. Besides theirs and ssh, it would open 80, 443, 853, 8053, 8054, 8444, 8853,
-  4001 and 4002.
+  and the swarm ports 4001 and 4002, over TCP only.

@@ -43,11 +43,10 @@ community_kubo_overrides:
   Addresses:
     API: "/ip4/{{ community_settings.api_address | split(':') | first }}/tcp/{{ community_settings.api_address | split(':') | last }}"
     Gateway: "/ip4/{{ community_settings.gateway_address | split(':') | first }}/tcp/{{ community_settings.gateway_address | split(':') | last }}"
+    # TCP only: with a swarm key, kubo turns QUIC off, since QUIC cannot use the key.
     Swarm:
       - "/ip4/0.0.0.0/tcp/{{ community_settings.swarm_port }}"
       - "/ip6/::/tcp/{{ community_settings.swarm_port }}"
-      - "/ip4/0.0.0.0/udp/{{ community_settings.swarm_port }}/quic-v1"
-      - "/ip6/::/udp/{{ community_settings.swarm_port }}/quic-v1"
   Routing:
     Type: dht
   AutoTLS:
