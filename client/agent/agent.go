@@ -86,11 +86,12 @@ func (o *Options) defaults() {
 	}
 }
 
-// InterfaceAddresses returns the addresses of every interface of this machine, but for the IPv6
-// ones not to publish, as mDNSResponder's SRP client leaves them out on macOS: temporary
-// addresses (RFC 8981), there so that the machine's connections cannot be linked to it, and
-// those not usable, yet or at all (tentative, duplicate, detached), or anycast. Linux and macOS
-// tell them apart (unpublishedIPv6); elsewhere every address is returned.
+// InterfaceAddresses returns the addresses of every interface of this machine that is up, but
+// for the IPv6 ones not to publish, as mDNSResponder's SRP client leaves them out on macOS:
+// temporary addresses (RFC 8981), there so that the machine's connections cannot be linked to
+// it, and those not usable, yet or at all (tentative, duplicate, detached), or anycast. Linux
+// and macOS tell them apart (unpublishedIPv6); elsewhere every address of an interface that is
+// up is returned.
 func InterfaceAddresses() ([]netip.Addr, error) {
 	ifis, err := net.Interfaces()
 	if err != nil {
@@ -101,9 +102,20 @@ func InterfaceAddresses() ([]netip.Addr, error) {
 		return nil, fmt.Errorf("reading the IPv6 addresses' flags: %w", err)
 	}
 	defer done()
+	return interfaceAddresses(ifis, (*net.Interface).Addrs, unpublished)
+}
+
+// interfaceAddresses returns the addresses that addrs gives for each interface in ifis that is
+// up, as mDNSResponder's SRP client takes only those (IFF_UP): a down interface may keep its
+// address, as Docker's bridge on Linux does while no container runs. Of the global IPv6
+// addresses, those unpublished reports are left out.
+func interfaceAddresses(ifis []net.Interface, addrs func(*net.Interface) ([]net.Addr, error), unpublished func(net.Interface, netip.Addr) (bool, error)) ([]netip.Addr, error) {
 	var out []netip.Addr
 	for _, ifi := range ifis {
-		ifAddrs, err := ifi.Addrs()
+		if ifi.Flags&net.FlagUp == 0 {
+			continue
+		}
+		ifAddrs, err := addrs(&ifi)
 		if err != nil {
 			return nil, fmt.Errorf("%s: %w", ifi.Name, err)
 		}

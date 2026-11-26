@@ -306,12 +306,13 @@ func Describe(w io.Writer, plan *Plan, interfaces func() ([]netip.Addr, error), 
     of hosts and names the template no longer registers (agent.release).
 
 func InterfaceAddresses() ([]netip.Addr, error)
-    InterfaceAddresses returns the addresses of every interface of this machine,
-    but for the IPv6 ones not to publish, as mDNSResponder's SRP client
-    leaves them out on macOS: temporary addresses (RFC 8981), there so that
-    the machine's connections cannot be linked to it, and those not usable,
+    InterfaceAddresses returns the addresses of every interface of this machine
+    that is up, but for the IPv6 ones not to publish, as mDNSResponder's SRP
+    client leaves them out on macOS: temporary addresses (RFC 8981), there so
+    that the machine's connections cannot be linked to it, and those not usable,
     yet or at all (tentative, duplicate, detached), or anycast. Linux and macOS
-    tell them apart (unpublishedIPv6); elsewhere every address is returned.
+    tell them apart (unpublishedIPv6); elsewhere every address of an interface
+    that is up is returned.
 
 func Run(ctx context.Context, path string, opts Options) error
     Run keeps what the template at path describes registered until ctx ends,

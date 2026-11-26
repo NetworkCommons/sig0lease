@@ -112,7 +112,7 @@ services, sent in one registration.
 | Field | Meaning |
 |---|---|
 | `name` | The host label: letters, digits and hyphens, not starting or ending with a hyphen (RFC 952, RFC 1123; BIND refuses other host names by default). Unique in its registrar, ignoring case. |
-| `addresses` | At least one: `auto`, IP addresses, or both. `auto` is this machine's addresses, read again at every poll: a change is registered. It leaves out loopback and link-local addresses, and, on Linux and macOS, IPv6 addresses that are temporary (privacy addresses, RFC 8981), not usable yet or at all (tentative, duplicate, detached) or anycast, as mDNSResponder's SRP client does on macOS; elsewhere temporary addresses are published too. A literal address may be any but unspecified, multicast or zoned (loopback is allowed, for tests). |
+| `addresses` | At least one: `auto`, IP addresses, or both. `auto` is this machine's addresses, read again at every poll: a change is registered. It leaves out the addresses of interfaces that are down (Docker's bridge on Linux keeps its address while no container runs), loopback and link-local addresses, and, on Linux and macOS, IPv6 addresses that are temporary (privacy addresses, RFC 8981), not usable yet or at all (tentative, duplicate, detached) or anycast, as mDNSResponder's SRP client does on macOS; elsewhere temporary addresses are published too. A literal address may be any but unspecified, multicast or zoned (loopback is allowed, for tests). |
 | `services` | The host's services. None: the host is registered alone, with its addresses. |
 | `lease`, `key_lease`, `on_stop` | As in the registrar, for this host only. One that the host does not set is the registrar's. |
 

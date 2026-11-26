@@ -4,6 +4,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"io/fs"
+	"net"
 	"net/netip"
 	"os"
 	"slices"
@@ -15,7 +16,7 @@ import (
 
 // TestInterfaceAddresses_Flags checks InterfaceAddresses against /proc/net/if_inet6, which
 // shows each IPv6 address's flags: a temporary, tentative or duplicate global address is left
-// out, any other kept.
+// out, and so is any address of an interface that is down; any other is kept.
 func TestInterfaceAddresses_Flags(t *testing.T) {
 	got, err := InterfaceAddresses()
 	if err != nil {
@@ -49,8 +50,12 @@ func TestInterfaceAddresses_Flags(t *testing.T) {
 		if !a.IsGlobalUnicast() {
 			continue
 		}
-		if want := flags&unpublished == 0; slices.Contains(got, a) != want {
-			t.Errorf("%s on %s, flags %#x: returned %v, want %v", a, f[5], flags, !want, want)
+		ifi, err := net.InterfaceByName(f[5])
+		if err != nil {
+			t.Fatalf("/proc/net/if_inet6 line %q: %v", line, err)
+		}
+		if want := flags&unpublished == 0 && ifi.Flags&net.FlagUp != 0; slices.Contains(got, a) != want {
+			t.Errorf("%s on %s (%v), flags %#x: returned %v, want %v", a, f[5], ifi.Flags, flags, !want, want)
 		}
 		checked++
 	}
