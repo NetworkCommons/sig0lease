@@ -756,9 +756,27 @@ class FediverseDashboard {
       }
       box.remove();
     }
-    // keep the order, appendChild moves existing nodes
-    for (const box of ordered) {
-      this.boxes.appendChild(box);
+    // keep the order, moving only the boxes that are out of place: moving a
+    // node blurs the element focused in it, e.g. the input of an open form
+    const focused = document.activeElement;
+    const selection = focused && this.boxes.contains(focused) &&
+        typeof focused.selectionStart === 'number' ?
+        [focused.selectionStart, focused.selectionEnd,
+         focused.selectionDirection] :
+        null;
+    ordered.forEach((box, index) => {
+      const current = this.boxes.children[index];
+      if (current !== box) {
+        this.boxes.insertBefore(box, current || null);
+      }
+    });
+    // a box with an open form that had to move gets its focus back
+    if (focused && focused !== document.activeElement &&
+        this.boxes.contains(focused)) {
+      focused.focus({preventScroll: true});
+      if (selection) {
+        focused.setSelectionRange(...selection);
+      }
     }
 
     this.empty.hidden = groups.length > 0;
