@@ -1,0 +1,51 @@
+#!/bin/bash
+
+source ./get_mname.sh
+
+##
+GITDIR=${GITDIR:-"$(git rev-parse --show-toplevel)"}
+DIR=${DIR:-"$(uname | tr '[:upper:]' '[:lower:]')"}
+
+
+# SRP defaults
+DOMAIN=${DOMAIN:-"srp.dev.zenr.io"}
+MNAME=$(get_mname ${DOMAIN})
+DIG_OPTIONS=${DIG_OPTIONS:-"+noall +answer @${MNAME}"}
+
+BROWSE_DIG_OPTIONS=${BROWSE_DIG_OPTIONS:-"${DIG_OPTIONS}"}
+SHORT_DIG_OPTIONS=${SHORT_DIG_OPTIONS:-"+short ${DIG_OPTIONS}"}
+
+# set DNS RFC9664 lease test defaults
+KEYLEASE=${KEYLEASE:-"600"}
+LEASE=${LEASE:-"300"}
+
+# set wg Service Host description defaults
+SERVER_HOSTNAME=${SERVER_HOSTNAME:-"vpn"}
+SERVER_HOST_IP=${SERVER_HOST_IP:-"128.140.34.230"}
+VPN_INTERFACE=${VPN_INTERFACE:-"wg1"}
+
+# WG server Service Description defaults
+SERVER_SERVICE_NAME="wgservice"
+SERVER_SD_TYPE="_wg._udp"
+
+# Set WG Service Instructions Details
+SERVER_LISTENPORT=${SERVER_LISTENPORT:-"51820"} # SRV port
+SERVER_NETWORK=${SERVER_NETWORK:-"10.0.0.0/27"}
+SERVER_PUBKEY=${SERVER_PUBKEY:-"dLAovvPP0LQ8ZBgbAw4tkVb3wuqZyS9HFFutsAz+ezA="}
+
+# set WG client request service type
+REQ_SERVICE_TYPE=${REQ_SERVICE_TYPE:-"_wgpeer._udp"}
+
+# service name to provide config to ...
+ANS_SERVICE_TYPE=${ANS_SERVICE_TYPE:-"_wgcfg._udp"}
+
+# service name to monitor requests for
+REQ_SERVICE_NAME=${SERVER_SERVICE_NAME:-"myservice"}
+
+#
+# MANUEL RESET FOR NON-VPN SERVER TESTING RUNS
+#
+#
+#VPN_SERVER_IP="172.16.30.1"
+VPN_SERVER_IP="10.0.0.1"
+
