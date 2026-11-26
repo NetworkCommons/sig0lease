@@ -23,6 +23,12 @@
 //	                                           {authoritative, records: [{name, type, ttl,
 //	                                           data}]}; a name the proxy does not serve goes
 //	                                           to fallback, and authoritative is false
+//	sig0lease.register({doh, domain, host, addresses, instances, lease, keyLease, key})
+//	                                           registers an SRP host once at the SRP
+//	                                           registrar doh, without start or refresh
+//	                                           (RegisterRequest; with remove, withdraws it):
+//	                                           {registered, conflict, key}
+//	sig0lease.newKey(name)                      a fresh key for register: {public, private}
 //
 // The browser's localStorage keeps the name's key and the claim. A question the proxy refuses
 // as a name it does not serve goes to fallback, Google's public resolver, which any page may
@@ -78,6 +84,8 @@ func main() {
 		"release": call(func(p *web.Page, _ []js.Value) (any, error) {
 			return nil, p.Release()
 		}),
+		"register": js.FuncOf(registerFunc),
+		"newKey":   js.FuncOf(newKeyFunc),
 		"lookup": js.FuncOf(func(_ js.Value, args []js.Value) any {
 			return promise(func() (any, error) {
 				return lookup(context.Background(), arg(args, 0), arg(args, 1), arg(args, 2))

@@ -19,8 +19,15 @@
         // DNS-over-HTTPS server of the sig0lease proxy, which answers its
         // zones from their authoritative server: `?doh=<url>`, by default
         // the origin the dashboard is served from (as on the registrar)
-        const DOH = new URLSearchParams(location.search).get('doh') ||
-            location.origin
+        const DOH = new URLSearchParams(location.search).get('doh')
+        // when no `?doh=` is given and the origin is no DoH server (a static
+        // web server, a file:// page): the sig0lease proxies asked for a zone
+        // that is, or is under, `domain`, if they answer DoH ...
+        const ZONE_DOH = [
+            {domain: 'zenr.io', doh: 'https://sig0lease.dev.zenr.io'},
+        ]
+        // ... and else a public resolver, whose answers may be cached
+        const PUBLIC_DOH = 'https://1.1.1.1'
         let dashboard = null
 
         /// zone from the URL hash, or the default zone
@@ -32,7 +39,7 @@
         // start the dashboard when WASM is ready
         window.addEventListener('wasm_ready', function(){
             console.log('WASM is ready')
-            dashboard = new Dashboard(DOH)
+            dashboard = new Dashboard(DOH, ZONE_DOH, PUBLIC_DOH)
             dashboard.set_zone(document.getElementById('zone').value)
         })
 
@@ -91,11 +98,13 @@
             <span id="status-text">Loading WASM …</span>
             <span id="dnssec" title="zone is DNSSEC signed" hidden><span class="fa-solid fa-shield-halved"></span> DNSSEC</span>
         </div>
+        <div id="filters" role="group" aria-label="show or hide service types" hidden></div>
     </header>
 
     <main>
         <div id="boxes"></div>
         <p id="empty" hidden>No DNS-SD service types are registered under this zone.</p>
+        <p id="all-hidden" hidden>All service types are hidden. Click a tag above to show it again.</p>
     </main>
 
     <!-- Templates -->

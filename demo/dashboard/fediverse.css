@@ -1,0 +1,623 @@
+/* sig0lease Fediverse DNS-SD Dashboard CSS */
+
+:root {
+    --bg: #ffffff;
+    --surface: #ffffff;
+    --fg: #000000;
+    --muted: #666666;
+    --line: #cccccc;
+    --line-strong: #000000;
+    --hover: #efefef;
+    --chip: #f0f0f0;
+    --ok: #1a7f37;
+    --error: #c62828;
+    /* share of the service color in box backgrounds */
+    --tint: 9%;
+    --tint-strong: 20%;
+}
+
+@media (prefers-color-scheme: dark) {
+    :root {
+        --bg: #111111;
+        --surface: #181818;
+        --fg: #eeeeee;
+        --muted: #999999;
+        --line: #333333;
+        --line-strong: #888888;
+        --hover: #222222;
+        --chip: #262626;
+        --ok: #4ac26b;
+        --error: #ff6b6b;
+        --tint: 16%;
+        --tint-strong: 28%;
+    }
+}
+
+* {
+    box-sizing: border-box;
+}
+
+[hidden] {
+    display: none !important;
+}
+
+body {
+    background-color: var(--bg);
+    color: var(--fg);
+    font-family: Arial, Helvetica, sans-serif;
+    font-size: 1rem;
+    margin: 0;
+    padding: 0;
+}
+
+a {
+    color: inherit;
+}
+
+/* header */
+header {
+    position: sticky;
+    top: 0;
+    z-index: 1;
+    background-color: var(--bg);
+    border-bottom: 1px solid var(--line-strong);
+    padding: 0.75rem 1rem 0.5rem;
+}
+
+header .bar {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 0.5rem 1.5rem;
+}
+
+h1 {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    font-size: 1.25rem;
+    margin: 0;
+}
+
+h1 .logo {
+    width: 1.8rem;
+    height: 1.8rem;
+}
+
+code {
+    font-family: ui-monospace, Menlo, Consolas, monospace;
+}
+
+.zone-form {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    flex: 1 1 16rem;
+    min-width: 0;
+    max-width: 36rem;
+}
+
+.zone-form label {
+    color: var(--muted);
+}
+
+.zone-form input {
+    flex: 1;
+    min-width: 0;
+    font: inherit;
+    padding: 0.3em 0.6em;
+    border: 0.1rem solid var(--line-strong);
+    border-radius: 0.9em;
+    background-color: var(--surface);
+    color: var(--fg);
+}
+
+.zone-form input:invalid:not(:placeholder-shown) {
+    border-color: var(--error);
+}
+
+button {
+    font: inherit;
+    color: inherit;
+    padding: 0.3em 0.9em;
+    border-radius: 0.9em;
+    border: solid 0.1rem var(--line-strong);
+    background-color: inherit;
+    cursor: pointer;
+    white-space: nowrap;
+}
+
+button:hover {
+    background-color: var(--hover);
+}
+
+/* status line */
+#status {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    margin-top: 0.5rem;
+    font-size: 0.85rem;
+    color: var(--muted);
+}
+
+#status .dot {
+    width: 0.6rem;
+    height: 0.6rem;
+    border-radius: 50%;
+    background-color: var(--muted);
+    flex: none;
+}
+
+#status[data-state="ok"] .dot {
+    background-color: var(--ok);
+}
+
+#status[data-state="error"] .dot {
+    background-color: var(--error);
+}
+
+#status[data-state="error"] {
+    color: var(--error);
+}
+
+#status[data-state="loading"] .dot {
+    animation: pulse 1s infinite alternate;
+}
+
+#seed {
+    padding-left: 0.5rem;
+    border-left: 1px solid var(--line);
+}
+
+#seed[data-state="loading"] {
+    animation: pulse 1s infinite alternate;
+}
+
+#seed[data-state="waiting"] {
+    color: var(--muted);
+    font-style: italic;
+}
+
+#seed[data-state="error"] {
+    color: var(--error);
+}
+
+#dnssec {
+    margin-left: auto;
+    color: var(--ok);
+}
+
+@keyframes pulse {
+    to {
+        opacity: 0.2;
+    }
+}
+
+/* service type boxes */
+main {
+    padding: 1rem;
+}
+
+/* masonry-like columns, so tall boxes don't leave gaps */
+#boxes {
+    columns: 20rem;
+    column-gap: 1rem;
+}
+
+.box {
+    --accent: #546e7a;
+    --on-accent: #ffffff;
+    break-inside: avoid;
+    margin-bottom: 1rem;
+    background-color: color-mix(in srgb, var(--accent) var(--tint), var(--surface));
+    border: 2px solid var(--accent);
+    border-radius: 0.6rem;
+    overflow: hidden;
+}
+
+/* title row, colored per service via --accent and --on-accent */
+.box .title {
+    display: flex;
+    align-items: center;
+    gap: 0.85rem;
+    padding: 0.8rem 0.85rem;
+    background-color: var(--accent);
+    background-image: linear-gradient(135deg, rgba(255, 255, 255, 0.14), rgba(0, 0, 0, 0.12));
+    color: var(--on-accent);
+}
+
+.box .service-icon {
+    flex: none;
+    display: grid;
+    place-items: center;
+    width: 3.2rem;
+    height: 3.2rem;
+    border-radius: 0.7rem;
+    padding: 0.35rem;
+    font-size: 1.8rem;
+    color: var(--accent);
+    background-color: #ffffff;
+    box-shadow: 0 1px 3px rgba(0, 0, 0, 0.25);
+}
+
+/* project logos keep their own colors */
+.box .service-icon img {
+    display: block;
+    width: 100%;
+    height: 100%;
+    object-fit: contain;
+}
+
+.box .heading {
+    flex: 1;
+    min-width: 0;
+}
+
+.box h2 {
+    font-size: 1.5rem;
+    line-height: 1.2;
+    margin: 0;
+    overflow-wrap: anywhere;
+}
+
+.box .type {
+    display: flex;
+    align-items: baseline;
+    gap: 0.4rem;
+    margin-top: 0.2rem;
+    font-size: 0.95rem;
+    opacity: 0.85;
+}
+
+.box .type .service {
+    font-family: ui-monospace, Menlo, Consolas, monospace;
+    overflow-wrap: anywhere;
+}
+
+.box .type .subtype {
+    font-size: 0.8rem;
+    font-weight: bold;
+    padding: 0.05em 0.45em;
+    overflow-wrap: anywhere;
+    border: 1px solid color-mix(in srgb, var(--on-accent) 60%, transparent);
+    border-radius: 0.3em;
+}
+
+.box .title .count {
+    flex: none;
+    font-size: 1rem;
+    font-weight: bold;
+    min-width: 1.8em;
+    text-align: center;
+    padding: 0.15em 0.55em;
+    border-radius: 1em;
+    background-color: var(--on-accent);
+    color: var(--accent);
+}
+
+/* embedded SVG icon, colored like the surrounding text */
+.svg-icon {
+    display: inline-block;
+    width: 1em;
+    height: 1em;
+    line-height: 1;
+    vertical-align: -0.125em;
+}
+
+.svg-icon svg {
+    display: block;
+    width: 100%;
+    height: 100%;
+}
+
+.box .fqdn {
+    font-size: 0.75rem;
+    color: var(--muted);
+    padding: 0.35rem 0.75rem;
+    border-bottom: 1px solid color-mix(in srgb, var(--accent) 35%, var(--surface));
+    overflow-wrap: anywhere;
+}
+
+.box ul {
+    list-style-type: none;
+    margin: 0;
+    padding: 0;
+}
+
+/* service instances */
+.entry {
+    padding: 0.5rem 0.75rem;
+    border-bottom: 1px solid color-mix(in srgb, var(--accent) 25%, var(--surface));
+}
+
+.entry:last-child {
+    border-bottom: none;
+}
+
+.entry:hover {
+    background-color: color-mix(in srgb, var(--accent) var(--tint-strong), var(--surface));
+}
+
+.entry .label {
+    font-weight: bold;
+    overflow-wrap: anywhere;
+}
+
+/* the favicon spans both rows of the head: label and URL */
+.entry .head {
+    display: grid;
+    grid-template-columns: auto 1fr;
+    column-gap: 0.6rem;
+    align-items: center;
+}
+
+.entry .head .icon {
+    grid-row: 1 / span 2;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    width: 2.4rem;
+    height: 2.4rem;
+    padding: 0.2rem;
+    box-sizing: border-box;
+    border-radius: 0.4em;
+    font-size: 1.4rem;
+    color: var(--accent);
+    /* logos keep their colors, also black ones in dark mode */
+    background-color: #ffffff;
+}
+
+.entry .head .icon img {
+    display: block;
+    width: 100%;
+    height: 100%;
+    object-fit: contain;
+}
+
+.entry .head .label,
+.entry .head .link {
+    grid-column: 2;
+    min-width: 0;
+}
+
+/* lease on the left, the buttons together on the right */
+.entry .actions {
+    display: flex;
+    align-items: center;
+    justify-content: flex-end;
+    gap: 0.5rem;
+    margin-top: 0.3rem;
+}
+
+/* add and edit: small buttons in the project color */
+.box .add-button,
+.entry .edit-button,
+.instance-form button {
+    font-size: 0.8rem;
+    padding: 0.15em 0.7em;
+    border-color: var(--accent);
+}
+
+.entry .edit-button {
+    flex: none;
+}
+
+/* folds the details of an entry out and in */
+.entry .details-button {
+    flex: none;
+    align-self: center;
+    font-size: 0.8rem;
+    padding: 0.15em 0.45em;
+    border-color: transparent;
+    background: none;
+    color: var(--muted);
+}
+
+.entry .details-button:hover {
+    border-color: var(--accent);
+    background-color: color-mix(in srgb, var(--accent) var(--tint-strong), var(--surface));
+}
+
+.entry .details-button .fa-chevron-down {
+    transition: transform 0.15s ease-out;
+}
+
+.entry .details-button[aria-expanded="true"] .fa-chevron-down {
+    transform: rotate(180deg);
+}
+
+.entry .details {
+    display: grid;
+    grid-template-columns: auto 1fr;
+    gap: 0.25rem 0.6rem;
+    align-items: baseline;
+    margin: 0.4rem 0 0;
+    padding: 0.4rem 0.5rem;
+    border-radius: 0.4em;
+    background-color: color-mix(in srgb, var(--accent) var(--tint), var(--surface));
+}
+
+.entry .details[hidden],
+.entry .details [hidden] {
+    display: none;
+}
+
+.entry .details dt {
+    font-size: 0.75rem;
+    font-weight: bold;
+    color: var(--muted);
+}
+
+.entry .details dd {
+    margin: 0;
+    min-width: 0;
+}
+
+.entry .instance-name {
+    font-size: 0.8rem;
+    font-family: ui-monospace, Menlo, Consolas, monospace;
+    color: var(--muted);
+    overflow-wrap: anywhere;
+}
+
+/* remaining lease of an entry this browser registered: a countdown and a
+   clock whose sector is the part of the lease that is left */
+.entry .lease {
+    flex: none;
+    margin-right: auto;
+    display: inline-flex;
+    align-items: center;
+    gap: 0.3em;
+    font-size: 0.8rem;
+    font-variant-numeric: tabular-nums;
+    color: var(--muted);
+    align-self: center;
+}
+
+.entry .lease[hidden] {
+    display: none;
+}
+
+.lease-clock {
+    width: 1.1rem;
+    height: 1.1rem;
+}
+
+.lease-face {
+    fill: color-mix(in srgb, var(--accent) 12%, var(--surface));
+    stroke: var(--accent);
+    stroke-width: 1.5;
+}
+
+.lease-left {
+    fill: none;
+    stroke: var(--accent);
+    stroke-width: 9;
+}
+
+.lease-hand {
+    stroke: var(--muted);
+    stroke-width: 1.2;
+    stroke-linecap: round;
+}
+
+.entry .lease.ending {
+    color: #c62828;
+}
+
+.lease.ending .lease-left {
+    stroke: #c62828;
+}
+
+.box .add-button:hover,
+.entry .edit-button:hover,
+.instance-form button:hover {
+    background-color: color-mix(in srgb, var(--accent) var(--tint-strong), var(--surface));
+}
+
+.box-actions {
+    padding: 0.5rem 0.75rem;
+    border-top: 1px solid color-mix(in srgb, var(--accent) 25%, var(--surface));
+}
+
+.instance-form {
+    display: flex;
+    flex-direction: column;
+    gap: 0.4rem;
+    margin-top: 0.5rem;
+}
+
+.instance-form input,
+.instance-form select {
+    font: inherit;
+    font-size: 0.9rem;
+    padding: 0.25em 0.5em;
+    border: 1px solid var(--accent);
+    border-radius: 0.4em;
+    background-color: var(--surface);
+    color: var(--fg);
+    min-width: 0;
+}
+
+.instance-form .form-buttons {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.4rem;
+}
+
+.instance-form .remove {
+    color: var(--error);
+}
+
+.instance-form .form-message {
+    font-size: 0.8rem;
+    color: var(--muted);
+}
+
+.instance-form .form-message:empty {
+    display: none;
+}
+
+.instance-form .form-message.error {
+    color: var(--error);
+}
+
+.entry .link {
+    display: block;
+    margin-top: 0.1rem;
+    font-size: 0.9rem;
+    overflow-wrap: anywhere;
+}
+
+.entry .link[hidden] {
+    display: none;
+}
+
+.entry .targets {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0 0.75rem;
+    font-size: 0.8rem;
+    font-family: ui-monospace, Menlo, Consolas, monospace;
+    color: var(--muted);
+}
+
+.entry .target {
+    overflow-wrap: anywhere;
+}
+
+.entry .target.missing {
+    font-family: inherit;
+    font-style: italic;
+}
+
+.entry .txt {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.25rem;
+}
+
+.entry .txt:empty {
+    display: none;
+}
+
+.entry .txt span {
+    font-size: 0.75rem;
+    padding: 0.1em 0.45em;
+    border-radius: 0.3em;
+    background-color: color-mix(in srgb, var(--accent) var(--tint-strong), var(--surface));
+    overflow-wrap: anywhere;
+}
+
+.box li.none {
+    padding: 0.5rem 0.75rem;
+    color: var(--muted);
+    font-style: italic;
+}
+
+#empty {
+    color: var(--muted);
+    text-align: center;
+    margin: 10vh 0;
+}
