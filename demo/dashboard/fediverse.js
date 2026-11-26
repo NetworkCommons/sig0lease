@@ -266,6 +266,9 @@ class FediverseDashboard {
     this.known = new Map();
     // keys of the boxes shown so far, to highlight only new projects
     this.known_boxes = new Set();
+    // names of the instances whose details are folded out, kept when their
+    // box is drawn again
+    this.expanded = new Set();
     // nothing is highlighted on the first render of a zone
     this.first_render = true;
 
@@ -350,6 +353,7 @@ class FediverseDashboard {
     this.seen.clear();
     this.known.clear();
     this.known_boxes.clear();
+    this.expanded.clear();
     this.first_render = true;
     this.boxes.replaceChildren();
     this.empty.hidden = true;
@@ -951,7 +955,8 @@ class FediverseDashboard {
     if (link) {
       link_node.href = link;
       link_node.querySelector('.url').textContent = link;
-      link_node.querySelector('.icon').appendChild(create_logo(appearance));
+      link_node.querySelector('.icon').appendChild(
+          create_favicon(link, appearance));
       link_node.hidden = false;
     }
 
@@ -1009,6 +1014,28 @@ class FediverseDashboard {
       span.textContent = entry;
       txt_node.appendChild(span);
     }
+    if (!txt_node.firstChild) {
+      txt_node.hidden = true;
+      li.querySelector('.txt-title').hidden = true;
+    }
+
+    // the instance name, SRV and TXT records fold out
+    li.querySelector('.instance-name').textContent = instance.name;
+    const details = li.querySelector('.details');
+    const toggle = li.querySelector('.details-button');
+    const show_details = (open) => {
+      details.hidden = !open;
+      toggle.setAttribute('aria-expanded', String(open));
+      toggle.title = (open ? 'hide' : 'show') +
+          ' the SRV and TXT records of this entry';
+      if (open) {
+        this.expanded.add(instance.name);
+      } else {
+        this.expanded.delete(instance.name);
+      }
+    };
+    show_details(this.expanded.has(instance.name));
+    toggle.addEventListener('click', () => show_details(details.hidden));
 
     return li;
   }
@@ -1032,6 +1059,49 @@ function create_logo(appearance) {
   img.alt = '';
   img.loading = 'lazy';
   return img;
+}
+
+/// favicon URLs of the sites already tried: origin -> URL, or null if the
+/// site has none, so re-rendered entries show their icon at once
+const favicons = new Map();
+
+/// the favicon of the site `link` points to, the logo of `appearance`
+/// until it has loaded, and if the site has none
+function create_favicon(link, appearance) {
+  const logo = create_logo(appearance);
+  let origin;
+  try {
+    origin = new URL(link).origin;
+  } catch (e) {
+    return logo;
+  }
+  const known = favicons.get(origin);
+  if (known === null) {
+    return logo;
+  }
+  const src = known || origin + '/favicon.ico';
+  const img = document.createElement('img');
+  img.alt = '';
+  if (known) {
+    img.src = src;
+    return img;
+  }
+  // a cross-origin image loads without CORS; swap it in once it did
+  const probe = new Image();
+  probe.onload = function() {
+    if (probe.naturalWidth > 0) {
+      favicons.set(origin, src);
+      img.src = src;
+      logo.replaceWith(img);
+    } else {
+      favicons.set(origin, null);
+    }
+  };
+  probe.onerror = function() {
+    favicons.set(origin, null);
+  };
+  probe.src = src;
+  return logo;
 }
 
 /// the localStorage name of the entry at host label `host` in `zone`

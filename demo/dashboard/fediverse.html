@@ -160,13 +160,20 @@
                     <span class="lease-time"></span>
                 </span>
                 <button type="button" class="edit-button" title="this browser registered this entry and can change it" hidden><span class="fa-solid fa-pen"></span></button>
+                <button type="button" class="details-button" title="show the SRV and TXT records of this entry" aria-expanded="false"><span class="fa-solid fa-chevron-down"></span></button>
             </div>
             <a class="link" href="" target="_blank" rel="noopener noreferrer" hidden>
                 <span class="icon"></span>
                 <span class="url"></span>
             </a>
-            <div class="targets"></div>
-            <div class="txt"></div>
+            <dl class="details" hidden>
+                <dt>Name</dt>
+                <dd class="instance-name"></dd>
+                <dt>SRV</dt>
+                <dd class="targets"></dd>
+                <dt class="txt-title">TXT</dt>
+                <dd class="txt"></dd>
+            </dl>
         </li>
     </template>
 </body>
