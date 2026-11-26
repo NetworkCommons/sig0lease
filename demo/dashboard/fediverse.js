@@ -260,17 +260,9 @@ class FediverseDashboard {
     this.members = new Map();
     // all instance names of the last refresh, to notice new instances
     this.seen = new Set();
-    // instance name -> content (project, SRV and TXT records) last shown,
-    // kept while an instance is briefly gone, to highlight only new entries
-    // and entries whose content changed, not re-registrations of the same
-    this.known = new Map();
-    // keys of the boxes shown so far, to highlight only new projects
-    this.known_boxes = new Set();
     // names of the instances whose details are folded out, kept when their
     // box is drawn again
     this.expanded = new Set();
-    // nothing is highlighted on the first render of a zone
-    this.first_render = true;
 
     this.boxes = document.getElementById('boxes');
     this.status = document.getElementById('status');
@@ -351,10 +343,7 @@ class FediverseDashboard {
     this.refreshes = 0;
     this.members.clear();
     this.seen.clear();
-    this.known.clear();
-    this.known_boxes.clear();
     this.expanded.clear();
-    this.first_render = true;
     this.boxes.replaceChildren();
     this.empty.hidden = true;
     this.dnssec.hidden = true;
@@ -737,8 +726,6 @@ class FediverseDashboard {
       existing.set(box.dataset.key, box);
     }
 
-    const initial = this.first_render;
-    this.first_render = false;
     const ordered = [];
     for (const group of groups) {
       const signature = JSON.stringify([
@@ -751,8 +738,7 @@ class FediverseDashboard {
       // a box with an open form stays until the form closes
       const editing = box && box.querySelector('.instance-form');
       if (!editing && (!box || box.dataset.signature !== signature)) {
-        const fresh = this.create_box(
-            group, !initial && !this.known_boxes.has(group.key), initial);
+        const fresh = this.create_box(group);
         fresh.dataset.signature = signature;
         if (box) {
           box.replaceWith(fresh);
@@ -779,13 +765,9 @@ class FediverseDashboard {
   }
 
   /// create a project box
-  create_box(group, is_new_box, initial) {
+  create_box(group) {
     const box = clone_template('box-template');
     box.dataset.key = group.key;
-    this.known_boxes.add(group.key);
-    if (is_new_box) {
-      box.classList.add('new');
-    }
 
     // title row: project logo, name and accent color
     const appearance = this.projects.appearance(group.label);
@@ -804,19 +786,9 @@ class FediverseDashboard {
     box.querySelector('.count').textContent = group.instances.length;
     box.querySelector('.fqdn').textContent = group.owner;
 
-    // highlight the entries that are new or whose content changed since
-    // they were last shown; a re-registration of the same content is not
     const ul = box.querySelector('.entries');
     for (const instance of group.instances) {
-      const li = this.create_entry(instance, appearance);
-      const content = JSON.stringify(
-          [group.key, instance.srv, txt_strings(instance.txt)]);
-      const previous = this.known.get(instance.name);
-      if (!initial && previous !== content) {
-        li.classList.add('new');
-      }
-      this.known.set(instance.name, content);
-      ul.appendChild(li);
+      ul.appendChild(this.create_entry(instance, appearance));
     }
 
     // a new entry in this box's project

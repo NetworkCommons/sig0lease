@@ -11,7 +11,6 @@
     --chip: #f0f0f0;
     --ok: #1a7f37;
     --error: #c62828;
-    --new: #fff3bf;
     /* share of the service color in box backgrounds */
     --tint: 9%;
     --tint-strong: 20%;
@@ -29,7 +28,6 @@
         --chip: #262626;
         --ok: #4ac26b;
         --error: #ff6b6b;
-        --new: #4a3f10;
         --tint: 16%;
         --tint-strong: 28%;
     }
@@ -218,10 +216,6 @@ main {
     overflow: hidden;
 }
 
-.box.new {
-    animation: highlight 3s ease-out;
-}
-
 /* title row, colored per service via --accent and --on-accent */
 .box .title {
     display: flex;
@@ -343,10 +337,6 @@ main {
 
 .entry:hover {
     background-color: color-mix(in srgb, var(--accent) var(--tint-strong), var(--surface));
-}
-
-.entry.new {
-    animation: highlight 3s ease-out;
 }
 
 .entry .label {
@@ -630,10 +620,4 @@ main {
     color: var(--muted);
     text-align: center;
     margin: 10vh 0;
-}
-
-@keyframes highlight {
-    from {
-        background-color: var(--new);
-    }
 }
