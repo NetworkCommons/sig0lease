@@ -42,13 +42,13 @@ done
 IP_FREE_ARRAY=("${NEW_FREE_ARRAY[@]}")
 unset NEW_FREE_ARRAY
 
-echo "VPN Server IP: ${VPN_SERVER_IP}"
-echo "VPN Free Array: ${IP_FREE_ARRAY[@]} (${#IP_FREE_ARRAY[@]} free addresses)"
-sleep 5
-if [[ -n ${TEST_IP_FREE_ARRAY} ]]; then
-	exit
-fi
-
+# echo "VPN Server IP: ${VPN_SERVER_IP}"
+# echo "VPN Free Array: ${IP_FREE_ARRAY[@]} (${#IP_FREE_ARRAY[@]} free addresses)"
+# sleep 5
+# if [[ -n ${TEST_IP_FREE_ARRAY} ]]; then
+# 	exit
+# fi
+#
 
 
 
@@ -94,15 +94,14 @@ do
         echo
     done
 
- #    echo "== *ALL* WIREGUARD SERVICE CLIENT_REQUESTS for all instances in ${DOMAIN}"
- #    CLIENT_REQUESTS=`dig ${SHORT_DIG_OPTIONS} ${REQ_SERVICE_TYPE}.${DOMAIN} PTR | grep -v RRSIG | grep -v NSEC`
- #    echo "${CLIENT_REQUESTS}"
- #    echo
+    #    echo "== *ALL* WIREGUARD SERVICE CLIENT_REQUESTS for all instances in ${DOMAIN}"
+    #    CLIENT_REQUESTS=`dig ${SHORT_DIG_OPTIONS} ${REQ_SERVICE_TYPE}.${DOMAIN} PTR | grep -v RRSIG | grep -v NSEC`
+    #    echo "${CLIENT_REQUESTS}"
+    #    echo
 
     echo "== WIREGUARD SERVICE CLIENT_REQUESTS (_wgpeer._udp) for my Service Instance (subtype) '${SERVER_SERVICE_NAME}' in ${DOMAIN}"
     CLIENT_REQUESTS_SUB=`dig ${SHORT_DIG_OPTIONS} ${REQ_SERVICE_NAME}._sub.${REQ_SERVICE_TYPE}.${DOMAIN} PTR | grep -v RRSIG | grep -v NSEC`
     CLIENT_LOOP="${CLIENT_REQUESTS_SUB//$'\n'/ }" # substitute new line for space in list for looping ...
-    #echo "CLIENT_LOOP=${CLIENT_LOOP}"
     for client in $(echo ${CLIENT_LOOP})
       do
           # echo "get_WGPEER_attribute ${client%%.*} ${SERVER_SERVICE_NAME} ${DOMAIN} pk"
@@ -110,6 +109,13 @@ do
           echo -e " ${client%%.*}:\tCi_REQ: client pk = ${CLIENT_PUBLIC_KEY}"
       done
     #
+
+    # wg_peerlist="$(wg | grep peer: | cut -d' ' -f2-)"
+    # for i in ${wg_peerlist}
+    # do
+    #         echo "$i: "
+    # done
+    # # exit
 
     echo
     echo
@@ -151,8 +157,8 @@ do
 	      break
 	    fi
 
-	    # TEST DATA (DEBUG)
-            WG_CLIENT_NET="172.16.0.0/24"
+            #WG_CLIENT_NET="172.16.0.0/24" # DUMMY TEST ROUTED NETWORK
+            WG_CLIENT_NET="10.0.0.0/27" # DUMMY TEST ROUTED NETWORK
             CLIENT_KEYSTORE_DIR="${GITDIR}/keystore/client" ${GITDIR}/bin/${DIR}/sig0lease-srp-client \
               -domain="${DOMAIN}" \
               -host="${SERVER_HOSTNAME}" \
@@ -165,6 +171,13 @@ do
               -txt="${SERVER_SERVICE_NAME}-${Ci%%.*}:allowed=${WG_CLIENT_NET}" \
               -lease=${LEASE} -keylease=${KEYLEASE} \
               -keystore="${GITDIR}/keystore/client" -k=15 -once
+            # new
+	    client_pk="$( get_WGPEER_attribute ${Ci%%.*} ${SERVER_SERVICE_NAME} ${DOMAIN} pk)"
+	    # echo " ************* client_pk= ${client_pk}"
+	    echo "wg set ${VPN_INTERFACE} peer ${client_pk} allowed-ips ${WG_CLIENT_IP}"
+	    wg set ${VPN_INTERFACE} peer ${client_pk} allowed-ips ${WG_CLIENT_IP}/27
+	    # $( get_WGPEER_attribute ${Ci%%.*} ${SERVER_SERVICE_NAME} ${DOMAIN} )"
+	    # exit
           fi
         fi
         echo -e " ${Ci%%.*}:\tCi_CFG: ${Ci_CFG}"
@@ -173,6 +186,7 @@ do
 
     echo
     echo "====="
+    # wg | grep peer: | cut -d' ' -f2-
     sleep 10
     clear
     date
