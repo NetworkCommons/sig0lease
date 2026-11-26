@@ -6,7 +6,7 @@
 /// one at most each SEED_INTERVAL, in this order:
 ///   1. what the visitor asks for: add, edit or remove an entry
 ///   2. renewals: each entry this browser keeps (has the key for) is
-///      registered again when 80 to 85% of its LEASE has passed
+///      registered again when RENEW_AT (80%) of its LEASE has passed
 ///   3. seeding: each instance of INSTANCES_JSON that the zone does not have
 ///      yet (when the page asks for it)
 ///
@@ -192,7 +192,7 @@ async function start({entries: kept, seed}) {
   for (const [storage_key, entry] of Object.entries(kept)) {
     entries.set(storage_key, {
       ...entry,
-      // a kept entry is renewed at 80 to 85% of its lease, at once when
+      // a kept entry is renewed at 80% of its lease, at once when
       // that is past or unknown; one without URL is only a key
       due: !entry.url ? Infinity :
           entry.registered ? renewal_time(entry.registered) :
@@ -216,10 +216,10 @@ async function start({entries: kept, seed}) {
   await work();
 }
 
-/// when to renew an entry registered at `registered`: after 80 to 85% of
-/// LEASE, at random, so that entries registered together spread out
+/// when to renew an entry registered at `registered`: after RENEW_AT (80%)
+/// of LEASE
 function renewal_time(registered) {
-  return registered + LEASE * 1000 * (0.8 + 0.05 * Math.random());
+  return registered + LEASE * 1000 * RENEW_AT;
 }
 
 /// run the jobs, the most urgent first; queue the renewals that are due
