@@ -160,6 +160,63 @@ button:hover {
     color: var(--ok);
 }
 
+/* service type filter tags */
+#filters {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.35rem;
+    margin-top: 0.5rem;
+}
+
+#filters .filter {
+    --accent: #546e7a;
+    --on-accent: #ffffff;
+    display: inline-flex;
+    align-items: center;
+    gap: 0.4em;
+    font-size: 0.85rem;
+    padding: 0.2em 0.35em 0.2em 0.7em;
+    border: 2px solid var(--accent);
+    background-color: var(--accent);
+    color: var(--on-accent);
+}
+
+#filters .filter:hover {
+    filter: brightness(1.08);
+}
+
+#filters .filter:focus-visible {
+    outline: 2px solid var(--fg);
+    outline-offset: 2px;
+}
+
+#filters .filter .filter-count {
+    font-size: 0.75rem;
+    font-weight: bold;
+    min-width: 1.6em;
+    text-align: center;
+    padding: 0 0.4em;
+    border-radius: 1em;
+    background-color: var(--on-accent);
+    color: var(--accent);
+}
+
+/* hidden service type: outlined and struck through */
+#filters .filter[aria-pressed="false"] {
+    background-color: transparent;
+    color: var(--muted);
+    border-style: dashed;
+}
+
+#filters .filter[aria-pressed="false"] .filter-name {
+    text-decoration: line-through;
+}
+
+#filters .filter[aria-pressed="false"] .filter-count {
+    background-color: var(--chip);
+    color: var(--muted);
+}
+
 @keyframes pulse {
     to {
         opacity: 0.2;
@@ -373,7 +430,8 @@ main {
     font-style: italic;
 }
 
-#empty {
+#empty,
+#all-hidden {
     color: var(--muted);
     text-align: center;
     margin: 10vh 0;

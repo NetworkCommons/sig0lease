@@ -9,6 +9,8 @@
 ///   <service instance> SRV + TXT       -> instance details
 
 const REFRESH_INTERVAL = 5000;
+// localStorage key of the service types the user has hidden
+const HIDDEN_STORAGE_KEY = 'dashboard.hidden_services';
 
 class Dashboard {
   /// `doh` is the DNS-over-HTTPS server of the sig0lease proxy all queries go
@@ -38,6 +40,13 @@ class Dashboard {
     this.status_text = document.getElementById('status-text');
     this.dnssec = document.getElementById('dnssec');
     this.empty = document.getElementById('empty');
+    this.all_hidden = document.getElementById('all-hidden');
+    this.filters = document.getElementById('filters');
+    // service types (`_service._protocol`) hidden by the user, kept across
+    // zones and visits
+    this.hidden = load_hidden();
+    // last rendered service type list, to only rebuild changed filter tags
+    this.filter_signature = null;
   }
 
   /// start watching a zone
@@ -54,7 +63,11 @@ class Dashboard {
     this.known.clear();
     this.first_render = true;
     this.boxes.replaceChildren();
+    this.filters.replaceChildren();
+    this.filters.hidden = true;
+    this.filter_signature = null;
     this.empty.hidden = true;
+    this.all_hidden.hidden = true;
     this.dnssec.hidden = true;
     this.set_status('loading', 'Loading ' + zone + ' …');
     document.title = zone + ' · DNS-SD Dashboard';
@@ -209,13 +222,89 @@ class Dashboard {
       this.boxes.appendChild(box);
     }
 
+    this.render_filters(types);
+    this.apply_filters();
     this.empty.hidden = types.length > 0;
+  }
+
+  /// update the header tags, one per service type of the zone, which toggle
+  /// the display of that service type
+  render_filters(types) {
+    const signature = JSON.stringify(
+        types.map(t => [service_key(t.service), t.instances.length]));
+    if (signature === this.filter_signature) {
+      return;
+    }
+    this.filter_signature = signature;
+
+    // service types can appear in several boxes, e.g. under subdomains
+    const tags = new Map();
+    for (const type of types) {
+      const key = service_key(type.service);
+      const tag = tags.get(key);
+      if (tag) {
+        tag.count += type.instances.length;
+      } else {
+        tags.set(key, {service: type.service, count: type.instances.length});
+      }
+    }
+
+    const buttons = [];
+    for (const [key, tag] of tags) {
+      const appearance = this.service_info.appearance(tag.service.service);
+      const button = document.createElement('button');
+      button.type = 'button';
+      button.className = 'filter';
+      button.dataset.key = key;
+      button.style.setProperty('--accent', appearance.color);
+      button.style.setProperty('--on-accent', appearance.on_color);
+      button.title = key + ' · ' + plural(tag.count, 'instance');
+      button.appendChild(this.service_info.create_icon(tag.service.service));
+      const name = document.createElement('span');
+      name.className = 'filter-name';
+      name.textContent = appearance.name;
+      button.appendChild(name);
+      const count = document.createElement('span');
+      count.className = 'filter-count';
+      count.textContent = tag.count;
+      button.appendChild(count);
+      button.addEventListener('click', () => this.toggle_service(key));
+      buttons.push(button);
+    }
+    this.filters.replaceChildren(...buttons);
+    this.filters.hidden = buttons.length === 0;
+  }
+
+  /// show or hide a service type
+  toggle_service(key) {
+    if (this.hidden.has(key)) {
+      this.hidden.delete(key);
+    } else {
+      this.hidden.add(key);
+    }
+    save_hidden(this.hidden);
+    this.apply_filters();
+  }
+
+  /// hide the boxes of hidden service types and mark their tags
+  apply_filters() {
+    for (const button of this.filters.children) {
+      const shown = !this.hidden.has(button.dataset.key);
+      button.setAttribute('aria-pressed', String(shown));
+    }
+    let visible = 0;
+    for (const box of this.boxes.children) {
+      box.hidden = this.hidden.has(box.dataset.service);
+      visible += box.hidden ? 0 : 1;
+    }
+    this.all_hidden.hidden = visible > 0 || this.boxes.children.length === 0;
   }
 
   /// create a service type box
   create_box(type, is_new_box) {
     const box = clone_template('box-template');
     box.dataset.type = type.name;
+    box.dataset.service = service_key(type.service);
     if (is_new_box) {
       box.classList.add('new');
     }
@@ -346,6 +435,30 @@ function txt_strings(txt_answers) {
     }
   }
   return strings;
+}
+
+/// the key a service type is shown or hidden by, e.g. `_http._tcp`
+function service_key(service) {
+  return service.service + '.' + service.protocol;
+}
+
+/// the hidden service types stored in localStorage
+function load_hidden() {
+  try {
+    const stored = JSON.parse(localStorage.getItem(HIDDEN_STORAGE_KEY));
+    return new Set(Array.isArray(stored) ? stored : []);
+  } catch (error) {
+    return new Set();
+  }
+}
+
+/// store the hidden service types in localStorage
+function save_hidden(hidden) {
+  try {
+    localStorage.setItem(HIDDEN_STORAGE_KEY, JSON.stringify([...hidden]));
+  } catch (error) {
+    console.warn('could not store hidden service types', error);
+  }
 }
 
 function unique(array) {

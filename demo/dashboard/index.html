@@ -98,11 +98,13 @@
             <span id="status-text">Loading WASM …</span>
             <span id="dnssec" title="zone is DNSSEC signed" hidden><span class="fa-solid fa-shield-halved"></span> DNSSEC</span>
         </div>
+        <div id="filters" role="group" aria-label="show or hide service types" hidden></div>
     </header>
 
     <main>
         <div id="boxes"></div>
         <p id="empty" hidden>No DNS-SD service types are registered under this zone.</p>
+        <p id="all-hidden" hidden>All service types are hidden. Click a tag above to show it again.</p>
     </main>
 
     <!-- Templates -->
