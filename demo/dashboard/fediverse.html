@@ -137,6 +137,7 @@
     <template id="form-template">
         <form class="instance-form">
             <input type="url" name="url" required placeholder="https://example.social/" spellcheck="false" autocomplete="off" aria-label="URL of the instance"/>
+            <input type="text" name="description" maxlength="100" placeholder="Description, e.g. Example Social – a friendly instance" autocomplete="off" aria-label="description of the instance"/>
             <select name="project" aria-label="project" hidden></select>
             <div class="form-buttons">
                 <button type="submit" class="save"><span class="fa-solid fa-check"></span> <span class="save-text"></span></button>

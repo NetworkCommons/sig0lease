@@ -14,7 +14,8 @@
 /// (`chaos.social` -> `chaos-social`), with the domain's addresses, and one
 /// `_fedi._tcp` instance of the same label, on port 443, in the subtypes of
 /// its projects. The SRV record names the host in the zone, so the TXT key
-/// `url` keeps the entry's own URL, which the dashboard links to. Leases of
+/// `url` keeps the entry's own URL, which the dashboard links to, and the TXT
+/// key `description` the text the dashboard shows for it. Leases of
 /// the records and of the KEY are both LEASE, so a name is free again when
 /// its entry is not renewed.
 ///
@@ -25,7 +26,8 @@
 /// on each refusal up to SEED_RETRY_MAX, and tries the request again.
 ///
 /// Entries are kept by the page in localStorage (the worker has none), by
-/// `entry_key(host, zone)`: `{host, key, url, subtypes, registered}`.
+/// `entry_key(host, zone)`: `{host, key, url, description, subtypes,
+/// registered}`.
 ///
 /// Messages from the page:
 ///   {type: 'registered', names}   the instance names the dashboard shows
@@ -34,8 +36,9 @@
 ///                                 registrar `registrar`; `entries` are the
 ///                                 kept entries by their storage key; `seed`
 ///                                 registers the instances of INSTANCES_JSON
-///   {type: 'add', id, url, subtypes}       register a new entry
-///   {type: 'edit', id, host, url, subtypes}  change an entry this browser
+///   {type: 'add', id, url, description, subtypes}  register a new entry
+///   {type: 'edit', id, host, url, description, subtypes}
+///                                 change an entry this browser
 ///                                 keeps; another domain moves it to another
 ///                                 host
 ///   {type: 'remove', id, host}    withdraw an entry this browser keeps
@@ -57,7 +60,8 @@ const SEEDING = 2;
 /// folded names of the instances the dashboard shows
 let shown = new Set();
 let config = null;
-/// storage key -> entry {host, key, url, subtypes, registered, due, queued}
+/// storage key -> entry {host, key, url, description, subtypes, registered,
+/// due, queued}
 const entries = new Map();
 /// jobs {priority, order, run}
 const queue = [];
@@ -265,6 +269,7 @@ function keep(entry) {
       host: entry.host,
       key: entry.key,
       url: entry.url,
+      description: entry.description || '',
       subtypes: entry.subtypes,
       registered: entry.registered,
     },
@@ -329,7 +334,8 @@ async function send(entry, remove) {
           service: FEDI_TYPE,
           subtypes: entry.subtypes,
           port: 443,
-          txt: ['path=' + url.pathname, 'url=' + url.href],
+          txt: ['path=' + url.pathname, 'url=' + url.href].concat(
+              entry.description ? ['description=' + entry.description] : []),
         }],
         lease: LEASE,
         keyLease: LEASE,
@@ -394,6 +400,7 @@ async function seed_instance(instance) {
         host: instance.host,
         key: kept ? kept.key : null,
         url: instance.url.href,
+        description: instance.description,
         subtypes: instance.subtypes,
         registered: 0,
       };
@@ -416,9 +423,11 @@ async function visitor_request(message) {
   let error = null;
   try {
     if (message.type === 'add') {
-      await add(instance_of(message.url, message.subtypes));
+      await add(instance_of(message.url, message.subtypes,
+                            message.description));
     } else if (message.type === 'edit') {
-      await edit(message.host, instance_of(message.url, message.subtypes));
+      await edit(message.host, instance_of(message.url, message.subtypes,
+                                           message.description));
     } else {
       await remove(message.host);
     }
@@ -429,7 +438,7 @@ async function visitor_request(message) {
   postMessage({type: 'done', id: message.id, error: error});
 }
 
-/// register a new entry for `instance` ({host, url, subtypes})
+/// register a new entry for `instance` ({host, url, description, subtypes})
 async function add(instance) {
   const kept = entries.get(storage_key_of(instance.host));
   if ((kept && kept.url) || await present(instance.host)) {
@@ -439,6 +448,7 @@ async function add(instance) {
     host: instance.host,
     key: kept ? kept.key : null,
     url: instance.url.href,
+    description: instance.description,
     subtypes: instance.subtypes,
     registered: 0,
   };
@@ -457,7 +467,8 @@ async function edit(host, instance) {
     return;
   }
   const changed =
-      {...entry, url: instance.url.href, subtypes: instance.subtypes};
+      {...entry, url: instance.url.href, description: instance.description,
+       subtypes: instance.subtypes};
   if (!await register_entry(changed)) {
     throw new Error(instance.url.hostname + ' is held by someone else now');
   }

@@ -5,7 +5,9 @@
 ///
 /// Fediverse services use the custom DNS-SD service type `_fedi._tcp`, which
 /// follows the specification of `_http._tcp` (SRV port 443 is linked as
-/// https, the TXT key `path` is the link's path). Each fediverse project has
+/// https, the TXT key `path` is the link's path; the TXT key `description`
+/// is the text shown for the instance, its label when there is none). Each
+/// fediverse project has
 /// its own subtype, named after the project's UTF-8 name (e.g. `Mastodon`,
 /// `Takahē`, `GNU social`), so all Mastodon servers of a zone are listed at
 ///   Mastodon._sub._fedi._tcp.<zone>
@@ -76,6 +78,9 @@ const ENTRY_PREFIX = 'fediverse-entry:';
 const OLD_KEY_PREFIX = 'fediverse-seed-key:';
 /// box key of the instances that are in no subtype
 const OTHER = '';
+/// most UTF-8 bytes of a description (a TXT string has 255, less
+/// `description=`)
+const DESCRIPTION_MAX = 100;
 
 /// accent colors of the well-known fediverse projects, by `slug` of
 /// SUBTYPES_JSON: the main color of the project's logo or web site.
@@ -337,6 +342,7 @@ class FediverseDashboard {
           const url = this.service_info.txt_2_object(instance.txt).url;
           if (typeof url === 'string' && /^https?:\/\//i.test(url)) {
             entry.url = url;
+            entry.description = txt_description(this.service_info, instance.txt);
             entry.subtypes = [...this.members.values()]
                                  .filter(m => m.instances.has(instance.name))
                                  .map(m => m.label);
@@ -770,6 +776,7 @@ class FediverseDashboard {
         actions.appendChild(this.create_form({
           mode: 'add',
           url: '',
+          description: '',
           subtypes: subtypes,
           done: () => this.redraw(),
         }));
@@ -780,15 +787,17 @@ class FediverseDashboard {
   }
 
   /// a form to add (`mode` 'add') or edit (`mode` 'edit', of the entry at
-  /// host label `host`) an entry: its URL, and when editing its project.
-  /// `done` is called when the form closes.
-  create_form({mode, host, url, subtypes, done}) {
+  /// host label `host`) an entry: its URL, its description, and when editing
+  /// its project. `done` is called when the form closes.
+  create_form({mode, host, url, description, subtypes, done}) {
     const form = clone_template('form-template');
     const input = form.querySelector('input[name="url"]');
+    const description_input = form.querySelector('input[name="description"]');
     const select = form.querySelector('select[name="project"]');
     const message = form.querySelector('.form-message');
     const remove = form.querySelector('.remove');
     input.value = url;
+    description_input.value = description || '';
     form.querySelector('.save-text').textContent =
         mode === 'add' ? 'Add' : 'Save';
 
@@ -847,16 +856,18 @@ class FediverseDashboard {
       try {
         const chosen = mode === 'add' ? subtypes :
             select.value ? [select.value] : [];
-        instance = instance_of(input.value.trim(), chosen);
+        instance = instance_of(input.value.trim(), chosen,
+                               description_input.value);
       } catch (error) {
         message.textContent = error.message;
         message.classList.add('error');
         return;
       }
       send(mode === 'add' ?
-               {type: 'add', url: instance.url.href, subtypes: instance.subtypes} :
+               {type: 'add', url: instance.url.href, subtypes: instance.subtypes,
+                description: instance.description} :
                {type: 'edit', host: host, url: instance.url.href,
-                subtypes: instance.subtypes},
+                subtypes: instance.subtypes, description: instance.description},
            mode === 'add' ? 'Registering …' : 'Saving …');
     });
     remove.addEventListener('click', () => {
@@ -870,7 +881,9 @@ class FediverseDashboard {
   /// create a service instance entry
   create_entry(instance, appearance) {
     const li = clone_template('entry-template');
-    li.querySelector('.label').textContent = instance.label;
+    // the TXT key `description`, else the instance label
+    const description = txt_description(this.service_info, instance.txt);
+    li.querySelector('.label').textContent = description || instance.label;
     li.querySelector('.label').title = instance.name;
 
     // the TXT key `url`, else as `_fedi` follows `_http`, the link
@@ -924,6 +937,8 @@ class FediverseDashboard {
           mode: 'edit',
           host: host,
           url: entry && entry.url ? entry.url : (link || ''),
+          description: entry && entry.url && typeof entry.description === 'string' ?
+              entry.description : description,
           subtypes: subtypes || [],
           done: () => this.redraw(),
         }));
@@ -971,7 +986,7 @@ function entry_key(host, zone) {
 }
 
 /// the entries of `zone` this browser keeps: storage key -> `{host, key,
-/// url, subtypes, registered}`; a key kept alone under OLD_KEY_PREFIX
+/// url, description, subtypes, registered}`; a key kept alone under OLD_KEY_PREFIX
 /// becomes an entry without url
 function load_entries(zone) {
   const entries = new Map();
@@ -993,18 +1008,19 @@ function load_entries(zone) {
       const host = name.slice(OLD_KEY_PREFIX.length, -suffix.length);
       const key = entry_key(host, zone);
       if (!entries.has(key)) {
-        entries.set(key, {host: host, key: value, url: null, subtypes: [],
-                          registered: 0});
+        entries.set(key, {host: host, key: value, url: null, description: '',
+                          subtypes: [], registered: 0});
       }
     }
   }
   return entries;
 }
 
-/// an entry to register for the URL `text` in the projects `subtypes`:
-/// `{host, url, subtypes}`, `host` the host label of the URL's domain;
-/// throws for what cannot be registered
-function instance_of(text, subtypes) {
+/// an entry to register for the URL `text` in the projects `subtypes`, shown
+/// as `description` (may be empty): `{host, url, description, subtypes}`,
+/// `host` the host label of the URL's domain; throws for what cannot be
+/// registered
+function instance_of(text, subtypes, description) {
   let url;
   try {
     url = new URL(text);
@@ -1027,13 +1043,30 @@ function instance_of(text, subtypes) {
       labels.push(subtype);
     }
   }
-  return {host: host, url: url, subtypes: labels};
+  description = String(description || '').normalize('NFC').trim()
+                    .replace(/\s+/g, ' ');
+  if (!usable_description(description)) {
+    throw new Error('the description is too long (at most ' +
+                    DESCRIPTION_MAX + ' bytes)');
+  }
+  return {host: host, url: url, description: description, subtypes: labels};
 }
 
-/// the instances of INSTANCES_JSON: a list of `{host, url, subtypes}`, each
+/// whether `text` fits a TXT string as `description=<text>`
+function usable_description(text) {
+  return new TextEncoder().encode(text).length <= DESCRIPTION_MAX;
+}
+
+/// the TXT key `description` of TXT answers, or ''
+function txt_description(service_info, txt) {
+  const description = service_info.txt_2_object(txt).description;
+  return typeof description === 'string' ? description.trim() : '';
+}
+
+/// the instances of INSTANCES_JSON: a list of `{url, description, subtypes}`, each
 /// host once; `subtypes` are the projects the instance is listed for, none
 /// for general fediverse services. Each entry is checked by `instance_of`,
-/// which also makes its URL. Returns `[{host, url, subtypes}]`, `host` the
+/// which also makes its URL. Returns `[{host, url, description, subtypes}]`, `host` the
 /// host label of the url's domain.
 function load_instances(list) {
   if (!Array.isArray(list)) {
@@ -1042,7 +1075,8 @@ function load_instances(list) {
   const instances = [];
   for (const entry of list) {
     try {
-      instances.push(instance_of(entry.url, entry.subtypes || []));
+      instances.push(instance_of(entry.url, entry.subtypes || [],
+                                 entry.description));
     } catch (error) {
       console.warn(INSTANCES_JSON + ': ' + error.message);
     }
