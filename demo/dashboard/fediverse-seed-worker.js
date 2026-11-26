@@ -418,16 +418,23 @@ async function seed_instance(instance) {
   seeding.running = seeding.done < seeding.total;
 }
 
-/// a visitor's add, edit or remove; answers with a 'done' message
+/// a visitor's add, edit or remove; answers with a 'done' message, which
+/// names the instance an add or edit registered, so the page asks for it
+/// at once
 async function visitor_request(message) {
   let error = null;
+  let name = null;
   try {
     if (message.type === 'add') {
-      await add(instance_of(message.url, message.subtypes,
-                            message.description));
+      const instance = instance_of(message.url, message.subtypes,
+                                   message.description);
+      await add(instance);
+      name = instance_name(instance.host);
     } else if (message.type === 'edit') {
-      await edit(message.host, instance_of(message.url, message.subtypes,
-                                           message.description));
+      const instance = instance_of(message.url, message.subtypes,
+                                   message.description);
+      await edit(message.host, instance);
+      name = instance_name(instance.host);
     } else {
       await remove(message.host);
     }
@@ -435,7 +442,7 @@ async function visitor_request(message) {
     console.warn(message.type + ' failed', e);
     error = e.message;
   }
-  postMessage({type: 'done', id: message.id, error: error});
+  postMessage({type: 'done', id: message.id, error: error, name: name});
 }
 
 /// register a new entry for `instance` ({host, url, description, subtypes})

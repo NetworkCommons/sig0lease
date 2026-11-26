@@ -31,7 +31,9 @@
 /// the instances the worker announced; an instance that is gone is dropped
 /// from its subtypes without asking. The SRV and TXT records of an instance
 /// are asked when it appears, and DETAILS_PER_REFRESH of the others each
-/// refresh, the longest unchecked first. All queries go through a Pacer:
+/// refresh, the longest unchecked first. An instance the visitor just added
+/// or edited is asked at once, in a refresh right after its registration.
+/// All queries go through a Pacer:
 /// at most `rate` per second, slowing down and trying again when the rate
 /// limit refuses one. Until a refresh is done the page shows the last one.
 ///
@@ -46,7 +48,7 @@
 /// browser's localStorage keeps each entry and its key (`entry_key`).
 
 /// time between two refreshes of the dashboard, in ms
-const REFRESH_INTERVAL = 5000;
+const REFRESH_INTERVAL = 15000;
 const FULL_SCAN_EVERY = 4;
 /// SRV and TXT records of known instances asked again per refresh
 const DETAILS_PER_REFRESH = 15;
@@ -240,6 +242,13 @@ class FediverseDashboard {
     this.expected = new Set();
     // instance name -> its SRV and TXT records and when they were asked
     this.details = new Map();
+    // names of the instances the visitor added or edited, whose records the
+    // next refresh asks, as soon as the base type lists them
+    this.forced = new Set();
+    // generation of the refresh running, and whether another one is due
+    // right after it
+    this.running = null;
+    this.refresh_again = false;
     this.pacer = new Pacer(QUERY_RATE, QUERY_RATE_MIN, QUERY_RATE_MAX,
                            QUERY_PAUSE);
     this.zone_doh = zone_doh || [];
@@ -342,6 +351,8 @@ class FediverseDashboard {
     this.hinted.clear();
     this.expected.clear();
     this.details.clear();
+    this.forced.clear();
+    this.refresh_again = false;
     this.refreshes = 0;
     this.members.clear();
     this.seen.clear();
@@ -440,6 +451,9 @@ class FediverseDashboard {
       case 'done': {
         const resolve = this.requests.get(message.id);
         this.requests.delete(message.id);
+        if (!message.error && message.name) {
+          this.recheck(message.name);
+        }
         if (resolve) {
           resolve(message.error);
         }
@@ -459,6 +473,25 @@ class FediverseDashboard {
       this.requests.set(id, resolve);
       this.worker.postMessage({...message, id: id});
     });
+  }
+
+  /// ask the records of the instance `name` in a refresh now, e.g. after the
+  /// visitor added or edited it; and the subtypes it was in, which may have
+  /// changed
+  recheck(name) {
+    name = normalize_name(name);
+    this.forced.add(name);
+    for (const member of this.members.values()) {
+      if (member.instances.has(name)) {
+        this.hinted.set(fold(member.label), member.label);
+      }
+    }
+    if (this.running === this.generation) {
+      this.refresh_again = true;
+    } else {
+      clearTimeout(this.timer);
+      this.refresh();
+    }
   }
 
   /// whether this browser has the key of `instance`, so it can edit it
@@ -522,6 +555,7 @@ class FediverseDashboard {
   /// query the zone and re-render, then schedule the next refresh
   async refresh() {
     const generation = this.generation;
+    this.running = generation;
     await this.projects_loaded;
     try {
       this.dns.cached_answers = 0;
@@ -569,7 +603,11 @@ class FediverseDashboard {
           'Update failed at ' + new Date().toLocaleTimeString() +
               ', showing last known state');
     }
-    this.timer = setTimeout(() => this.refresh(), REFRESH_INTERVAL);
+    this.running = null;
+    const again = this.refresh_again;
+    this.refresh_again = false;
+    this.timer = setTimeout(() => this.refresh(),
+                            again ? 0 : REFRESH_INTERVAL);
   }
 
   /// collect the fediverse instances of a zone, their SRV and TXT records,
@@ -654,11 +692,15 @@ class FediverseDashboard {
       }
     }
     const unknown = base_names.filter(name => !this.details.has(name));
-    const recheck = base_names.filter(name => this.details.has(name))
+    // a forced instance not listed yet waits for a later refresh
+    const forced = base_names.filter(name => this.forced.has(name) &&
+                                             this.details.has(name));
+    const recheck = base_names.filter(name => this.details.has(name) &&
+                                              !this.forced.has(name))
                         .sort((a, b) => this.details.get(a).checked -
                                   this.details.get(b).checked)
                         .slice(0, DETAILS_PER_REFRESH);
-    await Promise.all([...unknown, ...recheck].map(async (name) => {
+    await Promise.all([...unknown, ...forced, ...recheck].map(async (name) => {
       try {
         const [srv, txt] =
             await Promise.all([query(name, 'SRV'), query(name, 'TXT')]);
@@ -671,6 +713,7 @@ class FediverseDashboard {
           txt: txt,
           checked: Date.now(),
         });
+        this.forced.delete(name);
       } catch (error) {
         console.warn('records of ' + name + ' failed', error);
       }
