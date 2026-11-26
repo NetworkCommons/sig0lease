@@ -8,8 +8,8 @@ GITDIR="$(git rev-parse --show-toplevel)"
 
 # includes ...
 source get_mname.sh
-
-source ./env
+source get_WG_attribute.sh
+source ./env-client
 
 DIG_OPTIONS=${DIG_OPTIONS:-"+noall +answer @${MNAME}"}
 
@@ -87,7 +87,36 @@ echo "== Published Request with ${SERVER_SERVICE_NAME}._sub.${CLIENT_SERVICE_NAM
 CLIENT_REQUEST=`dig ${DIG_OPTIONS} ${SERVER_SERVICE_NAME}._sub.${CLIENT_SD_TYPE}.${DOMAIN} PTR | grep -v RRSIG | grep -v NSEC`
 echo "${CLIENT_REQUEST}"
 echo
-#
 
+n=10
+echo "Waiting ${n} seconds for a response ..."
+sleep ${n}
+
+# Look for config _wgcfg._udp type
+#
+#echo "DEBUG: get_WGCFG_attribute ${CLIENT_SERVICE_NAME} ${SERVER_SERVICE_NAME} ${DOMAIN} addr"
+
+IP_ADDR="$(get_WGCFG_attribute ${CLIENT_SERVICE_NAME} ${SERVER_SERVICE_NAME} ${DOMAIN} addr)"
+echo "IP = ${IP_ADDR}"
+PEER="$(get_WGCFG_attribute ${CLIENT_SERVICE_NAME} ${SERVER_SERVICE_NAME} ${DOMAIN} pk)"
+echo "PEER = ${PEER}"
+ALLOWED="$(get_WGCFG_attribute ${CLIENT_SERVICE_NAME} ${SERVER_SERVICE_NAME} ${DOMAIN} allowed)"
+#ALLOWED="10.0.0.0/24"
+echo "ALLOWED = ${ALLOWED}"
+#
+# SERVER_HOSTNAME & SERVER_LISTENPORT should be fetched from the _wg._udp service type SRV record
+
+echo "ip link add dev ${VPN_INTERFACE} type wireguard"
+echo "ip address add dev ${VPN_INTERFACE} ${IP_ADDR}/27"
+echo "ip link set up dev ${VPN_INTERFACE}"
+echo "wg set ${VPN_INTERFACE} listen-port 51820 private-key /etc/wireguard/privatekey-${CLIENT_SERVICE_NAME}.${SERVER_SERVICE_NAME}"
+
+ip link add dev ${VPN_INTERFACE} type wireguard
+ip address add dev ${VPN_INTERFACE} ${IP_ADDR}/27
+ip link set up dev ${VPN_INTERFACE}
+wg set ${VPN_INTERFACE} listen-port 51820 private-key /etc/wireguard/privatekey-${CLIENT_SERVICE_NAME}.${SERVER_SERVICE_NAME}
+
+echo "wg set ${VPN_INTERFACE} peer ${PEER} allowed-ips ${ALLOWED} endpoint ${SERVER_HOSTNAME}.${DOMAIN}:${SERVER_LISTENPORT}"
+wg set ${VPN_INTERFACE} peer ${PEER} allowed-ips ${ALLOWED} endpoint ${SERVER_HOSTNAME}.${DOMAIN}:${SERVER_LISTENPORT}
 exit
 
