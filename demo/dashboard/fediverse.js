@@ -951,13 +951,19 @@ class FediverseDashboard {
                   '_http', normalize_name(srv.target), srv.port,
                   instance.txt) :
               null;
+    // the favicon spans the label and URL rows: the site's, else the
+    // project logo
     const link_node = li.querySelector('.link');
+    const icon_node = li.querySelector('.head .icon');
     if (link) {
       link_node.href = link;
       link_node.querySelector('.url').textContent = link;
-      link_node.querySelector('.icon').appendChild(
-          create_favicon(link, appearance));
       link_node.hidden = false;
+      icon_node.href = link;
+      icon_node.appendChild(create_favicon(link, appearance));
+    } else {
+      icon_node.removeAttribute('href');
+      icon_node.appendChild(create_logo(appearance));
     }
 
     // SRV records

@@ -354,17 +354,50 @@ main {
     overflow-wrap: anywhere;
 }
 
-.entry .label-row {
-    display: flex;
-    align-items: baseline;
-    justify-content: space-between;
-    gap: 0.5rem;
+/* the favicon spans both rows of the head: label and URL */
+.entry .head {
+    display: grid;
+    grid-template-columns: auto 1fr;
+    column-gap: 0.6rem;
+    align-items: center;
 }
 
-/* the label takes the free space: the buttons stay together on the right */
-.entry .label-row .label {
-    flex: 1;
+.entry .head .icon {
+    grid-row: 1 / span 2;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    width: 2.4rem;
+    height: 2.4rem;
+    padding: 0.2rem;
+    box-sizing: border-box;
+    border-radius: 0.4em;
+    font-size: 1.4rem;
+    color: var(--accent);
+    /* logos keep their colors, also black ones in dark mode */
+    background-color: #ffffff;
+}
+
+.entry .head .icon img {
+    display: block;
+    width: 100%;
+    height: 100%;
+    object-fit: contain;
+}
+
+.entry .head .label,
+.entry .head .link {
+    grid-column: 2;
     min-width: 0;
+}
+
+/* lease on the left, the buttons together on the right */
+.entry .actions {
+    display: flex;
+    align-items: center;
+    justify-content: flex-end;
+    gap: 0.5rem;
+    margin-top: 0.3rem;
 }
 
 /* add and edit: small buttons in the project color */
@@ -442,7 +475,7 @@ main {
    clock whose sector is the part of the lease that is left */
 .entry .lease {
     flex: none;
-    margin-left: auto;
+    margin-right: auto;
     display: inline-flex;
     align-items: center;
     gap: 0.3em;
@@ -541,30 +574,14 @@ main {
 }
 
 .entry .link {
-    display: flex;
-    align-items: baseline;
-    gap: 0.4rem;
-    margin-top: 0.2rem;
+    display: block;
+    margin-top: 0.1rem;
     font-size: 0.9rem;
     overflow-wrap: anywhere;
 }
 
-.entry .link .icon {
-    flex: none;
-    align-self: center;
-    width: 1.1em;
-    height: 1.1em;
-    padding: 0.08em;
-    border-radius: 0.2em;
-    /* logos keep their colors, also black ones in dark mode */
-    background-color: #ffffff;
-}
-
-.entry .link .icon img {
-    display: block;
-    width: 100%;
-    height: 100%;
-    object-fit: contain;
+.entry .link[hidden] {
+    display: none;
 }
 
 .entry .targets {

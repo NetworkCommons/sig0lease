@@ -149,8 +149,14 @@
     </template>
     <template id="entry-template">
         <li class="entry">
-            <div class="label-row">
+            <div class="head">
+                <a class="icon" href="" target="_blank" rel="noopener noreferrer" tabindex="-1" aria-hidden="true"></a>
                 <div class="label"></div>
+                <a class="link" href="" target="_blank" rel="noopener noreferrer" hidden>
+                    <span class="url"></span>
+                </a>
+            </div>
+            <div class="actions">
                 <span class="lease" hidden>
                     <svg class="lease-clock" viewBox="0 0 20 20" aria-hidden="true">
                         <circle class="lease-face" cx="10" cy="10" r="9"/>
@@ -162,10 +168,6 @@
                 <button type="button" class="edit-button" title="this browser registered this entry and can change it" hidden><span class="fa-solid fa-pen"></span></button>
                 <button type="button" class="details-button" title="show the SRV and TXT records of this entry" aria-expanded="false"><span class="fa-solid fa-chevron-down"></span></button>
             </div>
-            <a class="link" href="" target="_blank" rel="noopener noreferrer" hidden>
-                <span class="icon"></span>
-                <span class="url"></span>
-            </a>
             <dl class="details" hidden>
                 <dt>Name</dt>
                 <dd class="instance-name"></dd>
