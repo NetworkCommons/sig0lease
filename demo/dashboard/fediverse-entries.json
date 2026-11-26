@@ -1,803 +1,615 @@
 [
  {
-  "host": "fediversum-info",
   "url": "https://fediversum.info/",
+  "description": "Fediversum – Fediverse Guides",
   "subtypes": []
  },
  {
-  "host": "instances-social",
-  "url": "https://instances.social/",
-  "subtypes": []
- },
- {
-  "host": "fedi-garden",
   "url": "https://fedi.garden/",
+  "description": "Fedi.Garden – Join the Fediverse",
   "subtypes": []
  },
  {
-  "host": "fedi-directory",
   "url": "https://fedi.directory/",
+  "description": "Fedi.Directory – Interesting Accounts",
   "subtypes": []
  },
  {
-  "host": "fedidb-org",
-  "url": "https://fedidb.org/",
-  "subtypes": []
- },
- {
-  "host": "fediverse-observer",
-  "url": "https://fediverse.observer/",
-  "subtypes": []
- },
- {
-  "host": "fedi-tips",
   "url": "https://fedi.tips/",
+  "description": "Fedi.Tips – Guide to the Fediverse",
   "subtypes": []
  },
  {
-  "host": "fediverse-info",
-  "url": "https://fediverse.info/",
-  "subtypes": []
- },
- {
-  "host": "chaos-social",
   "url": "https://chaos.social/",
+  "description": "chaos.social",
   "subtypes": [
    "Mastodon"
   ]
  },
  {
-  "host": "digitalcourage-social",
   "url": "https://digitalcourage.social/",
+  "description": "Digitalcourage Social",
   "subtypes": [
    "Mastodon"
   ]
  },
  {
-  "host": "nerdculture-de",
   "url": "https://nerdculture.de/",
+  "description": "NerdCulture",
   "subtypes": [
    "Mastodon"
   ]
  },
  {
-  "host": "troet-cafe",
   "url": "https://troet.cafe/",
+  "description": "troet.cafe",
   "subtypes": [
    "Mastodon"
   ]
  },
  {
-  "host": "mstdn-social",
-  "url": "https://mstdn.social/",
-  "subtypes": [
-   "Mastodon"
-  ]
- },
- {
-  "host": "masto-ai",
-  "url": "https://masto.ai/",
-  "subtypes": [
-   "Mastodon"
-  ]
- },
- {
-  "host": "mastodon-top",
-  "url": "https://mastodon.top/",
-  "subtypes": [
-   "Mastodon"
-  ]
- },
- {
-  "host": "ohai-social",
-  "url": "https://ohai.social/",
-  "subtypes": [
-   "Mastodon"
-  ]
- },
- {
-  "host": "mastodon-de",
-  "url": "https://mastodon.de/",
-  "subtypes": [
-   "Mastodon"
-  ]
- },
- {
-  "host": "eter9-com",
   "url": "https://eter9.com/",
+  "description": "ETER9",
   "subtypes": [
    "Misskey"
   ]
  },
  {
-  "host": "misskey-takeko-cyou",
   "url": "https://misskey.takeko.cyou/",
+  "description": "Takeko Misskey",
   "subtypes": [
    "Misskey"
   ]
  },
  {
-  "host": "kitsune-moe",
   "url": "https://kitsune.moe/",
+  "description": "Kitsune.MOE",
   "subtypes": [
    "Misskey"
   ]
  },
  {
-  "host": "freaksonly-space",
   "url": "https://freaksonly.space/",
+  "description": "Freaks Only",
   "subtypes": [
    "Misskey"
   ]
  },
  {
-  "host": "comfy-social",
-  "url": "https://comfy.social/",
-  "subtypes": [
-   "Misskey"
-  ]
- },
- {
-  "host": "gram-social",
   "url": "https://gram.social/",
+  "description": "Gram.social",
   "subtypes": [
    "Pixelfed"
   ]
  },
  {
-  "host": "pixelfed-de",
   "url": "https://pixelfed.de/",
+  "description": "Pixelfed.de",
   "subtypes": [
    "Pixelfed"
   ]
  },
  {
-  "host": "pixelfed-uno",
   "url": "https://pixelfed.uno/",
+  "description": "Pixelfed Uno Italia",
   "subtypes": [
    "Pixelfed"
   ]
  },
  {
-  "host": "pixey-org",
   "url": "https://pixey.org/",
+  "description": "Pixey",
   "subtypes": [
    "Pixelfed"
   ]
  },
  {
-  "host": "pixelfed-fr",
-  "url": "https://pixelfed.fr/",
-  "subtypes": [
-   "Pixelfed"
-  ]
- },
- {
-  "host": "tilvids-com",
-  "url": "https://tilvids.com/",
+  "url": "https://punktube.net/",
+  "description": "PunkTube",
   "subtypes": [
    "PeerTube"
   ]
  },
  {
-  "host": "videos-toromedia-com",
-  "url": "https://videos.toromedia.com/",
-  "subtypes": [
-   "PeerTube"
-  ]
- },
- {
-  "host": "makertube-net",
   "url": "https://makertube.net/",
+  "description": "MakerTube",
   "subtypes": [
    "PeerTube"
   ]
  },
  {
-  "host": "clip-place",
-  "url": "https://clip.place/",
+  "url": "https://fair.tube/",
+  "description": "fairtube",
   "subtypes": [
    "PeerTube"
   ]
  },
  {
-  "host": "ttrpg-network",
   "url": "https://ttrpg.network/",
+  "description": "TTRPG Network",
   "subtypes": [
    "Lemmy"
   ]
  },
  {
-  "host": "feddit-uk",
   "url": "https://feddit.uk/",
+  "description": "Feddit UK",
   "subtypes": [
    "Lemmy"
   ]
  },
  {
-  "host": "forums-rereading-space",
   "url": "https://forums.rereading.space/",
+  "description": "rereading Forums",
   "subtypes": [
    "Lemmy"
   ]
  },
  {
-  "host": "forum-ayom-media",
-  "url": "https://forum.ayom.media/",
-  "subtypes": [
-   "Lemmy"
-  ]
- },
- {
-  "host": "blog-liberta-vip",
   "url": "https://blog.liberta.vip/",
+  "description": "Liberta Blogs",
   "subtypes": [
    "WriteFreely"
   ]
  },
  {
-  "host": "blog-kuba-orlik-name",
   "url": "https://blog.kuba-orlik.name/",
+  "description": "Kuba Orlik's Blog",
   "subtypes": [
    "WriteFreely"
   ]
  },
  {
-  "host": "blog-librescrum-org",
   "url": "https://blog.librescrum.org/",
+  "description": "LibreScrum Blog",
   "subtypes": [
    "WriteFreely"
   ]
  },
  {
-  "host": "write-storydragon-nl",
-  "url": "https://write.storydragon.nl/",
-  "subtypes": [
-   "WriteFreely"
-  ]
- },
- {
-  "host": "community-i-doit-com",
   "url": "https://community.i-doit.com/",
+  "description": "i-doit Community",
   "subtypes": [
    "NodeBB"
   ]
  },
  {
-  "host": "radforum-duesseldorf-de",
   "url": "https://radforum-duesseldorf.de/",
+  "description": "Radforum Düsseldorf",
   "subtypes": [
    "NodeBB"
   ]
  },
  {
-  "host": "linux-nerds-org",
   "url": "https://linux-nerds.org/",
+  "description": "linux-nerds.org",
   "subtypes": [
    "NodeBB"
   ]
  },
  {
-  "host": "sudonix-org",
-  "url": "https://sudonix.org/",
-  "subtypes": [
-   "NodeBB"
-  ]
- },
- {
-  "host": "mobilizon-fr",
   "url": "https://mobilizon.fr/",
+  "description": "Mobilizon.fr",
   "subtypes": [
    "Mobilizon"
   ]
  },
  {
-  "host": "mobilizon-it",
   "url": "https://mobilizon.it/",
+  "description": "Mobilizon Italia",
   "subtypes": [
    "Mobilizon"
   ]
  },
  {
-  "host": "fomobremen-info",
   "url": "https://fomobremen.info/",
+  "description": "FomoBremen",
   "subtypes": [
    "Mobilizon"
   ]
  },
  {
-  "host": "miniwa-moe",
   "url": "https://miniwa.moe/",
+  "description": "Miniwa/Cute",
   "subtypes": [
    "Pleroma"
   ]
  },
  {
-  "host": "masto-destructatron-net",
-  "url": "https://masto.destructatron.net/",
-  "subtypes": [
-   "Pleroma"
-  ]
- },
- {
-  "host": "pleroma-soykaf-com",
   "url": "https://pleroma.soykaf.com/",
+  "description": "Pleroma/Soykaf",
   "subtypes": [
    "Pleroma"
   ]
  },
  {
-  "host": "loops-city",
   "url": "https://loops.city/",
+  "description": "Loops.City",
   "subtypes": [
    "Loops"
   ]
  },
  {
-  "host": "loops-stage-anoxinon-de",
   "url": "https://loops.stage.anoxinon.de/",
+  "description": "Anoxinon Loops (Staging)",
   "subtypes": [
    "Loops"
   ]
  },
  {
-  "host": "bonn-lol",
-  "url": "https://bonn.lol/",
-  "subtypes": [
-   "Loops"
-  ]
- },
- {
-  "host": "bookwyrm-it",
-  "url": "https://bookwyrm.it/",
-  "subtypes": [
-   "BookWyrm"
-  ]
- },
- {
-  "host": "bookwyrm-tilde-zone",
   "url": "https://bookwyrm.tilde.zone/",
+  "description": "tildebooks",
   "subtypes": [
    "BookWyrm"
   ]
  },
  {
-  "host": "books-infosec-exchange",
   "url": "https://books.infosec.exchange/",
+  "description": "Books.Infosec.Exchange",
   "subtypes": [
    "BookWyrm"
   ]
  },
  {
-  "host": "www-glotter-com",
   "url": "https://www.glotter.com/",
+  "description": "GLOTTER",
   "subtypes": [
    "WordPress"
   ]
  },
  {
-  "host": "radikalpolitikk-no",
   "url": "https://radikalpolitikk.no/",
+  "description": "Radikal Politikk",
   "subtypes": [
    "WordPress"
   ]
  },
  {
-  "host": "blog-tib-eu",
-  "url": "https://blog.tib.eu/",
-  "subtypes": [
-   "WordPress"
-  ]
- },
- {
-  "host": "sharkey-world",
   "url": "https://sharkey.world/",
+  "description": "Sharkey.World",
   "subtypes": [
    "Sharkey"
   ]
  },
  {
-  "host": "federation-network",
   "url": "https://federation.network/",
+  "description": "Federation Network",
   "subtypes": [
    "Sharkey"
   ]
  },
  {
-  "host": "lea-pet",
-  "url": "https://lea.pet/",
-  "subtypes": [
-   "Sharkey"
-  ]
- },
- {
-  "host": "neodb-kevga-de",
   "url": "https://neodb.kevga.de/",
+  "description": "KevGa-NeoDB",
   "subtypes": [
    "NeoDB"
   ]
  },
  {
-  "host": "neodb-social",
   "url": "https://neodb.social/",
+  "description": "NeoDB",
   "subtypes": [
    "NeoDB"
   ]
  },
  {
-  "host": "eggplant-place",
-  "url": "https://eggplant.place/",
-  "subtypes": [
-   "NeoDB"
-  ]
- },
- {
-  "host": "larkspur-one",
-  "url": "https://larkspur.one/",
-  "subtypes": [
-   "Akkoma"
-  ]
- },
- {
-  "host": "pleroma-envs-net",
   "url": "https://pleroma.envs.net/",
+  "description": "envs.net Akkoma",
   "subtypes": [
    "Akkoma"
   ]
  },
  {
-  "host": "infosec-place",
   "url": "https://infosec.place/",
+  "description": "Infosec.Place",
   "subtypes": [
    "Akkoma"
   ]
  },
  {
-  "host": "anarchist-nexus",
   "url": "https://anarchist.nexus/",
+  "description": "Anarchist Nexus",
   "subtypes": [
    "PieFed"
   ]
  },
  {
-  "host": "multiverse-soulism-net",
   "url": "https://multiverse.soulism.net/",
+  "description": "Multiverse",
   "subtypes": [
    "PieFed"
   ]
  },
  {
-  "host": "bookwyr-me",
-  "url": "https://bookwyr.me/",
-  "subtypes": [
-   "PieFed"
-  ]
- },
- {
-  "host": "friendica-world",
   "url": "https://friendica.world/",
+  "description": "Friendica.World",
   "subtypes": [
    "Friendica"
   ]
  },
  {
-  "host": "social-trom-tf",
   "url": "https://social.trom.tf/",
+  "description": "TROM Social",
   "subtypes": [
    "Friendica"
   ]
  },
  {
-  "host": "merveilles-town",
   "url": "https://merveilles.town/",
+  "description": "Merveilles",
   "subtypes": [
    "Hometown"
   ]
  },
  {
-  "host": "queer-group",
   "url": "https://queer.group/",
+  "description": "queer.group",
   "subtypes": [
    "Hometown"
   ]
  },
  {
-  "host": "hub-hubzilla-de",
   "url": "https://hub.hubzilla.de/",
+  "description": "Hubzilla.de",
   "subtypes": [
    "Hubzilla"
   ]
  },
  {
-  "host": "zotum-net",
   "url": "https://zotum.net/",
+  "description": "Zotum",
   "subtypes": [
    "Hubzilla"
   ]
  },
  {
-  "host": "bark-wolp-chat",
   "url": "https://bark.wolp.chat/",
+  "description": "bark.wolp.chat",
   "subtypes": [
    "Wafrn"
   ]
  },
  {
-  "host": "social-cybernetica-cc",
   "url": "https://social.cybernetica.cc/",
+  "description": "Social Cybernetica",
   "subtypes": [
    "Wafrn"
   ]
  },
  {
-  "host": "rimworld-gallery",
   "url": "https://rimworld.gallery/",
+  "description": "RimWorld Gallery",
   "subtypes": [
    "Mbin"
   ]
  },
  {
-  "host": "thebrainbin-org",
-  "url": "https://thebrainbin.org/",
-  "subtypes": [
-   "Mbin"
-  ]
- },
- {
-  "host": "jornalmaio-org",
   "url": "https://jornalmaio.org/",
+  "description": "Jornal Maio",
   "subtypes": [
    "Ghost"
   ]
  },
  {
-  "host": "richardlemon-com",
-  "url": "https://richardlemon.com/",
-  "subtypes": [
-   "Ghost"
-  ]
- },
- {
-  "host": "bcn-convoca-la",
-  "url": "https://bcn.convoca.la/",
-  "subtypes": [
-   "Gancio"
-  ]
- },
- {
-  "host": "berlin-askapunk-de",
   "url": "https://berlin.askapunk.de/",
+  "description": "Askapunk Berlin",
   "subtypes": [
    "Gancio"
   ]
  },
  {
-  "host": "chai-aozora-uk",
   "url": "https://chai.aozora.uk/",
+  "description": "あおぞら紅茶店@新館",
   "subtypes": [
    "CherryPick"
   ]
  },
  {
-  "host": "blewsky-social",
   "url": "https://blewsky.social/",
+  "description": "BlewSky",
   "subtypes": [
    "CherryPick"
   ]
  },
  {
-  "host": "plume-helios42-de",
   "url": "https://plume.helios42.de/",
+  "description": "Helios 42",
   "subtypes": [
    "Plume"
   ]
  },
  {
-  "host": "blogs-kitaitimakoto-net",
   "url": "https://blogs.kitaitimakoto.net/",
+  "description": "コンコニ",
   "subtypes": [
    "Plume"
   ]
  },
  {
-  "host": "infosec-town",
   "url": "https://infosec.town/",
+  "description": "Infosec.Town",
   "subtypes": [
    "Iceshrimp"
   ]
  },
  {
-  "host": "fedia-social",
   "url": "https://fedia.social/",
+  "description": "Fedia.Social",
   "subtypes": [
    "Iceshrimp"
   ]
  },
  {
-  "host": "tanukitunes-com",
   "url": "https://tanukitunes.com/",
+  "description": "Tanuki Tunes",
   "subtypes": [
    "Funkwhale"
   ]
  },
  {
-  "host": "stereo-kenobit-it",
   "url": "https://stereo.kenobit.it/",
+  "description": "Kenobit Stereo",
   "subtypes": [
    "Funkwhale"
   ]
  },
  {
-  "host": "social-queerit-org",
   "url": "https://social.queerit.org/",
+  "description": "queer*it social",
   "subtypes": [
    "Bonfire"
   ]
  },
  {
-  "host": "kakapo-social",
   "url": "https://kakapo.social/",
+  "description": "Kakapo Social",
   "subtypes": [
    "Bonfire"
   ]
  },
  {
-  "host": "vernissage-pnpde-social",
   "url": "https://vernissage.pnpde.social/",
+  "description": "PnPde Vernissage",
   "subtypes": [
    "Vernissage"
   ]
  },
  {
-  "host": "pics-fux-is",
-  "url": "https://pics.fux.is/",
-  "subtypes": [
-   "Vernissage"
-  ]
- },
- {
-  "host": "electricrequiem-com",
   "url": "https://electricrequiem.com/",
+  "description": "Electric Requiem",
   "subtypes": [
    "Catodon"
   ]
  },
  {
-  "host": "bandwagon-fm",
   "url": "https://bandwagon.fm/",
+  "description": "Bandwagon.fm",
   "subtypes": [
    "Emissary"
   ]
  },
  {
-  "host": "tagpush-app",
   "url": "https://tagpush.app/",
+  "description": "tagpush.app",
   "subtypes": [
    "GoToSocial"
   ]
  },
  {
-  "host": "nuxy-social",
   "url": "https://nuxy.social/",
+  "description": "Nuxy.social",
   "subtypes": [
    "Firefish"
   ]
  },
  {
-  "host": "scm-owu-one",
   "url": "https://scm.owu.one/",
+  "description": "OWU Mitra",
   "subtypes": [
    "Mitra"
   ]
  },
  {
-  "host": "codeberg-org",
   "url": "https://codeberg.org/",
+  "description": "Codeberg",
   "subtypes": [
    "Forgejo"
   ]
  },
  {
-  "host": "git-tilera-org",
   "url": "https://git.tilera.org/",
+  "description": "tilera Git",
   "subtypes": [
    "Forgejo"
   ]
  },
  {
-  "host": "takahe-schach-social",
   "url": "https://takahe.schach.social/",
+  "description": "schach.social",
   "subtypes": [
    "Takahē"
   ]
  },
  {
-  "host": "3d-bonn-digital",
   "url": "https://3d.bonn.digital/",
+  "description": "Bonn.digital 3D",
   "subtypes": [
    "Manyfold"
   ]
  },
  {
-  "host": "live-romerustv-de",
   "url": "https://live.romerustv.de/",
+  "description": "Romerus TV",
   "subtypes": [
    "Owncast"
   ]
  },
  {
-  "host": "wake-0am-jp",
   "url": "https://wake.0am.jp/",
+  "description": "０時おっき",
   "subtypes": [
    "FoundKey"
   ]
  },
  {
-  "host": "minidisc-tokyo",
   "url": "https://minidisc.tokyo/",
+  "description": "ミニディスク【Ｍｉｎｉ Ｄｉｓｕｋｕ】",
   "subtypes": [
    "FoundKey"
   ]
  },
  {
-  "host": "jeschke-dev",
   "url": "https://jeschke.dev/",
+  "description": "Peter Jeschke",
   "subtypes": [
    "Hollo"
   ]
  },
  {
-  "host": "bookmarks-mysh-dev",
   "url": "https://bookmarks.mysh.dev/",
+  "description": "Mysh's Bookmarks",
   "subtypes": [
    "Betula"
   ]
  },
  {
-  "host": "pod-geraspora-de",
   "url": "https://pod.geraspora.de/",
+  "description": "Geraspora*",
   "subtypes": [
    "diaspora*"
   ]
  },
  {
-  "host": "diasp-org",
-  "url": "https://diasp.org/",
-  "subtypes": [
-   "diaspora*"
-  ]
- },
- {
-  "host": "bobinas-p4g-club",
   "url": "https://bobinas.p4g.club/",
+  "description": "Bobinas P4G",
   "subtypes": [
    "GNU social"
   ]
  },
  {
-  "host": "polykyklo-gr",
   "url": "https://polykyklo.gr/",
+  "description": "Polykyklo",
   "subtypes": [
    "Discourse"
   ]
  },
  {
-  "host": "fed-brid-gy",
   "url": "https://fed.brid.gy/",
+  "description": "Bridgy Fed",
   "subtypes": [
    "Bridgy Fed"
   ]
  },
  {
-  "host": "socialhome-network",
   "url": "https://socialhome.network/",
+  "description": "Socialhome",
   "subtypes": [
    "Socialhome"
   ]
  },
  {
-  "host": "friends-grishka-me",
   "url": "https://friends.grishka.me/",
+  "description": "Gregory's Server",
   "subtypes": [
    "Smithereen"
   ]

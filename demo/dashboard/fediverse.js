@@ -38,7 +38,7 @@
 /// registration each SEED_INTERVAL, each for LEASE seconds: what the
 /// visitor adds, edits or removes in the boxes; the renewal of every entry
 /// this browser has the key for, at 80 to 85% of its lease; and, for the
-/// zone the page opened with, the instances listed in `icons/instances.json`
+/// zone the page opened with, the instances listed in `fediverse-entries.json`
 /// that the zone does not have yet. The dashboard hands the worker the
 /// instances it shows after every refresh, so the worker skips those. The
 /// browser's localStorage keeps each entry and its key (`entry_key`).
@@ -59,7 +59,7 @@ const ICON_DIR = 'icons/';
 /// the well-known fediverse projects, the subtypes the dashboard knows
 const SUBTYPES_JSON = 'fediverse-subtypes.json';
 /// the instances the worker registers when the zone does not have them
-const INSTANCES_JSON = ICON_DIR + 'instances.json';
+const INSTANCES_JSON = 'fediverse-entries.json';
 /// lease of the entries the worker registers, and of their keys, so the
 /// names are free again when the entries are not renewed
 const LEASE = 900;
