@@ -7,7 +7,7 @@
 ///   1. what the visitor asks for: add, edit or remove an entry
 ///   2. renewals: each entry this browser keeps (has the key for) is
 ///      registered again when 80 to 85% of its LEASE has passed
-///   3. seeding: each instance of INSTANCES_MD that the zone does not have
+///   3. seeding: each instance of INSTANCES_JSON that the zone does not have
 ///      yet (when the page asks for it)
 ///
 /// An entry is an SRP host named after the domain of its URL
@@ -33,7 +33,7 @@
 ///                                 work in `zone`, asking `doh`, at the SRP
 ///                                 registrar `registrar`; `entries` are the
 ///                                 kept entries by their storage key; `seed`
-///                                 registers the instances of INSTANCES_MD
+///                                 registers the instances of INSTANCES_JSON
 ///   {type: 'add', id, url, subtypes}       register a new entry
 ///   {type: 'edit', id, host, url, subtypes}  change an entry this browser
 ///                                 keeps; another domain moves it to another
@@ -197,12 +197,12 @@ async function start({entries: kept, seed}) {
     });
   }
   if (seed) {
-    const response = await fetch(INSTANCES_MD);
+    const response = await fetch(INSTANCES_JSON);
     if (!response.ok) {
-      throw new Error(INSTANCES_MD + ': ' + response.status + ' ' +
+      throw new Error(INSTANCES_JSON + ': ' + response.status + ' ' +
                       response.statusText);
     }
-    const listed = parse_instances(await response.text());
+    const listed = load_instances(await response.json());
     seeding.total = listed.length;
     seeding.running = listed.length > 0;
     for (const instance of listed) {
@@ -380,7 +380,7 @@ async function renew(entry) {
   }
 }
 
-/// seed one instance of INSTANCES_MD, unless the zone has it
+/// seed one instance of INSTANCES_JSON, unless the zone has it
 async function seed_instance(instance) {
   try {
     const kept = entries.get(storage_key_of(instance.host));

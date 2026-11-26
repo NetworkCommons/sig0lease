@@ -12,8 +12,8 @@
 ///
 /// DNS-SD has no way to enumerate the subtypes of a service type, so the
 /// dashboard asks for the subtype of every project it knows from
-/// `icons/sources.csv`, and for every `_fedi._tcp` subtype the zone lists in
-/// `_services._dns-sd._udp.<zone>`.
+/// `fediverse-subtypes.json`, and for every `_fedi._tcp` subtype the zone
+/// lists in `_services._dns-sd._udp.<zone>`.
 ///
 /// Query chain per refresh:
 ///   _fedi._tcp.<zone> PTR                    -> all fediverse instances
@@ -38,7 +38,7 @@
 /// registration each SEED_INTERVAL, each for LEASE seconds: what the
 /// visitor adds, edits or removes in the boxes; the renewal of every entry
 /// this browser has the key for, at 80 to 85% of its lease; and, for the
-/// zone the page opened with, the instances listed in `icons/instances.md`
+/// zone the page opened with, the instances listed in `icons/instances.json`
 /// that the zone does not have yet. The dashboard hands the worker the
 /// instances it shows after every refresh, so the worker skips those. The
 /// browser's localStorage keeps each entry and its key (`entry_key`).
@@ -56,8 +56,10 @@ const QUERY_RATE_MAX = 25;
 const QUERY_PAUSE = 3000;
 const FEDI_TYPE = '_fedi._tcp';
 const ICON_DIR = 'icons/';
-const SOURCES_CSV = ICON_DIR + 'sources.csv';
-const INSTANCES_MD = ICON_DIR + 'instances.md';
+/// the well-known fediverse projects, the subtypes the dashboard knows
+const SUBTYPES_JSON = 'fediverse-subtypes.json';
+/// the instances the worker registers when the zone does not have them
+const INSTANCES_JSON = ICON_DIR + 'instances.json';
 /// lease of the entries the worker registers, and of their keys, so the
 /// names are free again when the entries are not renewed
 const LEASE = 900;
@@ -76,7 +78,7 @@ const OLD_KEY_PREFIX = 'fediverse-seed-key:';
 const OTHER = '';
 
 /// accent colors of the well-known fediverse projects, by `slug` of
-/// sources.csv: the main color of the project's logo or web site.
+/// SUBTYPES_JSON: the main color of the project's logo or web site.
 /// Projects without a color here get a random color.
 const PROJECT_COLORS = {
   'fediverse': '#7a3db8',
@@ -130,10 +132,10 @@ const PROJECT_COLORS = {
   'smithereen': '#4c6e00',
 };
 
-/// The fediverse projects of `icons/sources.csv`: name, logo and color
+/// The fediverse projects of SUBTYPES_JSON: name, logo and color
 class FediProjects {
   constructor() {
-    /// projects in the order of sources.csv: {slug, name, icon, color}
+    /// projects in the order of SUBTYPES_JSON: {slug, name, icon, color}
     this.list = [];
     /// folded name or slug -> project
     this.by_key = new Map();
@@ -141,20 +143,23 @@ class FediProjects {
     this.fediverse = null;
   }
 
-  /// load the projects from the CSV file at `url`
+  /// load the projects from the JSON file at `url`: a list of
+  /// `{slug, name, icon}`, `icon` the URL of the logo relative to the page;
+  /// the project of slug `fediverse` stands for instances without a project
   async load(url) {
     const response = await fetch(url);
     if (!response.ok) {
       throw new Error(url + ': ' + response.status + ' ' + response.statusText);
     }
-    const rows = parse_csv(await response.text());
-    const header = rows.shift().map(h => h.trim());
-    const column = (row, name) => (row[header.indexOf(name)] || '').trim();
-    for (const row of rows) {
+    const list = await response.json();
+    if (!Array.isArray(list)) {
+      throw new Error(url + ': not a list');
+    }
+    for (const entry of list) {
       const project = {
-        slug: column(row, 'slug'),
-        name: column(row, 'name'),
-        icon: column(row, 'icon'),
+        slug: String(entry.slug || '').trim(),
+        name: String(entry.name || '').trim(),
+        icon: String(entry.icon || '').trim(),
       };
       if (!project.slug || !project.name) {
         continue;
@@ -192,7 +197,7 @@ class FediProjects {
       name: name,
       color: 'rgb(' + rgb.join(', ') + ')',
       on_color: on_color(rgb),
-      icon: icon ? ICON_DIR + icon : null,
+      icon: icon || null,
     };
   }
 }
@@ -206,7 +211,7 @@ class FediverseDashboard {
   ///
   /// Registering (adding, editing, renewing, see SEED_WORKER) goes to the
   /// SRP registrar `registrar` (a DoH URL), by default the DoH server of the
-  /// zone. `seed`: also register the instances of INSTANCES_MD missing in
+  /// zone. `seed`: also register the instances of INSTANCES_JSON missing in
   /// the first zone shown.
   constructor(doh, zone_doh, public_doh, seed, registrar) {
     this.doh = doh;
@@ -239,7 +244,7 @@ class FediverseDashboard {
     this.timer = null;
     this.service_info = new SdServiceInfo();
     this.projects = new FediProjects();
-    this.projects_loaded = this.projects.load(SOURCES_CSV).catch((error) => {
+    this.projects_loaded = this.projects.load(SUBTYPES_JSON).catch((error) => {
       console.error('fediverse projects did not load', error);
     });
     // incremented on every zone change, so stale refreshes can be dropped
@@ -1025,41 +1030,24 @@ function instance_of(text, subtypes) {
   return {host: host, url: url, subtypes: labels};
 }
 
-/// the instances of INSTANCES_MD: `## <project>` headings, each followed by
-/// a list of `- [name](url)` links. A heading starting with `_fedi` lists
-/// general fediverse services, which get no subtype. An instance listed
-/// twice is registered once, in the subtypes of both headings.
-/// Returns `[{host, url, subtypes}]`, `host` the host label of the url's
-/// domain.
-function parse_instances(markdown) {
-  const by_host = new Map();
-  let project = null;
-  for (const line of markdown.split(/\r?\n/)) {
-    const heading = /^##\s+(.+?)\s*$/.exec(line);
-    if (heading) {
-      project = heading[1].startsWith('_fedi') ? null : heading[1];
-      continue;
-    }
-    const link = /^\s*[-*]\s+\[[^\]]*\]\((https?:\/\/[^)\s]+)\)/.exec(line);
-    if (!link) {
-      continue;
-    }
-    let instance;
+/// the instances of INSTANCES_JSON: a list of `{host, url, subtypes}`, each
+/// host once; `subtypes` are the projects the instance is listed for, none
+/// for general fediverse services. Each entry is checked by `instance_of`,
+/// which also makes its URL. Returns `[{host, url, subtypes}]`, `host` the
+/// host label of the url's domain.
+function load_instances(list) {
+  if (!Array.isArray(list)) {
+    throw new Error(INSTANCES_JSON + ': not a list');
+  }
+  const instances = [];
+  for (const entry of list) {
     try {
-      instance = instance_of(link[1], project ? [project] : []);
+      instances.push(instance_of(entry.url, entry.subtypes || []));
     } catch (error) {
-      console.warn(INSTANCES_MD + ': ' + error.message);
-      continue;
-    }
-    const known = by_host.get(instance.host);
-    if (!known) {
-      by_host.set(instance.host, instance);
-    } else if (instance.subtypes.length &&
-               !known.subtypes.some(s => fold(s) === fold(instance.subtypes[0]))) {
-      known.subtypes.push(instance.subtypes[0]);
+      console.warn(INSTANCES_JSON + ': ' + error.message);
     }
   }
-  return [...by_host.values()];
+  return instances;
 }
 
 /// whether `error` is the refusal of the rate limit in front of the proxy:
@@ -1187,49 +1175,6 @@ function encode_label(text) {
 function usable_label(text) {
   const octets = new TextEncoder().encode(text.normalize('NFC')).length;
   return octets > 0 && octets <= 63 && !text.includes('.');
-}
-
-/// parse CSV text (RFC 4180, with quoted fields) into an array of rows
-function parse_csv(text) {
-  const rows = [];
-  let row = [];
-  let field = '';
-  let quoted = false;
-  for (let i = 0; i < text.length; i++) {
-    const c = text[i];
-    if (quoted) {
-      if (c === '"' && text[i + 1] === '"') {
-        field += '"';
-        i++;
-      } else if (c === '"') {
-        quoted = false;
-      } else {
-        field += c;
-      }
-    } else if (c === '"') {
-      quoted = true;
-    } else if (c === ',') {
-      row.push(field);
-      field = '';
-    } else if (c === '\n' || c === '\r') {
-      if (c === '\r' && text[i + 1] === '\n') {
-        i++;
-      }
-      row.push(field);
-      field = '';
-      if (row.length > 1 || row[0] !== '') {
-        rows.push(row);
-      }
-      row = [];
-    } else {
-      field += c;
-    }
-  }
-  row.push(field);
-  if (row.length > 1 || row[0] !== '') {
-    rows.push(row);
-  }
-  return rows;
 }
 
 /// decode TXT answers to an array of strings

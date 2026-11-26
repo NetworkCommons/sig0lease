@@ -1,0 +1,805 @@
+[
+ {
+  "host": "fediversum-info",
+  "url": "https://fediversum.info/",
+  "subtypes": []
+ },
+ {
+  "host": "instances-social",
+  "url": "https://instances.social/",
+  "subtypes": []
+ },
+ {
+  "host": "fedi-garden",
+  "url": "https://fedi.garden/",
+  "subtypes": []
+ },
+ {
+  "host": "fedi-directory",
+  "url": "https://fedi.directory/",
+  "subtypes": []
+ },
+ {
+  "host": "fedidb-org",
+  "url": "https://fedidb.org/",
+  "subtypes": []
+ },
+ {
+  "host": "fediverse-observer",
+  "url": "https://fediverse.observer/",
+  "subtypes": []
+ },
+ {
+  "host": "fedi-tips",
+  "url": "https://fedi.tips/",
+  "subtypes": []
+ },
+ {
+  "host": "fediverse-info",
+  "url": "https://fediverse.info/",
+  "subtypes": []
+ },
+ {
+  "host": "chaos-social",
+  "url": "https://chaos.social/",
+  "subtypes": [
+   "Mastodon"
+  ]
+ },
+ {
+  "host": "digitalcourage-social",
+  "url": "https://digitalcourage.social/",
+  "subtypes": [
+   "Mastodon"
+  ]
+ },
+ {
+  "host": "nerdculture-de",
+  "url": "https://nerdculture.de/",
+  "subtypes": [
+   "Mastodon"
+  ]
+ },
+ {
+  "host": "troet-cafe",
+  "url": "https://troet.cafe/",
+  "subtypes": [
+   "Mastodon"
+  ]
+ },
+ {
+  "host": "mstdn-social",
+  "url": "https://mstdn.social/",
+  "subtypes": [
+   "Mastodon"
+  ]
+ },
+ {
+  "host": "masto-ai",
+  "url": "https://masto.ai/",
+  "subtypes": [
+   "Mastodon"
+  ]
+ },
+ {
+  "host": "mastodon-top",
+  "url": "https://mastodon.top/",
+  "subtypes": [
+   "Mastodon"
+  ]
+ },
+ {
+  "host": "ohai-social",
+  "url": "https://ohai.social/",
+  "subtypes": [
+   "Mastodon"
+  ]
+ },
+ {
+  "host": "mastodon-de",
+  "url": "https://mastodon.de/",
+  "subtypes": [
+   "Mastodon"
+  ]
+ },
+ {
+  "host": "eter9-com",
+  "url": "https://eter9.com/",
+  "subtypes": [
+   "Misskey"
+  ]
+ },
+ {
+  "host": "misskey-takeko-cyou",
+  "url": "https://misskey.takeko.cyou/",
+  "subtypes": [
+   "Misskey"
+  ]
+ },
+ {
+  "host": "kitsune-moe",
+  "url": "https://kitsune.moe/",
+  "subtypes": [
+   "Misskey"
+  ]
+ },
+ {
+  "host": "freaksonly-space",
+  "url": "https://freaksonly.space/",
+  "subtypes": [
+   "Misskey"
+  ]
+ },
+ {
+  "host": "comfy-social",
+  "url": "https://comfy.social/",
+  "subtypes": [
+   "Misskey"
+  ]
+ },
+ {
+  "host": "gram-social",
+  "url": "https://gram.social/",
+  "subtypes": [
+   "Pixelfed"
+  ]
+ },
+ {
+  "host": "pixelfed-de",
+  "url": "https://pixelfed.de/",
+  "subtypes": [
+   "Pixelfed"
+  ]
+ },
+ {
+  "host": "pixelfed-uno",
+  "url": "https://pixelfed.uno/",
+  "subtypes": [
+   "Pixelfed"
+  ]
+ },
+ {
+  "host": "pixey-org",
+  "url": "https://pixey.org/",
+  "subtypes": [
+   "Pixelfed"
+  ]
+ },
+ {
+  "host": "pixelfed-fr",
+  "url": "https://pixelfed.fr/",
+  "subtypes": [
+   "Pixelfed"
+  ]
+ },
+ {
+  "host": "tilvids-com",
+  "url": "https://tilvids.com/",
+  "subtypes": [
+   "PeerTube"
+  ]
+ },
+ {
+  "host": "videos-toromedia-com",
+  "url": "https://videos.toromedia.com/",
+  "subtypes": [
+   "PeerTube"
+  ]
+ },
+ {
+  "host": "makertube-net",
+  "url": "https://makertube.net/",
+  "subtypes": [
+   "PeerTube"
+  ]
+ },
+ {
+  "host": "clip-place",
+  "url": "https://clip.place/",
+  "subtypes": [
+   "PeerTube"
+  ]
+ },
+ {
+  "host": "ttrpg-network",
+  "url": "https://ttrpg.network/",
+  "subtypes": [
+   "Lemmy"
+  ]
+ },
+ {
+  "host": "feddit-uk",
+  "url": "https://feddit.uk/",
+  "subtypes": [
+   "Lemmy"
+  ]
+ },
+ {
+  "host": "forums-rereading-space",
+  "url": "https://forums.rereading.space/",
+  "subtypes": [
+   "Lemmy"
+  ]
+ },
+ {
+  "host": "forum-ayom-media",
+  "url": "https://forum.ayom.media/",
+  "subtypes": [
+   "Lemmy"
+  ]
+ },
+ {
+  "host": "blog-liberta-vip",
+  "url": "https://blog.liberta.vip/",
+  "subtypes": [
+   "WriteFreely"
+  ]
+ },
+ {
+  "host": "blog-kuba-orlik-name",
+  "url": "https://blog.kuba-orlik.name/",
+  "subtypes": [
+   "WriteFreely"
+  ]
+ },
+ {
+  "host": "blog-librescrum-org",
+  "url": "https://blog.librescrum.org/",
+  "subtypes": [
+   "WriteFreely"
+  ]
+ },
+ {
+  "host": "write-storydragon-nl",
+  "url": "https://write.storydragon.nl/",
+  "subtypes": [
+   "WriteFreely"
+  ]
+ },
+ {
+  "host": "community-i-doit-com",
+  "url": "https://community.i-doit.com/",
+  "subtypes": [
+   "NodeBB"
+  ]
+ },
+ {
+  "host": "radforum-duesseldorf-de",
+  "url": "https://radforum-duesseldorf.de/",
+  "subtypes": [
+   "NodeBB"
+  ]
+ },
+ {
+  "host": "linux-nerds-org",
+  "url": "https://linux-nerds.org/",
+  "subtypes": [
+   "NodeBB"
+  ]
+ },
+ {
+  "host": "sudonix-org",
+  "url": "https://sudonix.org/",
+  "subtypes": [
+   "NodeBB"
+  ]
+ },
+ {
+  "host": "mobilizon-fr",
+  "url": "https://mobilizon.fr/",
+  "subtypes": [
+   "Mobilizon"
+  ]
+ },
+ {
+  "host": "mobilizon-it",
+  "url": "https://mobilizon.it/",
+  "subtypes": [
+   "Mobilizon"
+  ]
+ },
+ {
+  "host": "fomobremen-info",
+  "url": "https://fomobremen.info/",
+  "subtypes": [
+   "Mobilizon"
+  ]
+ },
+ {
+  "host": "miniwa-moe",
+  "url": "https://miniwa.moe/",
+  "subtypes": [
+   "Pleroma"
+  ]
+ },
+ {
+  "host": "masto-destructatron-net",
+  "url": "https://masto.destructatron.net/",
+  "subtypes": [
+   "Pleroma"
+  ]
+ },
+ {
+  "host": "pleroma-soykaf-com",
+  "url": "https://pleroma.soykaf.com/",
+  "subtypes": [
+   "Pleroma"
+  ]
+ },
+ {
+  "host": "loops-city",
+  "url": "https://loops.city/",
+  "subtypes": [
+   "Loops"
+  ]
+ },
+ {
+  "host": "loops-stage-anoxinon-de",
+  "url": "https://loops.stage.anoxinon.de/",
+  "subtypes": [
+   "Loops"
+  ]
+ },
+ {
+  "host": "bonn-lol",
+  "url": "https://bonn.lol/",
+  "subtypes": [
+   "Loops"
+  ]
+ },
+ {
+  "host": "bookwyrm-it",
+  "url": "https://bookwyrm.it/",
+  "subtypes": [
+   "BookWyrm"
+  ]
+ },
+ {
+  "host": "bookwyrm-tilde-zone",
+  "url": "https://bookwyrm.tilde.zone/",
+  "subtypes": [
+   "BookWyrm"
+  ]
+ },
+ {
+  "host": "books-infosec-exchange",
+  "url": "https://books.infosec.exchange/",
+  "subtypes": [
+   "BookWyrm"
+  ]
+ },
+ {
+  "host": "www-glotter-com",
+  "url": "https://www.glotter.com/",
+  "subtypes": [
+   "WordPress"
+  ]
+ },
+ {
+  "host": "radikalpolitikk-no",
+  "url": "https://radikalpolitikk.no/",
+  "subtypes": [
+   "WordPress"
+  ]
+ },
+ {
+  "host": "blog-tib-eu",
+  "url": "https://blog.tib.eu/",
+  "subtypes": [
+   "WordPress"
+  ]
+ },
+ {
+  "host": "sharkey-world",
+  "url": "https://sharkey.world/",
+  "subtypes": [
+   "Sharkey"
+  ]
+ },
+ {
+  "host": "federation-network",
+  "url": "https://federation.network/",
+  "subtypes": [
+   "Sharkey"
+  ]
+ },
+ {
+  "host": "lea-pet",
+  "url": "https://lea.pet/",
+  "subtypes": [
+   "Sharkey"
+  ]
+ },
+ {
+  "host": "neodb-kevga-de",
+  "url": "https://neodb.kevga.de/",
+  "subtypes": [
+   "NeoDB"
+  ]
+ },
+ {
+  "host": "neodb-social",
+  "url": "https://neodb.social/",
+  "subtypes": [
+   "NeoDB"
+  ]
+ },
+ {
+  "host": "eggplant-place",
+  "url": "https://eggplant.place/",
+  "subtypes": [
+   "NeoDB"
+  ]
+ },
+ {
+  "host": "larkspur-one",
+  "url": "https://larkspur.one/",
+  "subtypes": [
+   "Akkoma"
+  ]
+ },
+ {
+  "host": "pleroma-envs-net",
+  "url": "https://pleroma.envs.net/",
+  "subtypes": [
+   "Akkoma"
+  ]
+ },
+ {
+  "host": "infosec-place",
+  "url": "https://infosec.place/",
+  "subtypes": [
+   "Akkoma"
+  ]
+ },
+ {
+  "host": "anarchist-nexus",
+  "url": "https://anarchist.nexus/",
+  "subtypes": [
+   "PieFed"
+  ]
+ },
+ {
+  "host": "multiverse-soulism-net",
+  "url": "https://multiverse.soulism.net/",
+  "subtypes": [
+   "PieFed"
+  ]
+ },
+ {
+  "host": "bookwyr-me",
+  "url": "https://bookwyr.me/",
+  "subtypes": [
+   "PieFed"
+  ]
+ },
+ {
+  "host": "friendica-world",
+  "url": "https://friendica.world/",
+  "subtypes": [
+   "Friendica"
+  ]
+ },
+ {
+  "host": "social-trom-tf",
+  "url": "https://social.trom.tf/",
+  "subtypes": [
+   "Friendica"
+  ]
+ },
+ {
+  "host": "merveilles-town",
+  "url": "https://merveilles.town/",
+  "subtypes": [
+   "Hometown"
+  ]
+ },
+ {
+  "host": "queer-group",
+  "url": "https://queer.group/",
+  "subtypes": [
+   "Hometown"
+  ]
+ },
+ {
+  "host": "hub-hubzilla-de",
+  "url": "https://hub.hubzilla.de/",
+  "subtypes": [
+   "Hubzilla"
+  ]
+ },
+ {
+  "host": "zotum-net",
+  "url": "https://zotum.net/",
+  "subtypes": [
+   "Hubzilla"
+  ]
+ },
+ {
+  "host": "bark-wolp-chat",
+  "url": "https://bark.wolp.chat/",
+  "subtypes": [
+   "Wafrn"
+  ]
+ },
+ {
+  "host": "social-cybernetica-cc",
+  "url": "https://social.cybernetica.cc/",
+  "subtypes": [
+   "Wafrn"
+  ]
+ },
+ {
+  "host": "rimworld-gallery",
+  "url": "https://rimworld.gallery/",
+  "subtypes": [
+   "Mbin"
+  ]
+ },
+ {
+  "host": "thebrainbin-org",
+  "url": "https://thebrainbin.org/",
+  "subtypes": [
+   "Mbin"
+  ]
+ },
+ {
+  "host": "jornalmaio-org",
+  "url": "https://jornalmaio.org/",
+  "subtypes": [
+   "Ghost"
+  ]
+ },
+ {
+  "host": "richardlemon-com",
+  "url": "https://richardlemon.com/",
+  "subtypes": [
+   "Ghost"
+  ]
+ },
+ {
+  "host": "bcn-convoca-la",
+  "url": "https://bcn.convoca.la/",
+  "subtypes": [
+   "Gancio"
+  ]
+ },
+ {
+  "host": "berlin-askapunk-de",
+  "url": "https://berlin.askapunk.de/",
+  "subtypes": [
+   "Gancio"
+  ]
+ },
+ {
+  "host": "chai-aozora-uk",
+  "url": "https://chai.aozora.uk/",
+  "subtypes": [
+   "CherryPick"
+  ]
+ },
+ {
+  "host": "blewsky-social",
+  "url": "https://blewsky.social/",
+  "subtypes": [
+   "CherryPick"
+  ]
+ },
+ {
+  "host": "plume-helios42-de",
+  "url": "https://plume.helios42.de/",
+  "subtypes": [
+   "Plume"
+  ]
+ },
+ {
+  "host": "blogs-kitaitimakoto-net",
+  "url": "https://blogs.kitaitimakoto.net/",
+  "subtypes": [
+   "Plume"
+  ]
+ },
+ {
+  "host": "infosec-town",
+  "url": "https://infosec.town/",
+  "subtypes": [
+   "Iceshrimp"
+  ]
+ },
+ {
+  "host": "fedia-social",
+  "url": "https://fedia.social/",
+  "subtypes": [
+   "Iceshrimp"
+  ]
+ },
+ {
+  "host": "tanukitunes-com",
+  "url": "https://tanukitunes.com/",
+  "subtypes": [
+   "Funkwhale"
+  ]
+ },
+ {
+  "host": "stereo-kenobit-it",
+  "url": "https://stereo.kenobit.it/",
+  "subtypes": [
+   "Funkwhale"
+  ]
+ },
+ {
+  "host": "social-queerit-org",
+  "url": "https://social.queerit.org/",
+  "subtypes": [
+   "Bonfire"
+  ]
+ },
+ {
+  "host": "kakapo-social",
+  "url": "https://kakapo.social/",
+  "subtypes": [
+   "Bonfire"
+  ]
+ },
+ {
+  "host": "vernissage-pnpde-social",
+  "url": "https://vernissage.pnpde.social/",
+  "subtypes": [
+   "Vernissage"
+  ]
+ },
+ {
+  "host": "pics-fux-is",
+  "url": "https://pics.fux.is/",
+  "subtypes": [
+   "Vernissage"
+  ]
+ },
+ {
+  "host": "electricrequiem-com",
+  "url": "https://electricrequiem.com/",
+  "subtypes": [
+   "Catodon"
+  ]
+ },
+ {
+  "host": "bandwagon-fm",
+  "url": "https://bandwagon.fm/",
+  "subtypes": [
+   "Emissary"
+  ]
+ },
+ {
+  "host": "tagpush-app",
+  "url": "https://tagpush.app/",
+  "subtypes": [
+   "GoToSocial"
+  ]
+ },
+ {
+  "host": "nuxy-social",
+  "url": "https://nuxy.social/",
+  "subtypes": [
+   "Firefish"
+  ]
+ },
+ {
+  "host": "scm-owu-one",
+  "url": "https://scm.owu.one/",
+  "subtypes": [
+   "Mitra"
+  ]
+ },
+ {
+  "host": "codeberg-org",
+  "url": "https://codeberg.org/",
+  "subtypes": [
+   "Forgejo"
+  ]
+ },
+ {
+  "host": "git-tilera-org",
+  "url": "https://git.tilera.org/",
+  "subtypes": [
+   "Forgejo"
+  ]
+ },
+ {
+  "host": "takahe-schach-social",
+  "url": "https://takahe.schach.social/",
+  "subtypes": [
+   "Takahē"
+  ]
+ },
+ {
+  "host": "3d-bonn-digital",
+  "url": "https://3d.bonn.digital/",
+  "subtypes": [
+   "Manyfold"
+  ]
+ },
+ {
+  "host": "live-romerustv-de",
+  "url": "https://live.romerustv.de/",
+  "subtypes": [
+   "Owncast"
+  ]
+ },
+ {
+  "host": "wake-0am-jp",
+  "url": "https://wake.0am.jp/",
+  "subtypes": [
+   "FoundKey"
+  ]
+ },
+ {
+  "host": "minidisc-tokyo",
+  "url": "https://minidisc.tokyo/",
+  "subtypes": [
+   "FoundKey"
+  ]
+ },
+ {
+  "host": "jeschke-dev",
+  "url": "https://jeschke.dev/",
+  "subtypes": [
+   "Hollo"
+  ]
+ },
+ {
+  "host": "bookmarks-mysh-dev",
+  "url": "https://bookmarks.mysh.dev/",
+  "subtypes": [
+   "Betula"
+  ]
+ },
+ {
+  "host": "pod-geraspora-de",
+  "url": "https://pod.geraspora.de/",
+  "subtypes": [
+   "diaspora*"
+  ]
+ },
+ {
+  "host": "diasp-org",
+  "url": "https://diasp.org/",
+  "subtypes": [
+   "diaspora*"
+  ]
+ },
+ {
+  "host": "bobinas-p4g-club",
+  "url": "https://bobinas.p4g.club/",
+  "subtypes": [
+   "GNU social"
+  ]
+ },
+ {
+  "host": "polykyklo-gr",
+  "url": "https://polykyklo.gr/",
+  "subtypes": [
+   "Discourse"
+  ]
+ },
+ {
+  "host": "fed-brid-gy",
+  "url": "https://fed.brid.gy/",
+  "subtypes": [
+   "Bridgy Fed"
+  ]
+ },
+ {
+  "host": "socialhome-network",
+  "url": "https://socialhome.network/",
+  "subtypes": [
+   "Socialhome"
+  ]
+ },
+ {
+  "host": "friends-grishka-me",
+  "url": "https://friends.grishka.me/",
+  "subtypes": [
+   "Smithereen"
+  ]
+ }
+]
