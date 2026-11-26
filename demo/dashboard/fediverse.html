@@ -151,6 +151,14 @@
         <li class="entry">
             <div class="label-row">
                 <div class="label"></div>
+                <span class="lease" hidden>
+                    <svg class="lease-clock" viewBox="0 0 20 20" aria-hidden="true">
+                        <circle class="lease-face" cx="10" cy="10" r="9"/>
+                        <circle class="lease-left" cx="10" cy="10" r="4.5" pathLength="100" transform="rotate(-90 10 10)"/>
+                        <line class="lease-hand" x1="10" y1="10" x2="10" y2="1.5"/>
+                    </svg>
+                    <span class="lease-time"></span>
+                </span>
                 <button type="button" class="edit-button" title="this browser registered this entry and can change it" hidden><span class="fa-solid fa-pen"></span></button>
             </div>
             <a class="link" href="" target="_blank" rel="noopener noreferrer" hidden>

@@ -275,6 +275,49 @@ class FediverseDashboard {
     this.dnssec = document.getElementById('dnssec');
     this.empty = document.getElementById('empty');
     this.seed_status = document.getElementById('seed');
+
+    // the remaining lease of the entries this browser registered, counted
+    // down every second; read from `entries` on each tick, so a renewal
+    // shows without a redraw
+    setInterval(() => this.update_leases(), 1000);
+  }
+
+  /// update the remaining lease of every entry this browser registered
+  update_leases() {
+    for (const li of this.boxes.querySelectorAll('.entry[data-lease-key]')) {
+      this.update_lease(li);
+    }
+  }
+
+  /// update the remaining lease shown in the entry `li`: hours, minutes and
+  /// seconds, and a clock whose sector is the part of LEASE that is left
+  update_lease(li) {
+    const lease = li.querySelector('.lease');
+    const entry = this.entries.get(li.dataset.leaseKey);
+    if (!entry || !entry.registered) {
+      lease.hidden = true;
+      return;
+    }
+    const left = Math.max(0, entry.registered + LEASE * 1000 - Date.now());
+    const seconds = Math.ceil(left / 1000);
+    const fraction = Math.min(1, left / (LEASE * 1000));
+    const pad = (n) => String(n).padStart(2, '0');
+    lease.querySelector('.lease-time').textContent =
+        Math.floor(seconds / 3600) + ':' + pad(Math.floor(seconds / 60) % 60) +
+        ':' + pad(seconds % 60);
+    lease.title = seconds > 0 ?
+        'lease ends at ' + new Date(entry.registered + LEASE * 1000)
+                               .toLocaleTimeString() +
+            ', renewed while this page is open' :
+        'lease ended';
+    // the sector from the hand clockwise to 12 o'clock is what is left
+    const sector = lease.querySelector('.lease-left');
+    sector.style.strokeDasharray = (fraction * 100) + ' 100';
+    sector.style.strokeDashoffset = -((1 - fraction) * 100);
+    lease.querySelector('.lease-hand').setAttribute(
+        'transform', 'rotate(' + ((1 - fraction) * 360) + ' 10 10)');
+    lease.classList.toggle('ending', fraction < 0.1);
+    lease.hidden = false;
   }
 
   /// start watching a zone
@@ -932,6 +975,8 @@ class FediverseDashboard {
     if (this.owns(instance)) {
       const host = fold(instance.label);
       const entry = this.entries.get(entry_key(host, this.zone));
+      li.dataset.leaseKey = entry_key(host, this.zone);
+      this.update_lease(li);
       const button = li.querySelector('.edit-button');
       button.hidden = false;
       button.addEventListener('click', () => {

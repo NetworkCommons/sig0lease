@@ -374,6 +374,55 @@ main {
     flex: none;
 }
 
+/* remaining lease of an entry this browser registered: a countdown and a
+   clock whose sector is the part of the lease that is left */
+.entry .lease {
+    flex: none;
+    margin-left: auto;
+    display: inline-flex;
+    align-items: center;
+    gap: 0.3em;
+    font-size: 0.8rem;
+    font-variant-numeric: tabular-nums;
+    color: var(--muted);
+    align-self: center;
+}
+
+.entry .lease[hidden] {
+    display: none;
+}
+
+.lease-clock {
+    width: 1.1rem;
+    height: 1.1rem;
+}
+
+.lease-face {
+    fill: color-mix(in srgb, var(--accent) 12%, var(--surface));
+    stroke: var(--accent);
+    stroke-width: 1.5;
+}
+
+.lease-left {
+    fill: none;
+    stroke: var(--accent);
+    stroke-width: 9;
+}
+
+.lease-hand {
+    stroke: var(--muted);
+    stroke-width: 1.2;
+    stroke-linecap: round;
+}
+
+.entry .lease.ending {
+    color: #c62828;
+}
+
+.lease.ending .lease-left {
+    stroke: #c62828;
+}
+
 .box .add-button:hover,
 .entry .edit-button:hover,
 .instance-form button:hover {
